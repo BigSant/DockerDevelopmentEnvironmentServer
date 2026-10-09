@@ -87,6 +87,31 @@ def entry(ref, commit, at, rollback=False, **extra):
     return {"ref": ref, "commit": commit, "at": at, "rollback": rollback, "backup": None, **extra}
 
 
+class SharedHelpersTest(unittest.TestCase):
+    """bin/backup-projects and bin/worker-metrics each carry the build-root lookup and the backup name
+    patterns (the installed copies are single files); they must not drift apart."""
+
+    SHARED = ("environment_directory", "NAME", "SERIES")
+
+    def definitions(self, name):
+        import ast
+        source = (ROOT / "bin" / name).read_text()
+        found = {}
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.FunctionDef) and node.name in self.SHARED:
+                found[node.name] = ast.get_source_segment(source, node)
+            elif isinstance(node, ast.Assign) and len(node.targets) == 1 and getattr(node.targets[0], "id", None) in self.SHARED:
+                found[node.targets[0].id] = ast.get_source_segment(source, node)
+        return found
+
+    def test_the_duplicated_helpers_are_identical(self):
+        backups, metrics = self.definitions("backup-projects"), self.definitions("worker-metrics")
+        self.assertEqual(sorted(backups), sorted(self.SHARED))
+        for name in self.SHARED:
+            with self.subTest(name=name):
+                self.assertEqual(metrics.get(name), backups[name])
+
+
 class EndpointTest(ScriptTest):
     def setUp(self):
         super().setUp()
@@ -347,7 +372,9 @@ chown -R setup:setup /srv/setup-server/projects && chmod -R go-rwx /srv/setup-se
 # systemctl is a stub (no systemd in the container); the unit is verified below.
 PATH=/stubs:$PATH /setup-server/bin/install-metrics --address 127.0.0.1
 PATH=/stubs:$PATH /setup-server/bin/install-metrics | grep -c unchanged
-systemd-analyze verify /etc/systemd/system/setup-server-metrics.service && echo UNIT_VERIFIED
+# verify only warns (exit 0) about a bad setting: any output is a finding.
+systemd-analyze verify /etc/systemd/system/setup-server-metrics.service >/tmp/verify.log 2>&1 || true
+cat /tmp/verify.log; [ -s /tmp/verify.log ] || echo UNIT_VERIFIED
 stat -c '%U %a %n' /etc/setup-server/metrics.env /usr/local/sbin/setup-server-metrics
 # What the unit runs: the setup account with the root file's settings.
 set -a; . /etc/setup-server/metrics.env; set +a

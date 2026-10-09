@@ -2,9 +2,11 @@
 # Remove a project's build root ($ROOT/projects/<name>). It holds the project's database backups,
 # release history and deploy log, so those are only deleted on request, and a build root that a
 # running container still uses is never removed. --check shows what would go and changes nothing.
+# The project's secrets ($CONFIG/projects/<name>) are not removed.
 set -euo pipefail
 
 ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+CONFIG=${SETUP_SERVER_CONFIG:-/etc/setup-server}
 
 check=0
 with_backups=0
@@ -40,10 +42,15 @@ if [ -L "$build_root" ] || [ ! -d "$build_root" ]; then
     exit 65
 fi
 
-# What the build root holds besides checkouts.
-generated="$build_root/app/.generated"
-backups=$({ find "$generated/backups" -maxdepth 1 -type f 2>/dev/null || true; } | wc -l)
-deploys=$({ find "$generated/release" -mindepth 2 -maxdepth 2 -name deployments.json 2>/dev/null || true; } | wc -l)
+# What the build root holds besides checkouts. The environment repository is app/, or app/docker/ in older
+# layouts (environment_directory in bin/backup-projects and bin/worker-metrics); both are counted.
+backups=0
+deploys=0
+for environment_directory in "$build_root/app" "$build_root/app/docker"; do
+    generated="$environment_directory/.generated"
+    backups=$((backups + $({ find "$generated/backups" -maxdepth 1 -type f 2>/dev/null || true; } | wc -l)))
+    deploys=$((deploys + $({ find "$generated/release" -mindepth 2 -maxdepth 2 -name deployments.json 2>/dev/null || true; } | wc -l)))
+done
 size=$({ du -sh "$build_root" 2>/dev/null || true; } | cut -f1)
 echo "==> $build_root: ${size:-?}; database backups: $backups; environments with deploy history: $deploys"
 
@@ -59,9 +66,14 @@ if [ $((backups + deploys)) -gt 0 ] && [ "$with_backups" = 0 ]; then
     exit 65
 fi
 
+secrets="==> $CONFIG/projects/$name (the secrets of its nightly backups) is not removed; when it is not needed any more: sudo rm -r $CONFIG/projects/$name"
+# Only root sees whether it exists ($CONFIG is 0700); without root it is always named.
+if [ "$(id -u)" = 0 ] && [ ! -e "$CONFIG/projects/$name" ]; then secrets=; fi
 if [ "$check" = 1 ]; then
     echo "==> would remove $build_root; nothing was changed"
+    [ -z "$secrets" ] || echo "$secrets"
     exit 0
 fi
 rm -rf -- "$build_root"
 echo "==> removed $build_root"
+[ -z "$secrets" ] || echo "$secrets"

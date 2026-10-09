@@ -33,6 +33,7 @@ PROJECTS = ROOT / 'projects'
 ENVIRONMENTS = ('stage', 'prod')
 KEEP_DAILY, KEEP_WEEKLY = 7, 4
 JOB_TIMEOUT = 4 * 3600
+# NAME, SERIES and environment_directory are identical in bin/worker-metrics (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
 SERIES = re.compile(r'worker-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
 STAMP = '%Y%m%dT%H%M%S'

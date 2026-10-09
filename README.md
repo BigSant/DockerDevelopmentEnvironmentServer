@@ -57,8 +57,9 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 
    Pabaigoje parodomas viešasis git raktas. Pridėk jį **tik skaitymui** prie setup repo (GitHub,
    deploy key) ir prie kiekvieno projekto repo (Bitbucket, Access keys). Tada paleisk scriptą dar
-   kartą: jis nusiklonuos setup. Palygink parodytus `bitbucket.org` ir `github.com` SSH
-   fingerprint'us su paslaugų paskelbtais.
+   kartą: jis nusiklonuos setup. `bitbucket.org` ir `github.com` SSH host raktai įrašomi tik tada, kai
+   nuskenuoto rakto fingerprint'as sutampa su paslaugos paskelbtu (jie įrašyti scripte su nuorodomis į
+   GitHub ir Atlassian puslapius); kitaip raktas neįrašomas ir parodoma „Needs attention“.
 
 3. **Runner'is.** Bitbucket: *Repository (arba Workspace) settings → Runners → Add runner → Linux
    Shell*, pridėk žymą `setup.build`. Dialogo komandų **nevykdyk** – jose esančias reikšmes scriptas
@@ -76,10 +77,20 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    Visą dialogo tekstą galima ir paduoti per stdin (`sudo bin/install-runner < dialogas.txt`).
 
    OAuth duomenys įrašomi tik į `/etc/setup-server/runner.env` (root, 0600); dialogo teksto niekur
-   kitur nekopijuok. Pats runner'is juos gauna kaip `start.sh` argumentus (taip jį sukūrė Atlassian),
-   todėl šiame serveryje jie matomi `ps`. Po minutės Bitbucket'e runner'is turi būti **ONLINE**. Kitas
-   runner'is (pvz. workspace vietoj repository) įdiegiamas paleidžiant tą patį scriptą su naujomis
-   reikšmėmis.
+   kitur nekopijuok. Kol runner'is veikia, `OAuthClientId` ir `OAuthClientSecret` šiame serveryje
+   perskaitomi (taip jį sukūrė Atlassian):
+
+   - **komandų eilutėje**: systemd perduoda juos `start.sh` argumentais, o šis – `java` procesui kaip
+     `-D…` parametrus; `ps` ir `/proc/<PID>/cmdline` juos rodo **visoms** serverio paskyroms;
+   - **aplinkoje** (`RUNNER_ARGS` iš root failo): `/proc/<PID>/environ` skaito paskyra `setup`, taigi ir
+     visi jos procesai, **įskaitant pipeline žingsnius**.
+
+   `start.sh` (6.x) reikšmes priima ir iš aplinkos kintamųjų (`OAUTH_CLIENT_SECRET` ir kt.), konfigūracijos
+   failo neturi, bet `java` procesui jas vis tiek perduoda komandų eilutėje, todėl tai nieko nepaslėptų –
+   paliktas argumentų būdas. Dėl to į šį serverį neįleisk paskyrų, kurios neturi matyti šių duomenų.
+
+   Po minutės Bitbucket'e runner'is turi būti **ONLINE**. Kitas runner'is (pvz. workspace vietoj
+   repository) įdiegiamas paleidžiant tą patį scriptą su naujomis reikšmėmis.
 
 4. **Projektas:**
 
@@ -106,8 +117,11 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    sudo bin/remove-project asana_tracker
    ```
 
-   Jei kataloge yra DB kopijų ar deploy'ų istorijos, reikia `--with-backups` – tada prarandamos kopijos
-   ir rollback'as. Katalogo, kurį naudoja veikiantis konteineris, scriptas netrina.
+   Jei kataloge yra DB kopijų ar deploy'ų istorijos (`app/.generated` arba senesniame išdėstyme
+   `app/docker/.generated`), reikia `--with-backups` – tada prarandamos kopijos ir rollback'as. Katalogo,
+   kurį naudoja veikiantis konteineris, scriptas netrina. Projekto slaptažodžių katalogo
+   `/etc/setup-server/projects/<vardas>` (naktinėms kopijoms) scriptas netrina – jis tai parodo; kai nebereikia,
+   `sudo rm -r /etc/setup-server/projects/<vardas>`.
 
 6. **Naktinės DB kopijos** (worker'is, ne Bitbucket):
 
@@ -156,8 +170,13 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    ```
 
    **„Backup dabar“** – Bitbucket custom pipeline'as, vykdomas runner'io šiame serveryje. Jis kviečia tą pačią
-   komandą per `sudo` (taisyklė leidžia paskyrai `setup` tik `/usr/local/sbin/setup-server-backup`), todėl
-   naudoja tuos pačius root slaptažodžių failus, rotaciją ir nekuria įrašo Deployments istorijoje:
+   komandą per `sudo`, todėl naudoja tuos pačius root slaptažodžių failus, rotaciją ir nekuria įrašo
+   Deployments istorijoje. Sudo taisyklė leidžia paskyrai `setup` tik šią formą:
+   `/usr/local/sbin/setup-server-backup /srv/setup-server/projects/<vardas> [stage|prod]` (sudo 1.9.10+,
+   pvz. Ubuntu 24.04, tikrina reguliariąja išraiška). Senesnis sudo (Ubuntu 22.04: 1.9.9) turi tik
+   šablonus: pirmas argumentas privalo būti build katalogas, o kitus argumentus atmeta pati komanda.
+   Atnaujinus setup-server, pakartok `sudo bin/install-backups`, jei `bin/update` parodo pastabą, kad
+   sudo taisyklė skiriasi.
 
    ```yaml
    pipelines:
@@ -172,8 +191,9 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
                - sudo -n /usr/local/sbin/setup-server-backup "$BUILD_ROOT"
    ```
 
-   Antras argumentas (`stage` arba `prod`) apriboja aplinką. Atnaujinus šį repo, `sudo bin/install-backups`
-   pakartok – įdiegta komandos kopija atnaujinama.
+   Antras argumentas (`stage` arba `prod`) apriboja aplinką. Įdiegtą komandos kopiją atnaujina `bin/update`
+   (žr. „Atnaujinimas“). Pakartotinai paleistas `sudo bin/install-backups` palieka įdiegtą laiką, jei
+   nenurodytas `--at`.
 
 ## Atnaujinimas
 
@@ -190,6 +210,13 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
 - Leisk **be sudo**, kaip šio klono savininkas (setup-server parsiunčiamas tavo git raktu); setup checkout'o
   dalį scriptas pats vykdo per `sudo -u setup` (paprašys slaptažodžio). Paleistas su sudo – atsisako.
 - Galima nurodyti tik vieną pusę (`--setup-ref` arba `--server-ref`); kita lieka, kur buvo.
+- **Įdiegtos komandų kopijos.** Kai keičiasi setup-server, po perjungimo (prieš sveikatos patikrą) per
+  `sudo` perrašomos įdiegtos kopijos `/usr/local/sbin/setup-server-backup` ir `/usr/local/sbin/setup-server-metrics`
+  (tik tos, kurios įdiegtos) iš naujos versijos: `bin/install-backups --refresh` ir `bin/install-metrics --refresh`.
+  Pasikeitus metrikų kopijai, perkraunama paslauga `setup-server-metrics` (runner'io – ne). Kiti failai
+  (unit'ai, sudo taisyklė, nustatymai) nekeičiami; jei naujoje versijoje jie kitokie, išvedama pastaba
+  `note: … differs` – tada pakartok `sudo bin/install-backups` (laikas lieka) arba `sudo bin/install-metrics`.
+  Nepavykus perrašymui ar sveikatos patikrai, kartu su checkout'ais grąžinamos ir ankstesnės kopijos.
 - **Ref'as** – tag'as (pageidautina), `origin` šaka arba commit'o id. setup-server gali būti ir ne ant tag'o
   (tag'ų dar nėra). setup ne ant `vX.Y.Z` tag'o tinka **tik stage**: prod release'ui setup turi būti ant
   release tag'o – peržiūra tai parodo kaip pastabą.
@@ -198,6 +225,9 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
   Checkout'ų nekeičia.
 - Atsisako, jei checkout'e yra vietinių pakeitimų, ref'as nežinomas (parodo naujausius tag'us) arba vyksta
   pipeline žingsnis (paskyros `setup` `make` procesas) – tada palauk, kol jis baigsis.
+- Tag'ai parsiunčiami be `--force`: jei `origin` tag'as perkeltas į kitą commit'ą (perrašytas), vietinis
+  lieka, kur buvo, o `bin/update` (ir `--check`) baigiasi klaida, parodydamas tag'ą ir abu commit'us.
+  Release tag'as neturi judėti – išsiaiškink, kas ir kodėl jį perkėlė.
 
 **Sveikatos patikra po atnaujinimo** (visos trys, bet kuri nepavykusi = grįžimas):
 
@@ -213,7 +243,7 @@ repo, o setup checkout'ą kiekvienas pipeline žingsnis skaito iš naujo. Ar run
 Bitbucket'e (scriptas Bitbucket API neskaito).
 
 Nepavykus patikrai abu checkout'ai grąžinami į ankstesnius commit'us (ar šaką, jei checkout'as buvo ant
-jos), išvedama, kuri patikra nepavyko, ir grąžinamas kodas 1. Kodas 2 reiškia, kad nepavyko ir grįžimas –
+jos), o įdiegtos komandų kopijos – į ankstesnes; išvedama, kuri patikra nepavyko, ir grąžinamas kodas 1. Kodas 2 reiškia, kad nepavyko ir grįžimas –
 išvedamos komandos rankiniam atstatymui.
 
 ### Rankinis atstatymas
@@ -242,6 +272,10 @@ Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo 
    git -C ~/setup-server checkout --force <setup-server commit'as>
    (cd / && sudo -u setup -H git -C /srv/setup-server/setup checkout --force <setup commit'as>)
    ```
+
+   Jei scriptas išvedė ir `sudo install … /usr/local/sbin/setup-server-…` eilutę, įvykdyk ją (ankstesnė
+   kopija laikoma `/tmp/tmp.…` kataloge). Be jos įdiegtas kopijas iš grąžinto checkout'o perrašo
+   `sudo bin/install-backups --refresh` ir `sudo bin/install-metrics --refresh`.
 
 4. **Patikrink:**
 
@@ -288,8 +322,7 @@ sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env         # token
   kuriuo adresu, išskyrus `127.0.0.1`/`::1`. `--port` – numatytas `9101`. `--new-token` – naujas token'as.
 - Nustatymai laikomi `/etc/setup-server/metrics.env` (root, 0600): pirmą kartą sugeneruojamas 43 simbolių
   token'as. Pakartotinai paleidus nenurodyti nustatymai lieka, paslauga perkraunama tik pasikeitus failui;
-  runner'io paslauga neliečiama. Atnaujinus šį repo (`bin/update`), `sudo bin/install-metrics` pakartok –
-  įdiegta komandos kopija atnaujinama.
+  runner'io paslauga neliečiama. Įdiegtą komandos kopiją atnaujina `bin/update` (žr. „Atnaujinimas“).
 - Prieiga kaip taikinio `/metrics`: ne iš sąrašo – `403`, be token'o ar su neteisingu – `401`, kitas kelias – `404`.
   Be 24+ simbolių token'o ar be sąrašo paslauga nepasileidžia (`journalctl -u setup-server-metrics`).
   `X-Forwarded-For` ignoruojamas: priešais nėra proxy, klientai jungiasi tiesiogiai.
@@ -357,6 +390,9 @@ Papildomai verta: `up{job="setup-worker"} == 0` arba „no data“ (VPN ar pasla
   atskirai.
 - Esamas Docker niekada nepakeičiamas ir neperkraunamas, todėl jau veikiantys konteineriai
   (dabartinė asana.local) lieka veikti.
+- Runner'io OAuth duomenys laikomi tik `/etc/setup-server/runner.env` (root, 0600), bet veikiančio runner'io
+  komandų eilutėje jie matomi visoms serverio paskyroms, o aplinkoje – paskyros `setup` procesams ir pipeline
+  žingsniams (žr. „Eiga“, 3 žingsnis).
 - Slaptažodžiai į šį repo ir į projekto katalogus nerašomi. Naktinėms kopijoms jie laikomi tik
   `/etc/setup-server/projects/` (root, 0600). Sudo taisyklė `setup` paskyrai naujų teisių neprideda: ji ir
   taip Docker grupėje.

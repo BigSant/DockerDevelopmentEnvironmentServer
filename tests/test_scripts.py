@@ -1,12 +1,14 @@
 """Host scripts in --check mode with stubbed system commands: nothing is installed or changed.
 
 B level (opt-in): SETUP_SERVER_UBUNTU_IMAGE=ubuntu:24.04 runs prepare-host --check inside a real
-Ubuntu container and confirms the Java package the runner needs is installable there.
+Ubuntu container and confirms the Java package the runner needs is installable there, and installs the
+runner (a stand-in archive) for systemd-analyze verify of its unit.
 """
 
 import getpass
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -43,6 +45,23 @@ class ScriptTest(unittest.TestCase):
         path = self.bin / name
         path.write_text("#!/bin/sh\n" + script)
         path.chmod(0o755)
+
+    def fake_root(self):
+        """Stubs that let a script's root part run as this user: `sudo` records its call and runs the command
+        with `id -u` answering 0 and `install` without -o/-g; the account seems to be in the docker group."""
+        root_bin = self.root / "root-bin"
+        root_bin.mkdir(exist_ok=True)
+        stubs = {"id": f'case "$*" in -u) echo 0;; "-nG "*) echo "$2 docker";; *) exec {shutil.which("id")} "$@";; esac\n',
+                 "install": 'for argument; do shift; case "$skip$argument" in -o|-g) skip=1;; 1*) skip=;; *) set -- "$@" "$argument";; esac; done\n'
+                            f'exec {shutil.which("install")} "$@"\n'}
+        for name, script in stubs.items():
+            (root_bin / name).write_text("#!/bin/sh\n" + script)
+            (root_bin / name).chmod(0o755)
+        self.sudo_log = self.root / "sudo.calls"
+        self.stub("sudo", f'echo "$*" >> {self.sudo_log}\n'
+                          'while [ $# -gt 0 ]; do case "$1" in -u) shift 2;; -*) shift;; *) break;; esac; done\n'
+                          f'PATH={root_bin}:$PATH exec "$@"\n')
+        return root_bin
 
     def os_release(self, distribution, version):
         (self.root / "os-release").write_text(f'ID={distribution}\nVERSION_ID="{version}"\nVERSION_CODENAME=noble\n'
@@ -94,6 +113,50 @@ class PrepareHostTest(ScriptTest):
         self.assertNotIn("Needs attention", result.stdout)
         self.assertIn("Packages: 0 missing", result.stdout)
         self.assertNotIn("install Docker Engine", result.stdout)
+
+
+class PrepareHostKeysTest(ScriptTest):
+    """prepare-host as (fake) root on a ready host: the git hosts' SSH keys it records."""
+    PUBLISHED = {  # the providers' known_hosts lines (see the fingerprints in bin/prepare-host)
+        "github.com": "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+        "bitbucket.org": "bitbucket.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIazEu89wgQZ4bqs3d63QSMzYVa0MuJ2e2gKTKqu+UUO",
+    }
+
+    def setUp(self):
+        super().setUp()
+        root_bin = self.fake_root()
+        self.stub("dpkg-query", 'printf "install ok installed"\n')
+        self.stub("docker", 'echo 2.29.1\n')
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.root / "other")], check=True)
+        other = (self.root / "other.pub").read_text().split()[1]
+        # The first scan of a host answers its published key, every later one another key (or always with
+        # FAKE_HOSTKEY): what is recorded must be what was checked.
+        cases = "".join(f'  {host}) published="{line}";;\n' for host, line in self.PUBLISHED.items())
+        self.stub("ssh-keyscan", f'for host; do :; done\ncase "$host" in\n{cases}esac\n'
+                                 f'if [ -z "${{FAKE_HOSTKEY:-}}" ] && [ ! -e {self.root}/scanned-$host ]; then\n'
+                                 f'  touch {self.root}/scanned-$host; echo "$published"\n'
+                                 f'else echo "$host ssh-ed25519 {other}"; fi\n')
+        self.known = self.root / "srv/.ssh/known_hosts"
+        self.prepare = lambda **env: self.run_script(
+            "prepare-host", PATH=f"{root_bin}:{self.bin}:{os.environ['PATH']}", SETUP_SERVER_USER=getpass.getuser(),
+            SETUP_REPO=str(self.root / "missing.git"), **env)
+
+    def test_the_published_host_keys_are_recorded_with_their_own_fingerprints(self):
+        result = self.prepare()
+        self.assertEqual(sorted(self.known.read_text().splitlines()), sorted(self.PUBLISHED.values()),
+                         result.stdout + result.stderr)
+        self.assertIn("github.com fingerprint: SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU (published)", result.stdout)
+        self.assertIn("bitbucket.org fingerprint: SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM (published)",
+                      result.stdout)
+        self.assertNotIn("host key", result.stdout.split("Needs attention")[-1])
+
+    def test_a_host_key_that_is_not_the_published_one_is_refused(self):
+        result = self.prepare(FAKE_HOSTKEY="1")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.known.read_text() if self.known.exists() else "", "", "nothing recorded")
+        self.assertIn("github.com: the scanned host key SHA256:", result.stdout)
+        self.assertIn("is not the published SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU; nothing recorded",
+                      result.stdout)
 
 
 class InstallRunnerTest(ScriptTest):
@@ -221,6 +284,23 @@ class RemoveProjectTest(ScriptTest):
         self.assertIn("add --with-backups", refused.stderr)
         self.assertEqual(self.run_script("remove-project", "--check", "--with-backups", "demo").returncode, 0)
 
+    def test_the_older_app_docker_layout_counts_too_and_the_secrets_are_named(self):
+        # backup-projects and worker-metrics also use app/docker/: its backups are not lost silently.
+        (self.build_root / "app/docker/env").mkdir(parents=True)
+        (self.build_root / "app/docker/Makefile").write_text("include x\n")
+        (self.build_root / "app/docker/.generated/backups").mkdir(parents=True)
+        (self.build_root / "app/docker/.generated/backups/worker-prod-20261009T013000Z.sql.gz").write_text("x")
+        (self.build_root / "app/docker/.generated/release/stage").mkdir(parents=True)
+        (self.build_root / "app/docker/.generated/release/stage/deployments.json").write_text("[]")
+        refused = self.run_script("remove-project", "--check", "demo", SETUP_SERVER_CONFIG=str(self.root / "etc"))
+        self.assertEqual(refused.returncode, 65, refused.stdout + refused.stderr)
+        self.assertIn("database backups: 1; environments with deploy history: 1", refused.stdout)
+        allowed = self.run_script("remove-project", "--check", "--with-backups", "demo",
+                                  SETUP_SERVER_CONFIG=str(self.root / "etc"))
+        self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
+        self.assertIn(f"{self.root}/etc/projects/demo (the secrets of its nightly backups) is not removed",
+                      allowed.stdout)
+
     def test_a_build_root_used_by_a_running_container_is_kept(self):
         env_root = self.build_root
         os.environ["FAKE_CONTAINERS"] = "abc123"
@@ -299,6 +379,7 @@ class UpdateTest(ScriptTest):
         for path, text in files.items():
             (self.root / f"{name}-work" / path).parent.mkdir(parents=True, exist_ok=True)
             (self.root / f"{name}-work" / path).write_text(text)
+            (self.root / f"{name}-work" / path).chmod(0o755 if path.startswith("bin/") else 0o644)
         self.git("-C", work, "add", "-A")
         self.git("-C", work, "commit", "-q", "-m", message)
         if tag:
@@ -313,12 +394,62 @@ class UpdateTest(ScriptTest):
 
     def update(self, *arguments, **env):
         return self.run_script("update", *arguments, SETUP_SERVER_CHECKOUT=str(self.server),
-                               SETUP_SERVER_USER=getpass.getuser(), **env)
+                               SETUP_SERVER_USER=getpass.getuser(), SETUP_SERVER_SBIN=str(self.root / "sbin"),
+                               SETUP_SERVER_SYSTEMD=str(self.root / "systemd"),
+                               SETUP_SERVER_CONFIG=str(self.root / "etc"),
+                               SETUP_SERVER_SUDOERS=str(self.root / "sudoers.d"), **env)
 
     def runner_untouched(self):
         calls = self.calls.read_text() if self.calls.exists() else ""
-        for verb in ("restart", "stop", "start", "reload", "kill", "daemon-reload", "enable", "disable"):
-            self.assertNotRegex(calls, rf"(?m)^{verb}\b", f"systemctl {verb} was called:\n{calls}")
+        for verb in ("restart", "try-restart", "stop", "start", "reload", "kill", "daemon-reload", "enable", "disable"):
+            self.assertNotRegex(calls, rf"(?m)^{verb}( \S+)* setup-server-runner\b", f"systemctl {verb} was called:\n{calls}")
+            self.assertNotRegex(calls, rf"(?m)^{verb}$", f"systemctl {verb} was called:\n{calls}")
+
+    def release_with_installers(self, tag, tests, marker):
+        """A setup-server release that carries the real installers and commands, marked so its copies are known."""
+        files = {"tests/test_health.py": tests}
+        for name in ("install-backups", "install-metrics"):
+            files[f"bin/{name}"] = (ROOT / "bin" / name).read_text()
+        for name in ("backup-projects", "worker-metrics"):
+            files[f"bin/{name}"] = (ROOT / "bin" / name).read_text() + f"# {marker}\n"
+        self.commit("server", tag, files, f"Release {tag}")
+
+    def test_an_update_refreshes_the_installed_copies_and_a_return_restores_them(self):
+        self.fake_root()
+        sbin = self.root / "sbin"
+        sbin.mkdir()
+        (sbin / "setup-server-backup").write_text("previous backup copy\n")
+        (sbin / "setup-server-metrics").write_text("previous metrics copy\n")
+        self.release_with_installers("v0.5.0", PASSING_TESTS, "release 0.5.0")
+        self.release_with_installers("v0.6.0", FAILING_TESTS, "release 0.6.0")
+
+        check = self.update("--check", "--server-ref", "v0.5.0")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn(f"refresh the installed copies: {sbin}/setup-server-backup {sbin}/setup-server-metrics", check.stdout)
+        self.assertEqual((sbin / "setup-server-backup").read_text(), "previous backup copy\n")
+
+        broken = self.update("--server-ref", "v0.6.0")
+        self.assertEqual(broken.returncode, 1, broken.stdout + broken.stderr)
+        self.assertIn(f"wrote {sbin}/setup-server-backup", broken.stdout, "copied before the health check")
+        self.assertIn("Restored the previous installed copies", broken.stdout)
+        self.assertEqual((sbin / "setup-server-backup").read_text(), "previous backup copy\n")
+        self.assertEqual((sbin / "setup-server-metrics").read_text(), "previous metrics copy\n")
+        self.assertEqual(self.head(self.server), "v0.1.0")
+
+        result = self.update("--server-ref", "v0.5.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        backup = (sbin / "setup-server-backup").read_text()
+        self.assertIn("# release 0.5.0", backup)
+        self.assertIn(f"os.environ.get('SETUP_SERVER_ROOT', '{self.root}/srv')", backup, "the host's paths are kept")
+        self.assertIn("# release 0.5.0", (sbin / "setup-server-metrics").read_text())
+        self.assertIn("--refresh", self.sudo_log.read_text())
+        self.assertRegex(self.calls.read_text(), r"(?m)^try-restart setup-server-metrics.service$",
+                         "the metrics service runs the new copy")
+        self.runner_untouched()
+        # Only what is installed is refreshed.
+        (sbin / "setup-server-metrics").unlink()
+        self.assertEqual(self.update("--server-ref", "v0.2.0").returncode, 0)
+        self.assertFalse((sbin / "setup-server-metrics").exists())
 
     def test_check_shows_what_would_change_and_changes_nothing(self):
         result = self.update("--check", "--server-ref", "v0.2.0", "--setup-ref", "v1.1.0")
@@ -403,6 +534,21 @@ class UpdateTest(ScriptTest):
         self.assertEqual((self.head(self.server), self.head(self.setup)), ("v0.1.0", "v1.0.0"))
         self.runner_untouched()
 
+    def test_a_tag_moved_upstream_is_an_error_and_the_local_tag_stays(self):
+        self.assertEqual(self.update("--check", "--setup-ref", "v1.1.0").returncode, 0)  # fetches v1.1.0
+        before = self.git("-C", str(self.setup), "rev-parse", "v1.1.0")
+        work = str(self.root / "setup-work")
+        self.commit("setup", None, {"Makefile": "VERSION=rewritten\n"}, "Rewritten 1.1.0")
+        self.git("-C", work, "tag", "-f", "v1.1.0")
+        self.git("-C", work, "push", "-q", "-f", "origin", "v1.1.0")
+        for arguments in (("--check", "--setup-ref", "v1.1.0"), ("--setup-ref", "v1.0.0")):
+            with self.subTest(arguments=arguments):
+                result = self.update(*arguments)
+                self.assertEqual(result.returncode, 65, result.stdout + result.stderr)
+                self.assertIn("tag v1.1.0 was moved on origin", result.stderr)
+                self.assertEqual(self.git("-C", str(self.setup), "rev-parse", "v1.1.0"), before)
+                self.assertEqual(self.head(self.setup), "v1.0.0")
+
     def test_branches_and_commits_are_allowed_but_setup_off_a_tag_is_stage_only(self):
         stage = self.update("--setup-ref", "stage-fix")
         self.assertEqual(stage.returncode, 0, stage.stdout + stage.stderr)
@@ -429,6 +575,33 @@ class RealUbuntuTest(unittest.TestCase):
         self.assertIn("JAVA_AVAILABLE", result.stdout, result.stderr)
         self.assertIn("would apt-get install", result.stdout)
         self.assertIn("Docker: missing", result.stdout)
+
+    def test_the_installed_runner_unit_verifies(self):
+        # A stand-in archive (bin/start.sh) and a stub systemctl: the unit is checked by systemd-analyze.
+        script = """set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq >/dev/null && apt-get install -y -qq systemd >/dev/null
+useradd --system --create-home --home-dir /srv/setup-server --shell /bin/bash setup
+mkdir -p /stubs /tmp/archive/bin
+printf '#!/bin/sh\\nexit 0\\n' > /stubs/systemctl
+printf '#!/bin/sh\\nexec java -jar runner.jar\\n' > /tmp/archive/bin/start.sh
+chmod +x /stubs/systemctl /tmp/archive/bin/start.sh
+tar -czf /tmp/runner.tar.gz -C /tmp/archive bin
+PATH=/stubs:$PATH /setup-server/bin/install-runner --tarball /tmp/runner.tar.gz <<'DIALOG'
+""" + RUN_COMMAND + """DIALOG
+# verify only warns (exit 0) about a bad setting: any output is a finding.
+systemd-analyze verify /etc/systemd/system/setup-server-runner.service >/tmp/verify.log 2>&1 || true
+cat /tmp/verify.log; [ ! -s /tmp/verify.log ]
+echo RUNNER_UNIT_VERIFIED
+stat -c '%U %a %n' /etc/setup-server/runner.env
+"""
+        result = subprocess.run(["docker", "run", "--rm", "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script],
+                                capture_output=True, text=True, timeout=600)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("RUNNER_UNIT_VERIFIED", output)
+        self.assertIn("root 600 /etc/setup-server/runner.env", result.stdout)
+        self.assertNotIn("s3cr3t", output)
 
 
 if __name__ == "__main__":

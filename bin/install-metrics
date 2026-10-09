@@ -4,7 +4,8 @@
 # read-only, on one address (default 127.0.0.1; the VPN address for Prometheus). Its settings — the
 # bearer token, the address and the allowlist — live in the root-only file /etc/setup-server/metrics.env.
 # Idempotent: a rerun keeps the settings it is not given and restarts the service only when a file
-# changed; the runner service is never touched. --check shows everything and changes nothing.
+# changed; the runner service is never touched. --check shows everything and changes nothing. --refresh
+# only rewrites an installed command copy and restarts the service when it changed: bin/update runs it.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -17,6 +18,7 @@ NAME=setup-server-metrics
 LOOPBACK="127.0.0.1 ::1"
 
 check=0
+refresh=0
 new_token=0
 address=
 port=
@@ -30,12 +32,15 @@ Usage: sudo $0 [--check] [--address IP] [--allow "IP/CIDR ..."] [--port PORT] [-
   --port       TCP port (default 9101)
   --new-token  replace the bearer token (Prometheus needs the new one)
   --check      show the unit and settings (token hidden) and what would change; change nothing
+  --refresh    only rewrite $SBIN/$NAME from this checkout, when it is installed, and restart the
+               service if it changed (bin/update runs it)
 Settings not given are kept from $CONFIG/metrics.env.
 EOF
 }
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) check=1 ;;
+        --refresh) refresh=1 ;;
         --new-token) new_token=1 ;;
         --address) address=${2:-}; shift ;;
         --allow) allow=${2:-}; shift ;;
@@ -55,6 +60,27 @@ fi
 
 settings="$CONFIG/metrics.env"
 command="$SBIN/$NAME"
+stage_command() {  # stage_command TARGET — bin/worker-metrics with this host's root
+    sed "s|os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server')|os.environ.get('SETUP_SERVER_ROOT', '$ROOT')|" \
+        "$here/worker-metrics" > "$1"
+    grep -qF "SETUP_SERVER_ROOT', '$ROOT'" "$1" || { echo "bin/worker-metrics no longer has the default of SETUP_SERVER_ROOT" >&2; exit 70; }
+}
+if [ "$refresh" = 1 ]; then
+    [ -e "$command" ] || { echo "==> $command is not installed; nothing to refresh"; exit 0; }
+    fresh=$(mktemp)
+    trap 'rm -f "$fresh"' EXIT
+    stage_command "$fresh"
+    if cmp -s "$fresh" "$command"; then
+        echo "==> $command: unchanged"
+    elif [ "$check" = 1 ]; then
+        echo "==> would write $command and restart $NAME.service if it runs"
+    else
+        install -o root -g root -m 0755 "$fresh" "$command"
+        echo "==> wrote $command"
+        systemctl try-restart "$NAME.service"  # only if it runs; the runner service is not touched
+    fi
+    exit 0
+fi
 current() {  # current KEY — its value in the existing settings file, without quotes
     [ -r "$settings" ] || return 0
     sed -n "s/^$1=//p" "$settings" | tail -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
@@ -92,9 +118,7 @@ staging=$(mktemp -d)
 trap 'rm -rf "$staging"' EXIT
 umask 077
 
-sed "s|os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server')|os.environ.get('SETUP_SERVER_ROOT', '$ROOT')|" \
-    "$here/worker-metrics" > "$staging/command"
-grep -qF "SETUP_SERVER_ROOT', '$ROOT'" "$staging/command" || { echo "bin/worker-metrics no longer has the default of SETUP_SERVER_ROOT" >&2; exit 70; }
+stage_command "$staging/command"
 
 cat > "$staging/settings" <<EOF
 # $NAME (bin/install-metrics). Read by systemd as root and given to the service.

@@ -3,7 +3,9 @@
 # that the server still works and, when it does not, return both to the commits they were on before.
 # The runner service is never restarted or reloaded: pipeline steps read the setup checkout when they run.
 # Run it as the owner of this checkout (the admin who cloned it), without sudo; the setup account's part
-# runs through sudo -u. --check fetches and shows what would change; it changes no checkout.
+# runs through sudo -u. The installed command copies ($SBIN/setup-server-backup and setup-server-metrics,
+# when installed) are rewritten from the new checkout through sudo and returned with the checkouts.
+# --check fetches and shows what would change; it changes no checkout.
 set -euo pipefail
 
 ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
@@ -11,6 +13,9 @@ ACCOUNT=${SETUP_SERVER_USER:-setup}
 RUNNER=${SETUP_SERVER_RUNNER:-setup-server-runner}
 CHECKOUT=${SETUP_SERVER_CHECKOUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)}
 SETUP="$ROOT/setup"
+SBIN=${SETUP_SERVER_SBIN:-/usr/local/sbin}
+# Installed copy of a command : the installer whose --refresh rewrites it.
+COPIES=(setup-server-backup:install-backups setup-server-metrics:install-metrics)
 RELEASE_TAG='^v[0-9]+\.[0-9]+\.[0-9]+$'
 
 usage() {
@@ -23,7 +28,8 @@ REF is a tag (preferred), a branch of origin or a commit id. setup off a vX.Y.Z 
 prod releases need setup on a release tag. Exit: 0 updated, 1 health check failed and both checkouts
 returned, 2 the return failed too (see the printed commands), 64 usage, 65 refused, 75 a pipeline runs.
 Environment: SETUP_SERVER_ROOT ($ROOT), SETUP_SERVER_USER ($ACCOUNT), SETUP_SERVER_RUNNER ($RUNNER),
-SETUP_SERVER_CHECKOUT (this checkout)
+SETUP_SERVER_CHECKOUT (this checkout), SETUP_SERVER_SBIN ($SBIN); SETUP_SERVER_CONFIG,
+SETUP_SERVER_SYSTEMD and SETUP_SERVER_SUDOERS are passed to the installers
 EOF
 }
 
@@ -47,6 +53,64 @@ resolve() {  # resolve SIDE REF — the commit of a tag, else of origin's branch
         git_in "$1" rev-parse -q --verify "$candidate^{commit}" 2>/dev/null && return
     done
     [[ "$2" =~ ^[0-9a-f]{7,40}$ ]] && git_in "$1" rev-parse -q --verify "$2^{commit}" 2>/dev/null
+}
+as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
+installed_copies() {  # the installed command copies, as NAME:INSTALLER
+    local copy
+    for copy in "${COPIES[@]}"; do
+        [ ! -e "$SBIN/${copy%%:*}" ] || echo "$copy"
+    done
+}
+refresh_copies() {  # rewrite the installed copies from this (new) checkout; fails when one fails
+    local copy installer
+    for copy in "${copies[@]}"; do
+        installer="$CHECKOUT/bin/${copy#*:}"
+        say "Refreshing $SBIN/${copy%%:*} (sudo bin/${copy#*:} --refresh)"
+        if ! grep -q -- '--refresh' "$installer" 2>/dev/null; then
+            echo "    note: this version has no bin/${copy#*:} --refresh; the installed copy is left as it is"
+            continue
+        fi
+        as_root env SETUP_SERVER_ROOT="$ROOT" SETUP_SERVER_USER="$ACCOUNT" SETUP_SERVER_SBIN="$SBIN" \
+            SETUP_SERVER_CONFIG="${SETUP_SERVER_CONFIG:-/etc/setup-server}" \
+            SETUP_SERVER_SYSTEMD="${SETUP_SERVER_SYSTEMD:-/etc/systemd/system}" \
+            SETUP_SERVER_SUDOERS="${SETUP_SERVER_SUDOERS:-/etc/sudoers.d}" "$installer" --refresh 2>&1 \
+            | sed 's/^/    /'
+        [ "${PIPESTATUS[0]}" = 0 ] || return 1
+    done
+}
+restore_copies() {  # put the saved copies back where they changed; the failed ones go to manual
+    local copy name restored=1
+    for copy in "${copies[@]}"; do
+        name=${copy%%:*}
+        cmp -s "$saved/$name" "$SBIN/$name" && continue
+        if as_root install -o root -g root -m 0755 "$saved/$name" "$SBIN/$name"; then
+            [ "$name" != setup-server-metrics ] || as_root systemctl try-restart setup-server-metrics.service || true
+            echo "    restored $SBIN/$name"
+        else
+            manual+=("sudo install -o root -g root -m 0755 $saved/$name $SBIN/$name")
+            restored=0
+        fi
+    done
+    [ "$restored" = 0 ] || say "Restored the previous installed copies"
+}
+fetch() {  # fetch SIDE — new commits and tags; a tag that origin moved is refused, never taken over
+    local output moved
+    if output=$(git_in "$1" fetch -q --tags --prune origin 2>&1); then
+        [ -z "$output" ] || printf '%s\n' "$output" >&2
+        return
+    fi
+    # Without --force git keeps a local tag that origin now points elsewhere and fails; name those tags.
+    moved=$( { git_in "$1" show-ref --tags | sed 's/^/L /'; git_in "$1" ls-remote --tags origin | sed 's/^/R /'; } 2>/dev/null \
+        | awk '$1 == "L" {local[$3] = $2} $1 == "R" && $3 !~ /\^\{\}$/ {remote[$3] = $2}
+               END {for (tag in remote) if ((tag in local) && local[tag] != remote[tag]) {sub("^refs/tags/", "", tag); print tag}}' \
+        | sort | paste -sd ' ')
+    if [ -n "$moved" ]; then
+        fail "$(name_of "$1"): tag ${moved// /, tag } was moved on origin (rewritten upstream); refused, no checkout changed.
+A release tag must not move: find out who moved it and why. Here it stays where it was:
+$(for tag in $moved; do echo "    $tag: here $(git_in "$1" rev-parse --short "$tag^{commit}"), origin $(git_in "$1" ls-remote --tags origin "refs/tags/$tag^{}" "refs/tags/$tag" | head -n1 | cut -c1-7)"; done)"
+    fi
+    fail "Cannot fetch $(name_of "$1") from origin:
+$output"
 }
 runner_pid() { systemctl show -p MainPID --value "$RUNNER" 2>/dev/null || true; }
 
@@ -81,7 +145,8 @@ health() {  # every check runs; the result fails when one of them fails
     say "Health check"
     log=$(mktemp)
     if (cd "$CHECKOUT" && env -u SETUP_SERVER_ROOT -u SETUP_SERVER_USER -u SETUP_SERVER_RUNNER \
-            -u SETUP_SERVER_CHECKOUT -u SETUP_SERVER_UBUNTU_IMAGE python3 -m unittest discover -s tests) >"$log" 2>&1; then
+            -u SETUP_SERVER_CHECKOUT -u SETUP_SERVER_UBUNTU_IMAGE -u SETUP_SERVER_SBIN -u SETUP_SERVER_CONFIG \
+            -u SETUP_SERVER_SYSTEMD -u SETUP_SERVER_SUDOERS python3 -m unittest discover -s tests) >"$log" 2>&1; then
         echo "    setup-server tests: ok ($(grep -m1 '^Ran ' "$log"))"
     else
         echo "    setup-server tests: FAILED"
@@ -130,7 +195,9 @@ give_back() {  # return every moved checkout; print the manual commands for thos
     if [ -n "$setup_target" ] && ! restore setup "$setup_previous" "$setup_branch"; then
         manual+=("(cd / && sudo -u $ACCOUNT -H git -C $SETUP checkout --force $setup_previous)")
     fi
+    [ ${#copies[@]} -eq 0 ] || restore_copies
     if [ ${#manual[@]} -eq 0 ]; then
+        rm -rf "$saved"
         say "Returned both checkouts to the previous commits: setup-server $(label server "$server_previous"), setup $(label setup "$setup_previous"). The runner was not restarted."
         exit 1
     fi
@@ -179,7 +246,7 @@ $changes"
     for side in server setup; do
         local ref; [ "$side" = server ] && ref=$server_ref || ref=$setup_ref
         [ -n "$ref" ] || continue
-        git_in "$side" fetch -q --tags --force --prune origin || fail "Cannot fetch $(name_of "$side") from origin"
+        fetch "$side"
         local target
         target=$(resolve "$side" "$ref") \
             || fail "Unknown ${side/server/setup-server} ref $ref (newest tags: $(git_in "$side" tag --sort=-v:refname | head -n 5 | paste -sd ' '))"
@@ -200,6 +267,11 @@ $changes"
         say "Nothing to do."
         exit 0
     fi
+    copies=()
+    [ -z "$server_target" ] || mapfile -t copies < <(installed_copies)
+    if [ ${#copies[@]} -gt 0 ]; then
+        say "Then refresh the installed copies:$(printf " $SBIN/%s" "${copies[@]%%:*}") (sudo; back with the checkouts on a failure)"
+    fi
     if [ "$check" = 1 ]; then
         say "After updating: setup-server tests, setup at the new commit and readable by $ACCOUNT, runner still active with the same PID; on a failure both checkouts return."
         say "Check finished; nothing was changed (only fetched)."
@@ -208,6 +280,11 @@ $changes"
 
     # --- Update -----------------------------------------------------------------------------------
     say "Previous commits (for a manual return): setup-server $server_previous, setup $setup_previous"
+    saved=$(mktemp -d)
+    local copy
+    for copy in "${copies[@]}"; do
+        cp -p "$SBIN/${copy%%:*}" "$saved/" || fail "Cannot read $SBIN/${copy%%:*}"
+    done
     trap 'echo "Interrupted" >&2; give_back' INT TERM
     local switched=1
     if [ -n "$server_target" ] && ! git_in server checkout -q --detach "$server_target"; then switched=0; fi
@@ -216,10 +293,15 @@ $changes"
         say "Switching a checkout failed"
         give_back
     fi
+    if [ ${#copies[@]} -gt 0 ] && ! refresh_copies; then
+        say "Refreshing an installed copy failed"
+        give_back
+    fi
     if ! health; then
         give_back
     fi
     trap - INT TERM
+    rm -rf "$saved"
     say "Updated: setup-server $(label server HEAD), setup $(label setup HEAD). The runner was not restarted."
 }
 
