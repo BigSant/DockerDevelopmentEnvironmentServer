@@ -155,17 +155,18 @@ if [ -d "$ROOT/setup/.git" ]; then
     fi
 elif [ "$check" = 1 ] || [ ! -f "$key" ]; then
     would "clone $SETUP_REPO into $ROOT/setup${setup_ref:+ at $setup_ref} (after the git key is allowed on it)"
-elif as_account git ls-remote -q "$SETUP_REPO" >/dev/null 2>&1; then
+elif access_error=$(as_account git ls-remote -q "$SETUP_REPO" 2>&1 >/dev/null); then
     as_account git clone -q "$SETUP_REPO" "$ROOT/setup"
     [ -z "$setup_ref" ] || as_account git -C "$ROOT/setup" checkout -q "$setup_ref"
     say "setup cloned into $ROOT/setup"
 else
-    problems+=("The git key cannot read $SETUP_REPO yet: add $key.pub as a read-only deploy key, then run this again")
+    # Show git's own reason: a wrong repository, another key or a host key mismatch look alike otherwise.
+    problems+=("The git key cannot read $SETUP_REPO yet ($(printf '%s' "$access_error" | tr '\n' ' ' | cut -c1-200)): add $key.pub ($(ssh-keygen -lf "$key.pub" | cut -d' ' -f2)) as a read-only deploy key of that repository, then run this again")
 fi
 
 # --- Summary ----------------------------------------------------------------------------------
 if [ -f "$key.pub" ]; then
-    say "Git key of $ACCOUNT (add it read-only to the setup repo and every project repository):"
+    say "Git key of $ACCOUNT, fingerprint $(ssh-keygen -lf "$key.pub" | cut -d' ' -f2) (add it read-only to the setup repo and every project repository):"
     sed 's/^/    /' "$key.pub"
 fi
 if [ ${#problems[@]} -gt 0 ]; then
