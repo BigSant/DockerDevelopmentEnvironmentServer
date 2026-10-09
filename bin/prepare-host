@@ -123,7 +123,8 @@ for directory in "$ROOT" "$ROOT/projects" "$ROOT/runner"; do
 done
 
 # As root act as the service account; a --check run without root only reads what the caller can.
-as_account() { if [ "$(id -u)" = 0 ]; then sudo -u "$ACCOUNT" -H "$@"; else "$@"; fi; }
+# Run from a directory the account can read: a caller's home (0750 on Ubuntu) makes git fail early.
+as_account() { if [ "$(id -u)" = 0 ]; then (cd "$ROOT" 2>/dev/null || cd /; sudo -u "$ACCOUNT" -H "$@"); else "$@"; fi; }
 
 # --- Git access -------------------------------------------------------------------------------
 key="$ROOT/.ssh/id_ed25519"

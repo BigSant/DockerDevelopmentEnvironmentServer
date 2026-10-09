@@ -36,7 +36,8 @@ if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
 fi
 
 build_root="$ROOT/projects/$name"
-as_account() { if [ "$(id -u)" = 0 ]; then sudo -u "$ACCOUNT" -H "$@"; else "$@"; fi; }
+# Run from a directory the account can read: a caller's home (0750 on Ubuntu) makes git fail early.
+as_account() { if [ "$(id -u)" = 0 ]; then (cd "$ROOT" 2>/dev/null || cd /; sudo -u "$ACCOUNT" -H "$@"); else "$@"; fi; }
 clone() {  # clone URL DIRECTORY — an existing checkout of the same remote is kept as it is
     if [ -d "$2/.git" ]; then
         remote=$(as_account git -C "$2" remote get-url origin)
