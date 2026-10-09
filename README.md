@@ -210,6 +210,9 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
   Checkout'ų nekeičia.
 - Atsisako, jei checkout'e yra vietinių pakeitimų, ref'as nežinomas (parodo naujausius tag'us) arba vyksta
   pipeline žingsnis (paskyros `setup` `make` procesas) – tada palauk, kol jis baigsis.
+- Tag'ai parsiunčiami be `--force`: jei `origin` tag'as perkeltas į kitą commit'ą (perrašytas), vietinis
+  lieka, kur buvo, o `bin/update` (ir `--check`) baigiasi klaida, parodydamas tag'ą ir abu commit'us.
+  Release tag'as neturi judėti – išsiaiškink, kas ir kodėl jį perkėlė.
 
 **Sveikatos patikra po atnaujinimo** (visos trys, bet kuri nepavykusi = grįžimas):
 

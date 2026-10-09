@@ -534,6 +534,21 @@ class UpdateTest(ScriptTest):
         self.assertEqual((self.head(self.server), self.head(self.setup)), ("v0.1.0", "v1.0.0"))
         self.runner_untouched()
 
+    def test_a_tag_moved_upstream_is_an_error_and_the_local_tag_stays(self):
+        self.assertEqual(self.update("--check", "--setup-ref", "v1.1.0").returncode, 0)  # fetches v1.1.0
+        before = self.git("-C", str(self.setup), "rev-parse", "v1.1.0")
+        work = str(self.root / "setup-work")
+        self.commit("setup", None, {"Makefile": "VERSION=rewritten\n"}, "Rewritten 1.1.0")
+        self.git("-C", work, "tag", "-f", "v1.1.0")
+        self.git("-C", work, "push", "-q", "-f", "origin", "v1.1.0")
+        for arguments in (("--check", "--setup-ref", "v1.1.0"), ("--setup-ref", "v1.0.0")):
+            with self.subTest(arguments=arguments):
+                result = self.update(*arguments)
+                self.assertEqual(result.returncode, 65, result.stdout + result.stderr)
+                self.assertIn("tag v1.1.0 was moved on origin", result.stderr)
+                self.assertEqual(self.git("-C", str(self.setup), "rev-parse", "v1.1.0"), before)
+                self.assertEqual(self.head(self.setup), "v1.0.0")
+
     def test_branches_and_commits_are_allowed_but_setup_off_a_tag_is_stage_only(self):
         stage = self.update("--setup-ref", "stage-fix")
         self.assertEqual(stage.returncode, 0, stage.stdout + stage.stderr)

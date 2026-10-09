@@ -93,6 +93,25 @@ restore_copies() {  # put the saved copies back where they changed; the failed o
     done
     [ "$restored" = 0 ] || say "Restored the previous installed copies"
 }
+fetch() {  # fetch SIDE — new commits and tags; a tag that origin moved is refused, never taken over
+    local output moved
+    if output=$(git_in "$1" fetch -q --tags --prune origin 2>&1); then
+        [ -z "$output" ] || printf '%s\n' "$output" >&2
+        return
+    fi
+    # Without --force git keeps a local tag that origin now points elsewhere and fails; name those tags.
+    moved=$( { git_in "$1" show-ref --tags | sed 's/^/L /'; git_in "$1" ls-remote --tags origin | sed 's/^/R /'; } 2>/dev/null \
+        | awk '$1 == "L" {local[$3] = $2} $1 == "R" && $3 !~ /\^\{\}$/ {remote[$3] = $2}
+               END {for (tag in remote) if ((tag in local) && local[tag] != remote[tag]) {sub("^refs/tags/", "", tag); print tag}}' \
+        | sort | paste -sd ' ')
+    if [ -n "$moved" ]; then
+        fail "$(name_of "$1"): tag ${moved// /, tag } was moved on origin (rewritten upstream); refused, no checkout changed.
+A release tag must not move: find out who moved it and why. Here it stays where it was:
+$(for tag in $moved; do echo "    $tag: here $(git_in "$1" rev-parse --short "$tag^{commit}"), origin $(git_in "$1" ls-remote --tags origin "refs/tags/$tag^{}" "refs/tags/$tag" | head -n1 | cut -c1-7)"; done)"
+    fi
+    fail "Cannot fetch $(name_of "$1") from origin:
+$output"
+}
 runner_pid() { systemctl show -p MainPID --value "$RUNNER" 2>/dev/null || true; }
 
 plan() {  # plan SIDE REF CURRENT TARGET — what moving that checkout changes
@@ -227,7 +246,7 @@ $changes"
     for side in server setup; do
         local ref; [ "$side" = server ] && ref=$server_ref || ref=$setup_ref
         [ -n "$ref" ] || continue
-        git_in "$side" fetch -q --tags --force --prune origin || fail "Cannot fetch $(name_of "$side") from origin"
+        fetch "$side"
         local target
         target=$(resolve "$side" "$ref") \
             || fail "Unknown ${side/server/setup-server} ref $ref (newest tags: $(git_in "$side" tag --sort=-v:refname | head -n 5 | paste -sd ' '))"
