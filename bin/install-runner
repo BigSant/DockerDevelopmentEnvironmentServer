@@ -18,8 +18,8 @@ usage() {
 Usage: sudo $0 [--tarball URL|FILE] [--check] < dialog.txt
   --tarball   the runner archive; by default the Atlassian download link in the pasted text
   --check     validate the pasted text and show what would be installed; change nothing
-Paste the whole text of Bitbucket's runner installation dialog (the curl download line and the
-./start.sh --accountUuid … --runtime linux-shell … command) on stdin, then Ctrl-D.
+In a terminal it asks for the dialog's values one by one (the secret is not shown). Piped, it reads
+the whole dialog text (the curl download line and the ./start.sh … --runtime linux-shell command).
 EOF
 }
 while [ $# -gt 0 ]; do
@@ -36,16 +36,45 @@ if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
     exit 77
 fi
 
-# Keep only the start.sh arguments; the working directory is ours, not the dialog's relative one.
+ask() {  # ask QUESTION [secret] — one line from the terminal
+    local answer
+    if [ "${2:-}" = secret ]; then
+        read -r -s -p "$1: " answer </dev/tty; echo >&2
+    else
+        read -r -p "$1: " answer </dev/tty
+    fi
+    printf '%s' "$answer"
+}
+value() {  # value QUESTION [secret] — a pasted "--flag value" keeps the value; empty is an error
+    local answer
+    answer=$(ask "$@" | awk '{print $NF}')
+    [ -n "$answer" ] || { echo "No value given for: ${1%% (*}" >&2; exit 65; }
+    printf '%s' "$answer"
+}
+braces() { case "$1" in '') ;; '{'*) printf '%s' "$1" ;; *) printf '{%s}' "$1" ;; esac; }
 if [ -t 0 ]; then
-    echo "Paste the whole text of Bitbucket's runner installation dialog, then press Enter and Ctrl-D:" >&2
+    # In a terminal: one value at a time from the dialog; the secret is not echoed.
+    echo "Copy the values from Bitbucket's runner installation dialog, one at a time." >&2
+    link=
+    [ -n "$tarball" ] || link=$(ask "Download link (paste the curl line or just its https://... address)")
+    account=$(value "accountUuid"); account=$(braces "$account")
+    repository=$(ask "repositoryUuid (press Enter for a workspace runner)" | awk '{print $NF}')
+    repository=$(braces "$repository")
+    runner=$(value "runnerUuid"); runner=$(braces "$runner")
+    client=$(value "OAuthClientId")
+    secret=$(value "OAuthClientSecret (not shown while typing)" secret)
+    command="$link
+./start.sh --accountUuid $account ${repository:+--repositoryUuid $repository }--runnerUuid $runner --OAuthClientId $client --OAuthClientSecret $secret --runtime linux-shell"
+else
+    # Piped: the whole dialog text.
+    read -r -d '' command || true
 fi
-read -r -d '' command || true
 if [ -z "$tarball" ]; then
     # Only Atlassian's own download location is taken from the pasted text.
     tarball=$(printf '%s' "$command" | grep -oE 'https://product-downloads\.atlassian\.com/software/bitbucket/pipelines/atlassian-bitbucket-pipelines-runner-[0-9][0-9.]*\.tar\.gz' | head -n1 || true)
     [ -n "$tarball" ] || { echo "No runner download link in the pasted text; pass --tarball" >&2; exit 65; }
 fi
+# Keep only the start.sh arguments; the working directory is ours, not the dialog's relative one.
 arguments=$(printf '%s' "$command" | tr '\n\\' '  ' | sed -n 's/.*start\.sh[[:space:]]\{1,\}//p')
 [ -n "$arguments" ] || { echo "The pasted text has no start.sh command" >&2; exit 65; }
 read -r -a words <<<"$arguments"

@@ -117,6 +117,48 @@ class InstallRunnerTest(ScriptTest):
         self.assertEqual(refused.returncode, 65)
         self.assertIn("No runner download link", refused.stderr)
 
+    def interactive(self, answers):
+        """Run install-runner --check in a real terminal and type the answers one line at a time."""
+        import pty, select
+        env = {**os.environ, "SETUP_SERVER_ROOT": str(self.root / "srv")}
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execve(str(ROOT / "bin/install-runner"), [str(ROOT / "bin/install-runner"), "--check"], env)
+        output, pending = b"", list(answers)
+        while True:
+            ready, _, _ = select.select([fd], [], [], 5)
+            if not ready:
+                break
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+            if pending and output.rstrip().endswith(b":"):
+                os.write(fd, (pending.pop(0) + "\n").encode())
+        os.waitpid(pid, 0)
+        return output.decode(errors="replace")
+
+    def test_a_terminal_is_asked_one_value_at_a_time_and_the_secret_is_not_shown(self):
+        output = self.interactive([
+            "curl https://product-downloads.atlassian.com/software/bitbucket/pipelines/atlassian-bitbucket-pipelines-runner-6.0.8.tar.gz --output x.tar.gz",
+            "--accountUuid {11111111-2222-3333-4444-555555555555}", "66666666-7777-8888-9999-000000000000",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "FakeClientId123", "ATOAfake_secret-VALUE_9"])
+        self.assertIn("runner archive: https://product-downloads.atlassian.com/software/bitbucket/pipelines/"
+                      "atlassian-bitbucket-pipelines-runner-6.0.8.tar.gz", output)
+        self.assertIn("--accountUuid {11111111-2222-3333-4444-555555555555} --repositoryUuid "
+                      "{66666666-7777-8888-9999-000000000000} --runnerUuid {aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee} "
+                      "--OAuthClientId FakeClientId123 --OAuthClientSecret <hidden>", output)
+        self.assertNotIn("fake_secret", output, "the secret is neither echoed nor printed")
+
+    def test_a_missing_value_in_the_terminal_is_an_error(self):
+        output = self.interactive(["https://product-downloads.atlassian.com/software/bitbucket/pipelines/"
+                                   "atlassian-bitbucket-pipelines-runner-6.0.8.tar.gz", ""])
+        self.assertIn("No value given for: accountUuid", output)
+        self.assertNotIn("runner arguments", output)
+
     def test_unexpected_text_and_other_runtimes_are_refused(self):
         for text, message in ((RUN_COMMAND.replace("client123", "client123;rm"), "Unexpected text"),
                               (RUN_COMMAND.replace("linux-shell", "linux-docker"), "Only the Linux Shell runner"),

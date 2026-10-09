@@ -53,20 +53,25 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    fingerprint'us su paslaugų paskelbtais.
 
 3. **Runner'is.** Bitbucket: *Repository (arba Workspace) settings → Runners → Add runner → Linux
-   Shell*, pridėk žymą `setup.build`. Dialogas parodo komandas (atsisiuntimas, išskleidimas,
-   `./start.sh …`). Jų **nevykdyk** – nukopijuok visą dialogo tekstą ir įklijuok į scriptą:
+   Shell*, pridėk žymą `setup.build`. Dialogo komandų **nevykdyk** – jose esančias reikšmes scriptas
+   paklaus po vieną:
 
    ```bash
-   sudo bin/install-runner --check   # įklijuok visą dialogo tekstą, Enter, Ctrl-D
-   sudo bin/install-runner           # tas pats, įdiegia
+   sudo bin/install-runner --check   # klausia reikšmių, nieko nekeičia
+   sudo bin/install-runner           # klausia tų pačių reikšmių, įdiegia
    ```
 
-   Archyvo nuorodą scriptas paima iš įklijuoto teksto (tik iš `product-downloads.atlassian.com`);
-   kitą archyvą galima nurodyti `--tarball`. OAuth duomenys įrašomi tik į
-   `/etc/setup-server/runner.env` (root, 0600); dialogo teksto niekur kitur nekopijuok. Pats runner'is
-   juos gauna kaip `start.sh` argumentus (taip jį sukūrė Atlassian), todėl šiame serveryje jie matomi
-   `ps`. Po minutės Bitbucket'e runner'is turi būti **ONLINE**. Kitas runner'is (pvz. workspace
-   vietoj repository) įdiegiamas paleidžiant tą patį scriptą su nauju dialogo tekstu.
+   Klausiama: atsisiuntimo nuoroda (galima įklijuoti visą `curl …` eilutę), `accountUuid`,
+   `repositoryUuid` (workspace runner'iui – Enter), `runnerUuid`, `OAuthClientId`, `OAuthClientSecret`
+   (rašant nerodomas). Galima įklijuoti ir `--accountUuid {…}` – paimama tik reikšmė; tuščia reikšmė –
+   klaida. Archyvas imamas tik iš `product-downloads.atlassian.com` (kitą galima nurodyti `--tarball`).
+   Visą dialogo tekstą galima ir paduoti per stdin (`sudo bin/install-runner < dialogas.txt`).
+
+   OAuth duomenys įrašomi tik į `/etc/setup-server/runner.env` (root, 0600); dialogo teksto niekur
+   kitur nekopijuok. Pats runner'is juos gauna kaip `start.sh` argumentus (taip jį sukūrė Atlassian),
+   todėl šiame serveryje jie matomi `ps`. Po minutės Bitbucket'e runner'is turi būti **ONLINE**. Kitas
+   runner'is (pvz. workspace vietoj repository) įdiegiamas paleidžiant tą patį scriptą su naujomis
+   reikšmėmis.
 
 4. **Projektas:**
 
