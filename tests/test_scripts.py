@@ -11,6 +11,18 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+# The shape of Bitbucket's runner installation dialog (6.0.x), with made-up identifiers and secret.
+DIALOG = """# download the runner zip
+curl https://product-downloads.atlassian.com/software/bitbucket/pipelines/atlassian-bitbucket-pipelines-runner-6.0.8.tar.gz --output atlassian-bitbucket-pipelines-runner.tar.gz
+
+# extract the file
+mkdir atlassian-bitbucket-pipelines-runner && tar -xzvf atlassian-bitbucket-pipelines-runner.tar.gz -C atlassian-bitbucket-pipelines-runner
+
+# launch the runner
+cd atlassian-bitbucket-pipelines-runner/bin
+
+./start.sh --accountUuid {11111111-2222-3333-4444-555555555555} --repositoryUuid {66666666-7777-8888-9999-000000000000} --runnerUuid {aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee} --OAuthClientId FakeClientId123 --OAuthClientSecret ATOAfake_secret-VALUE_9 --runtime linux-shell --workingDirectory ../temp
+"""
 RUN_COMMAND = ("cd atlassian-bitbucket-pipelines-runner/bin; ./start.sh --accountUuid {aaaa-1111} "
                "--runnerUuid {bbbb-2222} --OAuthClientId client123 --OAuthClientSecret s3cr3t-VALUE "
                "--runtime linux-shell --workingDirectory ../temp\n")
@@ -91,6 +103,19 @@ class InstallRunnerTest(ScriptTest):
                       f"{self.root}/srv/runner/temp", result.stdout)
         self.assertNotIn("s3cr3t", result.stdout + result.stderr)
         self.assertNotIn("../temp", result.stdout)
+
+    def test_the_whole_dialog_text_is_accepted_and_the_download_link_taken_from_it(self):
+        result = self.run_script("install-runner", "--check", stdin=DIALOG)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("runner archive: https://product-downloads.atlassian.com/software/bitbucket/pipelines/"
+                      "atlassian-bitbucket-pipelines-runner-6.0.8.tar.gz", result.stdout)
+        self.assertIn("--repositoryUuid {66666666-7777-8888-9999-000000000000}", result.stdout)
+        self.assertIn("--OAuthClientSecret <hidden>", result.stdout)
+        self.assertNotIn("fake_secret", result.stdout + result.stderr)
+        foreign = DIALOG.replace("https://product-downloads.atlassian.com", "https://example.com")
+        refused = self.run_script("install-runner", "--check", stdin=foreign)
+        self.assertEqual(refused.returncode, 65)
+        self.assertIn("No runner download link", refused.stderr)
 
     def test_unexpected_text_and_other_runtimes_are_refused(self):
         for text, message in ((RUN_COMMAND.replace("client123", "client123;rm"), "Unexpected text"),

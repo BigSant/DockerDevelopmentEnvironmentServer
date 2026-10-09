@@ -15,10 +15,11 @@ check=0
 tarball=
 usage() {
     cat <<EOF
-Usage: sudo $0 --tarball URL|FILE [--check] < run-command.txt
-  --tarball   the runner archive linked in Bitbucket's runner installation dialog
-  --check     validate the pasted command and show what would be installed; change nothing
-Paste the dialog's Run command (…/start.sh --accountUuid … --runtime linux-shell …) on stdin.
+Usage: sudo $0 [--tarball URL|FILE] [--check] < dialog.txt
+  --tarball   the runner archive; by default the Atlassian download link in the pasted text
+  --check     validate the pasted text and show what would be installed; change nothing
+Paste the whole text of Bitbucket's runner installation dialog (the curl download line and the
+./start.sh --accountUuid … --runtime linux-shell … command) on stdin, then Ctrl-D.
 EOF
 }
 while [ $# -gt 0 ]; do
@@ -30,7 +31,6 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-[ -n "$tarball" ] || { usage >&2; exit 64; }
 if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
     echo "Run with sudo (or use --check)" >&2
     exit 77
@@ -38,6 +38,11 @@ fi
 
 # Keep only the start.sh arguments; the working directory is ours, not the dialog's relative one.
 read -r -d '' command || true
+if [ -z "$tarball" ]; then
+    # Only Atlassian's own download location is taken from the pasted text.
+    tarball=$(printf '%s' "$command" | grep -oE 'https://product-downloads\.atlassian\.com/software/bitbucket/pipelines/atlassian-bitbucket-pipelines-runner-[0-9][0-9.]*\.tar\.gz' | head -n1 || true)
+    [ -n "$tarball" ] || { echo "No runner download link in the pasted text; pass --tarball" >&2; exit 65; }
+fi
 arguments=$(printf '%s' "$command" | tr '\n\\' '  ' | sed -n 's/.*start\.sh[[:space:]]\{1,\}//p')
 [ -n "$arguments" ] || { echo "The pasted text has no start.sh command" >&2; exit 65; }
 read -r -a words <<<"$arguments"
@@ -47,7 +52,7 @@ for word in "${words[@]}"; do
     if [ "$skip" = 1 ]; then skip=0; continue; fi
     if [ "$word" = --workingDirectory ]; then skip=1; continue; fi
     # UUIDs, ids, secrets and flag names only: anything else could inject into the service command.
-    if ! [[ "$word" =~ ^[A-Za-z0-9{}._:/=+-]+$ ]]; then
+    if ! [[ "$word" =~ ^[A-Za-z0-9{}_.:/=+-]+$ ]]; then
         echo "Unexpected text in the command: $word" >&2
         exit 65
     fi
@@ -61,6 +66,7 @@ done
 work="$ROOT/runner/temp"
 kept+=(--workingDirectory "$work")
 masked=$(printf '%s ' "${kept[@]}" | sed -E 's/(--OAuthClientSecret )[^ ]+/\1<hidden>/')
+echo "==> runner archive: $tarball"
 echo "==> runner arguments: $masked"
 
 java -version 2>&1 | grep -q 'version "2[5-9]' || echo "Warning: the runner needs OpenJDK 25; run bin/prepare-host first" >&2

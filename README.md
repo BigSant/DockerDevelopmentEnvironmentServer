@@ -53,17 +53,20 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    fingerprint'us su paslaugų paskelbtais.
 
 3. **Runner'is.** Bitbucket: *Repository (arba Workspace) settings → Runners → Add runner → Linux
-   Shell*, pridėk žymą `setup.build`. Dialogas parodo archyvo nuorodą ir „Run“ komandą. Įklijuok
-   komandą į scriptą:
+   Shell*, pridėk žymą `setup.build`. Dialogas parodo komandas (atsisiuntimas, išskleidimas,
+   `./start.sh …`). Jų **nevykdyk** – nukopijuok visą dialogo tekstą ir įklijuok į scriptą:
 
    ```bash
-   sudo bin/install-runner --tarball '<archyvo nuoroda iš dialogo>' --check   # įklijuok Run komandą, Ctrl-D
-   sudo bin/install-runner --tarball '<archyvo nuoroda iš dialogo>'           # tas pats, įdiegia
+   sudo bin/install-runner --check   # įklijuok visą dialogo tekstą, Enter, Ctrl-D
+   sudo bin/install-runner           # tas pats, įdiegia
    ```
 
-   OAuth duomenys įrašomi tik į `/etc/setup-server/runner.env` (root, 0600). Pats runner'is juos
-   gauna kaip `start.sh` argumentus (taip jį sukūrė Atlassian), todėl šiame serveryje jie matomi `ps`.
-   Po minutės Bitbucket'e runner'is turi būti **ONLINE**.
+   Archyvo nuorodą scriptas paima iš įklijuoto teksto (tik iš `product-downloads.atlassian.com`);
+   kitą archyvą galima nurodyti `--tarball`. OAuth duomenys įrašomi tik į
+   `/etc/setup-server/runner.env` (root, 0600); dialogo teksto niekur kitur nekopijuok. Pats runner'is
+   juos gauna kaip `start.sh` argumentus (taip jį sukūrė Atlassian), todėl šiame serveryje jie matomi
+   `ps`. Po minutės Bitbucket'e runner'is turi būti **ONLINE**. Kitas runner'is (pvz. workspace
+   vietoj repository) įdiegiamas paleidžiant tą patį scriptą su nauju dialogo tekstu.
 
 4. **Projektas:**
 
