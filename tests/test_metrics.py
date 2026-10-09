@@ -87,6 +87,31 @@ def entry(ref, commit, at, rollback=False, **extra):
     return {"ref": ref, "commit": commit, "at": at, "rollback": rollback, "backup": None, **extra}
 
 
+class SharedHelpersTest(unittest.TestCase):
+    """bin/backup-projects and bin/worker-metrics each carry the build-root lookup and the backup name
+    patterns (the installed copies are single files); they must not drift apart."""
+
+    SHARED = ("environment_directory", "NAME", "SERIES")
+
+    def definitions(self, name):
+        import ast
+        source = (ROOT / "bin" / name).read_text()
+        found = {}
+        for node in ast.parse(source).body:
+            if isinstance(node, ast.FunctionDef) and node.name in self.SHARED:
+                found[node.name] = ast.get_source_segment(source, node)
+            elif isinstance(node, ast.Assign) and len(node.targets) == 1 and getattr(node.targets[0], "id", None) in self.SHARED:
+                found[node.targets[0].id] = ast.get_source_segment(source, node)
+        return found
+
+    def test_the_duplicated_helpers_are_identical(self):
+        backups, metrics = self.definitions("backup-projects"), self.definitions("worker-metrics")
+        self.assertEqual(sorted(backups), sorted(self.SHARED))
+        for name in self.SHARED:
+            with self.subTest(name=name):
+                self.assertEqual(metrics.get(name), backups[name])
+
+
 class EndpointTest(ScriptTest):
     def setUp(self):
         super().setUp()
