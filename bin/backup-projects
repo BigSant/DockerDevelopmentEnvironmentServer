@@ -1,0 +1,320 @@
+#!/usr/bin/python3
+"""Database backups of the projects on this worker, kept as 7 daily + 4 weekly copies.
+
+Every night setup-server-backup.timer runs this as root (installed by bin/install-backups as
+/usr/local/sbin/setup-server-backup). A project's environment is backed up when its environment
+repository in the build root ($ROOT/projects/<name>/app, or app/docker) has env/stage.env or
+env/prod.env: the file its deploy pipeline writes, so "deployed from here" is the declaration. Each
+backup is `make db-backup ENV=<env>` (setup: every schema of DATABASE_EXTRA_SCHEMAS in one dump), run as
+the setup account with the Deployment variables of /etc/setup-server/projects/<name>/<env>.env (root,
+0600) and written to .generated/backups/worker-<env>-<UTC time>Z.sql.gz. After a successful backup that
+series is rotated; a failed one deletes nothing. A failing project does not stop the others: they all
+run, and the command then exits 1 naming them (the unit shows failed, the journal has the details).
+
+"Backup now" for one project (Bitbucket custom pipeline on the runner):
+    sudo -n /usr/local/sbin/setup-server-backup "$BUILD_ROOT" [stage|prod]
+Without root it uses the caller's environment for the secrets (e.g. a deployment step's variables).
+"""
+
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import pwd
+import re
+import signal
+import stat
+import subprocess
+import sys
+
+ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
+ACCOUNT = os.environ.get('SETUP_SERVER_USER', 'setup')
+CONFIG = Path(os.environ.get('SETUP_SERVER_CONFIG', '/etc/setup-server'))
+PROJECTS = ROOT / 'projects'
+ENVIRONMENTS = ('stage', 'prod')
+KEEP_DAILY, KEEP_WEEKLY = 7, 4
+JOB_TIMEOUT = 4 * 3600
+NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
+SERIES = re.compile(r'worker-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
+STAMP = '%Y%m%dT%H%M%S'
+USAGE = f"""Usage: {Path(sys.argv[0]).name} [--check] [PROJECT [ENV]]
+  (none)    every project under {PROJECTS} with env/stage.env or env/prod.env (the nightly timer)
+  PROJECT   one project: its name or build root, e.g. "$BUILD_ROOT" in a pipeline ("backup now")
+  ENV       stage or prod; by default every one the project has
+  --check   show what would be backed up and which old backups rotation would delete; change nothing
+Keeps per project and ENV the newest backup of each of the last {KEEP_DAILY} days that have one and of
+{KEEP_WEEKLY} more weeks; pre-deploy backups and other files in .generated/backups are not touched."""
+
+
+class Refused(Exception):
+    """A request this command will not run (exit 65)."""
+
+
+def rotation(names, daily=KEEP_DAILY, weekly=KEEP_WEEKLY):
+    """Split one series' file names into (keep, remove), newest first.
+
+    Keeps the newest backup of each of the `daily` latest days that have one, then of each of the
+    `weekly` latest ISO weeks whose newest backup is not already kept (borg/restic style: a gap in
+    the backups never costs the last good ones).
+    """
+    stamped = sorted(((datetime.strptime(SERIES.fullmatch(name)[2], STAMP), name) for name in names), reverse=True)
+    keep = []
+    for count, period in ((daily, lambda time: time.date()), (weekly, lambda time: time.isocalendar()[:2])):
+        current, kept = None, 0
+        for time, name in stamped:
+            if kept >= count:
+                break
+            if period(time) == current:
+                continue
+            current = period(time)
+            if name not in keep:
+                keep.append(name)
+                kept += 1
+    return keep, [name for _, name in stamped if name not in keep]
+
+
+def environment_directory(build_root):
+    """The environment repository of a build root: app/, or app/docker/ in older layouts."""
+    for directory in (build_root / 'app', build_root / 'app/docker'):
+        if (directory / 'Makefile').is_file() and (directory / 'env').is_dir():
+            return directory
+    return None
+
+
+def declared(build_root):
+    directory = environment_directory(build_root)
+    environments = [env for env in ENVIRONMENTS if directory and (directory / f'env/{env}.env').is_file()]
+    return directory, environments
+
+
+def series(backups, environment):
+    """This command's backups of one ENV; anything else in the directory is never touched."""
+    if backups.is_symlink():
+        raise Refused(f'{backups} is a symlink; not rotated')
+    names = []
+    for path in sorted(backups.iterdir()) if backups.is_dir() else []:
+        match = SERIES.fullmatch(path.name)
+        if not match or match[1] != environment or path.is_symlink() or not path.is_file():
+            continue
+        try:
+            datetime.strptime(match[2], STAMP)
+        except ValueError:
+            continue
+        names.append(path.name)
+    return names
+
+
+def parse_env(text, path):
+    values = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('export '):
+            line = line[len('export '):].lstrip()
+        key, separator, value = line.partition('=')
+        key, value = key.strip(), value.strip()
+        if not separator or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
+            raise Refused(f'{path} line {number} is not NAME=value')
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def secrets(name, environment):
+    """(path, values): the project's Deployment variables for ENV, None when there is no readable file."""
+    path = CONFIG / 'projects' / name / f'{environment}.env'
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, PermissionError):
+        # Without root the runner account cannot see the file: the caller's environment applies.
+        return path, None
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        owner = 'root' if os.geteuid() == 0 else 'you'
+        raise Refused(f'{path} must be a regular file owned by {owner} with mode 0600')
+    return path, parse_env(path.read_text(), path)
+
+
+def stamp():
+    value = os.environ.get('SETUP_SERVER_BACKUP_TIME') or datetime.now(timezone.utc).strftime(STAMP)
+    datetime.strptime(value, STAMP)
+    return value
+
+
+def say(text, error=False):
+    print(text, file=sys.stderr if error else sys.stdout, flush=True)
+
+
+# --- One backup, run as the setup account --------------------------------------------------------
+def job(name, environment):
+    if os.geteuid() == 0:
+        raise Refused('--job runs as the setup account, not as root')
+    os.umask(0o077)
+    directory = environment_directory(PROJECTS / name)
+    if directory is None:
+        raise Refused(f'No environment repository in {PROJECTS / name}')
+    backups = directory / '.generated/backups'
+    target = backups / f'worker-{environment}-{stamp()}Z.sql.gz'
+    say(f'==> {name} {environment}: backing up into {target}')
+    result = subprocess.run(['make', '--no-print-directory', '-C', str(directory), 'db-backup',
+                             f'ENV={environment}', f'file={target}'])
+    if result.returncode or not target.is_file() or target.is_symlink():
+        say(f'{name} {environment}: backup failed (make exit {result.returncode}); old backups kept', error=True)
+        return 1
+    keep, remove = rotation(series(backups, environment))
+    for old in remove:
+        (backups / old).unlink()
+    say(f'    {name} {environment}: kept {len(keep)}, removed {len(remove)}' + (f': {" ".join(remove)}' if remove else ''))
+    return 0
+
+
+# --- Planning and running every project ----------------------------------------------------------
+def plan(arguments):
+    """[(name, environment)] to back up; projects without stage/prod env files are reported and skipped."""
+    if arguments:
+        project, *rest = arguments
+        if '/' in project:
+            path = Path(project)
+            if path.resolve().parent != PROJECTS.resolve():
+                raise Refused(f'{project} is not a build root under {PROJECTS}')
+            project = path.resolve().name
+        if not NAME.fullmatch(project):
+            raise Refused('NAME must be lowercase letters, digits, _ or -')
+        build_root = PROJECTS / project
+        if build_root.is_symlink() or not build_root.is_dir():
+            names = ' '.join(sorted(path.name for path in PROJECTS.iterdir())) if PROJECTS.is_dir() else ''
+            raise Refused(f'No build root {build_root} (projects: {names})')
+        _, environments = declared(build_root)
+        if rest:
+            if rest[0] not in ENVIRONMENTS:
+                raise Refused('ENV must be stage or prod')
+            if rest[0] not in environments:
+                raise Refused(f'{project} has no env/{rest[0]}.env: it is not deployed to {rest[0]} from here')
+            environments = rest[:1]
+        if not environments:
+            raise Refused(f'{project} has no env/stage.env or env/prod.env: nothing deployed from here yet')
+        return [(project, env) for env in environments]
+    jobs = []
+    for build_root in sorted(PROJECTS.iterdir()) if PROJECTS.is_dir() else []:
+        if build_root.is_symlink() or not build_root.is_dir() or not NAME.fullmatch(build_root.name):
+            continue
+        _, environments = declared(build_root)
+        if not environments:
+            say(f'==> {build_root.name}: no env/stage.env or env/prod.env (not deployed from here); skipped')
+        jobs += [(build_root.name, env) for env in environments]
+    return jobs
+
+
+def check(jobs):
+    """--check: what tonight's run would do; nothing is written or deleted."""
+    problems = 0
+    for name, environment in jobs:
+        directory = environment_directory(PROJECTS / name)
+        backups = directory / '.generated/backups'
+        new = f'worker-{environment}-{stamp()}Z.sql.gz'
+        say(f'==> would back up {name} {environment} into {backups / new}')
+        try:
+            path, values = secrets(name, environment)
+            if values is not None:
+                say(f'    secrets: {path} ({len(values)} values)')
+            elif os.geteuid() == 0:
+                say(f'    secrets: {path} is missing — the backup would fail', error=True)
+                problems += 1
+            else:
+                say(f'    secrets: not readable without sudo; the caller\'s environment applies')
+            _, remove = rotation(series(backups, environment) + [new])
+        except Refused as error:
+            say(f'    {error}', error=True)
+            problems += 1
+            continue
+        say(f'    would delete {len(remove)}' + (f': {" ".join(remove)}' if remove else ''))
+    return 1 if problems else 0
+
+
+def child_environment(name, environment):
+    path, values = secrets(name, environment)
+    if os.geteuid() == 0:
+        if values is None:
+            raise Refused(f'No secrets file {path}: put the Deployment variables of {name} {environment} '
+                          'there (root, 0600), see README')
+        account = pwd.getpwnam(ACCOUNT)
+        env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8',
+               'HOME': account.pw_dir, 'USER': ACCOUNT, 'LOGNAME': ACCOUNT, 'SHELL': '/bin/bash'}
+        for key in ('SETUP_SERVER_BACKUP_TIME',):
+            if key in os.environ:
+                env[key] = os.environ[key]
+    else:
+        env = dict(os.environ)
+    env.update(SETUP_SERVER_ROOT=str(ROOT), SETUP_SERVER_USER=ACCOUNT, SETUP_SERVER_CONFIG=str(CONFIG))
+    env.setdefault('SETUP_DIRECTORY', str(ROOT / 'setup'))
+    env.update(values or {})
+    return env
+
+
+def run(jobs):
+    failed = []
+    for name, environment in jobs:
+        try:
+            env = child_environment(name, environment)
+        except Refused as error:
+            say(f'{name} {environment}: {error}', error=True)
+            failed.append(f'{name}/{environment}')
+            continue
+        options = {}
+        if os.geteuid() == 0:
+            account = pwd.getpwnam(ACCOUNT)
+            options = dict(user=account.pw_uid, group=account.pw_gid,
+                           extra_groups=os.getgrouplist(ACCOUNT, account.pw_gid))
+        process = subprocess.Popen([sys.executable, os.path.realpath(__file__), '--job', name, environment],
+                                   env=env, cwd=str(PROJECTS / name), start_new_session=True, **options)
+        try:
+            code = process.wait(timeout=JOB_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            say(f'{name} {environment}: stopped after {JOB_TIMEOUT // 3600} h', error=True)
+            code = 1
+        if code:
+            failed.append(f'{name}/{environment}')
+    say(f'==> Backups: {len(jobs) - len(failed)} ok, {len(failed)} failed' + (f': {" ".join(failed)}' if failed else ''))
+    return 1 if failed else 0
+
+
+def main(arguments):
+    checking = False
+    positional = []
+    if arguments[:1] == ['--job'] and len(arguments) == 3:
+        return job(*arguments[1:])
+    for argument in arguments:
+        if argument == '--check':
+            checking = True
+        elif argument in ('-h', '--help'):
+            say(USAGE)
+            return 0
+        elif argument.startswith('-') or len(positional) == 2:
+            say(USAGE, error=True)
+            return 64
+        else:
+            positional.append(argument)
+    if not checking and os.geteuid() == 0:
+        try:
+            pwd.getpwnam(ACCOUNT)
+        except KeyError:
+            raise Refused(f'No account {ACCOUNT}; run bin/prepare-host first') from None
+    jobs = plan(positional)
+    if not jobs:
+        say(f'==> No project under {PROJECTS} has env/stage.env or env/prod.env; nothing to back up')
+        return 0
+    return check(jobs) if checking else run(jobs)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Refused as error:
+        say(str(error), error=True)
+        sys.exit(65)
