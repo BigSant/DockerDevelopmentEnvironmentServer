@@ -37,6 +37,9 @@ if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
 fi
 
 # Keep only the start.sh arguments; the working directory is ours, not the dialog's relative one.
+if [ -t 0 ]; then
+    echo "Paste the whole text of Bitbucket's runner installation dialog, then press Enter and Ctrl-D:" >&2
+fi
 read -r -d '' command || true
 if [ -z "$tarball" ]; then
     # Only Atlassian's own download location is taken from the pasted text.
