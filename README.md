@@ -109,6 +109,72 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    Jei kataloge yra DB kopijų ar deploy'ų istorijos, reikia `--with-backups` – tada prarandamos kopijos
    ir rollback'as. Katalogo, kurį naudoja veikiantis konteineris, scriptas netrina.
 
+6. **Naktinės DB kopijos** (worker'is, ne Bitbucket):
+
+   ```bash
+   sudo bin/install-backups --check          # unit'ai ir ką šią naktį kopijuotų; nieko nekeičia
+   sudo bin/install-backups                  # įdiegia; --at 03:30 – paleidimo laikas (numatytas)
+   ```
+
+   **Kurie projektai ir aplinkos.** Kopijuojama kiekviena `/srv/setup-server/projects/<vardas>` aplinka,
+   kuriai aplinkos repo (`app/`, senesniame išdėstyme `app/docker/`) turi `env/stage.env` arba `env/prod.env`.
+   Šį failą sukuria projekto deploy pipeline'as (`cp env/prod.env.example env/prod.env`), todėl kopijuojama
+   tai, kas iš šio serverio deploy'inama. `local` ir `test` nekopijuojamos. Kopija – setup `make db-backup
+   ENV=<env>`: stage/prod pagal lentelių registrą, su `DATABASE_EXTRA_SCHEMAS` – visos schemos vienu dump'u
+   (asana.local). Kopijuojama tik duomenų bazė: `data/` katalogai (paieškos indeksai ir pan.) nekopijuojami,
+   o kurios schemos ir lentelės patenka į dump'ą, nusprendžia projekto `DATABASE_EXTRA_SCHEMAS` ir registras.
+
+   **Slaptažodžiai.** Laikmatis veikia be Bitbucket, todėl Deployment variables jam reikia serveryje.
+   Kiekvienai aplinkai – root failas (tie patys `VARDAS=reikšmė`, kaip Bitbucket Deployment variables:
+   `DATABASE_PASSWORD`, `DATABASE_ROOT_PASSWORD`, `METRICS_TOKEN`, PS raktai …):
+
+   ```bash
+   sudo install -d -m 0700 /etc/setup-server/projects/asana_tracker
+   sudo install -m 0600 /dev/null /etc/setup-server/projects/asana_tracker/prod.env
+   sudoedit /etc/setup-server/projects/asana_tracker/prod.env
+   ```
+
+   Failą skaito tik root; `make db-backup` vykdomas paskyra `setup`, slaptažodžiai jai perduodami per
+   aplinką (ne argumentais), išvestyje jie nerodomi. Failas, kuris ne root ar ne 0600, atmetamas. Pašalinus
+   projektą (`remove-project`) jo katalogą `/etc/setup-server/projects/<vardas>` ištrink rankomis.
+
+   **Rotacija.** Kiekvienam projektui ir aplinkai paliekama naujausia kiekvienos iš 7 paskutinių dienų,
+   kurios turi kopiją, kopija ir dar 4 savaičių (ISO savaitė) naujausios kopijos – iš viso iki 11, maždaug
+   5 savaitės atgal. Senesnės ištrinamos tik po sėkmingos naujos kopijos; nepavykus nieko netrinama.
+   Liečiami tik `worker-<env>-…Z.sql.gz` failai: deploy'aus kopijos (`<projektas>-<env>-….sql.gz`) ir kiti
+   failai lieka (jas valo setup `make db-backup-prune`). Kopijos laikomos tik šio serverio diske.
+
+   **Klaidos.** Vieno projekto klaida kitų nestabdo; pabaigoje `==> Backups: N ok, M failed: projektas/env`,
+   o paslauga baigiasi klaida (`failed`). Patikrinti:
+
+   ```bash
+   systemctl list-timers setup-server-backup.timer      # kada kitas paleidimas
+   sudo systemctl start setup-server-backup.service     # paleisti dabar (laukia pabaigos)
+   systemctl status setup-server-backup.service         # paskutinio paleidimo būsena
+   journalctl -u setup-server-backup.service -n 100     # kas nukopijuota, kas nepavyko
+   sudo setup-server-backup --check                     # ką kopijuotų, ar yra slaptažodžių failai
+   ```
+
+   **„Backup dabar“** – Bitbucket custom pipeline'as, vykdomas runner'io šiame serveryje. Jis kviečia tą pačią
+   komandą per `sudo` (taisyklė leidžia paskyrai `setup` tik `/usr/local/sbin/setup-server-backup`), todėl
+   naudoja tuos pačius root slaptažodžių failus, rotaciją ir nekuria įrašo Deployments istorijoje:
+
+   ```yaml
+   pipelines:
+     custom:
+       backup-now:            # „backup dabar“
+         - step:
+             name: Backup now
+             runs-on: [self.hosted, linux.shell, setup.build]
+             script:
+               - unset DOCKER_HOST
+               - BUILD_ROOT=${BUILD_ROOT:-${SETUP_SERVER_ROOT:-/srv/setup-server}/projects/$BITBUCKET_REPO_SLUG}
+               - sudo -n /usr/local/sbin/setup-server-backup "$BUILD_ROOT"
+   ```
+
+   Antras argumentas (`stage` arba `prod`) apriboja aplinką. Atnaujinus šį repo, `sudo bin/install-backups`
+   pakartok – įdiegta komandos kopija atnaujinama.
+
 ## Atnaujinimas
 
 Viena komanda atnaujina abu checkout'us: šį repo (`~/setup-server`, administratoriaus klonas, iš kurio
@@ -203,72 +269,6 @@ Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo 
    git -C ~/setup-server.new checkout <commit'as>
    mv ~/setup-server ~/setup-server.broken && mv ~/setup-server.new ~/setup-server
    ```
-
-6. **Naktinės DB kopijos** (worker'is, ne Bitbucket):
-
-   ```bash
-   sudo bin/install-backups --check          # unit'ai ir ką šią naktį kopijuotų; nieko nekeičia
-   sudo bin/install-backups                  # įdiegia; --at 03:30 – paleidimo laikas (numatytas)
-   ```
-
-   **Kurie projektai ir aplinkos.** Kopijuojama kiekviena `/srv/setup-server/projects/<vardas>` aplinka,
-   kuriai aplinkos repo (`app/`, senesniame išdėstyme `app/docker/`) turi `env/stage.env` arba `env/prod.env`.
-   Šį failą sukuria projekto deploy pipeline'as (`cp env/prod.env.example env/prod.env`), todėl kopijuojama
-   tai, kas iš šio serverio deploy'inama. `local` ir `test` nekopijuojamos. Kopija – setup `make db-backup
-   ENV=<env>`: stage/prod pagal lentelių registrą, su `DATABASE_EXTRA_SCHEMAS` – visos schemos vienu dump'u
-   (asana.local). Kopijuojama tik duomenų bazė: `data/` katalogai (paieškos indeksai ir pan.) nekopijuojami,
-   o kurios schemos ir lentelės patenka į dump'ą, nusprendžia projekto `DATABASE_EXTRA_SCHEMAS` ir registras.
-
-   **Slaptažodžiai.** Laikmatis veikia be Bitbucket, todėl Deployment variables jam reikia serveryje.
-   Kiekvienai aplinkai – root failas (tie patys `VARDAS=reikšmė`, kaip Bitbucket Deployment variables:
-   `DATABASE_PASSWORD`, `DATABASE_ROOT_PASSWORD`, `METRICS_TOKEN`, PS raktai …):
-
-   ```bash
-   sudo install -d -m 0700 /etc/setup-server/projects/asana_tracker
-   sudo install -m 0600 /dev/null /etc/setup-server/projects/asana_tracker/prod.env
-   sudoedit /etc/setup-server/projects/asana_tracker/prod.env
-   ```
-
-   Failą skaito tik root; `make db-backup` vykdomas paskyra `setup`, slaptažodžiai jai perduodami per
-   aplinką (ne argumentais), išvestyje jie nerodomi. Failas, kuris ne root ar ne 0600, atmetamas. Pašalinus
-   projektą (`remove-project`) jo katalogą `/etc/setup-server/projects/<vardas>` ištrink rankomis.
-
-   **Rotacija.** Kiekvienam projektui ir aplinkai paliekama naujausia kiekvienos iš 7 paskutinių dienų,
-   kurios turi kopiją, kopija ir dar 4 savaičių (ISO savaitė) naujausios kopijos – iš viso iki 11, maždaug
-   5 savaitės atgal. Senesnės ištrinamos tik po sėkmingos naujos kopijos; nepavykus nieko netrinama.
-   Liečiami tik `worker-<env>-…Z.sql.gz` failai: deploy'aus kopijos (`<projektas>-<env>-….sql.gz`) ir kiti
-   failai lieka (jas valo setup `make db-backup-prune`). Kopijos laikomos tik šio serverio diske.
-
-   **Klaidos.** Vieno projekto klaida kitų nestabdo; pabaigoje `==> Backups: N ok, M failed: projektas/env`,
-   o paslauga baigiasi klaida (`failed`). Patikrinti:
-
-   ```bash
-   systemctl list-timers setup-server-backup.timer      # kada kitas paleidimas
-   sudo systemctl start setup-server-backup.service     # paleisti dabar (laukia pabaigos)
-   systemctl status setup-server-backup.service         # paskutinio paleidimo būsena
-   journalctl -u setup-server-backup.service -n 100     # kas nukopijuota, kas nepavyko
-   sudo setup-server-backup --check                     # ką kopijuotų, ar yra slaptažodžių failai
-   ```
-
-   **„Backup dabar“** – Bitbucket custom pipeline'as, vykdomas runner'io šiame serveryje. Jis kviečia tą pačią
-   komandą per `sudo` (taisyklė leidžia paskyrai `setup` tik `/usr/local/sbin/setup-server-backup`), todėl
-   naudoja tuos pačius root slaptažodžių failus, rotaciją ir nekuria įrašo Deployments istorijoje:
-
-   ```yaml
-   pipelines:
-     custom:
-       backup-now:            # „backup dabar“
-         - step:
-             name: Backup now
-             runs-on: [self.hosted, linux.shell, setup.build]
-             script:
-               - unset DOCKER_HOST
-               - BUILD_ROOT=${BUILD_ROOT:-${SETUP_SERVER_ROOT:-/srv/setup-server}/projects/$BITBUCKET_REPO_SLUG}
-               - sudo -n /usr/local/sbin/setup-server-backup "$BUILD_ROOT"
-   ```
-
-   Antras argumentas (`stage` arba `prod`) apriboja aplinką. Atnaujinus šį repo, `sudo bin/install-backups`
-   pakartok – įdiegta komandos kopija atnaujinama.
 
 ## Worker'io metrikos
 
@@ -368,7 +368,7 @@ Papildomai verta: `up{job="setup-worker"} == 0` arba „no data“ (VPN ar pasla
 
 Šios dalys dar daromos (žemėlapis „Map — setup-server“):
 
-- Prometheus prijungimas per VPN ir Grafana įspėjimai (tarp jų „kopija senesnė nei 26 val.“, žr. Worker'io metrikos);
+- Prometheus prijungimas per VPN ir Grafana įspėjimai (kopija senesnė nei 26 val., „no data“);
 - asana.local setup v2 forma ir perjungimas tame pačiame serveryje.
 
 ## Testai
