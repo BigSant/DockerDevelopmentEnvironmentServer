@@ -66,7 +66,9 @@ plan() {  # plan SIDE REF CURRENT TARGET — what moving that checkout changes
     fi
     say "$(name_of "$side"): $(label "$side" "$current") -> $shown: $direction;$(git_in "$side" diff --shortstat "$current" "$target")"
     git_in "$side" log --format='    + %h %s' -n 10 "$current..$target"
+    [ "$forward" -le 10 ] || echo "    + ... and $((forward - 10)) more"
     git_in "$side" log --format='    - %h %s' -n 10 "$target..$current"
+    [ "$back" -le 10 ] || echo "    - ... and $((back - 10)) more"
     if [ "$side" = setup ] && ! { [[ "$ref" =~ $RELEASE_TAG ]] && git_in setup rev-parse -q --verify "refs/tags/$ref" >/dev/null; }; then
         echo "    note: $ref is not a release tag (vX.Y.Z); prod releases need setup on a tag, so this is stage only"
     elif [ "$side" = server ] && ! git_in server rev-parse -q --verify "refs/tags/$ref" >/dev/null; then
@@ -180,7 +182,7 @@ $changes"
         git_in "$side" fetch -q --tags --force --prune origin || fail "Cannot fetch $(name_of "$side") from origin"
         local target
         target=$(resolve "$side" "$ref") \
-            || fail "Unknown ${side/server/setup-server} ref $ref (newest tags: $(git_in "$side" tag --sort=-v:refname | head -n 5 | tr '\n' ' '))"
+            || fail "Unknown ${side/server/setup-server} ref $ref (newest tags: $(git_in "$side" tag --sort=-v:refname | head -n 5 | paste -sd ' '))"
         local previous; [ "$side" = server ] && previous=$server_previous || previous=$setup_previous
         plan "$side" "$ref" "$previous" "$target"
         [ "$target" = "$previous" ] && continue
