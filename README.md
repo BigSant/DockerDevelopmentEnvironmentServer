@@ -87,7 +87,9 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    variable `BUILD_ROOT` reikia tik nurodžius kitą vardą (`add-project VARDAS URL`). Slaptažodžius įrašyk
    į Deployment variables (Secured). Kiekvienas pipeline žingsnis turi turėti
    `runs-on: [self.hosted, linux.shell, setup.build]`, kitaip jis vyktų Bitbucket debesyje ir naudotų
-   minutes.
+   minutes. Žingsnio scriptas turi prasidėti `unset DOCKER_HOST`: Bitbucket nustato
+   `DOCKER_HOST=tcp://localhost:2375` savo debesies docker servisui, o shell runner'yje Docker yra paties
+   serverio (unix socket'as) – kitaip `docker` ir `make release/deploy` neranda daemon'o.
 
 5. **Projekto pašalinimas:**
 
