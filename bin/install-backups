@@ -3,7 +3,8 @@
 # setup-server-backup.service every night, which runs /usr/local/sbin/setup-server-backup (a root-owned
 # copy of bin/backup-projects) as root; it backs up every deployed project as the setup account. A
 # sudoers rule lets that account start the same command for one project ("backup now" pipeline).
-# Idempotent; --check shows the units and what tonight's run would do, and changes nothing.
+# Idempotent (a rerun keeps the installed time); --check shows the units and what tonight's run would do,
+# and changes nothing. --refresh only rewrites an installed command copy: bin/update runs it.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -16,23 +17,29 @@ SUDOERS=${SETUP_SERVER_SUDOERS:-/etc/sudoers.d}
 NAME=setup-server-backup
 
 check=0
-at=03:30
+refresh=0
+at=
 usage() {
     cat <<EOF
-Usage: sudo $0 [--check] [--at HH:MM]
-  --at      local time of the nightly run (default $at; a missed run starts after the next boot)
-  --check   show the units and what tonight's run would back up and delete; change nothing
+Usage: sudo $0 [--check] [--at HH:MM] | --refresh
+  --at       local time of the nightly run (default: the installed one, else 03:30; a missed run starts
+             after the next boot)
+  --check    show the units and what tonight's run would back up and delete; change nothing
+  --refresh  only rewrite $SBIN/$NAME from this checkout, when it is installed (bin/update runs it)
 EOF
 }
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) check=1 ;;
+        --refresh) refresh=1 ;;
         --at) at=${2:-}; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 64 ;;
     esac
     shift
 done
+at=${at:-$(sed -n 's/^OnCalendar=\*-\*-\* \([0-9][0-9]:[0-9][0-9]\):00$/\1/p' "$SYSTEMD/$NAME.timer" 2>/dev/null || true)}
+at=${at:-03:30}
 [[ "$at" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "--at needs a time such as 03:30" >&2; exit 64; }
 for value in "$ROOT" "$CONFIG" "$SBIN" "$ACCOUNT"; do
     [[ "$value" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "Unexpected characters in $value" >&2; exit 65; }
@@ -101,6 +108,15 @@ place() {  # place SOURCE TARGET MODE [quiet] — write only what differs
         echo "==> wrote $2"
     fi
 }
+if [ "$refresh" = 1 ]; then
+    [ -e "$command" ] || { echo "==> $command is not installed; nothing to refresh"; exit 0; }
+    place "$staging/command" "$command" 0755 quiet
+    for file in "service:$SYSTEMD/$NAME.service" "timer:$SYSTEMD/$NAME.timer" "sudoers:$SUDOERS/$NAME"; do
+        cmp -s "$staging/${file%%:*}" "${file#*:}" 2>/dev/null \
+            || echo "==> note: ${file#*:} differs from this version; apply it with: sudo bin/install-backups"
+    done
+    exit 0
+fi
 place "$staging/command" "$command" 0755 quiet  # a copy of bin/backup-projects
 place "$staging/service" "$SYSTEMD/$NAME.service" 0644
 place "$staging/timer" "$SYSTEMD/$NAME.timer" 0644

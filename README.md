@@ -172,8 +172,9 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
                - sudo -n /usr/local/sbin/setup-server-backup "$BUILD_ROOT"
    ```
 
-   Antras argumentas (`stage` arba `prod`) apriboja aplinką. Atnaujinus šį repo, `sudo bin/install-backups`
-   pakartok – įdiegta komandos kopija atnaujinama.
+   Antras argumentas (`stage` arba `prod`) apriboja aplinką. Įdiegtą komandos kopiją atnaujina `bin/update`
+   (žr. „Atnaujinimas“). Pakartotinai paleistas `sudo bin/install-backups` palieka įdiegtą laiką, jei
+   nenurodytas `--at`.
 
 ## Atnaujinimas
 
@@ -190,6 +191,13 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
 - Leisk **be sudo**, kaip šio klono savininkas (setup-server parsiunčiamas tavo git raktu); setup checkout'o
   dalį scriptas pats vykdo per `sudo -u setup` (paprašys slaptažodžio). Paleistas su sudo – atsisako.
 - Galima nurodyti tik vieną pusę (`--setup-ref` arba `--server-ref`); kita lieka, kur buvo.
+- **Įdiegtos komandų kopijos.** Kai keičiasi setup-server, po perjungimo (prieš sveikatos patikrą) per
+  `sudo` perrašomos įdiegtos kopijos `/usr/local/sbin/setup-server-backup` ir `/usr/local/sbin/setup-server-metrics`
+  (tik tos, kurios įdiegtos) iš naujos versijos: `bin/install-backups --refresh` ir `bin/install-metrics --refresh`.
+  Pasikeitus metrikų kopijai, perkraunama paslauga `setup-server-metrics` (runner'io – ne). Kiti failai
+  (unit'ai, sudo taisyklė, nustatymai) nekeičiami; jei naujoje versijoje jie kitokie, išvedama pastaba
+  `note: … differs` – tada pakartok `sudo bin/install-backups` (laikas lieka) arba `sudo bin/install-metrics`.
+  Nepavykus perrašymui ar sveikatos patikrai, kartu su checkout'ais grąžinamos ir ankstesnės kopijos.
 - **Ref'as** – tag'as (pageidautina), `origin` šaka arba commit'o id. setup-server gali būti ir ne ant tag'o
   (tag'ų dar nėra). setup ne ant `vX.Y.Z` tag'o tinka **tik stage**: prod release'ui setup turi būti ant
   release tag'o – peržiūra tai parodo kaip pastabą.
@@ -213,7 +221,7 @@ repo, o setup checkout'ą kiekvienas pipeline žingsnis skaito iš naujo. Ar run
 Bitbucket'e (scriptas Bitbucket API neskaito).
 
 Nepavykus patikrai abu checkout'ai grąžinami į ankstesnius commit'us (ar šaką, jei checkout'as buvo ant
-jos), išvedama, kuri patikra nepavyko, ir grąžinamas kodas 1. Kodas 2 reiškia, kad nepavyko ir grįžimas –
+jos), o įdiegtos komandų kopijos – į ankstesnes; išvedama, kuri patikra nepavyko, ir grąžinamas kodas 1. Kodas 2 reiškia, kad nepavyko ir grįžimas –
 išvedamos komandos rankiniam atstatymui.
 
 ### Rankinis atstatymas
@@ -242,6 +250,10 @@ Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo 
    git -C ~/setup-server checkout --force <setup-server commit'as>
    (cd / && sudo -u setup -H git -C /srv/setup-server/setup checkout --force <setup commit'as>)
    ```
+
+   Jei scriptas išvedė ir `sudo install … /usr/local/sbin/setup-server-…` eilutę, įvykdyk ją (ankstesnė
+   kopija laikoma `/tmp/tmp.…` kataloge). Be jos įdiegtas kopijas iš grąžinto checkout'o perrašo
+   `sudo bin/install-backups --refresh` ir `sudo bin/install-metrics --refresh`.
 
 4. **Patikrink:**
 
@@ -288,8 +300,7 @@ sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env         # token
   kuriuo adresu, išskyrus `127.0.0.1`/`::1`. `--port` – numatytas `9101`. `--new-token` – naujas token'as.
 - Nustatymai laikomi `/etc/setup-server/metrics.env` (root, 0600): pirmą kartą sugeneruojamas 43 simbolių
   token'as. Pakartotinai paleidus nenurodyti nustatymai lieka, paslauga perkraunama tik pasikeitus failui;
-  runner'io paslauga neliečiama. Atnaujinus šį repo (`bin/update`), `sudo bin/install-metrics` pakartok –
-  įdiegta komandos kopija atnaujinama.
+  runner'io paslauga neliečiama. Įdiegtą komandos kopiją atnaujina `bin/update` (žr. „Atnaujinimas“).
 - Prieiga kaip taikinio `/metrics`: ne iš sąrašo – `403`, be token'o ar su neteisingu – `401`, kitas kelias – `404`.
   Be 24+ simbolių token'o ar be sąrašo paslauga nepasileidžia (`journalctl -u setup-server-metrics`).
   `X-Forwarded-For` ignoruojamas: priešais nėra proxy, klientai jungiasi tiesiogiai.

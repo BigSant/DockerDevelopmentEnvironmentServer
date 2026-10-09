@@ -214,6 +214,15 @@ class InstallBackupsTest(ScriptTest):
         for name in ("systemd", "sbin", "sudoers.d", "srv"):
             self.assertFalse((self.root / name).exists(), "--check changes nothing")
 
+    def test_a_rerun_keeps_the_installed_time_and_refresh_only_touches_an_installed_copy(self):
+        (self.root / "systemd").mkdir()
+        (self.root / "systemd/setup-server-backup.timer").write_text("[Timer]\nOnCalendar=*-*-* 02:15:00\n")
+        result = self.run_script("install-backups", "--check")
+        self.assertIn("OnCalendar=*-*-* 02:15:00", result.stdout)
+        refresh = self.run_script("install-backups", "--check", "--refresh")
+        self.assertEqual(refresh.returncode, 0, refresh.stdout + refresh.stderr)
+        self.assertIn("is not installed; nothing to refresh", refresh.stdout)
+
     def test_installing_needs_root_and_a_valid_time(self):
         if os.getuid() != 0:
             self.assertEqual(self.run_script("install-backups").returncode, 77)

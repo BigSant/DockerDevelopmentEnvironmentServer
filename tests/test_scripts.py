@@ -7,6 +7,7 @@ Ubuntu container and confirms the Java package the runner needs is installable t
 import getpass
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -43,6 +44,23 @@ class ScriptTest(unittest.TestCase):
         path = self.bin / name
         path.write_text("#!/bin/sh\n" + script)
         path.chmod(0o755)
+
+    def fake_root(self):
+        """Stubs that let a script's root part run as this user: `sudo` records its call and runs the command
+        with `id -u` answering 0 and `install` without -o/-g; the account seems to be in the docker group."""
+        root_bin = self.root / "root-bin"
+        root_bin.mkdir(exist_ok=True)
+        stubs = {"id": f'case "$*" in -u) echo 0;; "-nG "*) echo "$2 docker";; *) exec {shutil.which("id")} "$@";; esac\n',
+                 "install": 'for argument; do shift; case "$skip$argument" in -o|-g) skip=1;; 1*) skip=;; *) set -- "$@" "$argument";; esac; done\n'
+                            f'exec {shutil.which("install")} "$@"\n'}
+        for name, script in stubs.items():
+            (root_bin / name).write_text("#!/bin/sh\n" + script)
+            (root_bin / name).chmod(0o755)
+        self.sudo_log = self.root / "sudo.calls"
+        self.stub("sudo", f'echo "$*" >> {self.sudo_log}\n'
+                          'while [ $# -gt 0 ]; do case "$1" in -u) shift 2;; -*) shift;; *) break;; esac; done\n'
+                          f'PATH={root_bin}:$PATH exec "$@"\n')
+        return root_bin
 
     def os_release(self, distribution, version):
         (self.root / "os-release").write_text(f'ID={distribution}\nVERSION_ID="{version}"\nVERSION_CODENAME=noble\n'
@@ -299,6 +317,7 @@ class UpdateTest(ScriptTest):
         for path, text in files.items():
             (self.root / f"{name}-work" / path).parent.mkdir(parents=True, exist_ok=True)
             (self.root / f"{name}-work" / path).write_text(text)
+            (self.root / f"{name}-work" / path).chmod(0o755 if path.startswith("bin/") else 0o644)
         self.git("-C", work, "add", "-A")
         self.git("-C", work, "commit", "-q", "-m", message)
         if tag:
@@ -313,12 +332,62 @@ class UpdateTest(ScriptTest):
 
     def update(self, *arguments, **env):
         return self.run_script("update", *arguments, SETUP_SERVER_CHECKOUT=str(self.server),
-                               SETUP_SERVER_USER=getpass.getuser(), **env)
+                               SETUP_SERVER_USER=getpass.getuser(), SETUP_SERVER_SBIN=str(self.root / "sbin"),
+                               SETUP_SERVER_SYSTEMD=str(self.root / "systemd"),
+                               SETUP_SERVER_CONFIG=str(self.root / "etc"),
+                               SETUP_SERVER_SUDOERS=str(self.root / "sudoers.d"), **env)
 
     def runner_untouched(self):
         calls = self.calls.read_text() if self.calls.exists() else ""
-        for verb in ("restart", "stop", "start", "reload", "kill", "daemon-reload", "enable", "disable"):
-            self.assertNotRegex(calls, rf"(?m)^{verb}\b", f"systemctl {verb} was called:\n{calls}")
+        for verb in ("restart", "try-restart", "stop", "start", "reload", "kill", "daemon-reload", "enable", "disable"):
+            self.assertNotRegex(calls, rf"(?m)^{verb}( \S+)* setup-server-runner\b", f"systemctl {verb} was called:\n{calls}")
+            self.assertNotRegex(calls, rf"(?m)^{verb}$", f"systemctl {verb} was called:\n{calls}")
+
+    def release_with_installers(self, tag, tests, marker):
+        """A setup-server release that carries the real installers and commands, marked so its copies are known."""
+        files = {"tests/test_health.py": tests}
+        for name in ("install-backups", "install-metrics"):
+            files[f"bin/{name}"] = (ROOT / "bin" / name).read_text()
+        for name in ("backup-projects", "worker-metrics"):
+            files[f"bin/{name}"] = (ROOT / "bin" / name).read_text() + f"# {marker}\n"
+        self.commit("server", tag, files, f"Release {tag}")
+
+    def test_an_update_refreshes_the_installed_copies_and_a_return_restores_them(self):
+        self.fake_root()
+        sbin = self.root / "sbin"
+        sbin.mkdir()
+        (sbin / "setup-server-backup").write_text("previous backup copy\n")
+        (sbin / "setup-server-metrics").write_text("previous metrics copy\n")
+        self.release_with_installers("v0.5.0", PASSING_TESTS, "release 0.5.0")
+        self.release_with_installers("v0.6.0", FAILING_TESTS, "release 0.6.0")
+
+        check = self.update("--check", "--server-ref", "v0.5.0")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn(f"refresh the installed copies: {sbin}/setup-server-backup {sbin}/setup-server-metrics", check.stdout)
+        self.assertEqual((sbin / "setup-server-backup").read_text(), "previous backup copy\n")
+
+        broken = self.update("--server-ref", "v0.6.0")
+        self.assertEqual(broken.returncode, 1, broken.stdout + broken.stderr)
+        self.assertIn(f"wrote {sbin}/setup-server-backup", broken.stdout, "copied before the health check")
+        self.assertIn("Restored the previous installed copies", broken.stdout)
+        self.assertEqual((sbin / "setup-server-backup").read_text(), "previous backup copy\n")
+        self.assertEqual((sbin / "setup-server-metrics").read_text(), "previous metrics copy\n")
+        self.assertEqual(self.head(self.server), "v0.1.0")
+
+        result = self.update("--server-ref", "v0.5.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        backup = (sbin / "setup-server-backup").read_text()
+        self.assertIn("# release 0.5.0", backup)
+        self.assertIn(f"os.environ.get('SETUP_SERVER_ROOT', '{self.root}/srv')", backup, "the host's paths are kept")
+        self.assertIn("# release 0.5.0", (sbin / "setup-server-metrics").read_text())
+        self.assertIn("--refresh", self.sudo_log.read_text())
+        self.assertRegex(self.calls.read_text(), r"(?m)^try-restart setup-server-metrics.service$",
+                         "the metrics service runs the new copy")
+        self.runner_untouched()
+        # Only what is installed is refreshed.
+        (sbin / "setup-server-metrics").unlink()
+        self.assertEqual(self.update("--server-ref", "v0.2.0").returncode, 0)
+        self.assertFalse((sbin / "setup-server-metrics").exists())
 
     def test_check_shows_what_would_change_and_changes_nothing(self):
         result = self.update("--check", "--server-ref", "v0.2.0", "--setup-ref", "v1.1.0")
