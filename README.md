@@ -57,8 +57,9 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 
    Pabaigoje parodomas viešasis git raktas. Pridėk jį **tik skaitymui** prie setup repo (GitHub,
    deploy key) ir prie kiekvieno projekto repo (Bitbucket, Access keys). Tada paleisk scriptą dar
-   kartą: jis nusiklonuos setup. Palygink parodytus `bitbucket.org` ir `github.com` SSH
-   fingerprint'us su paslaugų paskelbtais.
+   kartą: jis nusiklonuos setup. `bitbucket.org` ir `github.com` SSH host raktai įrašomi tik tada, kai
+   nuskenuoto rakto fingerprint'as sutampa su paslaugos paskelbtu (jie įrašyti scripte su nuorodomis į
+   GitHub ir Atlassian puslapius); kitaip raktas neįrašomas ir parodoma „Needs attention“.
 
 3. **Runner'is.** Bitbucket: *Repository (arba Workspace) settings → Runners → Add runner → Linux
    Shell*, pridėk žymą `setup.build`. Dialogo komandų **nevykdyk** – jose esančias reikšmes scriptas

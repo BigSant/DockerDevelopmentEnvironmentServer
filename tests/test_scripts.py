@@ -115,6 +115,50 @@ class PrepareHostTest(ScriptTest):
         self.assertNotIn("install Docker Engine", result.stdout)
 
 
+class PrepareHostKeysTest(ScriptTest):
+    """prepare-host as (fake) root on a ready host: the git hosts' SSH keys it records."""
+    PUBLISHED = {  # the providers' known_hosts lines (see the fingerprints in bin/prepare-host)
+        "github.com": "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+        "bitbucket.org": "bitbucket.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIazEu89wgQZ4bqs3d63QSMzYVa0MuJ2e2gKTKqu+UUO",
+    }
+
+    def setUp(self):
+        super().setUp()
+        root_bin = self.fake_root()
+        self.stub("dpkg-query", 'printf "install ok installed"\n')
+        self.stub("docker", 'echo 2.29.1\n')
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(self.root / "other")], check=True)
+        other = (self.root / "other.pub").read_text().split()[1]
+        # The first scan of a host answers its published key, every later one another key (or always with
+        # FAKE_HOSTKEY): what is recorded must be what was checked.
+        cases = "".join(f'  {host}) published="{line}";;\n' for host, line in self.PUBLISHED.items())
+        self.stub("ssh-keyscan", f'for host; do :; done\ncase "$host" in\n{cases}esac\n'
+                                 f'if [ -z "${{FAKE_HOSTKEY:-}}" ] && [ ! -e {self.root}/scanned-$host ]; then\n'
+                                 f'  touch {self.root}/scanned-$host; echo "$published"\n'
+                                 f'else echo "$host ssh-ed25519 {other}"; fi\n')
+        self.known = self.root / "srv/.ssh/known_hosts"
+        self.prepare = lambda **env: self.run_script(
+            "prepare-host", PATH=f"{root_bin}:{self.bin}:{os.environ['PATH']}", SETUP_SERVER_USER=getpass.getuser(),
+            SETUP_REPO=str(self.root / "missing.git"), **env)
+
+    def test_the_published_host_keys_are_recorded_with_their_own_fingerprints(self):
+        result = self.prepare()
+        self.assertEqual(sorted(self.known.read_text().splitlines()), sorted(self.PUBLISHED.values()),
+                         result.stdout + result.stderr)
+        self.assertIn("github.com fingerprint: SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU (published)", result.stdout)
+        self.assertIn("bitbucket.org fingerprint: SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM (published)",
+                      result.stdout)
+        self.assertNotIn("host key", result.stdout.split("Needs attention")[-1])
+
+    def test_a_host_key_that_is_not_the_published_one_is_refused(self):
+        result = self.prepare(FAKE_HOSTKEY="1")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.known.read_text() if self.known.exists() else "", "", "nothing recorded")
+        self.assertIn("github.com: the scanned host key SHA256:", result.stdout)
+        self.assertIn("is not the published SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU; nothing recorded",
+                      result.stdout)
+
+
 class InstallRunnerTest(ScriptTest):
     def test_the_pasted_command_is_kept_and_the_secret_hidden(self):
         result = self.run_script("install-runner", "--check", "--tarball", "runner.tar.gz", stdin=RUN_COMMAND)

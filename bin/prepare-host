@@ -136,12 +136,32 @@ if [ ! -f "$key" ]; then
     fi
 fi
 known="$ROOT/.ssh/known_hosts"
+# The providers' published ED25519 host key fingerprints. A scanned key is recorded only when its own
+# fingerprint is the published one; anything else (a network in between, a key rotation) is refused.
+#   github.com:    https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
+#   bitbucket.org: https://support.atlassian.com/bitbucket-cloud/docs/configure-ssh-and-two-step-verification/
+#                  (the known_hosts lines: https://bitbucket.org/site/ssh)
+declare -A PUBLISHED_HOST_KEYS=(
+    [bitbucket.org]=SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM
+    [github.com]=SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU
+)
 for host in bitbucket.org github.com; do
     if [ ! -f "$known" ] || ! as_account ssh-keygen -F "$host" -f "$known" >/dev/null 2>&1; then
-        would "record the SSH host key of $host (compare the fingerprint with the provider's published one)"
+        published=${PUBLISHED_HOST_KEYS[$host]}
+        would "record the SSH host key of $host (only with the published fingerprint $published)"
         if [ "$check" = 0 ]; then
-            ssh-keyscan -t ed25519 "$host" 2>/dev/null | as_account tee -a "$known" >/dev/null
-            ssh-keygen -l -f <(ssh-keyscan -t ed25519 "$host" 2>/dev/null) | sed 's/^/    fingerprint: /'
+            # One scan: the fingerprint checked is the one of the line that is saved.
+            scanned=$(ssh-keyscan -t ed25519 "$host" 2>/dev/null | grep -v '^#' || true)
+            fingerprint=
+            if [ "$(printf '%s\n' "$scanned" | grep -c .)" = 1 ]; then
+                fingerprint=$(printf '%s\n' "$scanned" | ssh-keygen -l -f - 2>/dev/null | awk '{print $2}' || true)
+            fi
+            if [ -n "$fingerprint" ] && [ "$fingerprint" = "$published" ]; then
+                printf '%s\n' "$scanned" | as_account tee -a "$known" >/dev/null
+                echo "    $host fingerprint: $fingerprint (published)"
+            else
+                problems+=("$host: the scanned host key ${fingerprint:-(none)} is not the published $published; nothing recorded (check the provider's page and the network, then run this again)")
+            fi
         fi
     fi
 done
