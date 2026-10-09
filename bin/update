@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# Update this setup-server checkout and the shared setup checkout ($ROOT/setup) to the given refs, check
+# that the server still works and, when it does not, return both to the commits they were on before.
+# The runner service is never restarted or reloaded: pipeline steps read the setup checkout when they run.
+# Run it as the owner of this checkout (the admin who cloned it), without sudo; the setup account's part
+# runs through sudo -u. --check fetches and shows what would change; it changes no checkout.
+set -euo pipefail
+
+ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+ACCOUNT=${SETUP_SERVER_USER:-setup}
+RUNNER=${SETUP_SERVER_RUNNER:-setup-server-runner}
+CHECKOUT=${SETUP_SERVER_CHECKOUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)}
+SETUP="$ROOT/setup"
+RELEASE_TAG='^v[0-9]+\.[0-9]+\.[0-9]+$'
+
+usage() {
+    cat <<EOF
+Usage: $0 [--check] [--server-ref REF] [--setup-ref REF]
+  --server-ref REF  move this setup-server checkout ($CHECKOUT) to REF
+  --setup-ref REF   move the shared setup checkout ($SETUP) to REF
+  --check           fetch and show what would change; change no checkout
+REF is a tag (preferred), a branch of origin or a commit id. setup off a vX.Y.Z tag is for stage only:
+prod releases need setup on a release tag. Exit: 0 updated, 1 health check failed and both checkouts
+returned, 2 the return failed too (see the printed commands), 64 usage, 65 refused, 75 a pipeline runs.
+Environment: SETUP_SERVER_ROOT ($ROOT), SETUP_SERVER_USER ($ACCOUNT), SETUP_SERVER_RUNNER ($RUNNER),
+SETUP_SERVER_CHECKOUT (this checkout)
+EOF
+}
+
+say() { printf '==> %s\n' "$*"; }
+fail() { echo "$1" >&2; exit "${2:-65}"; }
+# The setup account owns the shared checkout; others reach it through sudo. Run from / so that git
+# does not start in a directory the account cannot read (a caller's 0750 home breaks git).
+as_account() { if [ "$(id -un)" = "$ACCOUNT" ]; then "$@"; else (cd / && sudo -u "$ACCOUNT" -H "$@"); fi; }
+git_in() {  # git_in server|setup ARGS — git in that checkout, as its owner
+    local side=$1; shift
+    if [ "$side" = setup ]; then as_account git -C "$SETUP" "$@"; else git -C "$CHECKOUT" "$@"; fi
+}
+name_of() { if [ "$1" = setup ]; then echo "setup $SETUP"; else echo "setup-server $CHECKOUT"; fi; }
+label() {  # label SIDE COMMIT — its tag, or its short id
+    git_in "$1" describe --tags --exact-match "$2" 2>/dev/null || git_in "$1" rev-parse --short "$2"
+}
+commits() { if [ "$1" = 1 ]; then echo "1 commit"; else echo "$1 commits"; fi; }
+resolve() {  # resolve SIDE REF — the commit of a tag, else of origin's branch, else a commit id
+    local candidate
+    for candidate in "refs/tags/$2" "refs/remotes/origin/$2"; do
+        git_in "$1" rev-parse -q --verify "$candidate^{commit}" 2>/dev/null && return
+    done
+    [[ "$2" =~ ^[0-9a-f]{7,40}$ ]] && git_in "$1" rev-parse -q --verify "$2^{commit}" 2>/dev/null
+}
+runner_pid() { systemctl show -p MainPID --value "$RUNNER" 2>/dev/null || true; }
+
+plan() {  # plan SIDE REF CURRENT TARGET — what moving that checkout changes
+    local side=$1 ref=$2 current=$3 target=$4 back forward shown
+    shown=$(label "$side" "$target")
+    [ "$shown" = "$ref" ] || shown="$shown ($ref)"
+    if [ "$current" = "$target" ]; then
+        say "$(name_of "$side"): already at $shown"
+        return
+    fi
+    read -r back forward < <(git_in "$side" rev-list --left-right --count "$current...$target")
+    local direction
+    if [ "$back" = 0 ]; then direction="$(commits "$forward") forward"
+    elif [ "$forward" = 0 ]; then direction="$(commits "$back") back"
+    else direction="$(commits "$forward") forward and $(commits "$back") back (another line of history)"
+    fi
+    say "$(name_of "$side"): $(label "$side" "$current") -> $shown: $direction;$(git_in "$side" diff --shortstat "$current" "$target")"
+    git_in "$side" log --format='    + %h %s' -n 10 "$current..$target"
+    [ "$forward" -le 10 ] || echo "    + ... and $((forward - 10)) more"
+    git_in "$side" log --format='    - %h %s' -n 10 "$target..$current"
+    [ "$back" -le 10 ] || echo "    - ... and $((back - 10)) more"
+    if [ "$side" = setup ] && ! { [[ "$ref" =~ $RELEASE_TAG ]] && git_in setup rev-parse -q --verify "refs/tags/$ref" >/dev/null; }; then
+        echo "    note: $ref is not a release tag (vX.Y.Z); prod releases need setup on a tag, so this is stage only"
+    elif [ "$side" = server ] && ! git_in server rev-parse -q --verify "refs/tags/$ref" >/dev/null; then
+        echo "    note: $ref is not a tag; allowed for setup-server"
+    fi
+}
+
+health() {  # every check runs; the result fails when one of them fails
+    local failed=0 log head
+    say "Health check"
+    log=$(mktemp)
+    if (cd "$CHECKOUT" && env -u SETUP_SERVER_ROOT -u SETUP_SERVER_USER -u SETUP_SERVER_RUNNER \
+            -u SETUP_SERVER_CHECKOUT -u SETUP_SERVER_UBUNTU_IMAGE python3 -m unittest discover -s tests) >"$log" 2>&1; then
+        echo "    setup-server tests: ok ($(grep -m1 '^Ran ' "$log"))"
+    else
+        echo "    setup-server tests: FAILED"
+        tail -n 20 "$log" | sed 's/^/      /'
+        failed=1
+    fi
+    rm -f "$log"
+    if head=$(git_in setup rev-parse HEAD 2>&1) && [ "$head" = "$setup_expected" ] \
+            && [ -z "$(git_in setup status --porcelain --untracked-files=no 2>&1)" ]; then
+        echo "    setup at $(label setup "$head"), readable by $ACCOUNT: ok"
+    else
+        echo "    setup: FAILED — $ACCOUNT sees ${head:-nothing} with $(git_in setup status --porcelain --untracked-files=no 2>&1 | wc -l) changed files, expected $setup_expected"
+        failed=1
+    fi
+    if [ -z "$runner_before" ]; then
+        echo "    runner $RUNNER: was not active before; not checked"
+    elif ! systemctl is-active --quiet "$RUNNER"; then
+        echo "    runner $RUNNER: FAILED — not active any more (it was PID $runner_before)"
+        failed=1
+    elif [ "$(runner_pid)" != "$runner_before" ]; then
+        echo "    runner $RUNNER: FAILED — PID changed from $runner_before to $(runner_pid) (restarted)"
+        failed=1
+    else
+        echo "    runner $RUNNER: still active, same PID $runner_before"
+    fi
+    return "$failed"
+}
+
+restore() {  # restore SIDE COMMIT BRANCH — back to the branch it was on, or to the bare commit
+    local side=$1 commit=$2 branch=$3
+    if [ -n "$branch" ]; then
+        git_in "$side" checkout -q --force "$branch" || return 1
+    else
+        git_in "$side" checkout -q --force --detach "$commit" || return 1
+    fi
+    [ "$(git_in "$side" rev-parse HEAD)" = "$commit" ]
+}
+
+give_back() {  # return every moved checkout; print the manual commands for those that did not return
+    local manual=()
+    trap - INT TERM
+    say "Returning to the previous commits"
+    if [ -n "$server_target" ] && ! restore server "$server_previous" "$server_branch"; then
+        manual+=("git -C $CHECKOUT checkout --force $server_previous")
+    fi
+    if [ -n "$setup_target" ] && ! restore setup "$setup_previous" "$setup_branch"; then
+        manual+=("(cd / && sudo -u $ACCOUNT -H git -C $SETUP checkout --force $setup_previous)")
+    fi
+    if [ ${#manual[@]} -eq 0 ]; then
+        say "Returned both checkouts to the previous commits: setup-server $(label server "$server_previous"), setup $(label setup "$setup_previous"). The runner was not restarted."
+        exit 1
+    fi
+    say "The automatic return failed. Return by hand (README: \"Rankinis atstatymas\"):"
+    printf '    %s\n' "${manual[@]}"
+    exit 2
+}
+
+main() {
+    local check=0 server_ref= setup_ref=
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --check) check=1 ;;
+            --server-ref) server_ref=${2:?--server-ref needs a ref}; shift ;;
+            --setup-ref) setup_ref=${2:?--setup-ref needs a ref}; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) usage >&2; exit 64 ;;
+        esac
+        shift
+    done
+    [ -n "$server_ref$setup_ref" ] || { usage >&2; exit 64; }
+
+    # --- Preconditions ----------------------------------------------------------------------------
+    git -C "$CHECKOUT" rev-parse --git-dir >/dev/null 2>&1 || fail "$CHECKOUT is not a git checkout"
+    local owner; owner=$(stat -c %U "$CHECKOUT")
+    [ "$(id -un)" = "$owner" ] || fail "Run this as $owner, the owner of $CHECKOUT, without sudo (the setup account's part uses sudo itself)" 77
+    as_account test -d "$SETUP/.git" || fail "No setup checkout at $SETUP (run bin/prepare-host first)"
+    local side changes
+    for side in server setup; do
+        changes=$(git_in "$side" status --porcelain --untracked-files=no)
+        [ -z "$changes" ] || fail "$(name_of "$side") has local changes; commit, stash or discard them first:
+$changes"
+    done
+    local busy; busy=$(pgrep -u "$ACCOUNT" -x make 2>/dev/null | tr '\n' ' ' || true)
+    if [ -n "$busy" ]; then
+        [ "$check" = 1 ] || fail "A pipeline step of $ACCOUNT is running (make, PID ${busy% }); update when it has finished" 75
+        say "Note: a pipeline step of $ACCOUNT is running (make, PID ${busy% }); an update now would be refused"
+    fi
+
+    # --- What would change ------------------------------------------------------------------------
+    server_previous=$(git_in server rev-parse HEAD)
+    server_branch=$(git_in server symbolic-ref -q --short HEAD || true)
+    setup_previous=$(git_in setup rev-parse HEAD)
+    setup_branch=$(git_in setup symbolic-ref -q --short HEAD || true)
+    server_target= setup_target=
+    for side in server setup; do
+        local ref; [ "$side" = server ] && ref=$server_ref || ref=$setup_ref
+        [ -n "$ref" ] || continue
+        git_in "$side" fetch -q --tags --force --prune origin || fail "Cannot fetch $(name_of "$side") from origin"
+        local target
+        target=$(resolve "$side" "$ref") \
+            || fail "Unknown ${side/server/setup-server} ref $ref (newest tags: $(git_in "$side" tag --sort=-v:refname | head -n 5 | paste -sd ' '))"
+        local previous; [ "$side" = server ] && previous=$server_previous || previous=$setup_previous
+        plan "$side" "$ref" "$previous" "$target"
+        [ "$target" = "$previous" ] && continue
+        if [ "$side" = server ]; then server_target=$target; else setup_target=$target; fi
+    done
+    setup_expected=${setup_target:-$setup_previous}
+    if systemctl is-active --quiet "$RUNNER"; then
+        runner_before=$(runner_pid)
+        say "runner $RUNNER active (PID $runner_before); an update never restarts it"
+    else
+        runner_before=
+        say "runner $RUNNER is not active; not checked"
+    fi
+    if [ -z "$server_target$setup_target" ]; then
+        say "Nothing to do."
+        exit 0
+    fi
+    if [ "$check" = 1 ]; then
+        say "After updating: setup-server tests, setup at the new commit and readable by $ACCOUNT, runner still active with the same PID; on a failure both checkouts return."
+        say "Check finished; nothing was changed (only fetched)."
+        exit 0
+    fi
+
+    # --- Update -----------------------------------------------------------------------------------
+    say "Previous commits (for a manual return): setup-server $server_previous, setup $setup_previous"
+    trap 'echo "Interrupted" >&2; give_back' INT TERM
+    local switched=1
+    if [ -n "$server_target" ] && ! git_in server checkout -q --detach "$server_target"; then switched=0; fi
+    if [ "$switched" = 1 ] && [ -n "$setup_target" ] && ! git_in setup checkout -q --detach "$setup_target"; then switched=0; fi
+    if [ "$switched" = 0 ]; then
+        say "Switching a checkout failed"
+        give_back
+    fi
+    if ! health; then
+        give_back
+    fi
+    trap - INT TERM
+    say "Updated: setup-server $(label server HEAD), setup $(label setup HEAD). The runner was not restarted."
+}
+
+# Bash reads a script while running it and the update replaces this file, so the whole run is one call
+# that bash has parsed before anything changes.
+main "$@"; exit $?
