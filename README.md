@@ -160,8 +160,13 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    ```
 
    **„Backup dabar“** – Bitbucket custom pipeline'as, vykdomas runner'io šiame serveryje. Jis kviečia tą pačią
-   komandą per `sudo` (taisyklė leidžia paskyrai `setup` tik `/usr/local/sbin/setup-server-backup`), todėl
-   naudoja tuos pačius root slaptažodžių failus, rotaciją ir nekuria įrašo Deployments istorijoje:
+   komandą per `sudo`, todėl naudoja tuos pačius root slaptažodžių failus, rotaciją ir nekuria įrašo
+   Deployments istorijoje. Sudo taisyklė leidžia paskyrai `setup` tik šią formą:
+   `/usr/local/sbin/setup-server-backup /srv/setup-server/projects/<vardas> [stage|prod]` (sudo 1.9.10+,
+   pvz. Ubuntu 24.04, tikrina reguliariąja išraiška). Senesnis sudo (Ubuntu 22.04: 1.9.9) turi tik
+   šablonus: pirmas argumentas privalo būti build katalogas, o kitus argumentus atmeta pati komanda.
+   Atnaujinus setup-server, pakartok `sudo bin/install-backups`, jei `bin/update` parodo pastabą, kad
+   sudo taisyklė skiriasi.
 
    ```yaml
    pipelines:

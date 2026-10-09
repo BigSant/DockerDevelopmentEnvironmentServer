@@ -214,6 +214,19 @@ class InstallBackupsTest(ScriptTest):
         for name in ("systemd", "sbin", "sudoers.d", "srv"):
             self.assertFalse((self.root / name).exists(), "--check changes nothing")
 
+    def test_the_sudo_rule_allows_only_the_backup_now_form(self):
+        rule = f"setup-test-account-missing ALL=(root) NOPASSWD: {self.root}/sbin/setup-server-backup "
+        projects = f"{self.root}/srv/projects/"
+        # sudo 1.9.10+ matches the arguments with a regular expression: the build root, optionally stage/prod.
+        self.stub("sudo", 'echo "Sudo version 1.9.15p5"\n')
+        exact = self.run_script("install-backups", "--check")
+        self.assertIn(rule + f"^{projects}[a-z0-9][a-z0-9_-]*( (stage|prod))?$\n", exact.stdout)
+        # Older sudo (Ubuntu 22.04: 1.9.9) has only wildcards: the first argument must be a build root, the
+        # command refuses anything else after it.
+        self.stub("sudo", 'echo "Sudo version 1.9.9"\n')
+        wildcard = self.run_script("install-backups", "--check")
+        self.assertIn(rule + f"{projects}[a-z0-9]*\n", wildcard.stdout)
+
     def test_a_rerun_keeps_the_installed_time_and_refresh_only_touches_an_installed_copy(self):
         (self.root / "systemd").mkdir()
         (self.root / "systemd/setup-server-backup.timer").write_text("[Timer]\nOnCalendar=*-*-* 02:15:00\n")
@@ -250,6 +263,17 @@ systemd-analyze verify /etc/systemd/system/setup-server-backup.service /etc/syst
 cat /tmp/verify.log; [ ! -s /tmp/verify.log ]
 echo UNITS_VERIFIED
 visudo -cf /etc/sudoers.d/setup-server-backup && echo SUDOERS_VALID
+# What the rule lets the runner account start (sudo -l: allowed or not, nothing runs).
+build_root=/srv/setup-server/projects/asana_tracker
+for arguments in "$build_root" "$build_root prod" "" "--check" "/etc" "--job asana_tracker prod" \
+        "/srv/setup-server/projects/../../etc" "$build_root --check"; do
+    if sudo -u setup sudo -n -l /usr/local/sbin/setup-server-backup $arguments >/dev/null 2>&1; then
+        echo "SUDO ALLOWED [$arguments]"
+    else
+        echo "SUDO REFUSED [$arguments]"
+    fi
+done
+grep -q ' \^/srv' /etc/sudoers.d/setup-server-backup && echo SUDO_REGEX
 cp /stubs/make /usr/local/bin/make
 app=/srv/setup-server/projects/asana_tracker/app
 mkdir -p $app/env && touch $app/Makefile $app/env/prod.env && chown -R setup:setup /srv/setup-server/projects
@@ -270,6 +294,14 @@ zcat $app/.generated/backups/worker-prod-*.sql.gz
         self.assertIn("\n4\n", result.stdout, "a second install changes nothing")
         self.assertIn("UNITS_VERIFIED", output)
         self.assertIn("SUDOERS_VALID", output)
+        build_root = "/srv/setup-server/projects/asana_tracker"
+        for arguments in (build_root, f"{build_root} prod"):
+            self.assertIn(f"SUDO ALLOWED [{arguments}]", result.stdout)
+        refused = ["", "--check", "/etc", "--job asana_tracker prod", "/srv/setup-server/projects/../../etc"]
+        if "SUDO_REGEX" in result.stdout:  # sudo 1.9.10+: nothing after the build root but stage or prod
+            refused.append(f"{build_root} --check")
+        for arguments in refused:
+            self.assertIn(f"SUDO REFUSED [{arguments}]", result.stdout)
         self.assertRegex(result.stdout, r"setup 600 /srv/setup-server/projects/asana_tracker/app/\.generated/backups/worker-prod-")
         self.assertIn("prod secret=from-root-file setup=/srv/setup-server/setup", result.stdout)
         self.assertIn("Backups: 1 ok, 0 failed", result.stdout)
