@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Remove a project's build root ($ROOT/projects/<name>). It holds the project's database backups,
+# release history and deploy log, so those are only deleted on request, and a build root that a
+# running container still uses is never removed. --check shows what would go and changes nothing.
+set -euo pipefail
+
+ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+
+check=0
+with_backups=0
+usage() {
+    cat <<EOF
+Usage: sudo $0 [--check] [--with-backups] NAME
+  NAME            directory under $ROOT/projects (see: ls $ROOT/projects)
+  --check         show what would be removed; change nothing
+  --with-backups  also remove database backups and release/deploy history (rollback is lost)
+EOF
+}
+name=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) check=1 ;;
+        --with-backups) with_backups=1 ;;
+        -h|--help) usage; exit 0 ;;
+        -*) usage >&2; exit 64 ;;
+        *) [ -z "$name" ] || { usage >&2; exit 64; }; name=$1 ;;
+    esac
+    shift
+done
+[ -n "$name" ] || { usage >&2; exit 64; }
+[[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || { echo "NAME must be lowercase letters, digits, _ or -" >&2; exit 65; }
+if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
+    echo "Run with sudo (or use --check)" >&2
+    exit 77
+fi
+
+build_root="$ROOT/projects/$name"
+if [ -L "$build_root" ] || [ ! -d "$build_root" ]; then
+    echo "No build root $build_root (projects: $(ls "$ROOT/projects" 2>/dev/null | tr '\n' ' '))" >&2
+    exit 65
+fi
+
+# What the build root holds besides checkouts.
+generated="$build_root/app/.generated"
+backups=$({ find "$generated/backups" -maxdepth 1 -type f 2>/dev/null || true; } | wc -l)
+deploys=$({ find "$generated/release" -mindepth 2 -maxdepth 2 -name deployments.json 2>/dev/null || true; } | wc -l)
+size=$({ du -sh "$build_root" 2>/dev/null || true; } | cut -f1)
+echo "==> $build_root: ${size:-?}; database backups: $backups; environments with deploy history: $deploys"
+
+# A running container that mounts something from the build root still depends on it.
+users=$({ docker ps -q 2>/dev/null || true; } | xargs -r docker inspect --format '{{.Name}} {{range .Mounts}}{{.Source}} {{end}}' 2>/dev/null \
+    | awk -v root="$build_root/" '{for (i = 2; i <= NF; i++) if (index($i "/", root) == 1) {print substr($1, 2); break}}' || true)
+if [ -n "$users" ]; then
+    echo "Containers still use $build_root: $(echo "$users" | tr '\n' ' ')— stop them first" >&2
+    exit 65
+fi
+if [ $((backups + deploys)) -gt 0 ] && [ "$with_backups" = 0 ]; then
+    echo "$build_root holds database backups or deploy history; add --with-backups to remove them too" >&2
+    exit 65
+fi
+
+if [ "$check" = 1 ]; then
+    echo "==> would remove $build_root; nothing was changed"
+    exit 0
+fi
+rm -rf -- "$build_root"
+echo "==> removed $build_root"

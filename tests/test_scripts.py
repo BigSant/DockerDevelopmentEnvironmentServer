@@ -189,6 +189,52 @@ class AddProjectTest(ScriptTest):
         self.assertIn(f"into {self.root}/srv/projects/forsena_docker/app/public", two.stdout)
 
 
+class RemoveProjectTest(ScriptTest):
+    def setUp(self):
+        super().setUp()
+        self.build_root = self.root / "srv/projects/demo"
+        (self.build_root / "app/.git").mkdir(parents=True)
+        (self.build_root / "app/index.php").write_text("<?php\n")
+        # No running containers unless a test says otherwise.
+        self.stub("docker", 'case "$1" in ps) printf "%s" "${FAKE_CONTAINERS:-}";; '
+                            'inspect) printf "%s\\n" "${FAKE_MOUNTS:-}";; esac\n')
+
+    def test_check_shows_and_keeps_and_a_plain_build_root_is_removed(self):
+        result = self.run_script("remove-project", "--check", "demo")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("database backups: 0", result.stdout)
+        self.assertIn("would remove", result.stdout)
+        self.assertTrue(self.build_root.exists(), "--check removes nothing")
+        if os.getuid() != 0:
+            self.assertEqual(self.run_script("remove-project", "demo").returncode, 77, "removing needs sudo")
+
+    def test_backups_and_deploy_history_need_with_backups(self):
+        (self.build_root / "app/.generated/backups").mkdir(parents=True)
+        (self.build_root / "app/.generated/backups/demo-prod-20261009.sql.gz").write_text("x")
+        (self.build_root / "app/.generated/release/prod").mkdir(parents=True)
+        (self.build_root / "app/.generated/release/prod/deployments.json").write_text("[]")
+        refused = self.run_script("remove-project", "--check", "demo")
+        self.assertEqual(refused.returncode, 65)
+        self.assertIn("database backups: 1; environments with deploy history: 1", refused.stdout)
+        self.assertIn("add --with-backups", refused.stderr)
+        self.assertEqual(self.run_script("remove-project", "--check", "--with-backups", "demo").returncode, 0)
+
+    def test_a_build_root_used_by_a_running_container_is_kept(self):
+        env_root = self.build_root
+        os.environ["FAKE_CONTAINERS"] = "abc123"
+        os.environ["FAKE_MOUNTS"] = f"/demo-prod-php-fpm {env_root}/app/public /var/run/docker.sock"
+        self.addCleanup(os.environ.pop, "FAKE_CONTAINERS")
+        self.addCleanup(os.environ.pop, "FAKE_MOUNTS")
+        result = self.run_script("remove-project", "--check", "--with-backups", "demo")
+        self.assertEqual(result.returncode, 65)
+        self.assertIn("Containers still use", result.stderr)
+        self.assertIn("demo-prod-php-fpm", result.stderr)
+
+    def test_unknown_and_invalid_names_are_refused(self):
+        self.assertIn("No build root", self.run_script("remove-project", "--check", "missing").stderr)
+        self.assertEqual(self.run_script("remove-project", "--check", "../srv").returncode, 65)
+
+
 UBUNTU = os.environ.get("SETUP_SERVER_UBUNTU_IMAGE")
 
 

@@ -13,7 +13,8 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | --- | --- |
 | `bin/prepare-host` | Paketai (`git`, `make`, `rsync`, `python3`, OpenJDK 25 runner'iui), Docker su Compose (jei jo nėra – iš download.docker.com; esamas Docker nekeičiamas), paskyra `setup` su Docker grupe, katalogai `/srv/setup-server`, git raktas, bendras setup checkout'as. |
 | `bin/install-runner` | Bitbucket Linux Shell runner'is kaip systemd paslauga `setup-server-runner` (paskyra `setup`). |
-| `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`. |
+| `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<repo vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`. |
+| `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
 
 Visi scriptai yra idempotentiški, juos galima kartoti. Su `--check` jie tik parodo, ką keistų,
 ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
@@ -87,6 +88,17 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    į Deployment variables (Secured). Kiekvienas pipeline žingsnis turi turėti
    `runs-on: [self.hosted, linux.shell, setup.build]`, kitaip jis vyktų Bitbucket debesyje ir naudotų
    minutes.
+
+5. **Projekto pašalinimas:**
+
+   ```bash
+   ls /srv/setup-server/projects/
+   sudo bin/remove-project --check asana_tracker    # parodo dydį, kopijas, deploy'ų istoriją
+   sudo bin/remove-project asana_tracker
+   ```
+
+   Jei kataloge yra DB kopijų ar deploy'ų istorijos, reikia `--with-backups` – tada prarandamos kopijos
+   ir rollback'as. Katalogo, kurį naudoja veikiantis konteineris, scriptas netrina.
 
 ## Saugumas
 
