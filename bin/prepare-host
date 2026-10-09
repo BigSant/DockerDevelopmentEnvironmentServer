@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Prepare an Ubuntu host as setup v2 build server and deploy target: system packages, Docker with
+# Compose, Java for the Bitbucket runner, the service account, its git key and the shared setup
+# checkout. Idempotent; --check only reports what it would change. A Docker that already runs
+# containers is never replaced.
+set -euo pipefail
+
+ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+ACCOUNT=${SETUP_SERVER_USER:-setup}
+SETUP_REPO=${SETUP_REPO:-git@github.com:BigSant/DockerDevelopmentEnvironment.git}
+OS_RELEASE=${SETUP_SERVER_OS_RELEASE:-/etc/os-release}
+MEMINFO=${SETUP_SERVER_MEMINFO:-/proc/meminfo}
+# setup v2 needs these; Java 25 is what the Linux Shell runner (v6+) requires.
+PACKAGES=(git make rsync python3 curl ca-certificates openssh-client openjdk-25-jre-headless)
+MIN_COMPOSE=2.24.4
+MIN_RAM_GB=8
+
+check=0
+setup_ref=
+usage() {
+    cat <<EOF
+Usage: sudo $0 [--check] [--setup-ref vX.Y.Z]
+  --check            report what would change, change nothing (no root needed)
+  --setup-ref REF    check out this setup tag in $ROOT/setup (servers build prod only from a tag)
+Environment: SETUP_SERVER_ROOT ($ROOT), SETUP_SERVER_USER ($ACCOUNT), SETUP_REPO ($SETUP_REPO)
+EOF
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) check=1 ;;
+        --setup-ref) setup_ref=${2:?--setup-ref needs a tag}; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 64 ;;
+    esac
+    shift
+done
+
+problems=()
+say() { printf '==> %s\n' "$*"; }
+would() { printf '    %s %s\n' "$([ "$check" = 1 ] && echo 'would' || echo 'doing:')" "$*"; }
+version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]; }
+
+# --- Host facts -------------------------------------------------------------------------------
+# shellcheck disable=SC1090
+. "$OS_RELEASE"
+if [ "${ID:-}" != ubuntu ]; then
+    echo "Only Ubuntu is supported (found ${ID:-unknown})" >&2
+    exit 65
+fi
+if ! version_ge "${VERSION_ID:-0}" 22.04; then
+    echo "Ubuntu 22.04 or newer is required (found ${VERSION_ID:-unknown})" >&2
+    exit 65
+fi
+if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
+    echo "Run with sudo (or use --check to only report)" >&2
+    exit 77
+fi
+ram_kb=$(awk '/^MemTotal:/ {print $2}' "$MEMINFO")
+ram_gb=$(( (ram_kb + 524288) / 1048576 ))
+free_root=$(df -BG --output=avail / | tail -n1 | tr -dc '0-9')
+say "Ubuntu ${VERSION_ID} (${PRETTY_NAME:-}); RAM ${ram_gb} GB; free on /: ${free_root} GB; CPUs $(nproc)"
+if [ "$ram_gb" -lt "$MIN_RAM_GB" ]; then
+    problems+=("RAM ${ram_gb} GB is below the ${MIN_RAM_GB} GB the Bitbucket Linux Shell runner requires")
+fi
+
+# --- Packages ---------------------------------------------------------------------------------
+missing=()
+for package in "${PACKAGES[@]}"; do
+    dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed' || missing+=("$package")
+done
+say "Packages: ${#missing[@]} missing${missing[*]:+ (${missing[*]})}"
+if [ ${#missing[@]} -gt 0 ]; then
+    would "apt-get install ${missing[*]} (openjdk-25 comes from the universe component)"
+    if [ "$check" = 0 ]; then
+        apt-get update -q
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${missing[@]}"
+    fi
+fi
+
+# --- Docker -----------------------------------------------------------------------------------
+if command -v docker >/dev/null 2>&1; then
+    compose=$(docker compose version --short 2>/dev/null || true)
+    if [ -z "$compose" ]; then
+        problems+=("Docker is installed but has no Compose plugin; install docker-compose-plugin (Docker repo) or docker-compose-v2 (Ubuntu) — not replaced here so running containers keep running")
+    elif ! version_ge "${compose#v}" "$MIN_COMPOSE"; then
+        problems+=("Docker Compose ${compose} is older than ${MIN_COMPOSE}; upgrade the Compose plugin")
+    fi
+    say "Docker: present (Compose ${compose:-missing}); left as it is"
+else
+    say "Docker: missing"
+    would "install Docker Engine and the Compose plugin from download.docker.com"
+    if [ "$check" = 0 ]; then
+        install -m 0755 -d /etc/apt/keyrings
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+        chmod a+r /etc/apt/keyrings/docker.asc
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
+            > /etc/apt/sources.list.d/docker.list
+        apt-get update -q
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+        systemctl enable --now docker
+    fi
+fi
+
+# --- Service account and layout ---------------------------------------------------------------
+if id "$ACCOUNT" >/dev/null 2>&1; then
+    say "Account $ACCOUNT: present"
+else
+    say "Account $ACCOUNT: missing"
+    would "create system account $ACCOUNT with home $ROOT"
+    [ "$check" = 1 ] || useradd --system --create-home --home-dir "$ROOT" --shell /bin/bash "$ACCOUNT"
+fi
+# The runner starts containers, so the account needs Docker; Docker group membership is root-equivalent
+# on this host, which is accepted because this host is the build server and its own deploy target.
+if ! id -nG "$ACCOUNT" 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    would "add $ACCOUNT to the docker group (root-equivalent on this host)"
+    [ "$check" = 1 ] || usermod -aG docker "$ACCOUNT"
+fi
+for directory in "$ROOT" "$ROOT/projects" "$ROOT/runner"; do
+    if [ ! -d "$directory" ]; then
+        would "create $directory (owner $ACCOUNT, 0750)"
+        [ "$check" = 1 ] || install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$directory"
+    fi
+done
+
+# As root act as the service account; a --check run without root only reads what the caller can.
+as_account() { if [ "$(id -u)" = 0 ]; then sudo -u "$ACCOUNT" -H "$@"; else "$@"; fi; }
+
+# --- Git access -------------------------------------------------------------------------------
+key="$ROOT/.ssh/id_ed25519"
+if [ ! -f "$key" ]; then
+    would "create the git key $key (read-only access key for the repositories)"
+    if [ "$check" = 0 ]; then
+        install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0700 "$ROOT/.ssh"
+        as_account ssh-keygen -q -t ed25519 -N '' -C "$ACCOUNT@$(hostname)" -f "$key"
+    fi
+fi
+known="$ROOT/.ssh/known_hosts"
+for host in bitbucket.org github.com; do
+    if [ ! -f "$known" ] || ! as_account ssh-keygen -F "$host" -f "$known" >/dev/null 2>&1; then
+        would "record the SSH host key of $host (compare the fingerprint with the provider's published one)"
+        if [ "$check" = 0 ]; then
+            ssh-keyscan -t ed25519 "$host" 2>/dev/null | as_account tee -a "$known" >/dev/null
+            ssh-keygen -l -f <(ssh-keyscan -t ed25519 "$host" 2>/dev/null) | sed 's/^/    fingerprint: /'
+        fi
+    fi
+done
+
+# --- Shared setup checkout --------------------------------------------------------------------
+if [ -d "$ROOT/setup/.git" ]; then
+    current=$(as_account git -C "$ROOT/setup" describe --tags --always 2>/dev/null || echo unknown)
+    say "setup checkout: $ROOT/setup at $current"
+    if [ -n "$setup_ref" ] && [ "$current" != "$setup_ref" ]; then
+        would "check out setup $setup_ref"
+        [ "$check" = 1 ] || { as_account git -C "$ROOT/setup" fetch -q --tags origin && as_account git -C "$ROOT/setup" checkout -q "$setup_ref"; }
+    fi
+elif [ "$check" = 1 ] || [ ! -f "$key" ]; then
+    would "clone $SETUP_REPO into $ROOT/setup${setup_ref:+ at $setup_ref} (after the git key is allowed on it)"
+elif as_account git ls-remote -q "$SETUP_REPO" >/dev/null 2>&1; then
+    as_account git clone -q "$SETUP_REPO" "$ROOT/setup"
+    [ -z "$setup_ref" ] || as_account git -C "$ROOT/setup" checkout -q "$setup_ref"
+    say "setup cloned into $ROOT/setup"
+else
+    problems+=("The git key cannot read $SETUP_REPO yet: add $key.pub as a read-only deploy key, then run this again")
+fi
+
+# --- Summary ----------------------------------------------------------------------------------
+if [ -f "$key.pub" ]; then
+    say "Git key of $ACCOUNT (add it read-only to the setup repo and every project repository):"
+    sed 's/^/    /' "$key.pub"
+fi
+if [ ${#problems[@]} -gt 0 ]; then
+    say "Needs attention:"
+    printf '    - %s\n' "${problems[@]}"
+    exit 1
+fi
+say "$([ "$check" = 1 ] && echo 'Check finished; nothing was changed.' || echo 'Host prepared.') Next: bin/install-runner, then bin/add-project."

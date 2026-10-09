@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Install the Bitbucket Pipelines Linux Shell runner as a systemd service of the setup account.
+# Bitbucket's "Runner installation" dialog shows a download link and a Run command (start.sh with the
+# account/runner UUIDs and OAuth credentials). Paste that command on stdin; the credentials go to a
+# root-only environment file, never to the repository or this script's arguments. The runner itself
+# receives them as start.sh arguments (Atlassian's design), so they show in ps on this host.
+set -euo pipefail
+
+ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+ACCOUNT=${SETUP_SERVER_USER:-setup}
+CONFIG=${SETUP_SERVER_CONFIG:-/etc/setup-server}
+UNIT=${SETUP_SERVER_UNIT:-/etc/systemd/system/setup-server-runner.service}
+
+check=0
+tarball=
+usage() {
+    cat <<EOF
+Usage: sudo $0 --tarball URL|FILE [--check] < run-command.txt
+  --tarball   the runner archive linked in Bitbucket's runner installation dialog
+  --check     validate the pasted command and show what would be installed; change nothing
+Paste the dialog's Run command (…/start.sh --accountUuid … --runtime linux-shell …) on stdin.
+EOF
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --tarball) tarball=${2:?--tarball needs a URL or file}; shift ;;
+        --check) check=1 ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 64 ;;
+    esac
+    shift
+done
+[ -n "$tarball" ] || { usage >&2; exit 64; }
+if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
+    echo "Run with sudo (or use --check)" >&2
+    exit 77
+fi
+
+# Keep only the start.sh arguments; the working directory is ours, not the dialog's relative one.
+read -r -d '' command || true
+arguments=$(printf '%s' "$command" | tr '\n\\' '  ' | sed -n 's/.*start\.sh[[:space:]]\{1,\}//p')
+[ -n "$arguments" ] || { echo "The pasted text has no start.sh command" >&2; exit 65; }
+read -r -a words <<<"$arguments"
+kept=()
+skip=0
+for word in "${words[@]}"; do
+    if [ "$skip" = 1 ]; then skip=0; continue; fi
+    if [ "$word" = --workingDirectory ]; then skip=1; continue; fi
+    # UUIDs, ids, secrets and flag names only: anything else could inject into the service command.
+    if ! [[ "$word" =~ ^[A-Za-z0-9{}._:/=+-]+$ ]]; then
+        echo "Unexpected text in the command: $word" >&2
+        exit 65
+    fi
+    kept+=("$word")
+done
+joined=" ${kept[*]} "
+for required in --accountUuid --runnerUuid --OAuthClientId --OAuthClientSecret; do
+    [[ "$joined" == *" $required "* ]] || { echo "The command lacks $required" >&2; exit 65; }
+done
+[[ "$joined" == *" --runtime linux-shell "* ]] || { echo "Only the Linux Shell runner (--runtime linux-shell) is supported" >&2; exit 65; }
+work="$ROOT/runner/temp"
+kept+=(--workingDirectory "$work")
+masked=$(printf '%s ' "${kept[@]}" | sed -E 's/(--OAuthClientSecret )[^ ]+/\1<hidden>/')
+echo "==> runner arguments: $masked"
+
+java -version 2>&1 | grep -q 'version "2[5-9]' || echo "Warning: the runner needs OpenJDK 25; run bin/prepare-host first" >&2
+
+if [ "$check" = 1 ]; then
+    echo "==> would unpack $tarball into $ROOT/runner/current, write $CONFIG/runner.env (root, 0600) and $UNIT, then start it"
+    exit 0
+fi
+
+# --- Unpack -----------------------------------------------------------------------------------
+release="$ROOT/runner/release-$(date +%Y%m%d%H%M%S)"
+install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$release" "$work"
+archive=$(mktemp)
+trap 'rm -f "$archive"' EXIT
+if [ -f "$tarball" ]; then cp "$tarball" "$archive"; else curl -fsSL "$tarball" -o "$archive"; fi
+tar -xzf "$archive" -C "$release"
+[ -x "$release/bin/start.sh" ] || { echo "The archive has no bin/start.sh" >&2; exit 65; }
+chown -R "$ACCOUNT:$ACCOUNT" "$release"
+ln -sfn "$release" "$ROOT/runner/current"
+
+# --- Credentials and service ------------------------------------------------------------------
+install -d -m 0700 "$CONFIG"
+umask 077
+printf 'RUNNER_ARGS="%s"\n' "${kept[*]}" > "$CONFIG/runner.env"
+chmod 0600 "$CONFIG/runner.env"
+cat > "$UNIT" <<EOF
+[Unit]
+Description=Bitbucket Pipelines Linux Shell runner (setup-server)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=$ACCOUNT
+Group=$ACCOUNT
+WorkingDirectory=$ROOT/runner/current/bin
+# Read by systemd as root, so the file itself stays unreadable to the runner account.
+EnvironmentFile=$CONFIG/runner.env
+# Pipelines run make in each project's build root; the shared setup checkout lives beside them.
+Environment=SETUP_DIRECTORY=$ROOT/setup
+ExecStart=$ROOT/runner/current/bin/start.sh \$RUNNER_ARGS
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now "$(basename "$UNIT")"
+systemctl restart "$(basename "$UNIT")"
+echo "==> runner service $(basename "$UNIT") is $(systemctl is-active "$(basename "$UNIT")"); Bitbucket shows it ONLINE within a minute"

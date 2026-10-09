@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Create a project's build root for the runner: $ROOT/projects/<name>/app is the environment
+# repository and, when the shop/application code is a separate repository, app/public is its clone.
+# Pipelines then run `make …` there (BUILD_ROOT = $ROOT/projects/<name>); nobody works in it by hand.
+set -euo pipefail
+
+ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+ACCOUNT=${SETUP_SERVER_USER:-setup}
+
+check=0
+usage() {
+    cat <<EOF
+Usage: sudo $0 [--check] NAME ENV_REPO_URL [CODE_REPO_URL]
+  NAME           lowercase project name (directory under $ROOT/projects)
+  ENV_REPO_URL   git URL of the environment repository (cloned into app/)
+  CODE_REPO_URL  git URL of a separate code repository (cloned into app/public/); omit when the
+                 environment repository already contains public/
+EOF
+}
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) check=1 ;;
+        -h|--help) usage; exit 0 ;;
+        -*) usage >&2; exit 64 ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+[ ${#args[@]} -ge 2 ] && [ ${#args[@]} -le 3 ] || { usage >&2; exit 64; }
+name=${args[0]}; env_repo=${args[1]}; code_repo=${args[2]:-}
+[[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || { echo "NAME must be lowercase letters, digits, _ or -" >&2; exit 65; }
+if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
+    echo "Run with sudo (or use --check)" >&2
+    exit 77
+fi
+
+build_root="$ROOT/projects/$name"
+as_account() { if [ "$(id -u)" = 0 ]; then sudo -u "$ACCOUNT" -H "$@"; else "$@"; fi; }
+clone() {  # clone URL DIRECTORY — an existing checkout of the same remote is kept as it is
+    if [ -d "$2/.git" ]; then
+        remote=$(as_account git -C "$2" remote get-url origin)
+        [ "$remote" = "$1" ] || { echo "$2 already holds $remote, not $1" >&2; exit 65; }
+        echo "==> $2: present"
+        return
+    fi
+    [ ! -e "$2" ] || { echo "$2 exists and is not a git checkout; preserved" >&2; exit 65; }
+    echo "==> $([ "$check" = 1 ] && echo would clone || echo cloning) $1 into $2"
+    [ "$check" = 1 ] || as_account git clone -q "$1" "$2"
+}
+
+[ "$check" = 1 ] || [ -d "$build_root" ] || install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$build_root"
+clone "$env_repo" "$build_root/app"
+[ -z "$code_repo" ] || clone "$code_repo" "$build_root/app/public"
+cat <<EOF
+==> Build root: $build_root
+    In Bitbucket set the repository variable BUILD_ROOT=$build_root, fill env/<stage|prod>.env.example
+    (no secrets) and add the secrets as Deployment variables (Secured).
+EOF
