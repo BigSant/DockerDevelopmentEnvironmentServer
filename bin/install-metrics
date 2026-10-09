@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# Install the worker's Prometheus /metrics: the systemd service setup-server-metrics runs
+# /usr/local/sbin/setup-server-metrics (a root-owned copy of bin/worker-metrics) as the setup account,
+# read-only, on one address (default 127.0.0.1; the VPN address for Prometheus). Its settings — the
+# bearer token, the address and the allowlist — live in the root-only file /etc/setup-server/metrics.env.
+# Idempotent: a rerun keeps the settings it is not given and restarts the service only when a file
+# changed; the runner service is never touched. --check shows everything and changes nothing.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+ACCOUNT=${SETUP_SERVER_USER:-setup}
+CONFIG=${SETUP_SERVER_CONFIG:-/etc/setup-server}
+SBIN=${SETUP_SERVER_SBIN:-/usr/local/sbin}
+SYSTEMD=${SETUP_SERVER_SYSTEMD:-/etc/systemd/system}
+NAME=setup-server-metrics
+LOOPBACK="127.0.0.1 ::1"
+
+check=0
+new_token=0
+address=
+port=
+allow=
+usage() {
+    cat <<EOF
+Usage: sudo $0 [--check] [--address IP] [--allow "IP/CIDR ..."] [--port PORT] [--new-token]
+  --address    where the endpoint listens (default 127.0.0.1); on the VPN server its VPN address, e.g. 10.8.0.14
+  --allow      who may connect: the Prometheus address(es), IP/CIDR separated by spaces or commas
+               (needed with any address but 127.0.0.1/::1, where it defaults to "$LOOPBACK")
+  --port       TCP port (default 9101)
+  --new-token  replace the bearer token (Prometheus needs the new one)
+  --check      show the unit and settings (token hidden) and what would change; change nothing
+Settings not given are kept from $CONFIG/metrics.env.
+EOF
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) check=1 ;;
+        --new-token) new_token=1 ;;
+        --address) address=${2:-}; shift ;;
+        --allow) allow=${2:-}; shift ;;
+        --port) port=${2:-}; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 64 ;;
+    esac
+    shift
+done
+for value in "$ROOT" "$CONFIG" "$SBIN" "$ACCOUNT"; do
+    [[ "$value" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "Unexpected characters in $value" >&2; exit 65; }
+done
+if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
+    echo "Run with sudo (or use --check)" >&2
+    exit 77
+fi
+
+settings="$CONFIG/metrics.env"
+command="$SBIN/$NAME"
+current() {  # current KEY — its value in the existing settings file, without quotes
+    [ -r "$settings" ] || return 0
+    sed -n "s/^$1=//p" "$settings" | tail -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
+if [ -e "$settings" ] && [ ! -r "$settings" ]; then
+    echo "==> $settings needs sudo to read: its settings are not compared here"
+fi
+address=${address:-$(current METRICS_ADDRESS)}
+address=${address:-127.0.0.1}
+port=${port:-$(current METRICS_PORT)}
+port=${port:-9101}
+allow=${allow:-$(current METRICS_ALLOWED_IPS)}
+case "$address" in
+    127.*|::1) allow=${allow:-$LOOPBACK} ;;
+    *) if [ -z "$allow" ] || [ "$allow" = "$LOOPBACK" ]; then
+           echo "Listening on $address needs --allow with the Prometheus address (IP/CIDR)" >&2
+           exit 64
+       fi ;;
+esac
+token=$(current METRICS_TOKEN)
+token_state=kept
+if [ "$new_token" = 1 ] || [ ${#token} -lt 24 ]; then
+    token=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+    token_state=new
+elif ! [[ "$token" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+    echo "METRICS_TOKEN in $settings has unexpected characters; use --new-token" >&2
+    exit 65
+fi
+
+# One validation for both: the service itself refuses settings it would not start with (exit 78).
+listen=$(METRICS_TOKEN="$token" METRICS_ADDRESS="$address" METRICS_PORT="$port" METRICS_ALLOWED_IPS="$allow" \
+         "$here/worker-metrics" --check) || exit $?
+
+staging=$(mktemp -d)
+trap 'rm -rf "$staging"' EXIT
+umask 077
+
+sed "s|os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server')|os.environ.get('SETUP_SERVER_ROOT', '$ROOT')|" \
+    "$here/worker-metrics" > "$staging/command"
+grep -qF "SETUP_SERVER_ROOT', '$ROOT'" "$staging/command" || { echo "bin/worker-metrics no longer has the default of SETUP_SERVER_ROOT" >&2; exit 70; }
+
+cat > "$staging/settings" <<EOF
+# $NAME (bin/install-metrics). Read by systemd as root and given to the service.
+# Prometheus sends METRICS_TOKEN as a bearer token; only METRICS_ALLOWED_IPS may connect.
+METRICS_TOKEN=$token
+METRICS_ADDRESS=$address
+METRICS_PORT=$port
+METRICS_ALLOWED_IPS="$allow"
+EOF
+
+cat > "$staging/service" <<EOF
+[Unit]
+Description=Worker /metrics of setup-server (backups, deploys, runner, disk)
+Documentation=https://github.com/BigSant/DockerDevelopmentEnvironmentServer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$ACCOUNT
+Group=$ACCOUNT
+# Token, address and allowlist: read by systemd as root, the file stays unreadable to $ACCOUNT.
+EnvironmentFile=$settings
+Environment=SETUP_SERVER_ROOT=$ROOT
+ExecStart=$command
+Restart=on-failure
+RestartSec=10
+# Exit 78: the settings are wrong; restarting would not help (journalctl -u $NAME).
+RestartPreventExitStatus=78
+# Read-only: it reads the build roots and asks systemd for the runner's state, nothing more.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+changed=0
+place() {  # place SOURCE TARGET MODE [quiet|DISPLAY] — write only what differs
+    if cmp -s "$1" "$2" 2>/dev/null; then
+        echo "==> $2: unchanged"
+        return
+    fi
+    changed=1
+    if [ "$check" = 1 ]; then
+        echo "==> would write $2"
+        case "${4:-}" in
+            quiet) ;;
+            '') sed 's/^/    /' "$1" ;;
+            *) sed 's/^/    /' "$4" ;;
+        esac
+    else
+        install -D -o root -g root -m "$3" "$1" "$2"
+        echo "==> wrote $2"
+    fi
+}
+sed "s/^METRICS_TOKEN=.*/METRICS_TOKEN=<$token_state, hidden>/" "$staging/settings" > "$staging/settings.shown"
+[ "$check" = 1 ] || install -d -o root -g root -m 0700 "$CONFIG"
+place "$staging/command" "$command" 0755 quiet  # a copy of bin/worker-metrics
+place "$staging/settings" "$settings" 0600 "$staging/settings.shown"
+place "$staging/service" "$SYSTEMD/$NAME.service" 0644
+
+if [ "$check" = 1 ]; then
+    echo "==> $listen"
+    echo "==> would enable $NAME.service and $([ "$changed" = 1 ] && echo restart || echo start) it; setup-server-runner is not touched"
+    exit 0
+fi
+
+systemctl daemon-reload
+systemctl enable "$NAME.service" >/dev/null
+if [ "$changed" = 1 ]; then
+    systemctl restart "$NAME.service"
+else
+    systemctl start "$NAME.service"
+fi
+echo "==> $NAME: $(systemctl is-active "$NAME.service" || true); $listen"
+host=$address
+[[ "$address" == *:* ]] && host="[$address]"
+# Without the token it must refuse: 401 (or 403 when this host is not in the allowlist).
+status=$(python3 - "http://$host:$port/metrics" <<'PYTHON' || true
+import sys, time, urllib.error, urllib.request
+for attempt in range(10):
+    try:
+        urllib.request.urlopen(sys.argv[1], timeout=3)
+        print('200 (without the token!)')
+        break
+    except urllib.error.HTTPError as error:
+        print(error.code)
+        break
+    except OSError:
+        time.sleep(0.5)
+else:
+    print('no answer (journalctl -u setup-server-metrics)')
+PYTHON
+)
+echo "==> without the token it answers: $status"
+echo "==> the token for Prometheus: sudo sed -n 's/^METRICS_TOKEN=//p' $settings"
