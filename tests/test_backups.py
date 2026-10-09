@@ -1,0 +1,269 @@
+"""Nightly database backups of the worker: rotation, per-project isolation, --check and the units.
+
+Nothing here touches a real database: `make` is a stub that writes the backup file it is asked for.
+B level (opt-in, SETUP_SERVER_UBUNTU_IMAGE=ubuntu:22.04): install-backups for real inside an Ubuntu
+container, systemd-analyze verify of its units, and the sudo path the "backup now" pipeline uses.
+"""
+
+from datetime import datetime, timedelta
+import importlib.machinery
+import importlib.util
+import os
+from pathlib import Path
+import subprocess
+import unittest
+
+from test_scripts import ROOT, ScriptTest, UBUNTU
+
+
+def load_backup_projects():
+    loader = importlib.machinery.SourceFileLoader("backup_projects", str(ROOT / "bin/backup-projects"))
+    spec = importlib.util.spec_from_loader("backup_projects", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def nightly(day, environment="prod", time="033000"):
+    return f"worker-{environment}-{day:%Y%m%d}T{time}Z.sql.gz"
+
+
+# Make stub: writes the requested backup (with what it was given), fails for build roots whose name has "broken".
+MAKE_STUB = r'''
+directory= file= environment=
+previous=
+for argument; do
+    [ "$previous" = -C ] && directory=$argument
+    case "$argument" in file=*) file=${argument#file=} ;; ENV=*) environment=${argument#ENV=} ;; esac
+    previous=$argument
+done
+echo "$directory $*" >> "${MAKE_LOG:-/dev/null}"
+case "$directory" in *broken*) echo "Database backup failed; check service/permissions. No backup published." >&2; exit 2 ;; esac
+mkdir -p "$(dirname "$file")"
+printf '%s secret=%s setup=%s\n' "$environment" "${DATABASE_ROOT_PASSWORD:-}" "${SETUP_DIRECTORY:-}" | gzip > "$file"
+echo "Database backup: $file"
+'''
+
+
+class RotationTest(unittest.TestCase):
+    """Keep the newest backup of each of the 7 latest days, then of 4 more ISO weeks; delete the rest."""
+
+    def setUp(self):
+        self.module = load_backup_projects()
+
+    def test_sixty_nights_keep_seven_daily_and_four_weekly(self):
+        last = datetime(2026, 10, 9)  # a Friday, ISO week 41
+        names = [nightly(last - timedelta(days=n)) for n in range(60)]
+        keep, remove = self.module.rotation(names)
+        daily = [nightly(datetime(2026, 10, d)) for d in (9, 8, 7, 6, 5, 4, 3)]
+        # Weeks 41 and 40 are already kept by the dailies; the weeklies are the Sundays before.
+        weekly = [nightly(datetime(2026, 9, d)) for d in (27, 20, 13, 6)]
+        self.assertEqual(keep, daily + weekly)
+        self.assertEqual(sorted(remove), sorted(set(names) - set(keep)))
+        self.assertEqual(len(remove), 49)
+
+    def test_the_newest_backup_of_a_day_is_the_daily_one(self):
+        day = datetime(2026, 10, 9)
+        names = [nightly(day), nightly(day, time="141500"), nightly(day - timedelta(days=1))]
+        keep, remove = self.module.rotation(names)
+        self.assertEqual(keep, [nightly(day, time="141500"), nightly(day - timedelta(days=1))])
+        self.assertEqual(remove, [nightly(day)])
+
+    def test_a_gap_does_not_cost_the_last_good_backups(self):
+        # Backups failed for two weeks: the last seven that exist stay, whatever their age.
+        names = [nightly(datetime(2026, 9, 20) - timedelta(days=n)) for n in range(10)]
+        keep, _ = self.module.rotation(names)
+        self.assertEqual(keep[:7], names[:7])
+        self.assertEqual(self.module.rotation(names[:3]), (names[:3], []))
+
+
+class BackupProjectsTest(ScriptTest):
+    def setUp(self):
+        super().setUp()
+        self.projects = self.root / "srv/projects"
+        self.stub("make", MAKE_STUB)
+        self.make_log = self.root / "make.log"
+        os.environ["MAKE_LOG"] = str(self.make_log)
+        os.environ["SETUP_SERVER_BACKUP_TIME"] = "20261009T013000"
+        os.environ["SETUP_SERVER_CONFIG"] = str(self.root / "etc")
+        for key in ("MAKE_LOG", "SETUP_SERVER_BACKUP_TIME", "SETUP_SERVER_CONFIG"):
+            self.addCleanup(os.environ.pop, key)
+
+    def project(self, name, *environments, layout="app"):
+        directory = self.projects / name / layout
+        (directory / "env").mkdir(parents=True)
+        (directory / "Makefile").write_text("include $(SETUP_DIRECTORY)/docker/project.mk\n")
+        (directory / "env/common.env").write_text("PROJECT_NAME=demo\n")
+        for environment in environments:
+            (directory / f"env/{environment}.env.example").write_text("DOMAIN=example.test\n")
+            (directory / f"env/{environment}.env").write_text("DOMAIN=example.test\n")
+        return directory
+
+    def seed(self, directory, environment, nights):
+        backups = directory / ".generated/backups"
+        backups.mkdir(parents=True, exist_ok=True)
+        for n in range(1, nights + 1):
+            (backups / nightly(datetime(2026, 10, 9) - timedelta(days=n), environment, "013000")).write_text("old")
+        return backups
+
+    def tree(self):
+        return sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*")
+                      if path.name != "make.log")
+
+    def test_every_deployed_environment_is_backed_up_and_rotated(self):
+        asana = self.project("asana_tracker", "prod")
+        forsena = self.project("forsena_docker", "stage", "prod", layout="app/docker")
+        self.project("not_deployed")
+        backups = self.seed(asana, "prod", 40)
+        # Pre-deploy backups of setup's own naming and stray files are never touched.
+        (backups / "asana-prod-20260101T000000000000.sql.gz").write_text("deploy")
+        (backups / "worker-prod-notes.txt").write_text("x")
+        result = self.run_script("backup-projects")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        kept = sorted(path.name for path in backups.glob("worker-prod-*.sql.gz"))
+        self.assertEqual(len(kept), 11, kept)
+        self.assertIn("worker-prod-20261009T013000Z.sql.gz", kept)
+        self.assertTrue((backups / "asana-prod-20260101T000000000000.sql.gz").exists())
+        self.assertTrue((backups / "worker-prod-notes.txt").exists())
+        for environment in ("stage", "prod"):
+            self.assertTrue((forsena / f".generated/backups/worker-{environment}-20261009T013000Z.sql.gz").is_file())
+        self.assertIn("not_deployed: no env/stage.env or env/prod.env", result.stdout)
+        self.assertIn("removed 30", result.stdout)
+        self.assertIn("Backups: 3 ok, 0 failed", result.stdout)
+
+    def test_one_failing_project_does_not_stop_the_others_and_keeps_its_backups(self):
+        broken = self.project("a_broken", "prod")
+        healthy = self.project("b_healthy", "prod")
+        broken_backups = self.seed(broken, "prod", 40)
+        self.seed(healthy, "prod", 40)
+        result = self.run_script("backup-projects")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Database backup failed", result.stderr)
+        self.assertIn("Backups: 1 ok, 1 failed: a_broken/prod", result.stdout)
+        self.assertEqual(len(list(broken_backups.glob("worker-prod-*"))), 40, "no rotation after a failure")
+        self.assertEqual(len(list((healthy / ".generated/backups").glob("worker-prod-*"))), 11)
+
+    def test_check_changes_nothing(self):
+        directory = self.project("asana_tracker", "prod")
+        self.seed(directory, "prod", 40)
+        before = self.tree()
+        result = self.run_script("backup-projects", "--check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("would back up asana_tracker prod into", result.stdout)
+        self.assertIn("would delete 30:", result.stdout)
+        self.assertEqual(self.tree(), before)
+        self.assertFalse(self.make_log.exists(), "--check runs no backup")
+
+    def test_one_project_by_build_root_for_the_backup_now_pipeline(self):
+        self.project("asana_tracker", "stage", "prod")
+        self.project("other", "prod")
+        result = self.run_script("backup-projects", str(self.projects / "asana_tracker"), "prod")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.make_log.read_text().count("db-backup"), 1)
+        self.assertIn("ENV=prod", self.make_log.read_text())
+        self.assertIn("Backups: 1 ok, 0 failed", result.stdout)
+        for arguments, message in ((["missing"], "No build root"), (["Bad.Name"], "NAME must be"),
+                                   (["../etc"], "not a build root under"),
+                                   ([str(self.root)], f"not a build root under {self.projects}"),
+                                   (["asana_tracker", "local"], "ENV must be stage or prod"),
+                                   (["other", "stage"], "other has no env/stage.env")):
+            with self.subTest(arguments=arguments):
+                refused = self.run_script("backup-projects", *arguments)
+                self.assertEqual(refused.returncode, 65, refused.stdout + refused.stderr)
+                self.assertIn(message, refused.stderr)
+
+    def test_the_secrets_file_reaches_make_and_a_loose_one_is_refused(self):
+        directory = self.project("asana_tracker", "prod")
+        secrets = self.root / "etc/projects/asana_tracker"
+        secrets.mkdir(parents=True)
+        (secrets / "prod.env").write_text("# Deployment variables\nDATABASE_ROOT_PASSWORD='r00t pass'\n")
+        (secrets / "prod.env").chmod(0o600)
+        result = self.run_script("backup-projects")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        import gzip
+        backup = directory / ".generated/backups/worker-prod-20261009T013000Z.sql.gz"
+        self.assertIn("secret=r00t pass", gzip.decompress(backup.read_bytes()).decode())
+        self.assertNotIn("r00t", result.stdout + result.stderr, "secrets are never printed")
+        (secrets / "prod.env").chmod(0o644)
+        os.environ["SETUP_SERVER_BACKUP_TIME"] = "20261010T013000"
+        loose = self.run_script("backup-projects")
+        self.assertEqual(loose.returncode, 1)
+        self.assertIn("must be a regular file owned by", loose.stderr)
+
+    def test_unknown_options_are_a_usage_error(self):
+        self.assertEqual(self.run_script("backup-projects", "--bogus").returncode, 64)
+
+
+class InstallBackupsTest(ScriptTest):
+    def setUp(self):
+        super().setUp()
+        os.environ["SETUP_SERVER_SYSTEMD"] = str(self.root / "systemd")
+        os.environ["SETUP_SERVER_SBIN"] = str(self.root / "sbin")
+        os.environ["SETUP_SERVER_SUDOERS"] = str(self.root / "sudoers.d")
+        for key in ("SETUP_SERVER_SYSTEMD", "SETUP_SERVER_SBIN", "SETUP_SERVER_SUDOERS"):
+            self.addCleanup(os.environ.pop, key)
+
+    def test_check_shows_the_units_and_changes_nothing(self):
+        result = self.run_script("install-backups", "--check", "--at", "02:15")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OnCalendar=*-*-* 02:15:00", result.stdout)
+        self.assertIn("Persistent=true", result.stdout)
+        self.assertIn(f"would write {self.root}/systemd/setup-server-backup.timer", result.stdout)
+        self.assertIn(f"setup-test-account-missing ALL=(root) NOPASSWD: {self.root}/sbin/setup-server-backup",
+                      result.stdout)
+        for name in ("systemd", "sbin", "sudoers.d", "srv"):
+            self.assertFalse((self.root / name).exists(), "--check changes nothing")
+
+    def test_installing_needs_root_and_a_valid_time(self):
+        if os.getuid() != 0:
+            self.assertEqual(self.run_script("install-backups").returncode, 77)
+        self.assertEqual(self.run_script("install-backups", "--check", "--at", "25:00").returncode, 64)
+
+
+@unittest.skipUnless(UBUNTU, "Set SETUP_SERVER_UBUNTU_IMAGE (e.g. ubuntu:22.04) to check on a real Ubuntu")
+class RealUbuntuBackupTest(unittest.TestCase):
+    def test_installed_units_verify_and_the_runner_account_backs_up_one_project_through_sudo(self):
+        # The stubs travel inside the script: Docker Desktop shares no temporary directories.
+        script = """set -eu
+mkdir -p /stubs
+cat > /stubs/make <<'STUB'
+#!/bin/sh""" + MAKE_STUB + """STUB
+printf '#!/bin/sh\\nexit 0\\n' > /stubs/systemctl
+chmod +x /stubs/make /stubs/systemctl
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq >/dev/null && apt-get install -y -qq systemd sudo python3 make >/dev/null
+useradd --system --create-home --home-dir /srv/setup-server --shell /bin/bash setup
+# systemctl is a stub (no systemd in the container); the units are verified below.
+PATH=/stubs:$PATH /setup-server/bin/install-backups
+PATH=/stubs:$PATH /setup-server/bin/install-backups | grep -c unchanged
+systemd-analyze verify /etc/systemd/system/setup-server-backup.service /etc/systemd/system/setup-server-backup.timer
+echo UNITS_VERIFIED
+visudo -cf /etc/sudoers.d/setup-server-backup && echo SUDOERS_VALID
+cp /stubs/make /usr/local/bin/make
+app=/srv/setup-server/projects/asana_tracker/app
+mkdir -p $app/env && touch $app/Makefile $app/env/prod.env && chown -R setup:setup /srv/setup-server/projects
+install -d -m 0700 /etc/setup-server/projects/asana_tracker
+printf 'DATABASE_ROOT_PASSWORD=from-root-file\\n' > /etc/setup-server/projects/asana_tracker/prod.env
+chmod 0600 /etc/setup-server/projects/asana_tracker/prod.env
+cd /srv/setup-server
+# The "backup now" pipeline step, as the runner account with Bitbucket's DOCKER_HOST.
+sudo -u setup env DOCKER_HOST=tcp://localhost:2375 sh -c \\
+    'unset DOCKER_HOST; BUILD_ROOT=/srv/setup-server/projects/asana_tracker; sudo -n /usr/local/sbin/setup-server-backup "$BUILD_ROOT"'
+stat -c '%U %a %n' $app/.generated/backups/worker-prod-*.sql.gz
+zcat $app/.generated/backups/worker-prod-*.sql.gz
+/usr/local/sbin/setup-server-backup --check
+"""
+        result = subprocess.run(["docker", "run", "--rm", "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script], capture_output=True, text=True, timeout=900)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("\n4\n", result.stdout, "a second install changes nothing")
+        self.assertIn("UNITS_VERIFIED", output)
+        self.assertIn("SUDOERS_VALID", output)
+        self.assertRegex(result.stdout, r"setup 600 /srv/setup-server/projects/asana_tracker/app/\.generated/backups/worker-prod-")
+        self.assertIn("prod secret=from-root-file setup=/srv/setup-server/setup", result.stdout)
+        self.assertIn("Backups: 1 ok, 0 failed", result.stdout)
+        self.assertIn("secrets: /etc/setup-server/projects/asana_tracker/prod.env (1 values)", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
