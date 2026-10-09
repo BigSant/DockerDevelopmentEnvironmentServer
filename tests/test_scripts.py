@@ -4,6 +4,7 @@ B level (opt-in): SETUP_SERVER_UBUNTU_IMAGE=ubuntu:24.04 runs prepare-host --che
 Ubuntu container and confirms the Java package the runner needs is installable there.
 """
 
+import getpass
 import os
 from pathlib import Path
 import subprocess
@@ -50,11 +51,12 @@ class ScriptTest(unittest.TestCase):
     def meminfo(self, gigabytes):
         (self.root / "meminfo").write_text(f"MemTotal:       {gigabytes * 1048576} kB\n")
 
-    def run_script(self, name, *arguments, stdin=""):
+    def run_script(self, name, *arguments, stdin="", **overrides):
         env = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
                "SETUP_SERVER_OS_RELEASE": str(self.root / "os-release"),
                "SETUP_SERVER_MEMINFO": str(self.root / "meminfo"),
-               "SETUP_SERVER_ROOT": str(self.root / "srv"), "SETUP_SERVER_USER": "setup-test-account-missing"}
+               "SETUP_SERVER_ROOT": str(self.root / "srv"), "SETUP_SERVER_USER": "setup-test-account-missing",
+               **overrides}
         return subprocess.run([str(ROOT / "bin" / name), *arguments], input=stdin, env=env,
                               capture_output=True, text=True, timeout=60)
 
@@ -233,6 +235,185 @@ class RemoveProjectTest(ScriptTest):
     def test_unknown_and_invalid_names_are_refused(self):
         self.assertIn("No build root", self.run_script("remove-project", "--check", "missing").stderr)
         self.assertEqual(self.run_script("remove-project", "--check", "../srv").returncode, 65)
+
+
+PASSING_TESTS = "import unittest\n\nclass Health(unittest.TestCase):\n    def test_ok(self):\n        pass\n"
+FAILING_TESTS = PASSING_TESTS.replace("pass", "self.fail('broken release')")
+# A broken release whose tests also leave the checkout unwritable, so the automatic return fails too.
+LOCKING_TESTS = ("import os, unittest\nfrom pathlib import Path\n\nclass Health(unittest.TestCase):\n"
+                 "    def test_locks(self):\n        os.chmod(Path(__file__).resolve().parents[1] / '.git', 0o500)\n"
+                 "        self.fail('broken release')\n")
+GIT_ENV = {**os.environ, "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.com",
+           "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.com",
+           "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+
+
+class UpdateTest(ScriptTest):
+    """bin/update against temporary repositories: bare remotes, the admin's setup-server clone and the
+    shared setup checkout, with systemctl and pgrep stubbed (the stubs record every call)."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls = self.root / "systemctl.calls"
+        # The runner is active as PID 4242; FAKE_RESTARTED makes every later look see a new PID and
+        # FAKE_STOPPED makes it inactive after the first look.
+        self.stub("systemctl", f'echo "$*" >> {self.calls}\n'
+                               'case "$1" in\n'
+                               f'  is-active) n=$(grep -c "^is-active" {self.calls}); [ "${{FAKE_RUNNER:-active}}" = active ] '
+                               '&& { [ -z "${FAKE_STOPPED:-}" ] || [ "$n" -le 1 ]; };;\n'
+                               f'  show) n=$(grep -c "^show" {self.calls}); '
+                               '[ -n "${FAKE_RESTARTED:-}" ] && [ "$n" -gt 1 ] && echo 5151 || echo 4242;;\n'
+                               'esac\n')
+        self.stub("pgrep", '[ -n "${FAKE_MAKE:-}" ] && echo 777\n')
+        self.server_remote = self.remote("server", [("v0.1.0", {"tests/test_health.py": PASSING_TESTS, "bin/x": "1"})])
+        self.setup_remote = self.remote("setup", [("v1.0.0", {"Makefile": "VERSION=1.0.0\n"})])
+        self.server = self.root / "home/setup-server"
+        self.setup = self.root / "srv/setup"
+        self.git("clone", "-q", str(self.server_remote), str(self.server))
+        self.git("-C", str(self.server), "checkout", "-q", "v0.1.0")
+        self.git("clone", "-q", str(self.setup_remote), str(self.setup))
+        self.git("-C", str(self.setup), "checkout", "-q", "v1.0.0")
+        # Newer releases appear on the remotes after the clones, so the update must fetch them.
+        self.commit("server", "v0.2.0", {"tests/test_health.py": PASSING_TESTS, "bin/x": "2"}, "Second release")
+        self.commit("server", "v0.3.0", {"tests/test_health.py": FAILING_TESTS, "bin/x": "3"}, "Broken release")
+        self.commit("setup", "v1.1.0", {"Makefile": "VERSION=1.1.0\n"}, "Setup 1.1.0")
+        self.commit("setup", None, {"Makefile": "VERSION=stage\n"}, "Stage fix", branch="stage-fix")
+
+    def git(self, *arguments):
+        return subprocess.run(["git", *arguments], env=GIT_ENV, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def remote(self, name, commits):
+        work = self.root / f"{name}-work"
+        self.git("init", "-q", "-b", "master", str(work))
+        self.git("init", "-q", "--bare", str(self.root / f"{name}.git"))
+        self.git("-C", str(work), "remote", "add", "origin", str(self.root / f"{name}.git"))
+        for tag, files in commits:
+            self.commit(name, tag, files, f"{name} {tag}")
+        return self.root / f"{name}.git"
+
+    def commit(self, name, tag, files, message, branch="master"):
+        work = str(self.root / f"{name}-work")
+        if branch != "master":
+            self.git("-C", work, "checkout", "-q", "-b", branch)
+        for path, text in files.items():
+            (self.root / f"{name}-work" / path).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / f"{name}-work" / path).write_text(text)
+        self.git("-C", work, "add", "-A")
+        self.git("-C", work, "commit", "-q", "-m", message)
+        if tag:
+            self.git("-C", work, "tag", tag)
+        self.git("-C", work, "push", "-q", "--tags", "origin", branch)
+        if branch != "master":
+            self.git("-C", work, "checkout", "-q", "master")
+        return self.git("-C", work, "rev-parse", "HEAD")
+
+    def head(self, checkout):
+        return self.git("-C", str(checkout), "describe", "--tags", "--always")
+
+    def update(self, *arguments, **env):
+        return self.run_script("update", *arguments, SETUP_SERVER_CHECKOUT=str(self.server),
+                               SETUP_SERVER_USER=getpass.getuser(), **env)
+
+    def runner_untouched(self):
+        calls = self.calls.read_text() if self.calls.exists() else ""
+        for verb in ("restart", "stop", "start", "reload", "kill", "daemon-reload", "enable", "disable"):
+            self.assertNotRegex(calls, rf"(?m)^{verb}\b", f"systemctl {verb} was called:\n{calls}")
+
+    def test_check_shows_what_would_change_and_changes_nothing(self):
+        result = self.update("--check", "--server-ref", "v0.2.0", "--setup-ref", "v1.1.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("v0.1.0 -> v0.2.0", result.stdout)
+        self.assertIn("1 commit forward", result.stdout)
+        self.assertIn("Second release", result.stdout)
+        self.assertIn("v1.0.0 -> v1.1.0", result.stdout)
+        self.assertIn("Setup 1.1.0", result.stdout)
+        self.assertIn("runner setup-server-runner active (PID 4242)", result.stdout)
+        self.assertIn("nothing was changed", result.stdout)
+        self.assertEqual((self.head(self.server), self.head(self.setup)), ("v0.1.0", "v1.0.0"))
+        self.assertEqual(self.git("-C", str(self.server), "status", "--porcelain"), "")
+        self.assertNotIn("Ran 1 test", result.stdout + result.stderr, "--check runs no health check")
+        self.runner_untouched()
+
+    def test_an_update_moves_both_checkouts_and_never_restarts_the_runner(self):
+        result = self.update("--server-ref", "v0.2.0", "--setup-ref", "v1.1.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.head(self.server), self.head(self.setup)), ("v0.2.0", "v1.1.0"))
+        self.assertIn("setup-server tests: ok", result.stdout)
+        self.assertIn("setup at v1.1.0, readable by", result.stdout)
+        self.assertIn("runner setup-server-runner: still active, same PID 4242", result.stdout)
+        self.assertIn("Updated", result.stdout)
+        self.runner_untouched()
+        # Only one side can be given; the other checkout stays where it is.
+        only_setup = self.update("--setup-ref", "v1.0.0")
+        self.assertEqual(only_setup.returncode, 0, only_setup.stdout + only_setup.stderr)
+        self.assertIn("1 commit back", only_setup.stdout)
+        self.assertEqual((self.head(self.server), self.head(self.setup)), ("v0.2.0", "v1.0.0"))
+
+    def test_a_failed_health_check_returns_both_checkouts_to_the_previous_commits(self):
+        result = self.update("--server-ref", "v0.3.0", "--setup-ref", "v1.1.0")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("setup-server tests: FAILED", result.stdout)
+        self.assertIn("broken release", result.stdout)
+        self.assertIn("Returned both checkouts to the previous commits", result.stdout)
+        self.assertEqual((self.head(self.server), self.head(self.setup)), ("v0.1.0", "v1.0.0"))
+        self.runner_untouched()
+
+    def test_a_restarted_or_stopped_runner_fails_the_health_check(self):
+        for env, message in (({"FAKE_RESTARTED": "1"}, "PID changed from 4242 to 5151"),
+                             ({"FAKE_STOPPED": "1"}, "not active any more (it was PID 4242)")):
+            with self.subTest(message=message):
+                self.calls.unlink(missing_ok=True)  # the stubs count their own calls
+                result = self.update("--server-ref", "v0.2.0", **env)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(message, result.stdout)
+                self.assertEqual(self.head(self.server), "v0.1.0")
+        # A runner that was not active before is reported, not a reason to refuse an update.
+        idle = self.update("--server-ref", "v0.2.0", FAKE_RUNNER="inactive")
+        self.assertEqual(idle.returncode, 0, idle.stdout + idle.stderr)
+        self.assertIn("runner setup-server-runner is not active; not checked", idle.stdout)
+
+    def test_when_the_return_fails_too_the_manual_recovery_is_printed(self):
+        if os.getuid() == 0:
+            self.skipTest("root ignores the read-only .git the broken release leaves behind")
+        self.commit("server", "v0.4.0", {"tests/test_health.py": LOCKING_TESTS}, "Locking release")
+        self.addCleanup(lambda: (self.server / ".git").chmod(0o755))
+        previous = self.git("-C", str(self.server), "rev-parse", "HEAD")
+        result = self.update("--server-ref", "v0.4.0", "--setup-ref", "v1.1.0")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("The automatic return failed", result.stdout)
+        self.assertIn(f"git -C {self.server} checkout --force {previous}", result.stdout)
+        self.assertEqual(self.head(self.setup), "v1.0.0", "the other checkout is still returned")
+
+    def test_unknown_refs_and_bad_states_are_errors_that_change_nothing(self):
+        unknown = self.update("--setup-ref", "v9.9.9")
+        self.assertEqual(unknown.returncode, 65)
+        self.assertIn("Unknown setup ref v9.9.9", unknown.stderr)
+        self.assertIn("v1.1.0", unknown.stderr, "the known tags are listed")
+        self.assertEqual(self.update("--server-ref", "nope", "--check").returncode, 65)
+        self.assertEqual(self.update().returncode, 64, "a ref is required")
+        (self.server / "bin/x").write_text("local edit")
+        dirty = self.update("--server-ref", "v0.2.0")
+        self.assertEqual(dirty.returncode, 65)
+        self.assertIn("local changes", dirty.stderr)
+        (self.server / "bin/x").write_text("1")
+        busy = self.update("--setup-ref", "v1.1.0", FAKE_MAKE="1")
+        self.assertEqual(busy.returncode, 75)
+        self.assertIn("pipeline", busy.stderr)
+        self.assertEqual((self.head(self.server), self.head(self.setup)), ("v0.1.0", "v1.0.0"))
+        self.runner_untouched()
+
+    def test_branches_and_commits_are_allowed_but_setup_off_a_tag_is_stage_only(self):
+        stage = self.update("--setup-ref", "stage-fix")
+        self.assertEqual(stage.returncode, 0, stage.stdout + stage.stderr)
+        self.assertIn("not a release tag", stage.stdout)
+        self.assertIn("stage only", stage.stdout)
+        self.assertEqual(self.git("-C", str(self.setup), "show", "HEAD:Makefile"), "VERSION=stage")
+        commit = self.git("-C", str(self.root / "server-work"), "rev-parse", "v0.2.0")
+        by_commit = self.update("--server-ref", commit[:10])
+        self.assertEqual(by_commit.returncode, 0, by_commit.stdout + by_commit.stderr)
+        self.assertEqual(self.git("-C", str(self.server), "rev-parse", "HEAD"), commit)
+        self.assertNotIn("stage only", by_commit.stdout, "setup-server itself may run untagged")
 
 
 UBUNTU = os.environ.get("SETUP_SERVER_UBUNTU_IMAGE")

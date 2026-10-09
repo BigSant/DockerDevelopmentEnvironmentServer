@@ -15,11 +15,13 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/install-runner` | Bitbucket Linux Shell runner'is kaip systemd paslauga `setup-server-runner` (paskyra `setup`). |
 | `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<repo vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`. |
 | `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
+| `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
 
 Visi scriptai yra idempotentiški, juos galima kartoti. Su `--check` jie tik parodo, ką keistų,
 ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 
 ```text
+~/setup-server/                 šis repo, administratoriaus klonas (iš jo leidžiami scriptai)
 /srv/setup-server/              paskyros setup namai
 ├── setup/                      bendras setup checkout'as (serveriuose – ant release tag'o)
 ├── projects/<vardas>/app/      projekto build katalogas (BUILD_ROOT = projects/<vardas>)
@@ -102,6 +104,101 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    Jei kataloge yra DB kopijų ar deploy'ų istorijos, reikia `--with-backups` – tada prarandamos kopijos
    ir rollback'as. Katalogo, kurį naudoja veikiantis konteineris, scriptas netrina.
 
+## Atnaujinimas
+
+Viena komanda atnaujina abu checkout'us: šį repo (`~/setup-server`, administratoriaus klonas, iš kurio
+paleista komanda) ir bendrą setup checkout'ą `/srv/setup-server/setup` (paskyros `setup`). Abu repo yra
+GitHub'e, todėl atnaujinama rankomis serveryje, ne per Pipelines.
+
+```bash
+cd ~/setup-server
+bin/update --check --server-ref v0.2.0 --setup-ref v2.0.0   # parodo, kas keistųsi
+bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikrina, nepavykus grąžina
+```
+
+- Leisk **be sudo**, kaip šio klono savininkas (setup-server parsiunčiamas tavo git raktu); setup checkout'o
+  dalį scriptas pats vykdo per `sudo -u setup` (paprašys slaptažodžio). Paleistas su sudo – atsisako.
+- Galima nurodyti tik vieną pusę (`--setup-ref` arba `--server-ref`); kita lieka, kur buvo.
+- **Ref'as** – tag'as (pageidautina), `origin` šaka arba commit'o id. setup-server gali būti ir ne ant tag'o
+  (tag'ų dar nėra). setup ne ant `vX.Y.Z` tag'o tinka **tik stage**: prod release'ui setup turi būti ant
+  release tag'o – peržiūra tai parodo kaip pastabą.
+- `--check` parsiunčia (`git fetch`) ir parodo kiekvieno checkout'o dabartinį ir naują ref'ą, commit'ų
+  skaičių pirmyn/atgal, pakeistų failų suvestinę ir commit'ų sąrašą (`+` – atsiras, `-` – dings).
+  Checkout'ų nekeičia.
+- Atsisako, jei checkout'e yra vietinių pakeitimų, ref'as nežinomas (parodo naujausius tag'us) arba vyksta
+  pipeline žingsnis (paskyros `setup` `make` procesas) – tada palauk, kol jis baigsis.
+
+**Sveikatos patikra po atnaujinimo** (visos trys, bet kuri nepavykusi = grįžimas):
+
+1. setup-server testai (`python3 -m unittest discover -s tests`) iš naujos versijos – patikrina, kad
+   scriptai veikia šiame serveryje;
+2. setup checkout'as yra ant naujo commit'o ir paskyra `setup` jį skaito be pakeitimų – būtent jį
+   pipeline'ai naudoja (`SETUP_DIRECTORY`);
+3. runner'io paslauga `setup-server-runner` tebėra aktyvi **su tuo pačiu PID** – tai įrodo, kad ji
+   nebuvo perkrauta. Jei prieš atnaujinimą ji neveikė, tai tik parodoma.
+
+Runner'io paslauga niekada neperkraunama: ji leidžiama iš `/srv/setup-server/runner/current`, ne iš šio
+repo, o setup checkout'ą kiekvienas pipeline žingsnis skaito iš naujo. Ar runner'is ONLINE, patikrink
+Bitbucket'e (scriptas Bitbucket API neskaito).
+
+Nepavykus patikrai abu checkout'ai grąžinami į ankstesnius commit'us (ar šaką, jei checkout'as buvo ant
+jos), išvedama, kuri patikra nepavyko, ir grąžinamas kodas 1. Kodas 2 reiškia, kad nepavyko ir grįžimas –
+išvedamos komandos rankiniam atstatymui.
+
+### Rankinis atstatymas
+
+Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo nutrauktas netikėtai:
+
+1. **Ankstesni commit'ai.** Juos išveda eilutė `Previous commits (for a manual return): …`. Jei jos
+   nebeturi – reflog'as (pirmoji eilutė prieš atnaujinimo `checkout`):
+
+   ```bash
+   git -C ~/setup-server reflog -n 5
+   (cd / && sudo -u setup -H git -C /srv/setup-server/setup reflog -n 5)
+   ```
+
+2. **Kodėl nepavyko grįžti.** Dažniausiai – teisės (`.git` neįrašomas) arba sugadinti failai:
+
+   ```bash
+   ls -ld ~/setup-server/.git /srv/setup-server/setup/.git
+   sudo chown -R "$USER": ~/setup-server
+   sudo chown -R setup:setup /srv/setup-server/setup
+   ```
+
+3. **Grąžink** (komandos tos pačios, kurias išveda scriptas):
+
+   ```bash
+   git -C ~/setup-server checkout --force <setup-server commit'as>
+   (cd / && sudo -u setup -H git -C /srv/setup-server/setup checkout --force <setup commit'as>)
+   ```
+
+4. **Patikrink:**
+
+   ```bash
+   cd ~/setup-server && python3 -m unittest discover -s tests
+   (cd / && sudo -u setup -H git -C /srv/setup-server/setup describe --tags --always)
+   systemctl is-active setup-server-runner      # active; Bitbucket'e runner'is ONLINE
+   ```
+
+   Jei runner'is neaktyvus, žr. `journalctl -u setup-server-runner -n 50` ir tik tada
+   `sudo systemctl start setup-server-runner`.
+
+5. **Jei checkout'as sugadintas** (git klaidos ir po `chown`): setup – perkelk seną į šalį ir leisk
+   `prepare-host` nusiklonuoti iš naujo (kol nėra `setup/`, pipeline'ai nepavyks):
+
+   ```bash
+   sudo mv /srv/setup-server/setup /srv/setup-server/setup.broken
+   sudo bin/prepare-host --setup-ref <tag'as>
+   ```
+
+   setup-server – nusiklonuok iš naujo greta ir sukeisk:
+
+   ```bash
+   git clone git@github.com:BigSant/DockerDevelopmentEnvironmentServer.git ~/setup-server.new
+   git -C ~/setup-server.new checkout <commit'as>
+   mv ~/setup-server ~/setup-server.broken && mv ~/setup-server.new ~/setup-server
+   ```
+
 ## Saugumas
 
 - Paskyra `setup` yra Docker grupėje, o tai šiame serveryje prilygsta root teisėms. Tai priimta,
@@ -117,8 +214,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 
 - išorinio Prometheus prieiga prie serverio `/metrics` ir TLS;
 - atsarginės kopijos;
-- asana.local perjungimas į setup v2 tame pačiame serveryje;
-- setup-server atnaujinimas per Pipelines.
+- asana.local perjungimas į setup v2 tame pačiame serveryje.
 
 ## Testai
 
