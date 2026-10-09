@@ -106,8 +106,11 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    sudo bin/remove-project asana_tracker
    ```
 
-   Jei kataloge yra DB kopijų ar deploy'ų istorijos, reikia `--with-backups` – tada prarandamos kopijos
-   ir rollback'as. Katalogo, kurį naudoja veikiantis konteineris, scriptas netrina.
+   Jei kataloge yra DB kopijų ar deploy'ų istorijos (`app/.generated` arba senesniame išdėstyme
+   `app/docker/.generated`), reikia `--with-backups` – tada prarandamos kopijos ir rollback'as. Katalogo,
+   kurį naudoja veikiantis konteineris, scriptas netrina. Projekto slaptažodžių katalogo
+   `/etc/setup-server/projects/<vardas>` (naktinėms kopijoms) scriptas netrina – jis tai parodo; kai nebereikia,
+   `sudo rm -r /etc/setup-server/projects/<vardas>`.
 
 6. **Naktinės DB kopijos** (worker'is, ne Bitbucket):
 
