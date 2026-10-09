@@ -179,6 +179,15 @@ class AddProjectTest(ScriptTest):
         self.assertIn(f"BUILD_ROOT={self.root}/srv/projects/asana", result.stdout)
         self.assertEqual(self.run_script("add-project", "--check", "Bad Name", "x").returncode, 65)
 
+    def test_the_build_root_defaults_to_the_repository_slug(self):
+        result = self.run_script("add-project", "--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"into {self.root}/srv/projects/asana_tracker/app", result.stdout)
+        self.assertIn("find it themselves", result.stdout)
+        two = self.run_script("add-project", "--check", "git@bitbucket.org:rsmaizys/Forsena_Docker.git",
+                              "git@bitbucket.org:rsmaizys/forsena.git")
+        self.assertIn(f"into {self.root}/srv/projects/forsena_docker/app/public", two.stdout)
+
 
 UBUNTU = os.environ.get("SETUP_SERVER_UBUNTU_IMAGE")
 

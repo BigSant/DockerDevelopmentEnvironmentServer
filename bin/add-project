@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Create a project's build root for the runner: $ROOT/projects/<name>/app is the environment
 # repository and, when the shop/application code is a separate repository, app/public is its clone.
-# Pipelines then run `make …` there (BUILD_ROOT = $ROOT/projects/<name>); nobody works in it by hand.
+# <name> defaults to the repository's slug, so a pipeline finds it without configuration:
+# BUILD_ROOT=${BUILD_ROOT:-$SETUP_SERVER_ROOT/projects/$BITBUCKET_REPO_SLUG}. Nobody works in it by hand.
 set -euo pipefail
 
 ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
@@ -10,8 +11,9 @@ ACCOUNT=${SETUP_SERVER_USER:-setup}
 check=0
 usage() {
     cat <<EOF
-Usage: sudo $0 [--check] NAME ENV_REPO_URL [CODE_REPO_URL]
-  NAME           lowercase project name (directory under $ROOT/projects)
+Usage: sudo $0 [--check] [NAME] ENV_REPO_URL [CODE_REPO_URL]
+  NAME           directory under $ROOT/projects; defaults to the repository slug of ENV_REPO_URL,
+                 which is what pipelines use (BITBUCKET_REPO_SLUG) — give it only to deviate
   ENV_REPO_URL   git URL of the environment repository (cloned into app/)
   CODE_REPO_URL  git URL of a separate code repository (cloned into app/public/); omit when the
                  environment repository already contains public/
@@ -27,8 +29,16 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-[ ${#args[@]} -ge 2 ] && [ ${#args[@]} -le 3 ] || { usage >&2; exit 64; }
-name=${args[0]}; env_repo=${args[1]}; code_repo=${args[2]:-}
+is_url() { [[ "$1" == *:* || "$1" == */* ]]; }
+if [ ${#args[@]} -ge 1 ] && ! is_url "${args[0]}"; then
+    name=${args[0]}; args=("${args[@]:1}")
+else
+    name=
+fi
+[ ${#args[@]} -ge 1 ] && [ ${#args[@]} -le 2 ] || { usage >&2; exit 64; }
+env_repo=${args[0]}; code_repo=${args[1]:-}
+slug=$(basename "${env_repo%/}" .git | tr '[:upper:]' '[:lower:]')
+name=${name:-$slug}
 [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || { echo "NAME must be lowercase letters, digits, _ or -" >&2; exit 65; }
 if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
     echo "Run with sudo (or use --check)" >&2
@@ -53,8 +63,10 @@ clone() {  # clone URL DIRECTORY — an existing checkout of the same remote is 
 [ "$check" = 1 ] || [ -d "$build_root" ] || install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$build_root"
 clone "$env_repo" "$build_root/app"
 [ -z "$code_repo" ] || clone "$code_repo" "$build_root/app/public"
-cat <<EOF
-==> Build root: $build_root
-    In Bitbucket set the repository variable BUILD_ROOT=$build_root, fill env/<stage|prod>.env.example
-    (no secrets) and add the secrets as Deployment variables (Secured).
-EOF
+echo "==> Build root: $build_root"
+if [ "$name" = "$slug" ]; then
+    echo "    Pipelines of '$slug' find it themselves (\$SETUP_SERVER_ROOT/projects/\$BITBUCKET_REPO_SLUG)."
+else
+    echo "    The name differs from the repository slug '$slug': set the repository variable BUILD_ROOT=$build_root."
+fi
+echo "    Fill env/<stage|prod>.env.example (no secrets) and add the secrets as Deployment variables (Secured)."

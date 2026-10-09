@@ -138,6 +138,8 @@ WorkingDirectory=$ROOT/runner/current/bin
 EnvironmentFile=$CONFIG/runner.env
 # Pipelines run make in each project's build root; the shared setup checkout lives beside them.
 Environment=SETUP_DIRECTORY=$ROOT/setup
+# Pipelines find a project's build root as \$SETUP_SERVER_ROOT/projects/\$BITBUCKET_REPO_SLUG.
+Environment=SETUP_SERVER_ROOT=$ROOT
 ExecStart=$ROOT/runner/current/bin/start.sh \$RUNNER_ARGS
 Restart=always
 RestartSec=10

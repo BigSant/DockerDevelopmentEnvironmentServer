@@ -76,14 +76,17 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 4. **Projektas:**
 
    ```bash
-   sudo bin/add-project asana git@bitbucket.org:rsmaizys/asana_tracker.git
-   sudo bin/add-project forsena git@bitbucket.org:rsmaizys/forsena_docker.git git@bitbucket.org:rsmaizys/forsena.git
+   sudo bin/add-project git@bitbucket.org:rsmaizys/asana_tracker.git
+   sudo bin/add-project git@bitbucket.org:rsmaizys/forsena_docker.git git@bitbucket.org:rsmaizys/forsena.git
    ```
 
-   Bitbucket'e nustatyk repository variable `BUILD_ROOT`, kurį parodo scriptas. Slaptažodžius
-   įrašyk į Deployment variables (Secured). Kiekvienas pipeline žingsnis turi turėti
-   `runs-on: [self.hosted, linux.shell, setup.build]`, kitaip jis vyktų Bitbucket debesyje ir
-   naudotų minutes.
+   Build katalogas pavadinamas pagal repo vardą (`/srv/setup-server/projects/asana_tracker`), todėl
+   pipeline'as jį randa pats: `BUILD_ROOT=${BUILD_ROOT:-$SETUP_SERVER_ROOT/projects/$BITBUCKET_REPO_SLUG}`
+   (`SETUP_SERVER_ROOT` perduoda runner'io paslauga, `BITBUCKET_REPO_SLUG` – Bitbucket). Repository
+   variable `BUILD_ROOT` reikia tik nurodžius kitą vardą (`add-project VARDAS URL`). Slaptažodžius įrašyk
+   į Deployment variables (Secured). Kiekvienas pipeline žingsnis turi turėti
+   `runs-on: [self.hosted, linux.shell, setup.build]`, kitaip jis vyktų Bitbucket debesyje ir naudotų
+   minutes.
 
 ## Saugumas
 
