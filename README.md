@@ -17,6 +17,7 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
 | `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
 | `bin/install-backups` | Naktinės DB kopijos: systemd laikmatis `setup-server-backup.timer`, komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
+| `bin/install-metrics` | Worker'io Prometheus `/metrics`: systemd paslauga `setup-server-metrics` (paskyra `setup`, tik skaito), komanda `/usr/local/sbin/setup-server-metrics` (kopija iš `bin/worker-metrics`), nustatymai `/etc/setup-server/metrics.env`. |
 
 Visi scriptai yra idempotentiški, juos galima kartoti. Su `--check` jie tik parodo, ką keistų,
 ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
@@ -31,6 +32,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 └── .ssh/id_ed25519             git raktas (tik skaitymui)
 /etc/setup-server/runner.env    runner'io OAuth duomenys (root, 0600)
 /etc/setup-server/projects/<vardas>/<env>.env   projekto slaptažodžiai naktinėms kopijoms (root, 0600)
+/etc/setup-server/metrics.env   worker'io /metrics token'as, adresas ir leidžiami adresai (root, 0600)
 ```
 
 ## Eiga
@@ -268,6 +270,86 @@ Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo 
    Antras argumentas (`stage` arba `prod`) apriboja aplinką. Atnaujinus šį repo, `sudo bin/install-backups`
    pakartok – įdiegta komandos kopija atnaujinama.
 
+## Worker'io metrikos
+
+Worker'is atiduoda savo Prometheus `/metrics` – tai, ką žino tik jis: DB kopijos, deploy'ai, runner'is ir
+diskas. Taikinio metrikos (sistema, svetainė, konteineriai, cron) – atskiras setup endpoint'as projekto
+domene; šis jų nedubliuoja.
+
+```bash
+cd ~/setup-server
+sudo bin/install-metrics --check --address 10.8.0.14 --allow 10.8.0.20   # parodo unit'ą ir nustatymus; nieko nekeičia
+sudo bin/install-metrics --address 10.8.0.14 --allow 10.8.0.20           # įdiegia ir paleidžia
+sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env         # token'as Prometheus'ui
+```
+
+- `--address` – kur klausoma: VPN serveryje jo VPN adresas (`10.8.0.14`); numatytas `127.0.0.1` (tik iš paties
+  serverio). `--allow` – Prometheus adresas(-ai), IP/CIDR, atskirti tarpais ar kableliais; privalomas su bet
+  kuriuo adresu, išskyrus `127.0.0.1`/`::1`. `--port` – numatytas `9101`. `--new-token` – naujas token'as.
+- Nustatymai laikomi `/etc/setup-server/metrics.env` (root, 0600): pirmą kartą sugeneruojamas 43 simbolių
+  token'as. Pakartotinai paleidus nenurodyti nustatymai lieka, paslauga perkraunama tik pasikeitus failui;
+  runner'io paslauga neliečiama. Atnaujinus šį repo (`bin/update`), `sudo bin/install-metrics` pakartok –
+  įdiegta komandos kopija atnaujinama.
+- Prieiga kaip taikinio `/metrics`: ne iš sąrašo – `403`, be token'o ar su neteisingu – `401`, kitas kelias – `404`.
+  Be 24+ simbolių token'o ar be sąrašo paslauga nepasileidžia (`journalctl -u setup-server-metrics`).
+  `X-Forwarded-For` ignoruojamas: priešais nėra proxy, klientai jungiasi tiesiogiai.
+
+**Kodėl atskira paslauga, ne nginx-proxy.** Worker'is neturi savo nginx-proxy (projektų nginx-proxy priklauso
+projektams ir jų release'ams). Python standartinės bibliotekos HTTP serveris paskyra `setup` (build katalogų
+savininkė) skaito failus tiesiogiai: be Docker socket'o, be root, be naujų paketų. systemd jį laiko tik
+skaitančiu (`ProtectSystem=strict`, `NoNewPrivileges`, be capability). Klausoma vienu adresu, todėl
+viešai jis nematomas; VPN adresą jis užima ir tada, kai VPN sąsaja pakyla vėliau (`IP_FREEBIND`).
+
+**Metrikos** (žymos `project` – build katalogo vardas, `environment` – `stage`/`prod`):
+
+| Metrika | Reikšmė |
+| --- | --- |
+| `setup_worker_backup_newest_age_seconds` | Kiek sekundžių praėjo nuo naujausios kopijos (failo laikas) |
+| `setup_worker_backup_newest_size_bytes` | Naujausios kopijos dydis |
+| `setup_worker_backups` | Kiek kopijų laikoma; `0` – aplinka deploy'inama iš čia (`env/<env>.env`), bet kopijos nėra |
+| `setup_worker_deploy_last_timestamp_seconds` | Paskutinio deploy'aus laikas (ir nepavykusio) |
+| `setup_worker_deploy_last_success` | `1` – paskutinis deploy'us baigtas; `0` – sustojo po rsync (`"failed": "after-rsync"`) |
+| `setup_worker_deploy_last_success_timestamp_seconds` | Paskutinio baigto deploy'aus laikas |
+| `setup_worker_deploy_last_rollback` | `1` – paskutinis deploy'us buvo `rollback=1` |
+| `setup_worker_deploy_last_info{ref,commit}` | Paskutinio deploy'aus ref'as (iki 64 simbolių) ir commit'as (12 simbolių) |
+| `setup_worker_runner_up`, `setup_worker_runner_state{state}`, `setup_worker_runner_restarts` | `setup-server-runner` būsena iš `systemctl show` (`active`, `failed`, `not-found` …) ir automatiniai perkrovimai |
+| `setup_worker_disk_size_bytes`, `_used_bytes`, `_available_bytes` `{path}` | Failų sistema, kurioje `/srv/setup-server` (kaip `df`) |
+| `setup_metrics_group_up{group}` | `0`, jei grupės (`backups`, `deploys`, `runner`, `disk`) dalies nepavyko perskaityti (priežastis – journal'e) |
+
+Kopijos – tik `worker-<env>-…Z.sql.gz` (naktinės ir „backup dabar“). Deploy'aus kopijos neskaičiuojamos, kad
+deploy'us neuždengtų sustojusio laikmačio. Deploy'ai – iš setup istorijos
+`app/.generated/release/<env>/deployments.json` (paskutinis įrašas). Patikrinti be Prometheus:
+
+```bash
+systemctl status setup-server-metrics
+sudo -u setup /usr/local/sbin/setup-server-metrics --once          # metrikos be serverio ir token'o
+curl -H "Authorization: Bearer $(sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env)" http://10.8.0.14:9101/metrics
+```
+
+**Prometheus** (serveris prijungtas prie VPN, token'as faile):
+
+```yaml
+scrape_configs:
+  - job_name: 'setup-worker'
+    scheme: http                      # srautą šifruoja VPN
+    metrics_path: /metrics
+    scrape_interval: 1m
+    authorization:
+      credentials_file: /etc/prometheus/tokens/setup-worker
+    static_configs:
+      - targets: ['10.8.0.14:9101']
+```
+
+**Siūlomas Grafana įspėjimas „kopija senesnė nei 26 val.“** (įjungiamas kartu su kitais įspėjimais):
+
+```promql
+max by (project, environment) (setup_worker_backup_newest_age_seconds) > 26 * 3600
+  or setup_worker_backups == 0
+```
+
+Papildomai verta: `up{job="setup-worker"} == 0` arba „no data“ (VPN ar paslauga neveikia),
+`setup_metrics_group_up == 0`, `setup_worker_runner_up == 0`, `setup_worker_deploy_last_success == 0`.
+
 ## Saugumas
 
 - Paskyra `setup` yra Docker grupėje, o tai šiame serveryje prilygsta root teisėms. Tai priimta,
@@ -278,13 +360,15 @@ Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo 
 - Slaptažodžiai į šį repo ir į projekto katalogus nerašomi. Naktinėms kopijoms jie laikomi tik
   `/etc/setup-server/projects/` (root, 0600). Sudo taisyklė `setup` paskyrai naujų teisių neprideda: ji ir
   taip Docker grupėje.
+- Worker'io `/metrics` token'as yra tik `/etc/setup-server/metrics.env` (root, 0600); paslauga jį gauna per
+  aplinką. Endpoint'as klauso tik nurodytu adresu (VPN), atsako tik leidžiamiems adresams su token'u ir nieko
+  nekeičia.
 
 ## Dar neįtraukta
 
 Šios dalys dar daromos (žemėlapis „Map — setup-server“):
 
-- worker'io `/metrics` (kopijų amžius ir įspėjimas, kai kopija senesnė nei 26 val., deploy'ai, runner'is);
-- Prometheus prijungimas per VPN ir Grafana įspėjimai;
+- Prometheus prijungimas per VPN ir Grafana įspėjimai (tarp jų „kopija senesnė nei 26 val.“, žr. Worker'io metrikos);
 - asana.local setup v2 forma ir perjungimas tame pačiame serveryje.
 
 ## Testai
@@ -292,4 +376,5 @@ Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo 
 ```bash
 python3 -m unittest discover -s tests                                    # be root ir be tinklo
 SETUP_SERVER_UBUNTU_IMAGE=ubuntu:24.04 python3 -m unittest discover -s tests   # + tikras Ubuntu konteineris
+SETUP_PROMTOOL_IMAGE=prom/prometheus:latest python3 -m unittest discover -s tests  # + metrikų formato patikra (be promtool)
 ```
