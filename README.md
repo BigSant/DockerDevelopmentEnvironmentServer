@@ -32,7 +32,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 1. **Serveryje** nusiklonuok šį repo ir patikrink mašiną:
 
    ```bash
-   git clone git@bitbucket.org:<workspace>/setup-server.git ~/setup-server
+   git clone -b feature/prepare-host git@github.com:BigSant/DockerDevelopmentEnvironmentServer.git ~/setup-server
    cd ~/setup-server
    bin/prepare-host --check
    ```
