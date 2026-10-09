@@ -77,10 +77,20 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    Visą dialogo tekstą galima ir paduoti per stdin (`sudo bin/install-runner < dialogas.txt`).
 
    OAuth duomenys įrašomi tik į `/etc/setup-server/runner.env` (root, 0600); dialogo teksto niekur
-   kitur nekopijuok. Pats runner'is juos gauna kaip `start.sh` argumentus (taip jį sukūrė Atlassian),
-   todėl šiame serveryje jie matomi `ps`. Po minutės Bitbucket'e runner'is turi būti **ONLINE**. Kitas
-   runner'is (pvz. workspace vietoj repository) įdiegiamas paleidžiant tą patį scriptą su naujomis
-   reikšmėmis.
+   kitur nekopijuok. Kol runner'is veikia, `OAuthClientId` ir `OAuthClientSecret` šiame serveryje
+   perskaitomi (taip jį sukūrė Atlassian):
+
+   - **komandų eilutėje**: systemd perduoda juos `start.sh` argumentais, o šis – `java` procesui kaip
+     `-D…` parametrus; `ps` ir `/proc/<PID>/cmdline` juos rodo **visoms** serverio paskyroms;
+   - **aplinkoje** (`RUNNER_ARGS` iš root failo): `/proc/<PID>/environ` skaito paskyra `setup`, taigi ir
+     visi jos procesai, **įskaitant pipeline žingsnius**.
+
+   `start.sh` (6.x) reikšmes priima ir iš aplinkos kintamųjų (`OAUTH_CLIENT_SECRET` ir kt.), konfigūracijos
+   failo neturi, bet `java` procesui jas vis tiek perduoda komandų eilutėje, todėl tai nieko nepaslėptų –
+   paliktas argumentų būdas. Dėl to į šį serverį neįleisk paskyrų, kurios neturi matyti šių duomenų.
+
+   Po minutės Bitbucket'e runner'is turi būti **ONLINE**. Kitas runner'is (pvz. workspace vietoj
+   repository) įdiegiamas paleidžiant tą patį scriptą su naujomis reikšmėmis.
 
 4. **Projektas:**
 
@@ -380,6 +390,9 @@ Papildomai verta: `up{job="setup-worker"} == 0` arba „no data“ (VPN ar pasla
   atskirai.
 - Esamas Docker niekada nepakeičiamas ir neperkraunamas, todėl jau veikiantys konteineriai
   (dabartinė asana.local) lieka veikti.
+- Runner'io OAuth duomenys laikomi tik `/etc/setup-server/runner.env` (root, 0600), bet veikiančio runner'io
+  komandų eilutėje jie matomi visoms serverio paskyroms, o aplinkoje – paskyros `setup` procesams ir pipeline
+  žingsniams (žr. „Eiga“, 3 žingsnis).
 - Slaptažodžiai į šį repo ir į projekto katalogus nerašomi. Naktinėms kopijoms jie laikomi tik
   `/etc/setup-server/projects/` (root, 0600). Sudo taisyklė `setup` paskyrai naujų teisių neprideda: ji ir
   taip Docker grupėje.

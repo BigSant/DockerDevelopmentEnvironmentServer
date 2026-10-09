@@ -2,8 +2,15 @@
 # Install the Bitbucket Pipelines Linux Shell runner as a systemd service of the setup account.
 # Bitbucket's "Runner installation" dialog shows a download link and a Run command (start.sh with the
 # account/runner UUIDs and OAuth credentials). Paste that command on stdin; the credentials go to a
-# root-only environment file, never to the repository or this script's arguments. The runner itself
-# receives them as start.sh arguments (Atlassian's design), so they show in ps on this host.
+# root-only environment file, never to the repository or this script's arguments.
+# While the runner runs, the OAuth client id and secret are readable on this host (Atlassian's design):
+#   - on its command line: systemd passes RUNNER_ARGS to start.sh, which hands the values to java as
+#     -D options; ps and /proc/<pid>/cmdline show them to every account on the host;
+#   - in its environment (RUNNER_ARGS, from the root-only file): /proc/<pid>/environ is readable by the
+#     setup account, so by every process it runs, pipeline steps included.
+# start.sh (6.x) also takes them from environment variables (ACCOUNT_UUID, RUNNER_UUID, OAUTH_CLIENT_ID,
+# OAUTH_CLIENT_SECRET, ...) and has no config file, but it passes them to java as -D options all the same,
+# so the environment form would hide nothing; the command line form is kept.
 set -euo pipefail
 
 ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
