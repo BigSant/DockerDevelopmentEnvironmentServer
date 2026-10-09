@@ -1,7 +1,8 @@
 """Host scripts in --check mode with stubbed system commands: nothing is installed or changed.
 
 B level (opt-in): SETUP_SERVER_UBUNTU_IMAGE=ubuntu:24.04 runs prepare-host --check inside a real
-Ubuntu container and confirms the Java package the runner needs is installable there.
+Ubuntu container and confirms the Java package the runner needs is installable there, and installs the
+runner (a stand-in archive) for systemd-analyze verify of its unit.
 """
 
 import getpass
@@ -498,6 +499,33 @@ class RealUbuntuTest(unittest.TestCase):
         self.assertIn("JAVA_AVAILABLE", result.stdout, result.stderr)
         self.assertIn("would apt-get install", result.stdout)
         self.assertIn("Docker: missing", result.stdout)
+
+    def test_the_installed_runner_unit_verifies(self):
+        # A stand-in archive (bin/start.sh) and a stub systemctl: the unit is checked by systemd-analyze.
+        script = """set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq >/dev/null && apt-get install -y -qq systemd >/dev/null
+useradd --system --create-home --home-dir /srv/setup-server --shell /bin/bash setup
+mkdir -p /stubs /tmp/archive/bin
+printf '#!/bin/sh\\nexit 0\\n' > /stubs/systemctl
+printf '#!/bin/sh\\nexec java -jar runner.jar\\n' > /tmp/archive/bin/start.sh
+chmod +x /stubs/systemctl /tmp/archive/bin/start.sh
+tar -czf /tmp/runner.tar.gz -C /tmp/archive bin
+PATH=/stubs:$PATH /setup-server/bin/install-runner --tarball /tmp/runner.tar.gz <<'DIALOG'
+""" + RUN_COMMAND + """DIALOG
+# verify only warns (exit 0) about a bad setting: any output is a finding.
+systemd-analyze verify /etc/systemd/system/setup-server-runner.service >/tmp/verify.log 2>&1 || true
+cat /tmp/verify.log; [ ! -s /tmp/verify.log ]
+echo RUNNER_UNIT_VERIFIED
+stat -c '%U %a %n' /etc/setup-server/runner.env
+"""
+        result = subprocess.run(["docker", "run", "--rm", "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script],
+                                capture_output=True, text=True, timeout=600)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("RUNNER_UNIT_VERIFIED", output)
+        self.assertIn("root 600 /etc/setup-server/runner.env", result.stdout)
+        self.assertNotIn("s3cr3t", output)
 
 
 if __name__ == "__main__":

@@ -245,7 +245,9 @@ useradd --system --create-home --home-dir /srv/setup-server --shell /bin/bash se
 # systemctl is a stub (no systemd in the container); the units are verified below.
 PATH=/stubs:$PATH /setup-server/bin/install-backups
 PATH=/stubs:$PATH /setup-server/bin/install-backups | grep -c unchanged
-systemd-analyze verify /etc/systemd/system/setup-server-backup.service /etc/systemd/system/setup-server-backup.timer
+# verify only warns (exit 0) about a bad setting: any output is a finding.
+systemd-analyze verify /etc/systemd/system/setup-server-backup.service /etc/systemd/system/setup-server-backup.timer >/tmp/verify.log 2>&1 || true
+cat /tmp/verify.log; [ ! -s /tmp/verify.log ]
 echo UNITS_VERIFIED
 visudo -cf /etc/sudoers.d/setup-server-backup && echo SUDOERS_VALID
 cp /stubs/make /usr/local/bin/make

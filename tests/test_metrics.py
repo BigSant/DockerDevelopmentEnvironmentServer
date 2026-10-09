@@ -347,7 +347,9 @@ chown -R setup:setup /srv/setup-server/projects && chmod -R go-rwx /srv/setup-se
 # systemctl is a stub (no systemd in the container); the unit is verified below.
 PATH=/stubs:$PATH /setup-server/bin/install-metrics --address 127.0.0.1
 PATH=/stubs:$PATH /setup-server/bin/install-metrics | grep -c unchanged
-systemd-analyze verify /etc/systemd/system/setup-server-metrics.service && echo UNIT_VERIFIED
+# verify only warns (exit 0) about a bad setting: any output is a finding.
+systemd-analyze verify /etc/systemd/system/setup-server-metrics.service >/tmp/verify.log 2>&1 || true
+cat /tmp/verify.log; [ -s /tmp/verify.log ] || echo UNIT_VERIFIED
 stat -c '%U %a %n' /etc/setup-server/metrics.env /usr/local/sbin/setup-server-metrics
 # What the unit runs: the setup account with the root file's settings.
 set -a; . /etc/setup-server/metrics.env; set +a
