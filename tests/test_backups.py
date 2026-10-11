@@ -13,7 +13,7 @@ from pathlib import Path
 import subprocess
 import unittest
 
-from test_scripts import ROOT, ScriptTest, UBUNTU
+from test_scripts import DOCKER_RUN, ROOT, ScriptTest, UBUNTU
 
 
 def load_backup_projects():
@@ -288,7 +288,7 @@ stat -c '%U %a %n' $app/.generated/backups/worker-prod-*.sql.gz
 zcat $app/.generated/backups/worker-prod-*.sql.gz
 /usr/local/sbin/setup-server-backup --check
 """
-        result = subprocess.run(["docker", "run", "--rm", "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script], capture_output=True, text=True, timeout=900)
+        result = subprocess.run([*DOCKER_RUN, "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script], capture_output=True, text=True, timeout=900)
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output)
         self.assertIn("\n4\n", result.stdout, "a second install changes nothing")

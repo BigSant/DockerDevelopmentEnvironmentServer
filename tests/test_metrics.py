@@ -18,7 +18,7 @@ import unittest
 import urllib.error
 import urllib.request
 
-from test_scripts import ROOT, ScriptTest, UBUNTU
+from test_scripts import DOCKER_RUN, ROOT, ScriptTest, UBUNTU
 
 TOKEN = "worker-metrics-test-token-0123456789"
 PROMTOOL = os.environ.get("SETUP_PROMTOOL_IMAGE")
@@ -342,7 +342,7 @@ class EndpointTest(ScriptTest):
             self.skipTest("Install promtool or set SETUP_PROMTOOL_IMAGE (e.g. prom/prometheus:latest)")
         self.fixtures()
         body = self.scrape()
-        command = ["promtool"] if shutil.which("promtool") else ["docker", "run", "--rm", "-i", "--entrypoint", "promtool", PROMTOOL]
+        command = ["promtool"] if shutil.which("promtool") else [*DOCKER_RUN, "-i", "--entrypoint", "promtool", PROMTOOL]
         result = subprocess.run(command + ["check", "metrics"], input=body, capture_output=True, text=True, timeout=120)
         # Exit 0: the exposition parses and the naming lint has nothing to report (it exits 3 otherwise).
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr + body)
@@ -429,7 +429,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do grep -q listening /tmp/server.log && break; sl
 echo "without: $(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9101/metrics)"
 curl -sf -H "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:9101/metrics
 """
-        result = subprocess.run(["docker", "run", "--rm", "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script],
+        result = subprocess.run([*DOCKER_RUN, "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script],
                                 capture_output=True, text=True, timeout=900)
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output)

@@ -860,6 +860,8 @@ class UpdateTest(ScriptTest):
 
 
 UBUNTU = os.environ.get("SETUP_SERVER_UBUNTU_IMAGE")
+# The test containers share the host with running stacks: capped, removed when done.
+DOCKER_RUN = ["docker", "run", "--rm", "--memory", "1g"]
 
 
 @unittest.skipUnless(UBUNTU, "Set SETUP_SERVER_UBUNTU_IMAGE (e.g. ubuntu:24.04) to check on a real Ubuntu")
@@ -867,7 +869,7 @@ class RealUbuntuTest(unittest.TestCase):
     def test_check_runs_on_ubuntu_and_the_runner_java_is_installable(self):
         script = ("apt-get update -qq >/dev/null && apt-cache policy openjdk-25-jre-headless | grep -q 'Candidate: [0-9]' "
                   "&& echo JAVA_AVAILABLE; /setup-server/bin/prepare-host --check; true")
-        result = subprocess.run(["docker", "run", "--rm", "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script],
+        result = subprocess.run([*DOCKER_RUN, "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script],
                                 capture_output=True, text=True, timeout=600)
         self.assertIn("JAVA_AVAILABLE", result.stdout, result.stderr)
         self.assertIn("would apt-get install", result.stdout)
@@ -892,7 +894,7 @@ cat /tmp/verify.log; [ ! -s /tmp/verify.log ]
 echo RUNNER_UNIT_VERIFIED
 stat -c '%U %a %n' /etc/setup-server/runner.env
 """
-        result = subprocess.run(["docker", "run", "--rm", "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script],
+        result = subprocess.run([*DOCKER_RUN, "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script],
                                 capture_output=True, text=True, timeout=600)
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output)
