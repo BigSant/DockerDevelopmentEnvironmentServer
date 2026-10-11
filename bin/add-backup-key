@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Let a developer download the newest database backups over SSH, from the VPN only, with their key.
+
+Writes the key into the setup account's authorized_keys as
+  from="<networks>",command="/usr/local/sbin/setup-server-backup-pull --key <name>",restrict <key> <name>
+so the key logs in only from the given networks and runs nothing but that command (no shell, no
+forwarding, no Docker). Installs the command (a root-owned copy of bin/backup-pull) first.
+Idempotent: a key of the same name is replaced. --refresh only rewrites an installed copy (bin/update).
+"""
+
+import argparse
+import ipaddress
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
+ACCOUNT = os.environ.get('SETUP_SERVER_USER', 'setup')
+SBIN = Path(os.environ.get('SETUP_SERVER_SBIN', '/usr/local/sbin'))
+COMMAND = SBIN / 'setup-server-backup-pull'
+KEYS = ROOT / '.ssh/authorized_keys'
+NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
+KEY = re.compile(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)'
+                 r' ([A-Za-z0-9+/]+={0,3})(?: .*)?')
+
+
+def command_copy():
+    """bin/backup-pull with this host's root as its default: sshd starts it without our environment."""
+    text = (HERE / 'backup-pull').read_text()
+    default = "os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server')"
+    if default not in text:
+        raise SystemExit('bin/backup-pull no longer has the default of SETUP_SERVER_ROOT')
+    return text.replace(default, f"os.environ.get('SETUP_SERVER_ROOT', '{ROOT}')")
+
+
+def place_command(check):
+    text = command_copy()
+    if COMMAND.is_file() and COMMAND.read_text() == text:
+        print(f'==> {COMMAND}: unchanged')
+    elif check:
+        print(f'==> would write {COMMAND}')
+    else:
+        COMMAND.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile('w', dir=COMMAND.parent, delete=False) as handle:
+            handle.write(text)
+        os.chmod(handle.name, 0o755)
+        os.chown(handle.name, 0, 0)
+        os.replace(handle.name, COMMAND)
+        print(f'==> wrote {COMMAND}')
+
+
+def networks(value):
+    """Comma-separated IPv4/IPv6 networks, e.g. the VPN 10.8.0.0/24; never 'any'."""
+    result = []
+    for part in [part.strip() for part in value.split(',') if part.strip()]:
+        try:
+            network = ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            raise SystemExit(f'--from: {part!r} is not an IP address or network')
+        if network.prefixlen == 0:
+            raise SystemExit('--from must name your VPN network, not every address')
+        result.append(str(network))
+    if not result:
+        raise SystemExit('--from needs the VPN network, e.g. 10.8.0.0/24')
+    return result
+
+
+def public_key(path):
+    text = sys.stdin.read() if path == '-' else Path(path).read_text()
+    lines = [line.strip() for line in text.splitlines() if line.strip() and not line.startswith('#')]
+    if len(lines) != 1:
+        raise SystemExit('Expected exactly one public key (one line such as "ssh-ed25519 AAAA… name")')
+    match = KEY.fullmatch(lines[0])
+    if not match:
+        raise SystemExit('Not an SSH public key; give the .pub file (never the private key)')
+    if shutil.which('ssh-keygen'):
+        with tempfile.NamedTemporaryFile('w', suffix='.pub') as handle:
+            handle.write(f'{match[1]} {match[2]}\n')
+            handle.flush()
+            if subprocess.run(['ssh-keygen', '-l', '-f', handle.name], capture_output=True).returncode:
+                raise SystemExit('ssh-keygen does not accept this public key')
+    return f'{match[1]} {match[2]}'
+
+
+def marker(name):
+    return f'command="{COMMAND} --key {name}"'
+
+
+def entry(name, sources, key):
+    return f'from="{",".join(sources)}",{marker(name)},restrict {key} {name}'
+
+
+def current_lines():
+    return KEYS.read_text().splitlines() if KEYS.is_file() else []
+
+
+def write_keys(lines, check):
+    text = '\n'.join(lines) + ('\n' if lines else '')
+    if KEYS.is_file() and KEYS.read_text() == text:
+        print(f'==> {KEYS}: unchanged')
+        return
+    if check:
+        print(f'==> would write {KEYS}:')
+        for line in lines:
+            print('    ' + line)
+        return
+    account = pwd.getpwnam(ACCOUNT)
+    directory = KEYS.parent
+    directory.mkdir(mode=0o700, exist_ok=True)
+    os.chown(directory, account.pw_uid, account.pw_gid)
+    os.chmod(directory, 0o700)
+    with tempfile.NamedTemporaryFile('w', dir=directory, delete=False) as handle:
+        handle.write(text)
+    os.chown(handle.name, account.pw_uid, account.pw_gid)
+    os.chmod(handle.name, 0o600)
+    os.replace(handle.name, KEYS)
+    print(f'==> wrote {KEYS}')
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument('key', nargs='?', help='the developer\'s public key file (.pub), or - for stdin')
+    parser.add_argument('--name', help='who the key belongs to, e.g. tomas (logged with every download)')
+    parser.add_argument('--from', dest='sources', help='networks it may connect from, e.g. the VPN 10.8.0.0/24')
+    parser.add_argument('--remove', metavar='NAME', help='remove the key of this name')
+    parser.add_argument('--list', action='store_true', help='show the backup keys')
+    parser.add_argument('--check', action='store_true', help='show what would change; change nothing')
+    parser.add_argument('--refresh', action='store_true', help='only rewrite the installed command copy (bin/update)')
+    args = parser.parse_args(argv)
+    if not args.check and not args.list and os.geteuid() != 0:
+        raise SystemExit('Run with sudo (or use --check / --list)')
+    if args.refresh:
+        if COMMAND.exists():
+            place_command(args.check)
+        else:
+            print(f'==> {COMMAND} is not installed; nothing to refresh')
+        return 0
+    lines = current_lines()
+    ours = [line for line in lines if f'command="{COMMAND} --key ' in line]
+    if args.list:
+        for line in ours:
+            match = re.search(r'from="([^"]*)".*--key ([^"]+)"', line)
+            print(f'{match[2]}  from {match[1]}' if match else line)
+        if not ours:
+            print('No backup keys.')
+        return 0
+    if args.remove:
+        kept = [line for line in lines if marker(args.remove) not in line]
+        if len(kept) == len(lines):
+            raise SystemExit(f'No backup key named {args.remove}')
+        write_keys(kept, args.check)
+        return 0
+    if not args.key or not args.name or not args.sources:
+        parser.error('give the public key file, --name and --from (or --remove NAME / --list)')
+    if not NAME.fullmatch(args.name):
+        raise SystemExit('--name: letters, digits, . _ @ - (up to 64)')
+    line = entry(args.name, networks(args.sources), public_key(args.key))
+    key_part = line.split(',restrict ', 1)[1].rsplit(' ', 1)[0]
+    if any(key_part in other for other in lines if marker(args.name) not in other):
+        raise SystemExit('This public key is already in authorized_keys under another entry; remove that one first')
+    place_command(args.check)
+    kept = [other for other in lines if marker(args.name) not in other]
+    write_keys(kept + [line], args.check)
+    host = os.environ.get('SETUP_SERVER_ADDRESS', '<server VPN address>')
+    print(f'==> {args.name} downloads with: make db-pull (BACKUP_SSH={ACCOUNT}@{host} in the project\'s env/common.env)')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

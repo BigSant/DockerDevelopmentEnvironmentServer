@@ -18,7 +18,7 @@ CHECKOUT=${SETUP_SERVER_CHECKOUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pw
 SETUP="$ROOT/setup"
 SBIN=${SETUP_SERVER_SBIN:-/usr/local/sbin}
 # Installed copy of a command : the installer whose --refresh rewrites it.
-COPIES=(setup-server-backup:install-backups setup-server-metrics:install-metrics)
+COPIES=(setup-server-backup:install-backups setup-server-metrics:install-metrics setup-server-backup-pull:add-backup-key)
 RELEASE_TAG='^v[0-9]+\.[0-9]+\.[0-9]+$'
 
 usage() {

@@ -18,6 +18,7 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
 | `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
 | `bin/install-backups` | Naktinės DB kopijos: systemd laikmatis `setup-server-backup.timer`, komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
+| `bin/add-backup-key` | Programuotojo SSH raktas naujausioms DB kopijoms atsisiųsti (`make db-pull`): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. |
 | `bin/install-metrics` | Worker'io Prometheus `/metrics`: systemd paslauga `setup-server-metrics` (paskyra `setup`, tik skaito), komanda `/usr/local/sbin/setup-server-metrics` (kopija iš `bin/worker-metrics`), nustatymai `/etc/setup-server/metrics.env`. |
 
 Visi scriptai yra idempotentiški, juos galima kartoti. Su `--check` jie tik parodo, ką keistų,
@@ -274,6 +275,32 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    (žr. „Atnaujinimas“). Pakartotinai paleistas `sudo bin/install-backups` palieka įdiegtą laiką, jei
    nenurodytas `--at`.
 
+7. **Kopijų atsisiuntimas programuotojams (neprivaloma).** Programuotojas savo kompiuteryje setup komanda
+   `make db-pull` parsisiunčia naujausią šio serverio išsaugotą projekto kopiją (naktinę, „backup dabar“ ar
+   prieš deploy'ų – kuri naujausia) ir iš jos pasiruošia veikiančią aplinką. LIVE nepasiekiamas.
+
+   ```bash
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --check   # parodo, ką keistų
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24           # įrašo raktą
+   sudo bin/add-backup-key --list                                                # kam leista ir iš kur
+   sudo bin/add-backup-key --remove tomas                                        # atima leidimą
+   ```
+
+   Raktas (programuotojo `.pub` failas, niekada ne privatus) įrašomas į paskyros `setup`
+   `.ssh/authorized_keys` su apribojimais: `from="10.8.0.0/24"` – jungtis galima tik iš nurodyto tinklo (VPN;
+   `0.0.0.0/0` atmetamas), `command="/usr/local/sbin/setup-server-backup-pull --key tomas"` – raktas vykdo tik
+   šią komandą, `restrict` – be terminalo, port'ų ir agento persiuntimo. Shell'o, Docker ir kitų failų raktas
+   negauna. Tas pats vardas pakartotinai – raktas pakeičiamas; kiti `authorized_keys` įrašai nekeičiami.
+   Prisijungiama tik raktu (paskyra `setup` slaptažodžio neturi).
+
+   Komanda moka du dalykus: `latest <projektas> <stage|prod>` – naujausios kopijos vardas, `get <projektas>
+   <stage|prod> <failas>` – tos kopijos turinys. Kiekvienas prašymas (ir atmestas) įrašomas į
+   `/srv/setup-server/backup-pulls.log`: laikas, rakto vardas, adresas, prašymas, rezultatas. Projekto vardas –
+   build katalogo vardas (`projects/<vardas>`, pvz. `asana_tracker`).
+
+   Kopijose yra tikri klientų duomenys (stage/prod pagal lentelių registrą): leisk tik tiems, kam jų reikia,
+   ir atimk leidimą (`--remove`), kai nebereikia. Įdiegtą komandos kopiją atnaujina `bin/update`.
+
 ## Atnaujinimas
 
 Viena komanda atnaujina abu checkout'us: šį repo (`~/setup-server`, administratoriaus klonas, iš kurio
@@ -290,8 +317,9 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
   dalį scriptas pats vykdo per `sudo -u setup` (paprašys slaptažodžio). Paleistas su sudo – atsisako.
 - Galima nurodyti tik vieną pusę (`--setup-ref` arba `--server-ref`); kita lieka, kur buvo.
 - **Įdiegtos komandų kopijos.** Kai keičiasi setup-server, po perjungimo (prieš sveikatos patikrą) per
-  `sudo` perrašomos įdiegtos kopijos `/usr/local/sbin/setup-server-backup` ir `/usr/local/sbin/setup-server-metrics`
-  (tik tos, kurios įdiegtos) iš naujos versijos: `bin/install-backups --refresh` ir `bin/install-metrics --refresh`.
+  `sudo` perrašomos įdiegtos kopijos `/usr/local/sbin/setup-server-backup`, `/usr/local/sbin/setup-server-metrics` ir
+  `/usr/local/sbin/setup-server-backup-pull` (tik tos, kurios įdiegtos) iš naujos versijos: `bin/install-backups --refresh`,
+  `bin/install-metrics --refresh` ir `bin/add-backup-key --refresh`.
   Pasikeitus metrikų kopijai, perkraunama paslauga `setup-server-metrics` (runner'io – ne). Kiti failai
   (unit'ai, sudo taisyklė, nustatymai) nekeičiami; jei naujoje versijoje jie kitokie, išvedama pastaba
   `note: … differs` – tada pakartok `sudo bin/install-backups` (laikas lieka) arba `sudo bin/install-metrics`.
@@ -487,6 +515,9 @@ Papildomai verta: `up{job="setup-worker"} == 0` arba „no data“ (VPN ar pasla
 - Slaptažodžiai į šį repo ir į projekto katalogus nerašomi. Naktinėms kopijoms jie laikomi tik
   `/etc/setup-server/projects/` (root, 0600). Sudo taisyklė `setup` paskyrai naujų teisių neprideda: ji ir
   taip Docker grupėje.
+- Kopijų atsisiuntimo raktai (`bin/add-backup-key`) prisijungia prie paskyros `setup`, bet tik iš nurodyto tinklo
+  ir tik su priverstine komanda, kuri atiduoda vien kopijas (`restrict`: be terminalo ir persiuntimų). Kopijose
+  yra tikri klientų duomenys; kiekvienas atsisiuntimas registruojamas `backup-pulls.log`.
 - Worker'io `/metrics` token'as yra tik `/etc/setup-server/metrics.env` (root, 0600); paslauga jį gauna per
   aplinką. Endpoint'as klauso tik nurodytu adresu (VPN), atsako tik leidžiamiems adresams su token'u ir nieko
   nekeičia.

@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Hand a developer the newest database backup of one project environment, over SSH.
+
+The forced command of a developer key in the setup account's authorized_keys (bin/add-backup-key writes
+`from="<VPN>",command="setup-server-backup-pull --key <name>",restrict <key>`): the key runs nothing else.
+SSH_ORIGINAL_COMMAND is one of
+  latest PROJECT ENV        print the file name of the newest backup of ENV (stage or prod)
+  get PROJECT ENV FILE      write that backup to stdout
+Backups are the ones in the project's .generated/backups: the nightly ones (worker-<env>-<time>Z.sql.gz)
+and the pre-deploy ones (<project>-<env>-<time>.sql.gz). Every answer is logged with the key's name.
+"""
+
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+
+ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
+PROJECTS = ROOT / 'projects'
+LOG = ROOT / 'backup-pulls.log'
+ENVIRONMENTS = ('stage', 'prod')
+NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
+KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
+# The nightly series of bin/backup-projects and the pre-deploy backups of setup's make db-backup.
+BACKUP = re.compile(r'(?:worker-(stage|prod)-\d{8}T\d{6}Z|[a-z0-9][a-z0-9_-]*-(stage|prod)-\d{8}T\d{6}\d*)\.sql\.gz')
+
+
+class Refused(Exception):
+    """A request this command does not answer."""
+
+
+def environment_directory(build_root):
+    """The environment repository of a build root: app/, or app/docker/ in older layouts (bin/backup-projects)."""
+    for directory in (build_root / 'app', build_root / 'app/docker'):
+        if (directory / 'Makefile').is_file() and (directory / 'env').is_dir():
+            return directory
+    return None
+
+
+def backups(project, environment):
+    """The backups of one project environment, newest first."""
+    if not NAME.fullmatch(project) or environment not in ENVIRONMENTS:
+        raise Refused('expected a project name and stage or prod')
+    directory = environment_directory(PROJECTS / project)
+    if directory is None:
+        raise Refused(f'no project {project} on this server')
+    folder = directory / '.generated/backups'
+    if folder.is_symlink():
+        raise Refused('the backup directory is a symlink')
+    found = []
+    for path in folder.iterdir() if folder.is_dir() else []:
+        match = BACKUP.fullmatch(path.name)
+        if match and environment in match.groups() and path.is_file() and not path.is_symlink():
+            found.append(path)
+    return sorted(found, key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+
+
+def log(key, request, answer):
+    stamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    peer = (os.environ.get('SSH_CONNECTION') or '-').split(' ')[0]
+    try:
+        with LOG.open('a') as handle:
+            handle.write(f'{stamp} key={key} from={peer} {request} -> {answer}\n')
+    except OSError:
+        pass  # the log is a record, not a gate
+
+
+def answer(key, request):
+    words = request.split()
+    if len(words) == 3 and words[0] == 'latest':
+        found = backups(words[1], words[2])
+        if not found:
+            raise Refused(f'no {words[2]} backup of {words[1]} yet')
+        print(found[0].name)
+        return found[0].name
+    if len(words) == 4 and words[0] == 'get':
+        found = {path.name: path for path in backups(words[1], words[2])}
+        if words[3] not in found:
+            raise Refused('no such backup')
+        with found[words[3]].open('rb') as source:
+            shutil.copyfileobj(source, sys.stdout.buffer, 1024 * 1024)
+        sys.stdout.buffer.flush()
+        return f'sent {found[words[3]].stat().st_size} bytes'
+    raise Refused('expected: latest PROJECT ENV | get PROJECT ENV FILE')
+
+
+def main(arguments):
+    key = arguments[1] if len(arguments) == 2 and arguments[0] == '--key' and KEY.fullmatch(arguments[1]) else '-'
+    request = os.environ.get('SSH_ORIGINAL_COMMAND', '')
+    if len(request) > 300:
+        request = request[:300]
+    try:
+        result = answer(key, request)
+    except Refused as refusal:
+        log(key, request, f'refused: {refusal}')
+        print(f'setup-server-backup-pull: {refusal}', file=sys.stderr)
+        return 65
+    except OSError as error:
+        log(key, request, f'failed: {error.strerror}')
+        print(f'setup-server-backup-pull: {error.strerror}', file=sys.stderr)
+        return 74
+    log(key, request, result)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
