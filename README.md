@@ -1,9 +1,10 @@
 # setup-server – build serverio ir taikinio paruošimas
 
 Scriptai, kurie paruošia Ubuntu serverį setup v2 projektams. Šis serveris kartu yra ir
-**build serveris** (Bitbucket Pipelines self-hosted runner'is, image'ų ir release'ų kūrimas), ir
-**taikinys** (ten veikia projektų konteineriai). Deploy'ai valdomi Bitbucket'e, o darbą atlieka
-runner'is šiame serveryje, todėl Bitbucket build minutės nenaudojamos.
+**build serveris** (Bitbucket Pipelines ir/ar GitHub Actions self-hosted runner'iai, image'ų ir release'ų
+kūrimas), ir **taikinys** (ten veikia projektų konteineriai). Deploy'ai valdomi Bitbucket'e arba GitHub'e,
+o darbą atlieka runner'is šiame serveryje, todėl debesies build minutės nenaudojamos. Abu runner'iai gali
+veikti tame pačiame serveryje kartu.
 
 Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asana.local.
 
@@ -12,8 +13,8 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | Scriptas | Ką daro |
 | --- | --- |
 | `bin/prepare-host` | Paketai (`git`, `make`, `rsync`, `python3`, OpenJDK 25 runner'iui), Docker su Compose (jei jo nėra – iš download.docker.com; esamas Docker nekeičiamas), paskyra `setup` su Docker grupe, katalogai `/srv/setup-server`, git raktas, bendras setup checkout'as. |
-| `bin/install-runner` | Bitbucket Linux Shell runner'is kaip systemd paslauga `setup-server-runner` (paskyra `setup`). |
-| `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<repo vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`. |
+| `bin/install-runner` | Bitbucket Linux Shell runner'is kaip systemd paslauga `setup-server-runner` (paskyra `setup`); su `--provider github` – GitHub Actions runner'is, paslauga `setup-server-github-runner@<scope>` (po vieną organizacijai ar repo). |
+| `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<repo vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`. GitHub repo – su savo deploy key. |
 | `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
 | `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
 | `bin/install-backups` | Naktinės DB kopijos: systemd laikmatis `setup-server-backup.timer`, komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
@@ -28,9 +29,11 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 ├── setup/                      bendras setup checkout'as (serveriuose – ant release tag'o)
 ├── projects/<vardas>/app/      projekto build katalogas (BUILD_ROOT = projects/<vardas>)
 │   └── .generated/backups/     DB kopijos (worker-<env>-<UTC laikas>Z.sql.gz – naktinės ir „backup dabar“)
-├── runner/current/             runner'io versija; runner/temp – jo darbo katalogas
-└── .ssh/id_ed25519             git raktas (tik skaitymui)
-/etc/setup-server/runner.env    runner'io OAuth duomenys (root, 0600)
+├── runner/current/             Bitbucket runner'io versija; runner/temp – jo darbo katalogas
+├── github-runner/<scope>/      GitHub runner'is (organizacijai `bigsant`, repo `bigsant.<repo>`); _work – darbo katalogas
+├── .ssh/id_ed25519             git raktas (tik skaitymui): setup repo ir Bitbucket projektai
+└── .ssh/github-<savininkas>.<repo>   GitHub projekto deploy key (tik skaitymui); host alias'ai – .ssh/config
+/etc/setup-server/runner.env    Bitbucket runner'io OAuth duomenys (root, 0600)
 /etc/setup-server/projects/<vardas>/<env>.env   projekto slaptažodžiai naktinėms kopijoms (root, 0600)
 /etc/setup-server/metrics.env   worker'io /metrics token'as, adresas ir leidžiami adresai (root, 0600)
 ```
@@ -56,7 +59,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    ```
 
    Pabaigoje parodomas viešasis git raktas. Pridėk jį **tik skaitymui** prie setup repo (GitHub,
-   deploy key) ir prie kiekvieno projekto repo (Bitbucket, Access keys). Tada paleisk scriptą dar
+   deploy key) ir prie kiekvieno Bitbucket projekto repo (Access keys); GitHub projekto repo gauna savo
+   raktą (žr. 4 žingsnį). Tada paleisk scriptą dar
    kartą: jis nusiklonuos setup. `bitbucket.org` ir `github.com` SSH host raktai įrašomi tik tada, kai
    nuskenuoto rakto fingerprint'as sutampa su paslaugos paskelbtu (jie įrašyti scripte su nuorodomis į
    GitHub ir Atlassian puslapius); kitaip raktas neįrašomas ir parodoma „Needs attention“.
@@ -92,6 +96,61 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    Po minutės Bitbucket'e runner'is turi būti **ONLINE**. Kitas runner'is (pvz. workspace vietoj
    repository) įdiegiamas paleidžiant tą patį scriptą su naujomis reikšmėmis.
 
+   **GitHub Actions runner'is** (projektams GitHub'e; veikia greta Bitbucket runner'io, jo neliečia).
+   GitHub: *organizacijos* (rekomenduojama: vienas runner'is visiems organizacijos repo) arba *repo
+   Settings → Actions → Runners → New self-hosted runner*, Linux. Organizacijos runner'iui reikia
+   organizacijos savininko, repo – repo administratoriaus teisių. Puslapio komandų **nevykdyk**:
+
+   ```bash
+   sudo bin/install-runner --provider github --check   # klausia URL ir token'o, nieko nekeičia
+   sudo bin/install-runner --provider github           # klausia tų pačių reikšmių, įdiegia
+   ```
+
+   Klausiama: organizacijos ar repo URL (`--url` reikšmė, pvz. `https://github.com/BigSant` arba
+   `https://github.com/BigSant/<repo>`) ir registracijos token'as (`--token` reikšmė, rašant nerodomas).
+   Galima paduoti ir visą puslapio tekstą per stdin (`sudo bin/install-runner --provider github < puslapis.txt`) –
+   iš jo imami tik `--url` ir `--token`. Token'as **galioja valandą** ir registruoja vieną kartą: pasibaigus –
+   atnaujink puslapį ir imk naują. Jį duoda ir API (`POST /orgs/{org}/actions/runners/registration-token`,
+   `admin:org`; `POST /repos/{owner}/{repo}/actions/runners/registration-token`).
+
+   - **Archyvas** – scripte prisegta versija (2.338.0) iš `github.com/actions/runner` releases; įdiegiama tik
+     sutapus SHA-256 (įrašytas scripte, toks pat release puslapyje). Kita versija – `--tarball URL --sha256 HASH`.
+     Puslapyje siūloma naujesnė versija tik parodoma: runner'is atsinaujina pats.
+   - **Žymos.** GitHub pats prideda `self-hosted`, `Linux`, `X64`, scriptas – `setup.build`. Workflow job'ai:
+     `runs-on: [self-hosted, linux, setup.build]` (runner'is turi turėti visas nurodytas žymas). `--no-default-labels`
+     nenaudojamas: `self-hosted` tada būtų tik sava žyma, o `X64` netrukdo.
+   - **Vardas** GitHub'e – serverio vardas (`hostname -s`), kitas – `--name`. Registruojama su `--replace`: įdiegus
+     serverį iš naujo, tas pats vardas pakeičia seną registraciją.
+   - **Kur.** Kiekvienas scope (organizacija ar repo) – atskiras katalogas `/srv/setup-server/github-runner/<scope>`
+     (`bigsant`, `bigsant.<repo>`) ir atskira paslauga `setup-server-github-runner@<scope>` (vienas systemd šablonas
+     `setup-server-github-runner@.service`). Kitai organizacijai ar repo – tas pats scriptas su kitu URL.
+     Paslauga veikia paskyra `setup` su tais pačiais `SETUP_SERVER_ROOT` ir `SETUP_DIRECTORY`, kaip Bitbucket'o.
+   - **Pakartotinai** paleistas su jau užregistruotu scope (`.runner` yra) – nei atsisiunčia, nei registruoja,
+     token'o neklausia: įrašo unit'ą ir paleidžia paslaugą, jei ji neveikia. Veikiančios neperkrauna; pasikeitus
+     unit'ui parodo `sudo systemctl restart …` – paleisk, kai nevyksta job'as.
+   - **Token'as** niekur neįrašomas ir nerodomas: `config.sh` (jis atsisako veikti kaip root, todėl leidžiamas
+     paskyra `setup`) jį gauna per aplinkos kintamąjį `ACTIONS_RUNNER_INPUT_TOKEN`, ne komandų eilutėje.
+     Užsiregistravęs runner'is laiko savo duomenis savo kataloge (0750; `.runner`, `.credentials`, privatus raktas
+     `.credentials_rsaparams` – 0600): juos skaito paskyra `setup`, taigi ir job'ai (kaip Bitbucket OAuth duomenis).
+     Root failo nėra: runner'is veikia paskyra `setup` ir jam pačiam jų reikia.
+   - **Atnaujinimas.** Runner'is atsinaujina pats (GitHub numatyta; neatnaujintam per 30 dienų nuo naujos versijos
+     GitHub job'ų nebeduoda): pakeičia `bin/` savo kataloge, o paslauga leidžia `bin/runsvc.sh`, todėl po perkrovimo –
+     naują versiją. Pagrindinis procesas (`runsvc.sh`) lieka tas pats, todėl `bin/update` patikra nenukenčia.
+   - **Kodėl ne GitHub'o `svc.sh install setup`:** jo unit'o vardas priklauso nuo registracijos
+     (`actions.runner.<…>.service`), o pipeline'ams reikia `SETUP_SERVER_ROOT`/`SETUP_DIRECTORY`. Savas unit'as
+     kartoja GitHub šabloną (`KillMode=process`, `KillSignal=SIGTERM`, `TimeoutStopSec=5min` – vykstantis job'as
+     baigiasi tvarkingai) ir prideda `Restart=on-failure`.
+   - **Kodėl ne `--ephemeral`:** toks runner'is atlieka vieną job'ą ir išsiregistruoja, kitam reikia naujos
+     registracijos (token'o iš API su PAT ar GitHub App). Build katalogai ir taip išlieka tarp job'ų.
+   - **Prieiga.** Organizacijos runner'is patenka į *Default* runner group; pagal nutylėjimą grupės runner'iais
+     naudojasi tik **privatūs** repo. Viešiems repo self-hosted runner'io neleisk: GitHub perspėja, kad bet kas gali
+     atidaryti pull request'ą ir paleisti savo kodą šiame serveryje.
+
+   Po minutės GitHub'e runner'is turi būti **Idle**. Patikrinti: `systemctl status setup-server-github-runner@bigsant`,
+   `journalctl -u setup-server-github-runner@bigsant -n 50`. Pašalinti: `sudo systemctl disable --now
+   setup-server-github-runner@<scope>`, GitHub'e *Runners → … → Remove runner*, tada
+   `sudo rm -r /srv/setup-server/github-runner/<scope>`.
+
 4. **Projektas:**
 
    ```bash
@@ -108,6 +167,26 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    minutes. Žingsnio scriptas turi prasidėti `unset DOCKER_HOST`: Bitbucket nustato
    `DOCKER_HOST=tcp://localhost:2375` savo debesies docker servisui, o shell runner'yje Docker yra paties
    serverio (unix socket'as) – kitaip `docker` ir `make release/deploy` neranda daemon'o.
+
+   **GitHub projektas:**
+
+   ```bash
+   sudo bin/add-project git@github.com:BigSant/<aplinkos-repo>.git [git@github.com:BigSant/<kodo-repo>.git]
+   ```
+
+   GitHub deploy key tinka **tik vienam** repo, o paskyros raktas `id_ed25519` jau yra setup repo deploy key. Todėl
+   kiekvienas GitHub SSH URL gauna savo raktą `/srv/setup-server/.ssh/github-<savininkas>.<repo>` ir host alias'ą
+   `github.com-<savininkas>.<repo>` paskyros `.ssh/config` (`IdentitiesOnly yes`, tikrinamas tas pats `github.com`
+   host raktas), ir klonuojama per jį. Pirmą kartą scriptas sukuria raktą, parodo jį ir nuorodą
+   `https://github.com/<savininkas>/<repo>/settings/keys` ir sustoja (kodas 1): pridėk jį (*Add deploy key*,
+   „Allow write access“ **neįjungtas**) ir paleisk tą pačią komandą dar kartą. Jei yra „machine user“ paskyra, kurios
+   raktas (paskyros `id_ed25519`) skaito visus repo, – `--shared-key`: klonuojama su juo, per paduotą URL.
+
+   Build katalogas – repo vardas mažosiomis raidėmis, todėl workflow jį randa pats:
+   `BUILD_ROOT=${BUILD_ROOT:-$SETUP_SERVER_ROOT/projects/<repo vardas mažosiomis>}` (bash'e:
+   `repository=${GITHUB_REPOSITORY#*/}` ir `${repository,,}`; `SETUP_SERVER_ROOT` perduoda runner'io paslauga).
+   Kitu vardu – Actions variable `BUILD_ROOT`. Slaptažodžiai – GitHub environment secrets. Job'as turi turėti
+   `runs-on: [self-hosted, linux, setup.build]`. `unset DOCKER_HOST` nereikia: GitHub jo nenustato.
 
 5. **Projekto pašalinimas:**
 
@@ -235,12 +314,15 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
    scriptai veikia šiame serveryje;
 2. setup checkout'as yra ant naujo commit'o ir paskyra `setup` jį skaito be pakeitimų – būtent jį
    pipeline'ai naudoja (`SETUP_DIRECTORY`);
-3. runner'io paslauga `setup-server-runner` tebėra aktyvi **su tuo pačiu PID** – tai įrodo, kad ji
-   nebuvo perkrauta. Jei prieš atnaujinimą ji neveikė, tai tik parodoma.
+3. runner'io paslauga `setup-server-runner` ir kiekviena prieš atnaujinimą veikusi GitHub runner'io paslauga
+   `setup-server-github-runner@<scope>` tebėra aktyvios **su tuo pačiu PID** – tai įrodo, kad jos nebuvo
+   perkrautos. Jei Bitbucket runner'is prieš atnaujinimą neveikė, tai tik parodoma; neveikusios GitHub paslaugos
+   netikrinamos.
 
-Runner'io paslauga niekada neperkraunama: ji leidžiama iš `/srv/setup-server/runner/current`, ne iš šio
-repo, o setup checkout'ą kiekvienas pipeline žingsnis skaito iš naujo. Ar runner'is ONLINE, patikrink
-Bitbucket'e (scriptas Bitbucket API neskaito).
+Runner'ių paslaugos niekada neperkraunamos: jos leidžiamos iš `/srv/setup-server/runner/current` ir
+`/srv/setup-server/github-runner/<scope>`, ne iš šio repo, o setup checkout'ą kiekvienas pipeline žingsnis
+skaito iš naujo. Ar runner'is ONLINE (GitHub'e – Idle), patikrink Bitbucket'e ar GitHub'e (scriptas jų API
+neskaito).
 
 Nepavykus patikrai abu checkout'ai grąžinami į ankstesnius commit'us (ar šaką, jei checkout'as buvo ant
 jos), o įdiegtos komandų kopijos – į ankstesnes; išvedama, kuri patikra nepavyko, ir grąžinamas kodas 1. Kodas 2 reiškia, kad nepavyko ir grįžimas –
@@ -283,10 +365,11 @@ Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo 
    cd ~/setup-server && python3 -m unittest discover -s tests
    (cd / && sudo -u setup -H git -C /srv/setup-server/setup describe --tags --always)
    systemctl is-active setup-server-runner      # active; Bitbucket'e runner'is ONLINE
+   systemctl is-active 'setup-server-github-runner@*'   # active; GitHub'e runner'is Idle
    ```
 
-   Jei runner'is neaktyvus, žr. `journalctl -u setup-server-runner -n 50` ir tik tada
-   `sudo systemctl start setup-server-runner`.
+   Jei runner'is neaktyvus, žr. `journalctl -u setup-server-runner -n 50` (`-u setup-server-github-runner@<scope>`)
+   ir tik tada `sudo systemctl start setup-server-runner` (`setup-server-github-runner@<scope>`).
 
 5. **Jei checkout'as sugadintas** (git klaidos ir po `chown`): setup – perkelk seną į šalį ir leisk
    `prepare-host` nusiklonuoti iš naujo (kol nėra `setup/`, pipeline'ai nepavyks):
@@ -345,9 +428,13 @@ viešai jis nematomas; VPN adresą jis užima ir tada, kai VPN sąsaja pakyla v�
 | `setup_worker_deploy_last_success_timestamp_seconds` | Paskutinio baigto deploy'aus laikas |
 | `setup_worker_deploy_last_rollback` | `1` – paskutinis deploy'us buvo `rollback=1` |
 | `setup_worker_deploy_last_info{ref,commit}` | Paskutinio deploy'aus ref'as (iki 64 simbolių) ir commit'as (12 simbolių) |
-| `setup_worker_runner_up`, `setup_worker_runner_state{state}`, `setup_worker_runner_restarts` | `setup-server-runner` būsena iš `systemctl show` (`active`, `failed`, `not-found` …) ir automatiniai perkrovimai |
+| `setup_worker_runner_up`, `setup_worker_runner_state{state}`, `setup_worker_runner_restarts` | `setup-server-runner` (Bitbucket) būsena iš `systemctl show` (`active`, `failed`, `not-found` …) ir automatiniai perkrovimai |
+| `setup_worker_github_runner_up{scope}`, `setup_worker_github_runner_state{scope,state}`, `setup_worker_github_runner_restarts{scope}` | Tas pats kiekvienam užregistruotam GitHub runner'iui (`github-runner/<scope>` su `.runner`): paslauga `setup-server-github-runner@<scope>`. Nė vieno nėra – šių eilučių nėra |
 | `setup_worker_disk_size_bytes`, `_used_bytes`, `_available_bytes` `{path}` | Failų sistema, kurioje `/srv/setup-server` (kaip `df`) |
-| `setup_metrics_group_up{group}` | `0`, jei grupės (`backups`, `deploys`, `runner`, `disk`) dalies nepavyko perskaityti (priežastis – journal'e) |
+| `setup_metrics_group_up{group}` | `0`, jei grupės (`backups`, `deploys`, `runner`, `github_runner`, `disk`) dalies nepavyko perskaityti (priežastis – journal'e) |
+
+Bitbucket runner'io metrikos paliktos kaip buvo (be žymų), kad esami įspėjimai ir grafikai nesikeistų; GitHub
+runner'iai – atskiros metrikos su žyma `scope`, nes jų gali būti keli.
 
 Kopijos – tik `worker-<env>-…Z.sql.gz` (naktinės ir „backup dabar“). Deploy'aus kopijos neskaičiuojamos, kad
 deploy'us neuždengtų sustojusio laikmačio. Deploy'ai – iš setup istorijos
@@ -381,7 +468,8 @@ max by (project, environment) (setup_worker_backup_newest_age_seconds) > 26 * 36
 ```
 
 Papildomai verta: `up{job="setup-worker"} == 0` arba „no data“ (VPN ar paslauga neveikia),
-`setup_metrics_group_up == 0`, `setup_worker_runner_up == 0`, `setup_worker_deploy_last_success == 0`.
+`setup_metrics_group_up == 0`, `setup_worker_runner_up == 0`, `setup_worker_github_runner_up == 0`,
+`setup_worker_deploy_last_success == 0`.
 
 ## Saugumas
 
@@ -393,6 +481,9 @@ Papildomai verta: `up{job="setup-worker"} == 0` arba „no data“ (VPN ar pasla
 - Runner'io OAuth duomenys laikomi tik `/etc/setup-server/runner.env` (root, 0600), bet veikiančio runner'io
   komandų eilutėje jie matomi visoms serverio paskyroms, o aplinkoje – paskyros `setup` procesams ir pipeline
   žingsniams (žr. „Eiga“, 3 žingsnis).
+- GitHub runner'io registracijos token'as niekur neįrašomas; užsiregistravusio runner'io raktas yra jo kataloge
+  (paskyra `setup`, todėl pasiekiamas ir job'ams). Self-hosted runner'is – tik privatiems repo.
+- GitHub projektų deploy key – po vieną kiekvienam repo, tik skaitymui (`/srv/setup-server/.ssh/github-…`).
 - Slaptažodžiai į šį repo ir į projekto katalogus nerašomi. Naktinėms kopijoms jie laikomi tik
   `/etc/setup-server/projects/` (root, 0600). Sudo taisyklė `setup` paskyrai naujų teisių neprideda: ji ir
   taip Docker grupėje.

@@ -187,7 +187,7 @@ fi
 
 # --- Summary ----------------------------------------------------------------------------------
 if [ -f "$key.pub" ]; then
-    say "Git key of $ACCOUNT, fingerprint $(ssh-keygen -lf "$key.pub" | cut -d' ' -f2) (add it read-only to the setup repo and every project repository):"
+    say "Git key of $ACCOUNT, fingerprint $(ssh-keygen -lf "$key.pub" | cut -d' ' -f2) (add it read-only to the setup repo and every Bitbucket project repository; bin/add-project gives each GitHub one its own key):"
     sed 's/^/    /' "$key.pub"
 fi
 if [ ${#problems[@]} -gt 0 ]; then
@@ -195,4 +195,4 @@ if [ ${#problems[@]} -gt 0 ]; then
     printf '    - %s\n' "${problems[@]}"
     exit 1
 fi
-say "$([ "$check" = 1 ] && echo 'Check finished; nothing was changed.' || echo 'Host prepared.') Next: bin/install-runner, then bin/add-project."
+say "$([ "$check" = 1 ] && echo 'Check finished; nothing was changed.' || echo 'Host prepared.') Next: bin/install-runner (--provider github for GitHub Actions), then bin/add-project."
