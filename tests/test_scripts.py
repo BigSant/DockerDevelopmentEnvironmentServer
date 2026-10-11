@@ -394,6 +394,8 @@ class InstallGitHubRunnerRootTest(ScriptTest):
         self.assertNotIn(GITHUB_TOKEN, self.everything_written() + result.stdout + result.stderr,
                          "the token is on no command line and in no file")
         self.assertTrue((self.directory / ".runner").is_file())
+        self.assertEqual(self.directory.stat().st_mode & 0o777, 0o750, "not the archive's 0755")
+        self.assertNotIn("previous unit", result.stdout)
         self.assertFalse((self.root / "dependencies.calls").exists(), "ICU is there: no dependencies installed")
         unit = self.template.read_text()
         self.assertIn(f"User={getpass.getuser()}", unit)
@@ -901,6 +903,54 @@ stat -c '%U %a %n' /etc/setup-server/runner.env
         self.assertIn("RUNNER_UNIT_VERIFIED", output)
         self.assertIn("root 600 /etc/setup-server/runner.env", result.stdout)
         self.assertNotIn("s3cr3t", output)
+
+    def test_the_github_runner_registers_through_real_sudo_and_its_unit_verifies(self):
+        # A stand-in archive whose config.sh behaves like GitHub's on the points that matter here: it refuses
+        # root and takes the token from ACTIONS_RUNNER_INPUT_TOKEN. Both runners' units then coexist.
+        script = """set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq >/dev/null && apt-get install -y -qq systemd sudo >/dev/null
+useradd --system --create-home --home-dir /srv/setup-server --shell /bin/bash setup
+mkdir -p /stubs /tmp/archive/bin /tmp/bitbucket/bin
+printf '#!/bin/sh\\nexit 0\\n' > /stubs/systemctl
+cat > /tmp/archive/config.sh <<'CONFIG'
+#!/bin/bash
+[ "$(id -u)" != 0 ] || { echo "Must not run with sudo"; exit 1; }
+[ "${ACTIONS_RUNNER_INPUT_TOKEN:-}" = """ + f'"{GITHUB_TOKEN}"' + """ ] || { echo "no token in the environment"; exit 1; }
+case "$*" in *""" + GITHUB_TOKEN + """*) echo "token on the command line"; exit 1;; esac
+echo "registered as $(id -un): $*"
+echo '{}' > .runner
+CONFIG
+printf '#!/bin/sh\\nexit 0\\n' > /tmp/archive/bin/runsvc.sh
+printf '#!/bin/sh\\necho dependencies installed\\n' > /tmp/archive/bin/installdependencies.sh
+chmod +x /stubs/systemctl /tmp/archive/config.sh /tmp/archive/bin/*.sh
+tar -czf /tmp/runner.tar.gz -C /tmp/archive .
+printf '#!/bin/sh\\nexec java -jar runner.jar\\n' > /tmp/bitbucket/bin/start.sh
+chmod +x /tmp/bitbucket/bin/start.sh
+tar -czf /tmp/bitbucket.tar.gz -C /tmp/bitbucket bin
+PATH=/stubs:$PATH /setup-server/bin/install-runner --tarball /tmp/bitbucket.tar.gz <<'DIALOG' >/dev/null
+""" + RUN_COMMAND + """DIALOG
+PATH=/stubs:$PATH /setup-server/bin/install-runner --provider github --tarball /tmp/runner.tar.gz \\
+    --sha256 $(sha256sum /tmp/runner.tar.gz | cut -d' ' -f1) <<'PAGE'
+""" + GITHUB_PAGE + """PAGE
+for unit in setup-server-github-runner@bigsant.service setup-server-runner.service; do
+    systemd-analyze verify /etc/systemd/system/$unit >/tmp/verify.log 2>&1 || true
+    cat /tmp/verify.log; [ ! -s /tmp/verify.log ]
+done
+echo UNITS_VERIFIED
+stat -c '%U %a %n' /srv/setup-server/github-runner/bigsant /srv/setup-server/github-runner/bigsant/.runner
+! grep -rq """ + GITHUB_TOKEN + """ /srv /etc/systemd /etc/setup-server
+echo TOKEN_NOWHERE
+"""
+        result = subprocess.run([*DOCKER_RUN, "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script],
+                                capture_output=True, text=True, timeout=600)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("registered as setup: --unattended --url https://github.com/BigSant", output)
+        self.assertIn("UNITS_VERIFIED", output)
+        self.assertIn("setup 750 /srv/setup-server/github-runner/bigsant\n", output)
+        self.assertIn("TOKEN_NOWHERE", output)
+        self.assertNotIn(GITHUB_TOKEN, output)
 
 
 if __name__ == "__main__":

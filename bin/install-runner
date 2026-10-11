@@ -196,6 +196,7 @@ github() {
         [ -x "$directory/config.sh" ] && [ -x "$directory/bin/runsvc.sh" ] \
             || { echo "The archive has no config.sh and bin/runsvc.sh" >&2; exit 65; }
         chown -R "$ACCOUNT:$ACCOUNT" "$directory"
+        chmod 0750 "$directory"  # the archive's ./ entry (0755) replaced the mode
         # config.sh stops without ICU (and a few other libraries); the runner's own script installs them.
         if ! ldconfig -p 2>/dev/null | grep -q 'libicu'; then
             echo "==> installing the runner's dependencies (its bin/installdependencies.sh)"
@@ -241,7 +242,8 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
-    cmp -s "$staged" "$template" 2>/dev/null || changed=1
+    # A changed unit reaches a running runner only when it restarts, which is left to the admin.
+    [ ! -f "$template" ] || cmp -s "$staged" "$template" || changed=1
     install -m 0644 "$staged" "$template"
     rm -f "$staged"
     systemctl daemon-reload
