@@ -607,7 +607,8 @@ class UpdateTest(ScriptTest):
     def runner_untouched(self):
         calls = self.calls.read_text() if self.calls.exists() else ""
         for verb in ("restart", "try-restart", "stop", "start", "reload", "kill", "daemon-reload", "enable", "disable"):
-            self.assertNotRegex(calls, rf"(?m)^{verb}( \S+)* setup-server-runner\b", f"systemctl {verb} was called:\n{calls}")
+            for unit in ("setup-server-runner", "setup-server-github-runner@"):
+                self.assertNotRegex(calls, rf"(?m)^{verb}( \S+)* {unit}", f"systemctl {verb} was called:\n{calls}")
             self.assertNotRegex(calls, rf"(?m)^{verb}$", f"systemctl {verb} was called:\n{calls}")
 
     def release_with_installers(self, tag, tests, marker):
@@ -708,6 +709,35 @@ class UpdateTest(ScriptTest):
         idle = self.update("--server-ref", "v0.2.0", FAKE_RUNNER="inactive")
         self.assertEqual(idle.returncode, 0, idle.stdout + idle.stderr)
         self.assertIn("runner setup-server-runner is not active; not checked", idle.stdout)
+
+    def github_runner(self):
+        """Both runners active: Bitbucket's as PID 4242, a GitHub one as PID 6161 (6262 after a restart
+        with FAKE_GITHUB_RESTARTED)."""
+        self.stub("systemctl", f'echo "$*" >> {self.calls}\n'
+                               'for unit; do :; done\n'
+                               'case "$1" in\n'
+                               f'  list-units) echo "{GITHUB_UNIT} loaded active running GitHub Actions runner bigsant (setup-server)";;\n'
+                               '  show) case "$unit" in\n'
+                               f'    *github*) n=$(grep -c "^show.*github" {self.calls}); '
+                               '[ -n "${FAKE_GITHUB_RESTARTED:-}" ] && [ "$n" -gt 1 ] && echo 6262 || echo 6161;;\n'
+                               '    *) echo 4242;; esac;;\n'
+                               'esac\n')
+
+    def test_a_github_runner_beside_the_bitbucket_one_is_checked_and_never_restarted(self):
+        self.github_runner()
+        result = self.update("--server-ref", "v0.2.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"runner {GITHUB_UNIT} active (PID 6161); an update never restarts it", result.stdout)
+        self.assertIn("runner setup-server-runner: still active, same PID 4242", result.stdout)
+        self.assertIn(f"runner {GITHUB_UNIT}: still active, same PID 6161", result.stdout)
+        self.assertRegex(self.calls.read_text(), r"(?m)^list-units .*--state=active .*setup-server-github-runner@\*\.service")
+        self.runner_untouched()
+        self.calls.unlink()
+        restarted = self.update("--server-ref", "v0.1.0", FAKE_GITHUB_RESTARTED="1")
+        self.assertEqual(restarted.returncode, 1, restarted.stdout + restarted.stderr)
+        self.assertIn(f"runner {GITHUB_UNIT}: FAILED — PID changed from 6161 to 6262 (restarted)", restarted.stdout)
+        self.assertEqual(self.head(self.server), "v0.2.0", "the first update stays, the second returned")
+        self.runner_untouched()
 
     def test_when_the_return_fails_too_the_manual_recovery_is_printed(self):
         if os.getuid() == 0:

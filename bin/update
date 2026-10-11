@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Update this setup-server checkout and the shared setup checkout ($ROOT/setup) to the given refs, check
 # that the server still works and, when it does not, return both to the commits they were on before.
-# The runner service is never restarted or reloaded: pipeline steps read the setup checkout when they run.
+# The runner services (Bitbucket's and every GitHub one) are never restarted or reloaded: pipeline steps
+# read the setup checkout when they run.
 # Run it as the owner of this checkout (the admin who cloned it), without sudo; the setup account's part
 # runs through sudo -u. The installed command copies ($SBIN/setup-server-backup and setup-server-metrics,
 # when installed) are rewritten from the new checkout through sudo and returned with the checkouts.
@@ -11,6 +12,8 @@ set -euo pipefail
 ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
 ACCOUNT=${SETUP_SERVER_USER:-setup}
 RUNNER=${SETUP_SERVER_RUNNER:-setup-server-runner}
+# The GitHub Actions runners: one instance per organization or repository (bin/install-runner --provider github).
+GITHUB_RUNNERS='setup-server-github-runner@*.service'
 CHECKOUT=${SETUP_SERVER_CHECKOUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)}
 SETUP="$ROOT/setup"
 SBIN=${SETUP_SERVER_SBIN:-/usr/local/sbin}
@@ -112,7 +115,24 @@ $(for tag in $moved; do echo "    $tag: here $(git_in "$1" rev-parse --short "$t
     fail "Cannot fetch $(name_of "$1") from origin:
 $output"
 }
-runner_pid() { systemctl show -p MainPID --value "$RUNNER" 2>/dev/null || true; }
+runner_pid() { systemctl show -p MainPID --value "${1:-$RUNNER}" 2>/dev/null || true; }
+github_runners() {  # the active GitHub runner services
+    systemctl list-units --type=service --state=active --plain --no-legend "$GITHUB_RUNNERS" 2>/dev/null | awk '{print $1}' || true
+}
+runner_check() {  # runner_check UNIT PID — still active with the PID it had before the update?
+    local unit=$1 before=$2
+    if [ -z "$before" ]; then
+        echo "    runner $unit: was not active before; not checked"
+    elif ! systemctl is-active --quiet "$unit"; then
+        echo "    runner $unit: FAILED — not active any more (it was PID $before)"
+        return 1
+    elif [ "$(runner_pid "$unit")" != "$before" ]; then
+        echo "    runner $unit: FAILED — PID changed from $before to $(runner_pid "$unit") (restarted)"
+        return 1
+    else
+        echo "    runner $unit: still active, same PID $before"
+    fi
+}
 
 plan() {  # plan SIDE REF CURRENT TARGET — what moving that checkout changes
     local side=$1 ref=$2 current=$3 target=$4 back forward shown
@@ -161,17 +181,11 @@ health() {  # every check runs; the result fails when one of them fails
         echo "    setup: FAILED — $ACCOUNT sees ${head:-nothing} with $(git_in setup status --porcelain --untracked-files=no 2>&1 | wc -l) changed files, expected $setup_expected"
         failed=1
     fi
-    if [ -z "$runner_before" ]; then
-        echo "    runner $RUNNER: was not active before; not checked"
-    elif ! systemctl is-active --quiet "$RUNNER"; then
-        echo "    runner $RUNNER: FAILED — not active any more (it was PID $runner_before)"
-        failed=1
-    elif [ "$(runner_pid)" != "$runner_before" ]; then
-        echo "    runner $RUNNER: FAILED — PID changed from $runner_before to $(runner_pid) (restarted)"
-        failed=1
-    else
-        echo "    runner $RUNNER: still active, same PID $runner_before"
-    fi
+    runner_check "$RUNNER" "$runner_before" || failed=1
+    local entry
+    for entry in "${github_before[@]}"; do
+        runner_check "${entry%:*}" "${entry##*:}" || failed=1
+    done
     return "$failed"
 }
 
@@ -198,7 +212,7 @@ give_back() {  # return every moved checkout; print the manual commands for thos
     [ ${#copies[@]} -eq 0 ] || restore_copies
     if [ ${#manual[@]} -eq 0 ]; then
         rm -rf "$saved"
-        say "Returned both checkouts to the previous commits: setup-server $(label server "$server_previous"), setup $(label setup "$setup_previous"). The runner was not restarted."
+        say "Returned both checkouts to the previous commits: setup-server $(label server "$server_previous"), setup $(label setup "$setup_previous"). The runners were not restarted."
         exit 1
     fi
     say "The automatic return failed. Return by hand (README: \"Rankinis atstatymas\"):"
@@ -263,6 +277,12 @@ $changes"
         runner_before=
         say "runner $RUNNER is not active; not checked"
     fi
+    github_before=()
+    local unit
+    for unit in $(github_runners); do
+        github_before+=("$unit:$(runner_pid "$unit")")
+        say "runner $unit active (PID ${github_before[-1]##*:}); an update never restarts it"
+    done
     if [ -z "$server_target$setup_target" ]; then
         say "Nothing to do."
         exit 0
@@ -273,7 +293,7 @@ $changes"
         say "Then refresh the installed copies:$(printf " $SBIN/%s" "${copies[@]%%:*}") (sudo; back with the checkouts on a failure)"
     fi
     if [ "$check" = 1 ]; then
-        say "After updating: setup-server tests, setup at the new commit and readable by $ACCOUNT, runner still active with the same PID; on a failure both checkouts return."
+        say "After updating: setup-server tests, setup at the new commit and readable by $ACCOUNT, every active runner still active with the same PID; on a failure both checkouts return."
         say "Check finished; nothing was changed (only fetched)."
         exit 0
     fi
@@ -302,7 +322,7 @@ $changes"
     fi
     trap - INT TERM
     rm -rf "$saved"
-    say "Updated: setup-server $(label server HEAD), setup $(label setup HEAD). The runner was not restarted."
+    say "Updated: setup-server $(label server HEAD), setup $(label setup HEAD). The runners were not restarted."
 }
 
 # Bash reads a script while running it and the update replaces this file, so the whole run is one call
