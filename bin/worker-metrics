@@ -6,12 +6,14 @@ service setup-server-metrics of the setup account (the owner of the build roots)
 front: the service answers HTTP itself on METRICS_ADDRESS (default 127.0.0.1; the VPN address for
 Prometheus), checks the client address against METRICS_ALLOWED_IPS (403) and then the bearer token
 METRICS_TOKEN (401), like the target /metrics of setup. It changes nothing: it reads the build roots
-under $SETUP_SERVER_ROOT/projects, asks systemd for the runner's state and the filesystem for its size.
+under $SETUP_SERVER_ROOT/projects, asks systemd for the runners' state and the filesystem for its size.
 
 Groups (setup_metrics_group_up{group} is 0 when a part of the group could not be read; details in the journal):
   backups  per project and ENV: age and size of the newest worker-<env>-…Z.sql.gz backup, how many are kept
   deploys  per project and ENV: the last entry of .generated/release/<env>/deployments.json
-  runner   the systemd state of setup-server-runner.service
+  runner   the systemd state of setup-server-runner.service (Bitbucket)
+  github_runner  per registered GitHub runner ($SETUP_SERVER_ROOT/github-runner/<scope>): the systemd state of
+           setup-server-github-runner@<scope>.service; nothing when none is registered
   disk     the filesystem holding $SETUP_SERVER_ROOT
 
 Usage: setup-server-metrics            serve (settings from the environment, see bin/install-metrics)
@@ -37,6 +39,10 @@ from urllib.parse import urlsplit
 ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
 PROJECTS = ROOT / 'projects'
 RUNNER_UNIT = os.environ.get('SETUP_SERVER_RUNNER_UNIT', 'setup-server-runner.service')
+# One GitHub runner per organization or repository (bin/install-runner --provider github).
+GITHUB_RUNNERS = ROOT / 'github-runner'
+GITHUB_RUNNER_UNIT = 'setup-server-github-runner@{}.service'
+SCOPE = re.compile(r'[a-z0-9][a-z0-9._-]*')
 ENVIRONMENTS = ('stage', 'prod')
 # NAME, SERIES and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
@@ -190,19 +196,27 @@ def deploys(metrics, found, now):
     return complete
 
 
-def runner(metrics, found, now):
-    """systemctl show only: the service is read, never started, stopped or restarted."""
+def unit_state(group, unit):
+    """systemctl show only: the service is read, never started, stopped or restarted. None when unknown."""
     try:
-        result = subprocess.run(['systemctl', 'show', '--property=LoadState,ActiveState,SubState,NRestarts', RUNNER_UNIT],
+        result = subprocess.run(['systemctl', 'show', '--property=LoadState,ActiveState,SubState,NRestarts', unit],
                                 capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.TimeoutExpired) as error:
-        log(f'runner: systemctl: {error}')
-        return False
+        log(f'{group}: systemctl: {error}')
+        return None
     properties = dict(line.partition('=')[::2] for line in result.stdout.splitlines())
-    load, active = properties.get('LoadState'), properties.get('ActiveState')
-    if result.returncode or not load or not active:
-        log(f'runner: systemctl show {RUNNER_UNIT} exit {result.returncode}: {result.stderr.strip()}')
+    if result.returncode or not properties.get('LoadState') or not properties.get('ActiveState'):
+        log(f'{group}: systemctl show {unit} exit {result.returncode}: {result.stderr.strip()}')
+        return None
+    return properties
+
+
+def runner(metrics, found, now):
+    """The Bitbucket runner."""
+    properties = unit_state('runner', RUNNER_UNIT)
+    if properties is None:
         return False
+    load, active = properties['LoadState'], properties['ActiveState']
     metrics.add('setup_worker_runner_up', f'Whether {RUNNER_UNIT} is active', 1 if active == 'active' else 0)
     metrics.add('setup_worker_runner_state', f'State of {RUNNER_UNIT} (systemd ActiveState, or LoadState such as '
                 'not-found when it is not installed)', 1, {'state': active if load == 'loaded' else load})
@@ -210,6 +224,36 @@ def runner(metrics, found, now):
         metrics.add('setup_worker_runner_restarts', f'Automatic restarts of {RUNNER_UNIT} since it was last started',
                     int(properties['NRestarts']))
     return True
+
+
+def github_runners(metrics, found, now):
+    """Every registered GitHub runner (a directory with .runner) and its service; a registered runner whose
+    service is not installed is not-found."""
+    try:
+        scopes = sorted(item.name for item in GITHUB_RUNNERS.iterdir()
+                        if SCOPE.fullmatch(item.name) and item.is_dir() and not item.is_symlink()
+                        and (item / '.runner').is_file()) if GITHUB_RUNNERS.is_dir() else []
+    except OSError as error:
+        log(f'github_runner: {GITHUB_RUNNERS}: {error}')
+        return False
+    complete = True
+    for scope in scopes:
+        unit = GITHUB_RUNNER_UNIT.format(scope)
+        properties = unit_state('github_runner', unit)
+        if properties is None:
+            complete = False
+            continue
+        load, active = properties['LoadState'], properties['ActiveState']
+        labels = {'scope': scope}
+        metrics.add('setup_worker_github_runner_up', 'Whether the GitHub runner service of the scope '
+                    '(setup-server-github-runner@<scope>.service) is active', 1 if active == 'active' else 0, labels)
+        metrics.add('setup_worker_github_runner_state', 'State of the GitHub runner service of the scope (systemd '
+                    'ActiveState, or LoadState such as not-found when it is not installed)', 1,
+                    {**labels, 'state': active if load == 'loaded' else load})
+        if properties.get('NRestarts', '').isdigit():
+            metrics.add('setup_worker_github_runner_restarts', 'Automatic restarts of the GitHub runner service of the '
+                        'scope since it was last started', int(properties['NRestarts']), labels)
+    return complete
 
 
 def disk(metrics, found, now):
@@ -228,7 +272,7 @@ def disk(metrics, found, now):
     return True
 
 
-GROUPS = (('backups', backups), ('deploys', deploys), ('runner', runner), ('disk', disk))
+GROUPS = (('backups', backups), ('deploys', deploys), ('runner', runner), ('github_runner', github_runners), ('disk', disk))
 
 
 def collect():

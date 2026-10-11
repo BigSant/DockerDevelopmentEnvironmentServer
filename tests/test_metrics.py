@@ -156,7 +156,14 @@ class EndpointTest(ScriptTest):
             entry("v3.3.0", "d" * 40, "2026-10-08T09:00:00+00:00", failed="after-rsync"),
         ])
         self.tree.project("not_deployed")
+        self.github_runner("bigsant")
         return asana, forsena
+
+    def github_runner(self, scope, registered=True):
+        directory = self.tree.root / "github-runner" / scope
+        directory.mkdir(parents=True)
+        if registered:
+            (directory / ".runner").write_text('{"agentName": "worker1"}\n')
 
     # --- Access ----------------------------------------------------------------------------------
     def test_without_the_token_or_with_a_wrong_one_it_is_refused(self):
@@ -230,7 +237,7 @@ class EndpointTest(ScriptTest):
         # The last deploy that completed is the one before the failure.
         self.assertEqual(value(samples, "setup_worker_deploy_last_success_timestamp_seconds", **forsena), 1791363600)
         self.assertEqual(value(samples, "setup_worker_deploy_last_info", ref="v3.3.0", commit="d" * 12, **forsena), 1)
-        for group in ("backups", "deploys", "runner", "disk"):
+        for group in ("backups", "deploys", "runner", "github_runner", "disk"):
             self.assertEqual(value(samples, "setup_metrics_group_up", group=group), 1, group)
 
     def test_a_broken_history_clears_only_its_group_and_keeps_the_other_projects(self):
@@ -274,6 +281,43 @@ class EndpointTest(ScriptTest):
                     self.assertEqual(value(samples, "setup_worker_runner_state", state=state), 1)
                 else:
                     self.assertNotIn(("setup_worker_runner_up", ()), samples)
+
+    def test_each_registered_github_runner_is_read_from_systemd_beside_the_bitbucket_one(self):
+        self.github_runner("bigsant")
+        self.github_runner("bigsant.forsena_docker")
+        self.github_runner("half_done", registered=False)  # unpacked, never registered: not a runner yet
+        self.github_runner("Not-A-Scope")
+        self.stub("systemctl", 'echo "$*" >> "$SYSTEMCTL_LOG"\nfor unit; do :; done\ncase "$unit" in\n'
+                               '  *@bigsant.forsena_docker.service) printf "LoadState=not-found\\nActiveState=inactive\\nNRestarts=0\\n";;\n'
+                               '  *@bigsant.service) printf "LoadState=loaded\\nActiveState=active\\nNRestarts=2\\n";;\n'
+                               '  *) printf "LoadState=loaded\\nActiveState=failed\\nNRestarts=7\\n";;\nesac\n')
+        samples = parse(self.scrape())
+        self.assertEqual(value(samples, "setup_worker_github_runner_up", scope="bigsant"), 1)
+        self.assertEqual(value(samples, "setup_worker_github_runner_state", scope="bigsant", state="active"), 1)
+        self.assertEqual(value(samples, "setup_worker_github_runner_restarts", scope="bigsant"), 2)
+        self.assertEqual(value(samples, "setup_worker_github_runner_up", scope="bigsant.forsena_docker"), 0)
+        self.assertEqual(value(samples, "setup_worker_github_runner_state", scope="bigsant.forsena_docker",
+                               state="not-found"), 1)
+        self.assertEqual({dict(key[1]).get("scope") for key in samples if key[0].startswith("setup_worker_github")},
+                         {"bigsant", "bigsant.forsena_docker"})
+        # The Bitbucket runner keeps its own unlabelled series.
+        self.assertEqual(value(samples, "setup_worker_runner_up"), 0)
+        self.assertEqual(value(samples, "setup_worker_runner_state", state="failed"), 1)
+        self.assertEqual(value(samples, "setup_metrics_group_up", group="github_runner"), 1)
+        calls = self.systemctl_log.read_text().splitlines()
+        self.assertTrue(all(call.startswith("show ") for call in calls), calls)
+        self.assertIn("setup-server-github-runner@bigsant.service", " ".join(calls))
+
+    def test_without_github_runners_there_are_no_github_series_and_an_unreadable_one_clears_its_group(self):
+        samples = parse(self.scrape())
+        self.assertFalse([key for key in samples if key[0].startswith("setup_worker_github")])
+        self.assertEqual(value(samples, "setup_metrics_group_up", group="github_runner"), 1)
+        self.github_runner("bigsant")
+        self.stub("systemctl", 'case "$*" in *github*) echo "Failed to connect to bus" >&2; exit 1;; esac\n' + SYSTEMCTL_ACTIVE)
+        samples = parse(self.scrape())
+        self.assertEqual(value(samples, "setup_metrics_group_up", group="github_runner"), 0)
+        self.assertEqual(value(samples, "setup_metrics_group_up", group="runner"), 1)
+        self.assertEqual(value(samples, "setup_worker_runner_up"), 1)
 
     def test_disk_usage_of_the_filesystem_holding_the_worker_root(self):
         samples = parse(self.scrape())
