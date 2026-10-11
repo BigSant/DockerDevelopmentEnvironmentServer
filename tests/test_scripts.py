@@ -182,13 +182,13 @@ class InstallRunnerTest(ScriptTest):
         self.assertEqual(refused.returncode, 65)
         self.assertIn("No runner download link", refused.stderr)
 
-    def interactive(self, answers):
+    def interactive(self, answers, *arguments):
         """Run install-runner --check in a real terminal and type the answers one line at a time."""
         import pty, select
-        env = {**os.environ, "SETUP_SERVER_ROOT": str(self.root / "srv")}
+        env = {**os.environ, "SETUP_SERVER_ROOT": str(self.root / "srv"), "PATH": f"{self.bin}:{os.environ['PATH']}"}
         pid, fd = pty.fork()
         if pid == 0:
-            os.execve(str(ROOT / "bin/install-runner"), [str(ROOT / "bin/install-runner"), "--check"], env)
+            os.execve(str(ROOT / "bin/install-runner"), [str(ROOT / "bin/install-runner"), "--check", *arguments], env)
         output, pending = b"", list(answers)
         while True:
             ready, _, _ = select.select([fd], [], [], 5)
@@ -233,6 +233,211 @@ class InstallRunnerTest(ScriptTest):
                 result = self.run_script("install-runner", "--check", "--tarball", "x", stdin=text)
                 self.assertEqual(result.returncode, 65)
                 self.assertIn(message, result.stderr)
+
+
+# The shape of GitHub's "New self-hosted runner" page (Linux x64), with a made-up token.
+GITHUB_TOKEN = "AAGHFAKETOKEN0123456789ABCDE"
+GITHUB_PAGE = f"""# Create a folder
+$ mkdir actions-runner && cd actions-runner
+# Download the latest runner package
+$ curl -o actions-runner-linux-x64-2.338.0.tar.gz -L https://github.com/actions/runner/releases/download/v2.338.0/actions-runner-linux-x64-2.338.0.tar.gz
+# Optional: Validate the hash
+$ echo "af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32  actions-runner-linux-x64-2.338.0.tar.gz" | shasum -a 256 -c
+# Extract the installer
+$ tar xzf ./actions-runner-linux-x64-2.338.0.tar.gz
+# Create the runner and start the configuration experience
+$ ./config.sh --url https://github.com/BigSant --token {GITHUB_TOKEN}
+# Last step, run it!
+$ ./run.sh
+"""
+GITHUB_UNIT = "setup-server-github-runner@bigsant.service"
+
+
+class InstallGitHubRunnerTest(ScriptTest):
+    """install-runner --provider github: the page's URL and token, the pinned archive and its SHA-256."""
+
+    def setUp(self):
+        super().setUp()
+        self.stub("uname", 'echo x86_64\n')
+        self.stub("hostname", 'echo worker1\n')
+
+    def github(self, *arguments, stdin=GITHUB_PAGE, **env):
+        return self.run_script("install-runner", "--provider", "github", *arguments, stdin=stdin, **env)
+
+    def test_check_takes_the_url_and_token_from_the_page_and_hides_the_token(self):
+        result = self.github("--check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = result.stdout + result.stderr
+        self.assertIn("GitHub runner of the organization BigSant (https://github.com/BigSant)", result.stdout)
+        self.assertIn("runner archive: https://github.com/actions/runner/releases/download/v2.338.0/"
+                      "actions-runner-linux-x64-2.338.0.tar.gz (SHA-256 "
+                      "af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32)", result.stdout)
+        self.assertIn("runner worker1: labels self-hosted, Linux, X64 (GitHub's) and setup.build; "
+                      f"directory {self.root}/srv/github-runner/bigsant", result.stdout)
+        self.assertIn(f"registration token: <hidden> ({len(GITHUB_TOKEN)} characters", result.stdout)
+        self.assertIn(f"service {GITHUB_UNIT}", result.stdout)
+        self.assertNotIn(GITHUB_TOKEN, output)
+        self.assertNotIn("Note:", result.stderr, "the page offers the pinned version")
+        self.assertFalse((self.root / "srv").exists(), "--check changes nothing")
+
+    def test_a_repository_runner_has_its_own_scope_and_a_name_can_be_given(self):
+        page = f"./config.sh --url https://github.com/BigSant/Forsena_Docker.git/ --token {GITHUB_TOKEN}\n"
+        result = self.github("--check", "--name", "vpn-server", stdin=page)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GitHub runner of the repository BigSant/Forsena_Docker", result.stdout)
+        self.assertIn(f"runner vpn-server: labels", result.stdout)
+        self.assertIn(f"{self.root}/srv/github-runner/bigsant.forsena_docker", result.stdout)
+        self.assertIn("setup-server-github-runner@bigsant.forsena_docker.service", result.stdout)
+
+    def test_a_newer_version_on_the_page_is_noted_and_the_pinned_one_kept(self):
+        result = self.github("--check", stdin=GITHUB_PAGE.replace("2.338.0", "2.340.1"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("GitHub offers 2.340.1; this installs the pinned 2.338.0", result.stderr)
+        self.assertIn("v2.338.0/actions-runner-linux-x64-2.338.0.tar.gz", result.stdout)
+
+    def test_bad_values_are_refused(self):
+        page = GITHUB_PAGE
+        for text, arguments, code, message in (
+                ("$ ./run.sh\n", (), 65, "No organization or repository URL"),
+                (page.replace("https://github.com/BigSant", "https://gitlab.com/BigSant"), (), 65, "Not a github.com"),
+                (page.replace("https://github.com/BigSant", "https://github.com/Big;Sant"), (), 65, "Not a github.com"),
+                (page.replace(f" --token {GITHUB_TOKEN}", ""), (), 65, "No registration token"),
+                (page.replace(GITHUB_TOKEN, "abc$(id)"), (), 65, "Unexpected characters"),
+                (page, ("--name", "bad name;"), 65, "Unexpected runner name"),
+                (page, ("--sha256", "abc"), 64, "64 hex digits")):
+            with self.subTest(message=message):
+                result = self.github("--check", *arguments, stdin=text)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+                self.assertIn(message, result.stderr)
+                self.assertNotIn(GITHUB_TOKEN, result.stdout + result.stderr)
+        self.stub("uname", 'echo riscv64\n')
+        self.assertIn("No pinned GitHub runner for riscv64", self.github("--check").stderr)
+
+    def test_the_provider_options_are_checked(self):
+        self.assertEqual(self.run_script("install-runner", "--check", "--provider", "gitlab").returncode, 64)
+        bitbucket = self.run_script("install-runner", "--check", "--sha256", "a" * 64, stdin=RUN_COMMAND)
+        self.assertEqual(bitbucket.returncode, 64)
+        self.assertIn("for --provider github", bitbucket.stderr)
+        # The default stays Bitbucket.
+        self.assertIn("--OAuthClientSecret <hidden>",
+                      self.run_script("install-runner", "--check", "--tarball", "x", stdin=RUN_COMMAND).stdout)
+
+    def test_a_terminal_is_asked_for_the_url_and_then_the_token_which_is_not_shown(self):
+        output = InstallRunnerTest.interactive(self, ["https://github.com/BigSant", GITHUB_TOKEN], "--provider", "github")
+        self.assertIn("GitHub runner of the organization BigSant", output)
+        self.assertIn(f"registration token: <hidden> ({len(GITHUB_TOKEN)} characters", output)
+        self.assertNotIn(GITHUB_TOKEN, output, "the token is neither echoed nor printed")
+
+
+class InstallGitHubRunnerRootTest(ScriptTest):
+    """install-runner --provider github as (fake) root: a stand-in runner archive, config.sh and systemctl."""
+
+    def setUp(self):
+        super().setUp()
+        self.root_bin = self.fake_root()
+        self.stub("uname", 'echo x86_64\n')
+        self.stub("hostname", 'echo worker1\n')
+        self.stub("ldconfig", 'echo "libicuuc.so.74 (libc6,x86-64) => /lib/x86_64-linux-gnu/libicuuc.so.74"\n')
+        self.calls = self.root / "systemctl.calls"
+        self.stub("systemctl", f'echo "$*" >> {self.calls}\n'
+                               'case "$1" in is-active) [ -n "${FAKE_ACTIVE:-}" ] || { [ "$2" = --quiet ] || echo inactive; exit 3; }; '
+                               '[ "$2" = --quiet ] || echo active;; esac\n')
+        # The stand-in archive: config.sh records how it was called and registers (.runner).
+        self.config_log = self.root / "config.calls"
+        archive = self.root / "archive"
+        (archive / "bin").mkdir(parents=True)
+        (archive / "config.sh").write_text(
+            "#!/bin/sh\n"
+            f'echo "args: $*" >> {self.config_log}\n'
+            f'echo "token: ${{ACTIONS_RUNNER_INPUT_TOKEN:-none}}" >> {self.config_log}\n'
+            f'echo "cwd: $(pwd)" >> {self.config_log}\n'
+            '[ -z "${FAKE_CONFIG_FAILS:-}" ] || exit 1\n'
+            'echo \'{"agentName": "worker1"}\' > .runner\n')
+        (archive / "bin/runsvc.sh").write_text("#!/bin/sh\nexit 0\n")
+        (archive / "bin/installdependencies.sh").write_text(f"#!/bin/sh\necho installed >> {self.root}/dependencies.calls\n")
+        for script in ("config.sh", "bin/runsvc.sh", "bin/installdependencies.sh"):
+            (archive / script).chmod(0o755)
+        self.archive = self.root / "runner.tar.gz"
+        subprocess.run(["tar", "-czf", str(self.archive), "-C", str(archive), "."], check=True)
+        import hashlib
+        self.sha256 = hashlib.sha256(self.archive.read_bytes()).hexdigest()
+        self.directory = self.root / "srv/github-runner/bigsant"
+        self.template = self.root / "systemd/setup-server-github-runner@.service"
+
+    def install(self, *arguments, stdin=GITHUB_PAGE, **env):
+        return self.run_script("install-runner", "--provider", "github", "--tarball", str(self.archive), *arguments,
+                               stdin=stdin, PATH=f"{self.root_bin}:{self.bin}:{os.environ['PATH']}",
+                               SETUP_SERVER_USER=getpass.getuser(), SETUP_SERVER_SYSTEMD=str(self.root / "systemd"),
+                               SETUP_SERVER_UNIT=str(self.root / "systemd/setup-server-runner.service"), **env)
+
+    def everything_written(self):
+        texts = [self.calls.read_text() if self.calls.exists() else "", self.sudo_log.read_text()]
+        for path in (self.root / "srv").rglob("*"):
+            if path.is_file():
+                texts.append(path.read_text(errors="replace"))
+        for path in (self.root / "systemd").rglob("*"):
+            texts.append(path.read_text())
+        return "\n".join(texts)
+
+    def test_it_verifies_registers_as_the_account_and_starts_its_own_service(self):
+        (self.root / "systemd").mkdir()
+        result = self.install("--sha256", self.sha256.upper())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("SHA-256 verified", result.stdout)
+        config = self.config_log.read_text()
+        self.assertIn("args: --unattended --url https://github.com/BigSant --name worker1 --labels setup.build "
+                      "--work _work --replace", config)
+        self.assertIn(f"token: {GITHUB_TOKEN}", config, "config.sh gets the token from its environment")
+        self.assertIn(f"cwd: {self.directory}", config)
+        sudo = self.sudo_log.read_text()
+        self.assertIn(f"-u {getpass.getuser()} -H --preserve-env=ACTIONS_RUNNER_INPUT_TOKEN ./config.sh", sudo)
+        self.assertNotIn(GITHUB_TOKEN, self.everything_written() + result.stdout + result.stderr,
+                         "the token is on no command line and in no file")
+        self.assertTrue((self.directory / ".runner").is_file())
+        self.assertFalse((self.root / "dependencies.calls").exists(), "ICU is there: no dependencies installed")
+        unit = self.template.read_text()
+        self.assertIn(f"User={getpass.getuser()}", unit)
+        self.assertIn(f"WorkingDirectory={self.root}/srv/github-runner/%i", unit)
+        self.assertIn(f"ExecStart={self.root}/srv/github-runner/%i/bin/runsvc.sh", unit)
+        self.assertIn(f"Environment=SETUP_SERVER_ROOT={self.root}/srv", unit)
+        self.assertIn(f"Environment=SETUP_DIRECTORY={self.root}/srv/setup", unit)
+        self.assertIn("KillMode=process", unit)
+        calls = self.calls.read_text().splitlines()
+        self.assertIn(f"enable --now {GITHUB_UNIT}", calls)
+        self.assertNotIn("restart", self.calls.read_text())
+        self.assertFalse([call for call in calls if "setup-server-runner" in call], "the Bitbucket runner is not touched")
+        self.assertFalse((self.root / "systemd/setup-server-runner.service").exists())
+
+    def test_a_registered_scope_needs_no_token_and_is_not_registered_again(self):
+        (self.root / "systemd").mkdir()
+        self.assertEqual(self.install("--sha256", self.sha256).returncode, 0)
+        self.config_log.unlink()
+        again = self.install(stdin="./config.sh --url https://github.com/BigSant\n", FAKE_ACTIVE="1")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("registered already", again.stdout)
+        self.assertFalse(self.config_log.exists(), "no second registration")
+        self.assertNotIn("still runs the previous unit", again.stdout, "the unit did not change")
+        self.template.write_text("[Service]\n")
+        changed = self.install(stdin="./config.sh --url https://github.com/BigSant\n", FAKE_ACTIVE="1")
+        self.assertIn("restart it when no job runs", changed.stdout)
+        self.assertNotRegex(self.calls.read_text(), r"(?m)^restart ", "a running runner is never restarted")
+
+    def test_an_archive_with_another_checksum_is_not_installed(self):
+        result = self.install()  # the stand-in archive is not the pinned release
+        self.assertEqual(result.returncode, 65, result.stdout + result.stderr)
+        self.assertIn(f"SHA-256 is {self.sha256}, not af4b794c", result.stderr)
+        self.assertFalse(self.config_log.exists())
+        self.assertFalse((self.directory / "config.sh").exists(), "nothing unpacked")
+        self.assertFalse(self.template.exists())
+
+    def test_missing_icu_runs_the_runners_dependency_script_and_a_failed_registration_stops(self):
+        (self.root / "systemd").mkdir()
+        self.stub("ldconfig", 'echo "libc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6"\n')
+        result = self.install("--sha256", self.sha256, FAKE_CONFIG_FAILS="1")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual((self.root / "dependencies.calls").read_text(), "installed\n")
+        self.assertIn("take a new one and run this again", result.stderr)
+        self.assertFalse(self.template.exists(), "no service without a registration")
 
 
 class AddProjectTest(ScriptTest):

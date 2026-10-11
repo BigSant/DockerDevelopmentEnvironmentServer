@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Install the Bitbucket Pipelines Linux Shell runner as a systemd service of the setup account.
+# Install a self-hosted runner as a systemd service of the setup account: the Bitbucket Pipelines Linux
+# Shell runner (default, --provider bitbucket) or a GitHub Actions runner (--provider github, see the
+# GitHub section below). Both can run on one host side by side.
 # Bitbucket's "Runner installation" dialog shows a download link and a Run command (start.sh with the
 # account/runner UUIDs and OAuth credentials). Paste that command on stdin; the credentials go to a
 # root-only environment file, never to the repository or this script's arguments.
@@ -17,27 +19,47 @@ ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
 ACCOUNT=${SETUP_SERVER_USER:-setup}
 CONFIG=${SETUP_SERVER_CONFIG:-/etc/setup-server}
 UNIT=${SETUP_SERVER_UNIT:-/etc/systemd/system/setup-server-runner.service}
+SYSTEMD=${SETUP_SERVER_SYSTEMD:-/etc/systemd/system}
 
 check=0
 tarball=
+provider=bitbucket
+sha256=
+runner_name=
 usage() {
     cat <<EOF
-Usage: sudo $0 [--tarball URL|FILE] [--check] < dialog.txt
-  --tarball   the runner archive; by default the Atlassian download link in the pasted text
+Usage: sudo $0 [--provider bitbucket] [--tarball URL|FILE] [--check] < dialog.txt
+       sudo $0 --provider github [--name NAME] [--tarball URL|FILE --sha256 HASH] [--check] < dialog.txt
+  --provider  bitbucket (default): the Bitbucket Pipelines Linux Shell runner, service setup-server-runner;
+              github: a GitHub Actions runner of one organization or repository, service
+              setup-server-github-runner@<scope> (one per organization or repository)
+  --tarball   the runner archive; Bitbucket: by default the Atlassian download link in the pasted text;
+              GitHub: by default the pinned release from github.com/actions/runner
+  --sha256    GitHub: the archive's SHA-256 when it is not the pinned release (it is always verified)
+  --name      GitHub: the runner's name in GitHub (default: this host's name)
   --check     validate the pasted text and show what would be installed; change nothing
-In a terminal it asks for the dialog's values one by one (the secret is not shown). Piped, it reads
-the whole dialog text (the curl download line and the ./start.sh … --runtime linux-shell command).
+In a terminal it asks for the dialog's values one by one (secrets are not shown). Piped, it reads the
+whole dialog text: Bitbucket's (the curl download line and the ./start.sh … --runtime linux-shell
+command) or GitHub's (the ./config.sh --url … --token … line).
 EOF
 }
 while [ $# -gt 0 ]; do
     case "$1" in
+        --provider) provider=${2:?--provider needs bitbucket or github}; shift ;;
         --tarball) tarball=${2:?--tarball needs a URL or file}; shift ;;
+        --sha256) sha256=${2:?--sha256 needs a hash}; shift ;;
+        --name) runner_name=${2:?--name needs a name}; shift ;;
         --check) check=1 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 64 ;;
     esac
     shift
 done
+case "$provider" in
+    bitbucket) [ -z "$sha256$runner_name" ] || { echo "--sha256 and --name are for --provider github" >&2; exit 64; } ;;
+    github) ;;
+    *) usage >&2; exit 64 ;;
+esac
 if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
     echo "Run with sudo (or use --check)" >&2
     exit 77
@@ -59,6 +81,183 @@ value() {  # value QUESTION [secret] — a pasted "--flag value" keeps the value
     printf '%s' "$answer"
 }
 braces() { case "$1" in '') ;; '{'*) printf '%s' "$1" ;; *) printf '{%s}' "$1" ;; esac; }
+
+# --- GitHub Actions ------------------------------------------------------------------------------
+# GitHub: Settings → Actions → Runners → New self-hosted runner, of an organization (one runner serves
+# its repositories) or of one repository. That page shows a download and a ./config.sh --url URL
+# --token TOKEN line; the token registers a runner once and expires after one hour. Only the URL and
+# the token are taken: the archive is the pinned release below, verified by its SHA-256.
+# The token reaches neither a command line nor a file: config.sh (run as the account; it refuses root)
+# reads it from ACTIONS_RUNNER_INPUT_TOKEN. Registered, the runner keeps its own credentials in its
+# directory (.runner, .credentials, .credentials_rsaparams), readable by the account: the runner runs as
+# that account, so its jobs can read them, like the Bitbucket runner's OAuth values.
+# Every scope (organization or repository) is one directory $ROOT/github-runner/<scope> and one
+# instance of the template unit setup-server-github-runner@.service. Not GitHub's svc.sh: its unit name
+# is derived from the registration, and pipelines need SETUP_SERVER_ROOT and SETUP_DIRECTORY.
+# The runner updates itself (GitHub's default; a runner not updated within 30 days of a release gets no
+# jobs): it replaces bin/ in its directory, so the unit starts bin/runsvc.sh of the current version.
+GITHUB_VERSION=2.338.0
+# https://github.com/actions/runner/releases/tag/v2.338.0 (its notes and the asset digests agree)
+declare -A GITHUB_SHA256=(
+    [x64]=af4b794c1bc41d73d40535e3fe092a39f9679cd8d965954c2aca25a05ca41d32
+    [arm64]=628b4a7258487b80c1d3c221095a7ded349f5ae0175fd3dfab708d07428f041b
+)
+# GitHub adds self-hosted, Linux and X64 itself; workflows ask for runs-on: [self-hosted, linux, setup.build].
+GITHUB_LABEL=setup.build
+GITHUB_UNIT=setup-server-github-runner
+
+flag_value() {  # flag_value FLAG TEXT — the word after the flag ("--flag value" or "--flag=value")
+    printf '%s' "$2" | tr '\n\\' '  ' | grep -oE -- "$1[[:space:]=]+[^[:space:]]+" | head -n1 | sed -E "s/^$1[[:space:]=]+//" || true
+}
+
+github() {
+    local text= url token=
+    if [ -t 0 ]; then
+        echo "Copy the values from GitHub's New self-hosted runner page (Settings → Actions → Runners)." >&2
+        text=$(ask "Organization or repository URL (the --url value, e.g. https://github.com/BigSant)")
+        url=$(flag_value --url "$text")
+        [ -n "$url" ] || url=$(printf '%s' "$text" | grep -oE 'https://[^[:space:]]+' | head -n1 || true)
+        token=$(flag_value --token "$text")
+    else
+        read -r -d '' text || true
+        url=$(flag_value --url "$text")
+        token=$(flag_value --token "$text")
+    fi
+    url=${url%/}; url=${url%.git}
+    [ -n "$url" ] || { echo "No organization or repository URL (--url) given" >&2; exit 65; }
+    [[ "$url" =~ ^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]*)(/([A-Za-z0-9._-]+))?$ ]] \
+        || { echo "Not a github.com organization or repository URL: $url" >&2; exit 65; }
+    local owner=${BASH_REMATCH[1]} repository=${BASH_REMATCH[3]} scope kind
+    scope=$(printf '%s' "$owner${repository:+.$repository}" | tr '[:upper:]' '[:lower:]')
+    if [ -n "$repository" ]; then kind="repository $owner/$repository"; else kind="organization $owner"; fi
+    local directory="$ROOT/github-runner/$scope" unit="$GITHUB_UNIT@$scope.service" configured=0
+    [ ! -f "$directory/.runner" ] || configured=1
+
+    if [ "$configured" = 0 ]; then
+        if [ -t 0 ] && [ -z "$token" ]; then
+            token=$(value "Registration token (the --token value; valid one hour; not shown)" secret)
+        fi
+        [ -n "$token" ] || { echo "No registration token (--token) given" >&2; exit 65; }
+        [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "Unexpected characters in the registration token" >&2; exit 65; }
+    fi
+    local name=${runner_name:-$(hostname -s)}
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "Unexpected runner name: $name" >&2; exit 65; }
+
+    local machine arch
+    machine=$(uname -m)
+    case "$machine" in
+        x86_64|amd64) arch=x64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) echo "No pinned GitHub runner for $machine" >&2; exit 65 ;;
+    esac
+    local source=${tarball:-https://github.com/actions/runner/releases/download/v$GITHUB_VERSION/actions-runner-linux-$arch-$GITHUB_VERSION.tar.gz}
+    local expected
+    expected=$(printf '%s' "${sha256:-${GITHUB_SHA256[$arch]}}" | tr '[:upper:]' '[:lower:]')
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { echo "--sha256 needs the 64 hex digits of a SHA-256" >&2; exit 64; }
+    local offered
+    offered=$(printf '%s' "$text" | grep -oE "actions-runner-linux-$arch-[0-9][0-9.]*[0-9]\.tar\.gz" | head -n1 \
+        | sed -E 's/.*-([0-9.]+)\.tar\.gz/\1/' || true)
+    if [ -z "$tarball" ] && [ -n "$offered" ] && [ "$offered" != "$GITHUB_VERSION" ]; then
+        echo "Note: GitHub offers $offered; this installs the pinned $GITHUB_VERSION, which then updates itself" >&2
+    fi
+
+    echo "==> GitHub runner of the $kind ($url)"
+    if [ "$configured" = 1 ]; then
+        echo "==> $directory is registered already (.runner): no download, no registration, no token needed"
+    else
+        echo "==> runner archive: $source (SHA-256 $expected)"
+        echo "==> runner $name: labels self-hosted, Linux, X64 (GitHub's) and $GITHUB_LABEL; directory $directory"
+        echo "==> registration token: <hidden> (${#token} characters; used once, not stored)"
+    fi
+    echo "==> service $unit (account $ACCOUNT); the Bitbucket runner's service is not touched"
+    if [ "$check" = 1 ]; then
+        if [ "$configured" = 0 ]; then
+            echo "==> would download and verify the archive, unpack it into $directory, register it as $ACCOUNT (config.sh), write $SYSTEMD/$GITHUB_UNIT@.service and start $unit"
+        else
+            echo "==> would write $SYSTEMD/$GITHUB_UNIT@.service and start $unit unless it runs"
+        fi
+        exit 0
+    fi
+
+    # --- Unpack and register --------------------------------------------------------------------
+    install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$ROOT/github-runner" "$directory"
+    if [ "$configured" = 0 ]; then
+        local actual  # archive stays global: the EXIT trap removes it after this function returned
+        archive=$(mktemp)
+        trap 'rm -f "$archive"' EXIT
+        if [ -f "$source" ]; then cp "$source" "$archive"; else curl -fsSL "$source" -o "$archive"; fi
+        actual=$(sha256sum "$archive" | cut -d' ' -f1)
+        if [ "$actual" != "$expected" ]; then
+            echo "The archive's SHA-256 is $actual, not $expected; nothing installed" >&2
+            exit 65
+        fi
+        echo "==> SHA-256 verified"
+        tar -xzf "$archive" -C "$directory"
+        [ -x "$directory/config.sh" ] && [ -x "$directory/bin/runsvc.sh" ] \
+            || { echo "The archive has no config.sh and bin/runsvc.sh" >&2; exit 65; }
+        chown -R "$ACCOUNT:$ACCOUNT" "$directory"
+        # config.sh stops without ICU (and a few other libraries); the runner's own script installs them.
+        if ! ldconfig -p 2>/dev/null | grep -q 'libicu'; then
+            echo "==> installing the runner's dependencies (its bin/installdependencies.sh)"
+            "$directory/bin/installdependencies.sh"
+        fi
+        echo "==> registering with GitHub as $ACCOUNT"
+        if ! (cd "$directory" && ACTIONS_RUNNER_INPUT_TOKEN=$token sudo -u "$ACCOUNT" -H --preserve-env=ACTIONS_RUNNER_INPUT_TOKEN \
+                ./config.sh --unattended --url "$url" --name "$name" --labels "$GITHUB_LABEL" --work _work --replace); then
+            echo "The registration failed. A token registers once and only within an hour: take a new one and run this again" >&2
+            exit 1
+        fi
+        [ -f "$directory/.runner" ] || { echo "config.sh wrote no $directory/.runner" >&2; exit 1; }
+    fi
+
+    # --- Service --------------------------------------------------------------------------------
+    local template="$SYSTEMD/$GITHUB_UNIT@.service" staged changed=0 running=0
+    staged=$(mktemp)
+    cat > "$staged" <<EOF
+[Unit]
+Description=GitHub Actions runner %i (setup-server)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=$ACCOUNT
+Group=$ACCOUNT
+# One registered runner per organization or repository: $ROOT/github-runner/<scope> (bin/install-runner).
+WorkingDirectory=$ROOT/github-runner/%i
+# Workflows run make in each project's build root; the shared setup checkout lives beside them.
+Environment=SETUP_DIRECTORY=$ROOT/setup
+# Workflows find a project's build root as \$SETUP_SERVER_ROOT/projects/<repository name in lower case>.
+Environment=SETUP_SERVER_ROOT=$ROOT
+# bin/ of the current version: the runner replaces bin/ when it updates itself.
+ExecStart=$ROOT/github-runner/%i/bin/runsvc.sh
+# As GitHub's own service template: runsvc.sh stops the runner gracefully, a running job may finish.
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=5min
+# The runner exits cleanly when it is removed in GitHub; then it stays stopped.
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    cmp -s "$staged" "$template" 2>/dev/null || changed=1
+    install -m 0644 "$staged" "$template"
+    rm -f "$staged"
+    systemctl daemon-reload
+    ! systemctl is-active --quiet "$unit" || running=1
+    systemctl enable --now "$unit"
+    if [ "$running" = 1 ] && [ "$changed" = 1 ]; then
+        echo "==> $unit still runs the previous unit; restart it when no job runs: sudo systemctl restart $unit"
+    fi
+    echo "==> runner service $unit is $(systemctl is-active "$unit" || true); GitHub shows the runner Idle within a minute"
+}
+if [ "$provider" = github ]; then
+    github
+    exit 0
+fi
+
+# --- Bitbucket -----------------------------------------------------------------------------------
 if [ -t 0 ]; then
     # In a terminal: one value at a time from the dialog; the secret is not echoed.
     echo "Copy the values from Bitbucket's runner installation dialog, one at a time." >&2
