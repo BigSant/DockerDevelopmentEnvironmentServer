@@ -3,26 +3,36 @@
 # repository and, when the shop/application code is a separate repository, app/public is its clone.
 # <name> defaults to the repository's slug, so a pipeline finds it without configuration:
 # BUILD_ROOT=${BUILD_ROOT:-$SETUP_SERVER_ROOT/projects/$BITBUCKET_REPO_SLUG}. Nobody works in it by hand.
+# Git access: Bitbucket repositories (and --shared-key) use the account's key ($ROOT/.ssh/id_ed25519,
+# added read-only to each repository). GitHub does not accept one deploy key on several repositories
+# (the account's key is the setup repository's already), so a github.com SSH URL gets its own key
+# $ROOT/.ssh/github-<owner>.<repository> and the host alias github.com-<owner>.<repository> in
+# $ROOT/.ssh/config, and is cloned through that alias.
 set -euo pipefail
 
 ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
 ACCOUNT=${SETUP_SERVER_USER:-setup}
 
 check=0
+shared_key=0
 usage() {
     cat <<EOF
-Usage: sudo $0 [--check] [NAME] ENV_REPO_URL [CODE_REPO_URL]
+Usage: sudo $0 [--check] [--shared-key] [NAME] ENV_REPO_URL [CODE_REPO_URL]
   NAME           directory under $ROOT/projects; defaults to the repository slug of ENV_REPO_URL,
-                 which is what pipelines use (BITBUCKET_REPO_SLUG) — give it only to deviate
+                 which is what pipelines use (BITBUCKET_REPO_SLUG; on GitHub the repository name in
+                 lower case) — give it only to deviate
   ENV_REPO_URL   git URL of the environment repository (cloned into app/)
   CODE_REPO_URL  git URL of a separate code repository (cloned into app/public/); omit when the
                  environment repository already contains public/
+  --shared-key   GitHub: clone with the account's own key (a machine user that reads every repository)
+                 instead of a deploy key per repository
 EOF
 }
 args=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) check=1 ;;
+        --shared-key) shared_key=1 ;;
         -h|--help) usage; exit 0 ;;
         -*) usage >&2; exit 64 ;;
         *) args+=("$1") ;;
@@ -48,25 +58,79 @@ fi
 build_root="$ROOT/projects/$name"
 # Run from a directory the account can read: a caller's home (0750 on Ubuntu) makes git fail early.
 as_account() { if [ "$(id -u)" = 0 ]; then (cd "$ROOT" 2>/dev/null || cd /; sudo -u "$ACCOUNT" -H "$@"); else "$@"; fi; }
+github_repository() {  # github_repository URL — "owner repository" of a github.com SSH URL
+    [[ "$1" =~ ^(git@github\.com:|ssh://git@github\.com/)([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9._-]+)$ ]] || return 1
+    echo "${BASH_REMATCH[2]} ${BASH_REMATCH[3]%.git}"
+}
+scope_of() { printf '%s.%s' "$1" "$2" | tr '[:upper:]' '[:lower:]'; }
+clone_url() {  # clone_url URL — the URL to clone: through the repository's host alias on GitHub
+    local owner repository
+    if [ "$shared_key" = 0 ] && read -r owner repository < <(github_repository "$1"); then
+        echo "git@github.com-$(scope_of "$owner" "$repository"):$owner/$repository.git"
+    else
+        echo "$1"
+    fi
+}
+deploy_key() {  # deploy_key URL — the per-repository key and host alias of a GitHub URL, once it can read
+    local owner repository scope key alias config="$ROOT/.ssh/config"
+    [ "$shared_key" = 0 ] && read -r owner repository < <(github_repository "$1") || return 0
+    scope=$(scope_of "$owner" "$repository")
+    key="$ROOT/.ssh/github-$scope" alias="github.com-$scope"
+    if [ "$check" = 1 ]; then
+        echo "==> would create the deploy key $key (unless present) and the host alias $alias in $config"
+        return
+    fi
+    install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0700 "$ROOT/.ssh"
+    if [ ! -f "$key" ]; then
+        as_account ssh-keygen -q -t ed25519 -N '' -C "$ACCOUNT@$(hostname) github.com/$owner/$repository" -f "$key"
+        echo "==> created the deploy key $key"
+    fi
+    if ! as_account grep -qx "Host $alias" "$config" 2>/dev/null; then
+        # HostName github.com: the host key recorded for github.com (bin/prepare-host) is the one checked.
+        printf '\n# bin/add-project: read-only deploy key of github.com/%s/%s\nHost %s\n    HostName github.com\n    User git\n    IdentityFile %s\n    IdentitiesOnly yes\n' \
+            "$owner" "$repository" "$alias" "$key" | as_account tee -a "$config" >/dev/null
+        as_account chmod 0600 "$config"
+        echo "==> added the host alias $alias to $config"
+    fi
+    if ! as_account git ls-remote -q "$(clone_url "$1")" >/dev/null 2>&1; then
+        echo "==> Needs attention: the deploy key cannot read github.com/$owner/$repository yet. Add it at"
+        echo "    https://github.com/$owner/$repository/settings/keys (Add deploy key; leave \"Allow write access\" off),"
+        echo "    fingerprint $(ssh-keygen -lf "$key.pub" | cut -d' ' -f2), then run this again:"
+        sed 's/^/    /' "$key.pub"
+        exit 1
+    fi
+}
 clone() {  # clone URL DIRECTORY — an existing checkout of the same remote is kept as it is
+    local clone_url remote
+    clone_url=$(clone_url "$1")
     if [ -d "$2/.git" ]; then
         remote=$(as_account git -C "$2" remote get-url origin)
-        [ "$remote" = "$1" ] || { echo "$2 already holds $remote, not $1" >&2; exit 65; }
+        [ "$remote" = "$1" ] || [ "$remote" = "$clone_url" ] || { echo "$2 already holds $remote, not $1" >&2; exit 65; }
         echo "==> $2: present"
         return
     fi
     [ ! -e "$2" ] || { echo "$2 exists and is not a git checkout; preserved" >&2; exit 65; }
-    echo "==> $([ "$check" = 1 ] && echo would clone || echo cloning) $1 into $2"
-    [ "$check" = 1 ] || as_account git clone -q "$1" "$2"
+    deploy_key "$1"
+    echo "==> $([ "$check" = 1 ] && echo would clone || echo cloning) $clone_url into $2"
+    [ "$check" = 1 ] || as_account git clone -q "$clone_url" "$2"
 }
 
 [ "$check" = 1 ] || [ -d "$build_root" ] || install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$build_root"
 clone "$env_repo" "$build_root/app"
 [ -z "$code_repo" ] || clone "$code_repo" "$build_root/app/public"
 echo "==> Build root: $build_root"
-if [ "$name" = "$slug" ]; then
-    echo "    Pipelines of '$slug' find it themselves (\$SETUP_SERVER_ROOT/projects/\$BITBUCKET_REPO_SLUG)."
+if [[ "$env_repo" == *github.com[:/]* ]]; then
+    if [ "$name" = "$slug" ]; then
+        echo "    Workflows of '$slug' find it themselves (\$SETUP_SERVER_ROOT/projects/<repository name in lower case>)."
+    else
+        echo "    The name differs from the repository name '$slug': set the Actions variable BUILD_ROOT=$build_root."
+    fi
+    echo "    Fill env/<stage|prod>.env.example (no secrets) and add the secrets as GitHub environment secrets."
 else
-    echo "    The name differs from the repository slug '$slug': set the repository variable BUILD_ROOT=$build_root."
+    if [ "$name" = "$slug" ]; then
+        echo "    Pipelines of '$slug' find it themselves (\$SETUP_SERVER_ROOT/projects/\$BITBUCKET_REPO_SLUG)."
+    else
+        echo "    The name differs from the repository slug '$slug': set the repository variable BUILD_ROOT=$build_root."
+    fi
+    echo "    Fill env/<stage|prod>.env.example (no secrets) and add the secrets as Deployment variables (Secured)."
 fi
-echo "    Fill env/<stage|prod>.env.example (no secrets) and add the secrets as Deployment variables (Secured)."

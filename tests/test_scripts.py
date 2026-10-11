@@ -459,6 +459,68 @@ class AddProjectTest(ScriptTest):
         self.assertIn(f"into {self.root}/srv/projects/forsena_docker/app/public", two.stdout)
 
 
+class AddGitHubProjectTest(ScriptTest):
+    """add-project with GitHub repositories: a deploy key and host alias per repository (GitHub refuses one
+    deploy key on several repositories), or the account's key with --shared-key."""
+
+    def test_check_plans_a_deploy_key_and_alias_per_repository(self):
+        result = self.run_script("add-project", "--check", "git@github.com:BigSant/Forsena_Docker.git",
+                                 "ssh://git@github.com/BigSant/forsena.git")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        ssh = self.root / "srv/.ssh"
+        self.assertIn(f"would create the deploy key {ssh}/github-bigsant.forsena_docker (unless present) and the host "
+                      f"alias github.com-bigsant.forsena_docker in {ssh}/config", result.stdout)
+        self.assertIn("would clone git@github.com-bigsant.forsena_docker:BigSant/Forsena_Docker.git into "
+                      f"{self.root}/srv/projects/forsena_docker/app", result.stdout)
+        self.assertIn("would clone git@github.com-bigsant.forsena:BigSant/forsena.git into "
+                      f"{self.root}/srv/projects/forsena_docker/app/public", result.stdout)
+        self.assertIn("Workflows of 'forsena_docker' find it themselves", result.stdout)
+        self.assertIn("GitHub environment secrets", result.stdout)
+        self.assertFalse((self.root / "srv").exists(), "--check changes nothing")
+
+    def test_a_shared_key_clones_the_url_as_given(self):
+        result = self.run_script("add-project", "--check", "--shared-key", "git@github.com:BigSant/asana_tracker.git")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("would clone git@github.com:BigSant/asana_tracker.git into", result.stdout)
+        self.assertNotIn("deploy key", result.stdout)
+
+    def test_the_key_waits_for_github_and_the_alias_reaches_github_with_only_that_key(self):
+        root_bin = self.fake_root()
+        # git: ls-remote reads only with FAKE_ACCESS; clone records its URL as origin.
+        self.stub("git", 'case "$1" in\n'
+                         '  ls-remote) echo "$*" >> "$GIT_LOG"; [ -n "${FAKE_ACCESS:-}" ];;\n'
+                         '  clone) for last; do :; done; mkdir -p "$last/.git"; echo "$3" > "$last/.git/origin"; echo "$*" >> "$GIT_LOG";;\n'
+                         '  -C) cat "$2/.git/origin";;\n'
+                         'esac\n')
+        git_log = self.root / "git.calls"
+        run = lambda **env: self.run_script("add-project", "git@github.com:BigSant/Forsena_Docker.git",
+                                            PATH=f"{root_bin}:{self.bin}:{os.environ['PATH']}",
+                                            SETUP_SERVER_USER=getpass.getuser(), GIT_LOG=str(git_log), **env)
+        waiting = run()
+        self.assertEqual(waiting.returncode, 1, waiting.stdout + waiting.stderr)
+        key = self.root / "srv/.ssh/github-bigsant.forsena_docker"
+        self.assertIn("https://github.com/BigSant/Forsena_Docker/settings/keys", waiting.stdout)
+        self.assertIn(key.with_name(key.name + ".pub").read_text().strip(), waiting.stdout)
+        self.assertNotIn("clone", git_log.read_text())
+        public = key.with_name(key.name + ".pub").read_text()
+        config = self.root / "srv/.ssh/config"
+        self.assertEqual(config.stat().st_mode & 0o777, 0o600)
+
+        cloned = run(FAKE_ACCESS="1")
+        self.assertEqual(cloned.returncode, 0, cloned.stdout + cloned.stderr)
+        self.assertIn("clone -q git@github.com-bigsant.forsena_docker:BigSant/Forsena_Docker.git", git_log.read_text())
+        self.assertEqual(key.with_name(key.name + ".pub").read_text(), public, "the key is made once")
+        self.assertEqual(config.read_text().count("Host github.com-bigsant.forsena_docker"), 1, "the alias is added once")
+        again = run(FAKE_ACCESS="1")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("app: present", again.stdout)
+        # Real ssh resolves the alias to github.com with only this key (the host key of github.com is checked).
+        resolved = subprocess.run(["ssh", "-G", "-F", str(config), "github.com-bigsant.forsena_docker"],
+                                  capture_output=True, text=True, check=True).stdout.splitlines()
+        for line in ("hostname github.com", "user git", f"identityfile {key}", "identitiesonly yes"):
+            self.assertIn(line, resolved)
+
+
 class RemoveProjectTest(ScriptTest):
     def setUp(self):
         super().setUp()
