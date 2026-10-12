@@ -73,7 +73,7 @@ NAME = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}')
 GIT_URL = re.compile(r'(?:git@[A-Za-z0-9.-]+:|ssh://git@[A-Za-z0-9.-]+(?::[0-9]{1,5})?/|https://[A-Za-z0-9.-]+/)'
                      r'[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*')
 # bin/add-project's own pattern of a target, with the optional ENV= of one environment.
-TARGET = re.compile(r'(?:(?:stage|prod)=)?(?:local|ssh://(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+)')
+TARGET = re.compile(r'(?:(?:stage|prod)=)?(?:local(?::/[A-Za-z0-9._/-]+)?|ssh://(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+)')
 REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,99}')
 RUNNER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
 KEY_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
@@ -255,7 +255,7 @@ def plan_add_project(form, status):
         raise Invalid('Taikinių – ne daugiau kaip trys (bendras, stage=, prod=).')
     for target in targets:
         if len(target) > 200 or not TARGET.fullmatch(target):
-            raise Invalid(f'Netinkamas taikinys: {target[:80]} (local arba ssh://VARTOTOJAS@SERVERIS/KELIAS, '
+            raise Invalid(f'Netinkamas taikinys: {target[:80]} (local, local:/KELIAS arba ssh://VARTOTOJAS@SERVERIS/KELIAS, '
                           'prieš jį gali būti stage= ar prod=).')
     arguments = (['--shared-key'] if flag(form, 'shared_key') else []) + [part for target in targets for part in ('--target', target)]
     arguments += ([name] if name else []) + [env_repo] + ([code_repo] if code_repo else [])
@@ -914,7 +914,7 @@ class Page:
             text('env_repo', 'Aplinkos repo URL', 'git@bitbucket.org:darbo-erdve/projektas.git') +
             text('code_repo', 'Kodo repo URL (nebūtina)', 'git@bitbucket.org:darbo-erdve/kodas.git') +
             text('name', 'Vardas (nebūtina)', 'numatyta – repo vardas') +
-            '<label><span>Taikinys (po vieną eilutėje)</span><textarea name="targets" placeholder="local&#10;prod=ssh://deploy@shop.example/home/deploy/shop"></textarea></label>'
+            '<label><span>Taikinys (po vieną eilutėje)</span><textarea name="targets" placeholder="local&#10;local:/home/vartotojas/projektas&#10;prod=ssh://deploy@shop.example/home/deploy/shop"></textarea></label>'
             '<label><input type="checkbox" name="shared_key" value="yes"> GitHub: paskyros raktas (--shared-key)</label>',
             note='Naujam projektui taikinys privalomas (local – šis serveris). Esamam tuščias laukas taikinio nekeičia. Projekto pašalinimas – projekto puslapyje.')
         body += '<h2>Runner\'iai</h2>' + self.form(

@@ -186,6 +186,11 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    - **Taikinys nurodomas visada:** naujas projektas be `--target` nesukuriamas (nieko neklonuoja).
    - **`local`** – šis serveris (`DEPLOY_CONTEXT=default`), projekto šaknis yra build katalogas,
      konteineriai veikia paskyra `setup` (jos `APP_UID`/`APP_GID`).
+   - **`local:/KELIAS`** – šis serveris, bet projekto šaknis kitame kataloge (pvz. `local:/home/vardas/Projects/asana`).
+     Nesantį katalogą scriptas sukuria paskyrai `setup` (0750); esamas turi būti jai rašomas. Failai ir konteineriai –
+     paskyros `setup`. Deploy'us ten kopijuoja kodą, o setup 2.7.0+ ir konteinerių prijungiamus aplinkos failus
+     (`config/` ir kt.). Jei failai turi priklausyti katalogo savininkui, naudok `ssh://SAVININKAS@localhost/KELIAS`
+     (tada kopijuojama ir konteineriai veikia jo vardu; jam reikia `setup` rakto ir `docker` grupės).
    - **`ssh://VARTOTOJAS@SERVERIS/KELIAS`** – kitas serveris: paskyra `setup` jungiasi savo raktu
      (`/srv/setup-server/.ssh/id_ed25519`; jei negali – scriptas parodo raktą, kurį reikia įdėti į
      `VARTOTOJAS` `authorized_keys`, ir sustoja), patikrina Docker ir ar `KELIAS` rašomas, perima vartotojo

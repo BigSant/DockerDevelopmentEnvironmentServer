@@ -33,7 +33,8 @@ Usage: sudo $0 [--check] [--shared-key] [--target [ENV=]local|ssh://USER@HOST/PA
   --shared-key   GitHub: clone with the account's own key (a machine user that reads every repository)
                  instead of a deploy key per repository
   --target       where stage/prod deploy (target.env), required for a new project: local = this host, the build root, the
-                 account's ids; ssh://USER@HOST/PATH = a server reached as USER (key: $ROOT/.ssh/id_ed25519),
+                 account's ids; local:/PATH = this host, project root PATH (created for $ACCOUNT, or writable by it);
+                 ssh://USER@HOST/PATH = a server reached as USER (key: $ROOT/.ssh/id_ed25519),
                  project root PATH. stage=... or prod=... registers one environment (target.<env>.env).
                  Repeatable. Without it a rerun keeps the registered target.
 EOF
@@ -128,13 +129,33 @@ clone() {  # clone URL DIRECTORY — an existing checkout of the same remote is 
 
 target_lines() {  # target_lines ENV SPEC — the target.env lines of one target (reaches a remote server once)
     local environment=$1 spec=$2 user host path ssh context ids
-    if [ "$spec" = local ]; then
+    if [ "$spec" = local ] || [[ "$spec" == local:* ]]; then
+        # This host. local: the build root is the project root; local:/PATH another directory, which the
+        # deploys fill (code, data and the environment files, setup 2.7.0+) as $ACCOUNT, owner of the files.
+        path=$build_root
+        if [ "$spec" != local ]; then
+            path=${spec#local:}
+            path=${path%/}
+            [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ && "/$path/" != */../* && "/$path/" != */./* ]] \
+                || { echo "--target $spec: expected local:/ABSOLUTE/PATH" >&2; exit 64; }
+            case "$path/" in "$ROOT/"*) [ "$path" = "$build_root" ] || { echo "--target $spec: inside $ROOT, which belongs to setup-server" >&2; exit 64; } ;; esac
+            if [ "$check" = 1 ]; then
+                [ -e "$path" ] || echo "==> would create $path ($ACCOUNT, 0750)" >&2
+            elif [ ! -e "$path" ]; then
+                install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$path"
+                echo "==> created $path ($ACCOUNT, 0750)" >&2
+            elif ! as_account test -d "$path" -a -w "$path"; then
+                echo "$path is not a directory $ACCOUNT can write: chown $ACCOUNT: $path (or give the group setup write" >&2
+                echo "access), or deploy as its owner with --target ssh://OWNER@localhost$path" >&2
+                exit 65
+            fi
+        fi
         printf 'DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH=%s\nAPP_UID=%s\nAPP_GID=%s\n' \
-            "$build_root" "$(id -u "$ACCOUNT" 2>/dev/null || echo 1000)" "$(id -g "$ACCOUNT" 2>/dev/null || echo 1000)"
+            "$path" "$(id -u "$ACCOUNT" 2>/dev/null || echo 1000)" "$(id -g "$ACCOUNT" 2>/dev/null || echo 1000)"
         return
     fi
     [[ "$spec" =~ ^ssh://([a-z_][a-z0-9_.-]*@)?([A-Za-z0-9.-]+)(/[A-Za-z0-9._/-]+)$ ]] \
-        || { echo "--target $spec: expected local or ssh://USER@HOST/ABSOLUTE/PATH" >&2; exit 64; }
+        || { echo "--target $spec: expected local, local:/PATH or ssh://USER@HOST/ABSOLUTE/PATH" >&2; exit 64; }
     user=${BASH_REMATCH[1]%@} host=${BASH_REMATCH[2]} path=${BASH_REMATCH[3]%/}
     ssh=${user:+$user@}$host
     context="setup-$name${environment:+-$environment}"

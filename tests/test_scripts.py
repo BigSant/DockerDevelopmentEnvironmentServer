@@ -501,7 +501,7 @@ class AddProjectTargetTest(ScriptTest):
                       "    DEPLOY_PATH=/home/deploy/shop", remote.stdout)
         bad = self.run_script("add-project", "--target", "local", "--check", "--target", "ftp://x/y", "git@bitbucket.org:rsmaizys/asana_tracker.git")
         self.assertEqual(bad.returncode, 64)
-        self.assertIn("expected local or ssh://USER@HOST/ABSOLUTE/PATH", bad.stderr)
+        self.assertIn("expected local, local:/PATH or ssh://USER@HOST/ABSOLUTE/PATH", bad.stderr)
         self.assertFalse((self.root / "srv").exists(), "--check changes nothing")
 
     def test_the_local_target_is_written_once_and_kept_on_a_rerun(self):
@@ -517,6 +517,34 @@ class AddProjectTargetTest(ScriptTest):
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn("deploy target kept", again.stdout)
         self.assertTrue(target.read_text().endswith("# edited\n"))
+
+    def test_a_local_directory_target_is_created_for_the_account_or_must_be_writable(self):
+        place = self.root / "home/someone/projects/asana"
+        check = self.run_script("add-project", "--check", "--target", f"local:{place}", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn(f"would create {place}", check.stderr)
+        self.assertIn(f"DEPLOY_CONTEXT=default\n    DEPLOY_SSH=\n    DEPLOY_PATH={place}\n", check.stdout)
+        self.assertFalse(place.exists(), "--check changes nothing")
+        for spec, message in ((f"local:{self.root}/srv/projects/other", "belongs to setup-server"),
+                              ("local:relative/path", "expected local:/ABSOLUTE/PATH"),
+                              (f"local:{place}/../x", "expected local:/ABSOLUTE/PATH")):
+            with self.subTest(spec=spec):
+                refused = self.run_script("add-project", "--check", "--target", spec, "git@bitbucket.org:rsmaizys/asana_tracker.git")
+                self.assertEqual(refused.returncode, 64, refused.stdout + refused.stderr)
+                self.assertIn(message, refused.stderr)
+        result = self.run_add("--target", f"prod=local:{place}", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(place.is_dir())
+        text = (self.root / "srv/projects/asana_tracker/target.prod.env").read_text()
+        self.assertIn(f"DEPLOY_PATH={place}\nAPP_UID={os.getuid()}\n", text)
+        if os.getuid() != 0:
+            locked = self.root / "home/locked"
+            locked.mkdir(parents=True)
+            locked.chmod(0o555)
+            self.addCleanup(locked.chmod, 0o755)
+            refused = self.run_add("--target", f"local:{locked}", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+            self.assertEqual(refused.returncode, 65, refused.stdout + refused.stderr)
+            self.assertIn("--target ssh://OWNER@localhost", refused.stderr)
 
     def test_a_remote_target_needs_the_key_then_gets_a_context_and_the_users_ids(self):
         arguments = ("--target", "prod=ssh://deploy@shop.example/home/deploy/shop", "git@bitbucket.org:rsmaizys/forsena_docker.git")
