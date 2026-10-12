@@ -5,6 +5,7 @@
 set -euo pipefail
 
 ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+ACCOUNT=${SETUP_SERVER_USER:-setup}
 
 check=0
 with_backups=0
@@ -64,9 +65,15 @@ if [ $((backups + deploys)) -gt 0 ] && [ "$with_backups" = 0 ]; then
     exit 65
 fi
 
+# The Docker contexts bin/add-project made for a remote target (setup-<name>, setup-<name>-<env>).
+as_account() { if [ "$(id -u)" = 0 ]; then (cd / && sudo -u "$ACCOUNT" -H "$@"); else "$@"; fi; }
+contexts=$({ as_account docker context ls --format '{{.Name}}' 2>/dev/null || true; } | grep -E "^setup-$name(-stage|-prod)?$" || true)
 if [ "$check" = 1 ]; then
-    echo "==> would remove $build_root; nothing was changed"
+    echo "==> would remove $build_root$([ -z "$contexts" ] || echo " and the Docker contexts $(echo $contexts)"); nothing was changed"
     exit 0
 fi
 rm -rf -- "$build_root"
 echo "==> removed $build_root"
+for context in $contexts; do
+    as_account docker context rm -f "$context" >/dev/null && echo "==> removed the Docker context $context"
+done

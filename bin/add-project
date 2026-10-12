@@ -8,6 +8,11 @@
 # (the account's key is the setup repository's already), so a github.com SSH URL gets its own key
 # $ROOT/.ssh/github-<owner>.<repository> and the host alias github.com-<owner>.<repository> in
 # $ROOT/.ssh/config, and is cloned through that alias.
+# The deploy target is the server's, not the project's: target.env in the build root (setup reads it on
+# every deploy) names DEPLOY_CONTEXT, DEPLOY_SSH, DEPLOY_PATH, APP_UID and APP_GID. By default this host,
+# the build root itself and the account's ids; --target ssh://USER@HOST/PATH a remote server (a Docker
+# context setup-<name> of the account), ENV=... one environment only (target.<env>.env). A rerun keeps
+# the clones and the registered target unless --target is given.
 set -euo pipefail
 
 ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
@@ -15,9 +20,10 @@ ACCOUNT=${SETUP_SERVER_USER:-setup}
 
 check=0
 shared_key=0
+targets=()
 usage() {
     cat <<EOF
-Usage: sudo $0 [--check] [--shared-key] [NAME] ENV_REPO_URL [CODE_REPO_URL]
+Usage: sudo $0 [--check] [--shared-key] [--target [ENV=]local|ssh://USER@HOST/PATH] [NAME] ENV_REPO_URL [CODE_REPO_URL]
   NAME           directory under $ROOT/projects; defaults to the repository slug of ENV_REPO_URL,
                  which is what pipelines use (BITBUCKET_REPO_SLUG; on GitHub the repository name in
                  lower case) — give it only to deviate
@@ -26,6 +32,10 @@ Usage: sudo $0 [--check] [--shared-key] [NAME] ENV_REPO_URL [CODE_REPO_URL]
                  environment repository already contains public/
   --shared-key   GitHub: clone with the account's own key (a machine user that reads every repository)
                  instead of a deploy key per repository
+  --target       where stage/prod deploy (target.env): local (default) = this host, the build root, the
+                 account's ids; ssh://USER@HOST/PATH = a server reached as USER (key: $ROOT/.ssh/id_ed25519),
+                 project root PATH. stage=... or prod=... registers one environment (target.<env>.env).
+                 Repeatable. Without it a rerun keeps the registered target.
 EOF
 }
 args=()
@@ -33,6 +43,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --check) check=1 ;;
         --shared-key) shared_key=1 ;;
+        --target) targets+=("${2:?--target needs local or ssh://USER@HOST/PATH}"); shift ;;
         -h|--help) usage; exit 0 ;;
         -*) usage >&2; exit 64 ;;
         *) args+=("$1") ;;
@@ -115,9 +126,72 @@ clone() {  # clone URL DIRECTORY — an existing checkout of the same remote is 
     [ "$check" = 1 ] || as_account git clone -q "$clone_url" "$2"
 }
 
+target_lines() {  # target_lines ENV SPEC — the target.env lines of one target (reaches a remote server once)
+    local environment=$1 spec=$2 user host path ssh context ids
+    if [ "$spec" = local ]; then
+        printf 'DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH=%s\nAPP_UID=%s\nAPP_GID=%s\n' \
+            "$build_root" "$(id -u "$ACCOUNT" 2>/dev/null || echo 1000)" "$(id -g "$ACCOUNT" 2>/dev/null || echo 1000)"
+        return
+    fi
+    [[ "$spec" =~ ^ssh://([a-z_][a-z0-9_.-]*@)?([A-Za-z0-9.-]+)(/[A-Za-z0-9._/-]+)$ ]] \
+        || { echo "--target $spec: expected local or ssh://USER@HOST/ABSOLUTE/PATH" >&2; exit 64; }
+    user=${BASH_REMATCH[1]%@} host=${BASH_REMATCH[2]} path=${BASH_REMATCH[3]%/}
+    ssh=${user:+$user@}$host
+    context="setup-$name${environment:+-$environment}"
+    if [ "$check" = 1 ]; then
+        printf 'DEPLOY_CONTEXT=%s\nDEPLOY_SSH=%s\nDEPLOY_PATH=%s\nAPP_UID=<id -u of %s>\nAPP_GID=<id -g>\n' \
+            "$context" "$ssh" "$path" "${user:-the login}"
+        return
+    fi
+    # The account's own key; a new host key is recorded on first contact and shown below.
+    if ! ids=$(as_account ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new "$ssh" \
+               "id -u; id -g; docker version --format '{{.Server.Version}}' 2>/dev/null || echo no-docker; test -d '$path' && test -w '$path' && echo writable || echo not-writable" 2>&1); then
+        echo "==> Needs attention: $ACCOUNT cannot log in to $ssh without a password." >&2
+        echo "    Add this key to ~${user:-<user>}/.ssh/authorized_keys on $host, then run this again:" >&2
+        sed 's/^/    /' "$ROOT/.ssh/id_ed25519.pub" >&2 2>/dev/null || echo "    (no $ROOT/.ssh/id_ed25519.pub: run bin/prepare-host)" >&2
+        echo "    ssh said: $(echo "$ids" | tail -n 1)" >&2
+        exit 1
+    fi
+    mapfile -t ids <<< "$ids"
+    [[ "${ids[0]:-}" =~ ^[0-9]+$ && "${ids[1]:-}" =~ ^[0-9]+$ ]] || { echo "Unexpected answer from $ssh: ${ids[*]}" >&2; exit 1; }
+    [ "${ids[2]:-}" != no-docker ] || { echo "$ssh: docker does not answer for ${user:-the login} (install Docker, add the user to the docker group)" >&2; exit 1; }
+    [ "${ids[3]:-}" = writable ] || { echo "$ssh: $path is missing or not writable for ${user:-the login}; create it" >&2; exit 1; }
+    if as_account docker context inspect "$context" >/dev/null 2>&1; then
+        as_account docker context update "$context" --docker "host=ssh://$ssh" >/dev/null
+    else
+        as_account docker context create "$context" --docker "host=ssh://$ssh" >/dev/null
+    fi
+    echo "==> Docker context $context: ssh://$ssh (Docker ${ids[2]}; host key $(as_account ssh-keygen -F "$host" 2>/dev/null | awk '!/^#/ {print $2; exit}'))" >&2
+    printf 'DEPLOY_CONTEXT=%s\nDEPLOY_SSH=%s\nDEPLOY_PATH=%s\nAPP_UID=%s\nAPP_GID=%s\n' "$context" "$ssh" "$path" "${ids[0]}" "${ids[1]}"
+}
+register_target() {  # register_target [ENV=]SPEC — write target.env or target.<env>.env
+    local environment= spec=$1 file lines
+    case "$spec" in stage=*|prod=*) environment=${spec%%=*}; spec=${spec#*=} ;; esac
+    file="$build_root/target${environment:+.$environment}.env"
+    lines=$(target_lines "$environment" "$spec")
+    if [ "$check" = 1 ]; then
+        echo "==> would write $file:"
+        echo "$lines" | sed 's/^/    /'
+        return
+    fi
+    { echo "# bin/add-project: where ${environment:-stage and prod} of $name deploy$([ -z "$environment" ] || echo s) (setup-server; not secret, not in git)."
+      echo "$lines"; } | as_account tee "$file.new" >/dev/null
+    as_account chmod 0640 "$file.new"
+    as_account mv -f "$file.new" "$file"
+    echo "==> deploy target ${environment:-stage/prod}: $file"
+    echo "$lines" | sed 's/^/    /'
+}
+
 [ "$check" = 1 ] || [ -d "$build_root" ] || install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$build_root"
 clone "$env_repo" "$build_root/app"
 [ -z "$code_repo" ] || clone "$code_repo" "$build_root/app/public"
+if [ ${#targets[@]} -gt 0 ]; then
+    for target in "${targets[@]}"; do register_target "$target"; done
+elif [ ! -f "$build_root/target.env" ]; then
+    register_target local
+else
+    echo "==> deploy target kept: $build_root/target.env (change it with --target)"
+fi
 echo "==> Build root: $build_root"
 if [[ "$env_repo" == *github.com[:/]* ]]; then
     if [ "$name" = "$slug" ]; then
@@ -125,12 +199,14 @@ if [[ "$env_repo" == *github.com[:/]* ]]; then
     else
         echo "    The name differs from the repository name '$slug': set the Actions variable BUILD_ROOT=$build_root."
     fi
-    echo "    Fill env/<stage|prod>.env.example (no secrets) and add the secrets as GitHub environment secrets."
+    echo "    Fill env/<stage|prod>.env.example (no secrets, no DEPLOY_*/APP_UID/APP_GID: the target is in target.env)"
+    echo "    and add the secrets as GitHub environment secrets."
 else
     if [ "$name" = "$slug" ]; then
         echo "    Pipelines of '$slug' find it themselves (\$SETUP_SERVER_ROOT/projects/\$BITBUCKET_REPO_SLUG)."
     else
         echo "    The name differs from the repository slug '$slug': set the repository variable BUILD_ROOT=$build_root."
     fi
-    echo "    Fill env/<stage|prod>.env.example (no secrets) and add the secrets as Deployment variables (Secured)."
+    echo "    Fill env/<stage|prod>.env.example (no secrets, no DEPLOY_*/APP_UID/APP_GID: the target is in target.env)"
+    echo "    and add the secrets as Deployment variables (Secured)."
 fi

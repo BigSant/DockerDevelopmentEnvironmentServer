@@ -461,6 +461,77 @@ class AddProjectTest(ScriptTest):
         self.assertIn(f"into {self.root}/srv/projects/forsena_docker/app/public", two.stdout)
 
 
+class AddProjectTargetTest(ScriptTest):
+    """The deploy target is the server's: target.env (or target.<env>.env) in the build root, never the project's env."""
+
+    def run_add(self, *arguments, **env):
+        root_bin = self.fake_root()
+        self.stub("git", 'case "$1" in\n'
+                         '  clone) for last; do :; done; mkdir -p "$last/.git"; echo "$3" > "$last/.git/origin";;\n'
+                         '  -C) cat "$2/.git/origin";;\n'
+                         'esac\n')
+        self.stub("ssh", 'echo "$*" >> "$SSH_LOG"\n'
+                         '[ -z "${FAKE_SSH_FAIL:-}" ] || { echo "Permission denied (publickey)." >&2; exit 255; }\n'
+                         'printf "1012\\n1013\\n27.3.1\\nwritable\\n"\n')
+        self.stub("docker", 'echo "$*" >> "$DOCKER_LOG"\ncase "$1 $2" in "context inspect") exit 1;; esac\n')
+        self.stub("ssh-keygen", 'echo "shop.example ssh-ed25519 AAAA"\n')
+        (self.root / "srv/.ssh").mkdir(parents=True, exist_ok=True)
+        (self.root / "srv/.ssh/id_ed25519.pub").write_text("ssh-ed25519 AAAAsetupkey setup@worker\n")
+        self.ssh_log, self.docker_log = self.root / "ssh.calls", self.root / "docker.calls"
+        return self.run_script("add-project", *arguments, PATH=f"{root_bin}:{self.bin}:{os.environ['PATH']}",
+                               SETUP_SERVER_USER=getpass.getuser(), SSH_LOG=str(self.ssh_log),
+                               DOCKER_LOG=str(self.docker_log), **env)
+
+    def test_check_plans_the_local_target_and_a_remote_one(self):
+        build_root = self.root / "srv/projects/asana_tracker"
+        local = self.run_script("add-project", "--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(local.returncode, 0, local.stdout + local.stderr)
+        self.assertIn(f"would write {build_root}/target.env:", local.stdout)
+        self.assertIn(f"DEPLOY_CONTEXT=default\n    DEPLOY_SSH=\n    DEPLOY_PATH={build_root}\n", local.stdout)
+        remote = self.run_script("add-project", "--check", "--target", "prod=ssh://deploy@shop.example/home/deploy/shop",
+                                 "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(remote.returncode, 0, remote.stdout + remote.stderr)
+        self.assertIn(f"would write {build_root}/target.prod.env:", remote.stdout)
+        self.assertIn("DEPLOY_CONTEXT=setup-asana_tracker-prod\n    DEPLOY_SSH=deploy@shop.example\n"
+                      "    DEPLOY_PATH=/home/deploy/shop", remote.stdout)
+        bad = self.run_script("add-project", "--check", "--target", "ftp://x/y", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(bad.returncode, 64)
+        self.assertIn("expected local or ssh://USER@HOST/ABSOLUTE/PATH", bad.stderr)
+        self.assertFalse((self.root / "srv").exists(), "--check changes nothing")
+
+    def test_the_local_target_is_written_once_and_kept_on_a_rerun(self):
+        result = self.run_add("git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        target = self.root / "srv/projects/asana_tracker/target.env"
+        text = target.read_text()
+        self.assertIn(f"DEPLOY_PATH={self.root}/srv/projects/asana_tracker\n", text)
+        self.assertIn(f"APP_UID={os.getuid()}\nAPP_GID={os.getgid()}\n", text)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+        target.write_text(text + "# edited\n")
+        again = self.run_add("git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("deploy target kept", again.stdout)
+        self.assertTrue(target.read_text().endswith("# edited\n"))
+
+    def test_a_remote_target_needs_the_key_then_gets_a_context_and_the_users_ids(self):
+        arguments = ("--target", "prod=ssh://deploy@shop.example/home/deploy/shop", "git@bitbucket.org:rsmaizys/forsena_docker.git")
+        refused = self.run_add(*arguments, FAKE_SSH_FAIL="1")
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn("cannot log in to deploy@shop.example without a password", refused.stderr)
+        self.assertIn("ssh-ed25519 AAAAsetupkey setup@worker", refused.stderr)
+        target = self.root / "srv/projects/forsena_docker/target.prod.env"
+        self.assertFalse(target.exists())
+        result = self.run_add(*arguments)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("BatchMode=yes", self.ssh_log.read_text())
+        self.assertIn("context create setup-forsena_docker-prod --docker host=ssh://deploy@shop.example",
+                      self.docker_log.read_text())
+        text = target.read_text()
+        for line in ("DEPLOY_CONTEXT=setup-forsena_docker-prod", "DEPLOY_SSH=deploy@shop.example",
+                     "DEPLOY_PATH=/home/deploy/shop", "APP_UID=1012", "APP_GID=1013"):
+            self.assertIn(line + "\n", text)
+
+
 class AddGitHubProjectTest(ScriptTest):
     """add-project with GitHub repositories: a deploy key and host alias per repository (GitHub refuses one
     deploy key on several repositories), or the account's key with --shared-key."""

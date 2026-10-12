@@ -134,6 +134,9 @@ def secret_store(name, environment):
     """(container, state): setup's secret store of the project ENV; state running, stopped or missing."""
     directory = environment_directory(PROJECTS / name)
     values = {**read_env(directory / 'env/common.env'), **read_env(directory / f'env/{environment}.env')} if directory else {}
+    # The deploy target bin/add-project registered (target.env, target.<env>.env) names the context.
+    for target in (PROJECTS / name / 'target.env', PROJECTS / name / f'target.{environment}.env'):
+        values.update(read_env(target))
     container = f"{values.get('PROJECT_NAME', name)}-{environment}-secrets"
     context = values.get('DEPLOY_CONTEXT')
     command = ['docker', *(['--context', context] if context else []), 'inspect', '--type', 'container',

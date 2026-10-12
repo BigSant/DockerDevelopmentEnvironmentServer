@@ -168,6 +168,28 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    `DOCKER_HOST=tcp://localhost:2375` savo debesies docker servisui, o shell runner'yje Docker yra paties
    serverio (unix socket'as) – kitaip `docker` ir `make release/deploy` neranda daemon'o.
 
+   **Kur deploy'inama (taikinys)** – serverio, ne projekto žinojimas. `add-project` jį įrašo į build katalogo
+   `target.env` (setup 2.6.0+ jį prideda prie `env/<env>.env` kiekvieno deploy'aus metu), o projekto
+   `env/*.env.example` `DEPLOY_CONTEXT`, `DEPLOY_SSH`, `DEPLOY_PATH`, `APP_UID`, `APP_GID` nebemini (setup
+   tokį pavyzdį atmeta):
+
+   ```bash
+   sudo bin/add-project git@bitbucket.org:rsmaizys/asana_tracker.git        # numatyta: šis serveris
+   sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@bitbucket.org:rsmaizys/forsena_docker.git
+   ```
+
+   - **Numatyta (`local`)** – šis serveris (`DEPLOY_CONTEXT=default`), projekto šaknis yra build katalogas,
+     konteineriai veikia paskyra `setup` (jos `APP_UID`/`APP_GID`).
+   - **`ssh://VARTOTOJAS@SERVERIS/KELIAS`** – kitas serveris: paskyra `setup` jungiasi savo raktu
+     (`/srv/setup-server/.ssh/id_ed25519`; jei negali – scriptas parodo raktą, kurį reikia įdėti į
+     `VARTOTOJAS` `authorized_keys`, ir sustoja), patikrina Docker ir ar `KELIAS` rašomas, perima vartotojo
+     `id -u`/`id -g` ir sukuria Docker context'ą `setup-<vardas>[-<env>]`. Naujas host raktas įrašomas
+     pirmo prisijungimo metu (parodomas).
+   - **`stage=…` / `prod=…`** – tik viena aplinka (`target.<env>.env`, laimi prieš bendrą `target.env`),
+     kai stage ir prod skirtinguose serveriuose. `--target` galima kartoti.
+   - Pakartotinai paleistas be `--target` taikinio nekeičia; su `--target` – perrašo. `remove-project`
+     pašalina ir build katalogą (su `target*.env`), ir projekto Docker context'us.
+
    **GitHub projektas:**
 
    ```bash
