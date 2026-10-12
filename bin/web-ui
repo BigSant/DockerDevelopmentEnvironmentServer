@@ -906,14 +906,15 @@ class Page:
     # --- Actions ---
     def actions(self, where):
         def text(name, label, placeholder='', value=''):
+            # autocomplete off: a browser must not fill in a value typed for another project (a build root name).
             return (f'<label><span>{e(label)}</span><input type="text" name="{name}" value="{e(value)}" '
-                    f'placeholder="{e(placeholder)}"></label>')
+                    f'placeholder="{e(placeholder)}" autocomplete="off"></label>')
         body = '<p class="note">Kiekvienas veiksmas pirmiausia paleidžiamas su --check: matai, ką jis darytų, ir tik tada spaudi „Vykdyti“.</p>'
         body += '<h2 id="add-project">Projektai</h2>' + self.form(
             'add-project', 'Pridėti projektą (bin/add-project)',
             text('env_repo', 'Aplinkos repo URL', 'git@bitbucket.org:darbo-erdve/projektas.git') +
             text('code_repo', 'Kodo repo URL (nebūtina)', 'git@bitbucket.org:darbo-erdve/kodas.git') +
-            text('name', 'Vardas (nebūtina)', 'numatyta – repo vardas') +
+            text('name', 'Vardas (palik tuščią: repo vardas, kurį randa pipeline\'as)', 'numatyta – repo vardas') +
             '<label><span>Taikinys (po vieną eilutėje)</span><textarea name="targets" placeholder="local&#10;local:/home/vartotojas/projektas&#10;prod=ssh://deploy@shop.example/home/deploy/shop"></textarea></label>'
             '<label><input type="checkbox" name="shared_key" value="yes"> GitHub: paskyros raktas (--shared-key)</label>',
             note='Naujam projektui taikinys privalomas (local – šis serveris). Esamam tuščias laukas taikinio nekeičia. Projekto pašalinimas – projekto puslapyje.')
