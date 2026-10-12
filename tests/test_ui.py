@@ -470,6 +470,13 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("add-project"), [], "nothing ran")
         allowed = self.request("POST", "/preview", {**form, "csrf": self.csrf()}, headers={"Origin": f"http://localhost:{self.port}"})
         self.assertEqual(allowed[0], 200, allowed[2])
+        # A browser sends the Origin of its form only when the page's Referrer-Policy allows it to the same
+        # origin; with no-referrer every form posts Origin: null and is refused.
+        status, headers, _ = self.request("GET", "/actions")
+        self.assertEqual((status, headers["Referrer-Policy"]), (200, "same-origin"))
+        self.assertEqual(self.request("POST", "/preview", {**form, "csrf": self.csrf()}, headers={"Origin": "null"})[0], 403)
+        tunnel = self.request("POST", "/preview", {**form, "csrf": self.csrf()}, headers={"Origin": f"http://127.0.0.1:{self.port}"})
+        self.assertEqual(tunnel[0], 200, tunnel[2])
 
     def test_only_the_loopback_address_and_complete_settings_are_accepted(self):
         def run(*arguments, **settings):
