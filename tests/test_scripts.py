@@ -445,19 +445,19 @@ class InstallGitHubRunnerRootTest(ScriptTest):
 
 class AddProjectTest(ScriptTest):
     def test_check_plans_the_build_root(self):
-        result = self.run_script("add-project", "--check", "asana", "git@bitbucket.org:ws/asana_tracker.git")
+        result = self.run_script("add-project", "--target", "local", "--check", "asana", "git@bitbucket.org:ws/asana_tracker.git")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"would clone git@bitbucket.org:ws/asana_tracker.git into {self.root}/srv/projects/asana/app",
                       result.stdout)
         self.assertIn(f"BUILD_ROOT={self.root}/srv/projects/asana", result.stdout)
-        self.assertEqual(self.run_script("add-project", "--check", "Bad Name", "x").returncode, 65)
+        self.assertEqual(self.run_script("add-project", "--target", "local", "--check", "Bad Name", "x").returncode, 65)
 
     def test_the_build_root_defaults_to_the_repository_slug(self):
-        result = self.run_script("add-project", "--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        result = self.run_script("add-project", "--target", "local", "--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"into {self.root}/srv/projects/asana_tracker/app", result.stdout)
         self.assertIn("find it themselves", result.stdout)
-        two = self.run_script("add-project", "--check", "git@bitbucket.org:rsmaizys/Forsena_Docker.git",
+        two = self.run_script("add-project", "--target", "local", "--check", "git@bitbucket.org:rsmaizys/Forsena_Docker.git",
                               "git@bitbucket.org:rsmaizys/forsena.git")
         self.assertIn(f"into {self.root}/srv/projects/forsena_docker/app/public", two.stdout)
 
@@ -485,23 +485,27 @@ class AddProjectTargetTest(ScriptTest):
 
     def test_check_plans_the_local_target_and_a_remote_one(self):
         build_root = self.root / "srv/projects/asana_tracker"
-        local = self.run_script("add-project", "--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        missing = self.run_script("add-project", "--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(missing.returncode, 64, missing.stdout + missing.stderr)
+        self.assertIn("Name the deploy target: --target local", missing.stderr)
+        self.assertNotIn("would clone", missing.stdout, "nothing is planned without a target")
+        local = self.run_script("add-project", "--target", "local", "--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
         self.assertEqual(local.returncode, 0, local.stdout + local.stderr)
         self.assertIn(f"would write {build_root}/target.env:", local.stdout)
         self.assertIn(f"DEPLOY_CONTEXT=default\n    DEPLOY_SSH=\n    DEPLOY_PATH={build_root}\n", local.stdout)
-        remote = self.run_script("add-project", "--check", "--target", "prod=ssh://deploy@shop.example/home/deploy/shop",
+        remote = self.run_script("add-project", "--target", "local", "--check", "--target", "prod=ssh://deploy@shop.example/home/deploy/shop",
                                  "git@bitbucket.org:rsmaizys/asana_tracker.git")
         self.assertEqual(remote.returncode, 0, remote.stdout + remote.stderr)
         self.assertIn(f"would write {build_root}/target.prod.env:", remote.stdout)
         self.assertIn("DEPLOY_CONTEXT=setup-asana_tracker-prod\n    DEPLOY_SSH=deploy@shop.example\n"
                       "    DEPLOY_PATH=/home/deploy/shop", remote.stdout)
-        bad = self.run_script("add-project", "--check", "--target", "ftp://x/y", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        bad = self.run_script("add-project", "--target", "local", "--check", "--target", "ftp://x/y", "git@bitbucket.org:rsmaizys/asana_tracker.git")
         self.assertEqual(bad.returncode, 64)
         self.assertIn("expected local or ssh://USER@HOST/ABSOLUTE/PATH", bad.stderr)
         self.assertFalse((self.root / "srv").exists(), "--check changes nothing")
 
     def test_the_local_target_is_written_once_and_kept_on_a_rerun(self):
-        result = self.run_add("git@bitbucket.org:rsmaizys/asana_tracker.git")
+        result = self.run_add("--target", "local", "git@bitbucket.org:rsmaizys/asana_tracker.git")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         target = self.root / "srv/projects/asana_tracker/target.env"
         text = target.read_text()
@@ -538,7 +542,7 @@ class AddGitHubProjectTest(ScriptTest):
     deploy key on several repositories), or the account's key with --shared-key."""
 
     def test_check_plans_a_deploy_key_and_alias_per_repository(self):
-        result = self.run_script("add-project", "--check", "git@github.com:BigSant/Forsena_Docker.git",
+        result = self.run_script("add-project", "--target", "local", "--check", "git@github.com:BigSant/Forsena_Docker.git",
                                  "ssh://git@github.com/BigSant/forsena.git")
         self.assertEqual(result.returncode, 0, result.stderr)
         ssh = self.root / "srv/.ssh"
@@ -553,7 +557,7 @@ class AddGitHubProjectTest(ScriptTest):
         self.assertFalse((self.root / "srv").exists(), "--check changes nothing")
 
     def test_a_shared_key_clones_the_url_as_given(self):
-        result = self.run_script("add-project", "--check", "--shared-key", "git@github.com:BigSant/asana_tracker.git")
+        result = self.run_script("add-project", "--target", "local", "--check", "--shared-key", "git@github.com:BigSant/asana_tracker.git")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("would clone git@github.com:BigSant/asana_tracker.git into", result.stdout)
         self.assertNotIn("deploy key", result.stdout)
@@ -567,7 +571,7 @@ class AddGitHubProjectTest(ScriptTest):
                          '  -C) cat "$2/.git/origin";;\n'
                          'esac\n')
         git_log = self.root / "git.calls"
-        run = lambda **env: self.run_script("add-project", "git@github.com:BigSant/Forsena_Docker.git",
+        run = lambda **env: self.run_script("add-project", "--target", "local", "git@github.com:BigSant/Forsena_Docker.git",
                                             PATH=f"{root_bin}:{self.bin}:{os.environ['PATH']}",
                                             SETUP_SERVER_USER=getpass.getuser(), GIT_LOG=str(git_log), **env)
         waiting = run()

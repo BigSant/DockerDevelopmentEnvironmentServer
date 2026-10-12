@@ -9,8 +9,8 @@
 # $ROOT/.ssh/github-<owner>.<repository> and the host alias github.com-<owner>.<repository> in
 # $ROOT/.ssh/config, and is cloned through that alias.
 # The deploy target is the server's, not the project's: target.env in the build root (setup reads it on
-# every deploy) names DEPLOY_CONTEXT, DEPLOY_SSH, DEPLOY_PATH, APP_UID and APP_GID. By default this host,
-# the build root itself and the account's ids; --target ssh://USER@HOST/PATH a remote server (a Docker
+# every deploy) names DEPLOY_CONTEXT, DEPLOY_SSH, DEPLOY_PATH, APP_UID and APP_GID. It is always named:
+# --target local is this host, the build root itself and the account's ids; ssh://USER@HOST/PATH a remote server (a Docker
 # context setup-<name> of the account), ENV=... one environment only (target.<env>.env). A rerun keeps
 # the clones and the registered target unless --target is given.
 set -euo pipefail
@@ -32,7 +32,7 @@ Usage: sudo $0 [--check] [--shared-key] [--target [ENV=]local|ssh://USER@HOST/PA
                  environment repository already contains public/
   --shared-key   GitHub: clone with the account's own key (a machine user that reads every repository)
                  instead of a deploy key per repository
-  --target       where stage/prod deploy (target.env): local (default) = this host, the build root, the
+  --target       where stage/prod deploy (target.env), required for a new project: local = this host, the build root, the
                  account's ids; ssh://USER@HOST/PATH = a server reached as USER (key: $ROOT/.ssh/id_ed25519),
                  project root PATH. stage=... or prod=... registers one environment (target.<env>.env).
                  Repeatable. Without it a rerun keeps the registered target.
@@ -182,13 +182,17 @@ register_target() {  # register_target [ENV=]SPEC — write target.env or target
     echo "$lines" | sed 's/^/    /'
 }
 
+# The target is always named: nothing is created for a project without one.
+if [ ${#targets[@]} -eq 0 ] && [ ! -f "$build_root/target.env" ]; then
+    echo "Name the deploy target: --target local (this host, the build root $build_root) or" >&2
+    echo "--target ssh://USER@HOST/PATH (another server); stage=/prod= in front for one environment." >&2
+    exit 64
+fi
 [ "$check" = 1 ] || [ -d "$build_root" ] || install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$build_root"
 clone "$env_repo" "$build_root/app"
 [ -z "$code_repo" ] || clone "$code_repo" "$build_root/app/public"
 if [ ${#targets[@]} -gt 0 ]; then
     for target in "${targets[@]}"; do register_target "$target"; done
-elif [ ! -f "$build_root/target.env" ]; then
-    register_target local
 else
     echo "==> deploy target kept: $build_root/target.env (change it with --target)"
 fi

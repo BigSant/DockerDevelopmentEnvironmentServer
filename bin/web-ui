@@ -916,7 +916,7 @@ class Page:
             text('name', 'Vardas (nebūtina)', 'numatyta – repo vardas') +
             '<label><span>Taikinys (po vieną eilutėje)</span><textarea name="targets" placeholder="local&#10;prod=ssh://deploy@shop.example/home/deploy/shop"></textarea></label>'
             '<label><input type="checkbox" name="shared_key" value="yes"> GitHub: paskyros raktas (--shared-key)</label>',
-            note='Tuščias taikinys – šis serveris, kai projektas naujas; esamo nekeičia. Projekto pašalinimas – projekto puslapyje.')
+            note='Naujam projektui taikinys privalomas (local – šis serveris). Esamam tuščias laukas taikinio nekeičia. Projekto pašalinimas – projekto puslapyje.')
         body += '<h2>Runner\'iai</h2>' + self.form(
             'install-runner', 'Įdiegti runner\'į (bin/install-runner)',
             '<label><span>Runner\'is</span><select name="provider"><option value="bitbucket">Bitbucket</option>'

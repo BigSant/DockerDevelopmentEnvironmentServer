@@ -159,8 +159,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 4. **Projektas:**
 
    ```bash
-   sudo bin/add-project git@bitbucket.org:rsmaizys/asana_tracker.git
-   sudo bin/add-project git@bitbucket.org:rsmaizys/forsena_docker.git git@bitbucket.org:rsmaizys/forsena.git
+   sudo bin/add-project --target local git@bitbucket.org:rsmaizys/asana_tracker.git
+   sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@bitbucket.org:rsmaizys/forsena_docker.git git@bitbucket.org:rsmaizys/forsena.git
    ```
 
    Build katalogas pavadinamas pagal repo vardą (`/srv/setup-server/projects/asana_tracker`), todėl
@@ -179,11 +179,12 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    tokį pavyzdį atmeta):
 
    ```bash
-   sudo bin/add-project git@bitbucket.org:rsmaizys/asana_tracker.git        # numatyta: šis serveris
+   sudo bin/add-project --target local git@bitbucket.org:rsmaizys/asana_tracker.git   # šis serveris
    sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@bitbucket.org:rsmaizys/forsena_docker.git
    ```
 
-   - **Numatyta (`local`)** – šis serveris (`DEPLOY_CONTEXT=default`), projekto šaknis yra build katalogas,
+   - **Taikinys nurodomas visada:** naujas projektas be `--target` nesukuriamas (nieko neklonuoja).
+   - **`local`** – šis serveris (`DEPLOY_CONTEXT=default`), projekto šaknis yra build katalogas,
      konteineriai veikia paskyra `setup` (jos `APP_UID`/`APP_GID`).
    - **`ssh://VARTOTOJAS@SERVERIS/KELIAS`** – kitas serveris: paskyra `setup` jungiasi savo raktu
      (`/srv/setup-server/.ssh/id_ed25519`; jei negali – scriptas parodo raktą, kurį reikia įdėti į
@@ -198,7 +199,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    **GitHub projektas:**
 
    ```bash
-   sudo bin/add-project git@github.com:BigSant/<aplinkos-repo>.git [git@github.com:BigSant/<kodo-repo>.git]
+   sudo bin/add-project --target local git@github.com:BigSant/<aplinkos-repo>.git [git@github.com:BigSant/<kodo-repo>.git]
    ```
 
    GitHub deploy key tinka **tik vienam** repo, o paskyros raktas `id_ed25519` jau yra setup repo deploy key. Todėl
@@ -572,7 +573,7 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 
 | Veiksmas | Ką vykdo (`L` = `/usr/local/lib/setup-server/bin`) |
 | --- | --- |
-| Pridėti projektą | `sudo -n L/add-project [--shared-key] [--target …] [VARDAS] URL [KODO_URL]` |
+| Pridėti projektą | `sudo -n L/add-project [--shared-key] --target … [VARDAS] URL [KODO_URL]` (naujam projektui taikinys privalomas) |
 | Pašalinti projektą (projekto puslapyje) | `sudo -n L/remove-project [--with-backups] VARDAS` |
 | Įdiegti runner'į | `sudo -n L/install-runner --provider bitbucket\|github [--name …]`; dialogo tekstas – per stdin |
 | Naktinės DB kopijos | `sudo -n L/install-backups [--at HH:MM]` |
