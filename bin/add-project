@@ -138,6 +138,7 @@ target_lines() {  # target_lines ENV SPEC — the target.env lines of one target
             path=${path%/}
             [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ && "/$path/" != */../* && "/$path/" != */./* ]] \
                 || { echo "--target $spec: expected local:/ABSOLUTE/PATH" >&2; exit 64; }
+            [ "${path##*/}" != app ] || { echo "--target $spec: PATH is the project root, which holds app/ and data/; give ${path%/app}" >&2; exit 64; }
             case "$path/" in "$ROOT/"*) [ "$path" = "$build_root" ] || { echo "--target $spec: inside $ROOT, which belongs to setup-server" >&2; exit 64; } ;; esac
             if [ "$check" = 1 ]; then
                 [ -e "$path" ] || echo "==> would create $path ($ACCOUNT, 0750)" >&2
@@ -145,8 +146,9 @@ target_lines() {  # target_lines ENV SPEC — the target.env lines of one target
                 install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$path"
                 echo "==> created $path ($ACCOUNT, 0750)" >&2
             elif ! as_account test -d "$path" -a -w "$path"; then
-                echo "$path is not a directory $ACCOUNT can write: chown $ACCOUNT: $path (or give the group setup write" >&2
-                echo "access), or deploy as its owner with --target ssh://OWNER@localhost$path" >&2
+                echo "$path is not a directory $ACCOUNT can reach and write (a home directory is often closed to others)." >&2
+                echo "Either let $ACCOUNT own it (chown $ACCOUNT: $path; every directory above it must let $ACCOUNT through)," >&2
+                echo "or deploy as its owner, who then owns the files and runs the containers: --target ssh://OWNER@localhost$path" >&2
                 exit 65
             fi
         fi
@@ -157,6 +159,7 @@ target_lines() {  # target_lines ENV SPEC — the target.env lines of one target
     [[ "$spec" =~ ^ssh://([a-z_][a-z0-9_.-]*@)?([A-Za-z0-9.-]+)(/[A-Za-z0-9._/-]+)$ ]] \
         || { echo "--target $spec: expected local, local:/PATH or ssh://USER@HOST/ABSOLUTE/PATH" >&2; exit 64; }
     user=${BASH_REMATCH[1]%@} host=${BASH_REMATCH[2]} path=${BASH_REMATCH[3]%/}
+    [ "${path##*/}" != app ] || { echo "--target $spec: PATH is the project root, which holds app/ and data/; give ${path%/app}" >&2; exit 64; }
     ssh=${user:+$user@}$host
     context="setup-$name${environment:+-$environment}"
     if [ "$check" = 1 ]; then
@@ -185,11 +188,17 @@ target_lines() {  # target_lines ENV SPEC — the target.env lines of one target
     echo "==> Docker context $context: ssh://$ssh (Docker ${ids[2]}; host key $(as_account ssh-keygen -F "$host" 2>/dev/null | awk '!/^#/ {print $2; exit}'))" >&2
     printf 'DEPLOY_CONTEXT=%s\nDEPLOY_SSH=%s\nDEPLOY_PATH=%s\nAPP_UID=%s\nAPP_GID=%s\n' "$context" "$ssh" "$path" "${ids[0]}" "${ids[1]}"
 }
-register_target() {  # register_target [ENV=]SPEC — write target.env or target.<env>.env
-    local environment= spec=$1 file lines
+planned_files=() planned_environments=() planned_lines=()
+prepare_target() {  # prepare_target [ENV=]SPEC — check a target and work out its lines before any clone
+    local environment= spec=$1 lines
     case "$spec" in stage=*|prod=*) environment=${spec%%=*}; spec=${spec#*=} ;; esac
-    file="$build_root/target${environment:+.$environment}.env"
     lines=$(target_lines "$environment" "$spec")
+    planned_files+=("$build_root/target${environment:+.$environment}.env")
+    planned_environments+=("$environment")
+    planned_lines+=("$lines")
+}
+write_target() {  # write_target INDEX — target.env or target.<env>.env of one prepared target
+    local file=${planned_files[$1]} environment=${planned_environments[$1]} lines=${planned_lines[$1]}
     if [ "$check" = 1 ]; then
         echo "==> would write $file:"
         echo "$lines" | sed 's/^/    /'
@@ -209,11 +218,13 @@ if [ ${#targets[@]} -eq 0 ] && [ ! -f "$build_root/target.env" ]; then
     echo "--target ssh://USER@HOST/PATH (another server); stage=/prod= in front for one environment." >&2
     exit 64
 fi
+# Every target is checked (and a remote one reached) before anything of the project is created.
+for target in "${targets[@]}"; do prepare_target "$target"; done
 [ "$check" = 1 ] || [ -d "$build_root" ] || install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$build_root"
 clone "$env_repo" "$build_root/app"
 [ -z "$code_repo" ] || clone "$code_repo" "$build_root/app/public"
 if [ ${#targets[@]} -gt 0 ]; then
-    for target in "${targets[@]}"; do register_target "$target"; done
+    for index in "${!planned_files[@]}"; do write_target "$index"; done
 else
     echo "==> deploy target kept: $build_root/target.env (change it with --target)"
 fi

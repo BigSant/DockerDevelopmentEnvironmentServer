@@ -527,7 +527,9 @@ class AddProjectTargetTest(ScriptTest):
         self.assertFalse(place.exists(), "--check changes nothing")
         for spec, message in ((f"local:{self.root}/srv/projects/other", "belongs to setup-server"),
                               ("local:relative/path", "expected local:/ABSOLUTE/PATH"),
-                              (f"local:{place}/../x", "expected local:/ABSOLUTE/PATH")):
+                              (f"local:{place}/../x", "expected local:/ABSOLUTE/PATH"),
+                              (f"local:{place}/app", f"PATH is the project root, which holds app/ and data/; give {place}"),
+                              ("prod=ssh://deploy@shop.example/home/deploy/shop/app", "give /home/deploy/shop")):
             with self.subTest(spec=spec):
                 refused = self.run_script("add-project", "--check", "--target", spec, "git@bitbucket.org:rsmaizys/asana_tracker.git")
                 self.assertEqual(refused.returncode, 64, refused.stdout + refused.stderr)
@@ -542,9 +544,11 @@ class AddProjectTargetTest(ScriptTest):
             locked.mkdir(parents=True)
             locked.chmod(0o555)
             self.addCleanup(locked.chmod, 0o755)
-            refused = self.run_add("--target", f"local:{locked}", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+            refused = self.run_add("--target", f"local:{locked}", "git@bitbucket.org:rsmaizys/other_shop.git")
             self.assertEqual(refused.returncode, 65, refused.stdout + refused.stderr)
             self.assertIn("--target ssh://OWNER@localhost", refused.stderr)
+            self.assertIn("can reach and write", refused.stderr)
+            self.assertFalse((self.root / "srv/projects/other_shop").exists(), "nothing is cloned for a refused target")
 
     def test_a_remote_target_needs_the_key_then_gets_a_context_and_the_users_ids(self):
         arguments = ("--target", "prod=ssh://deploy@shop.example/home/deploy/shop", "git@bitbucket.org:rsmaizys/forsena_docker.git")
@@ -554,6 +558,7 @@ class AddProjectTargetTest(ScriptTest):
         self.assertIn("ssh-ed25519 AAAAsetupkey setup@worker", refused.stderr)
         target = self.root / "srv/projects/forsena_docker/target.prod.env"
         self.assertFalse(target.exists())
+        self.assertFalse(target.parent.exists(), "nothing is cloned before the target answers")
         result = self.run_add(*arguments)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("BatchMode=yes", self.ssh_log.read_text())
