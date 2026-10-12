@@ -317,7 +317,7 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
   (unit'ai, sudo taisyklė, nustatymai) nekeičiami; jei naujoje versijoje jie kitokie, išvedama pastaba
   `note: … differs` – tada pakartok `sudo bin/install-backups` (laikas lieka) arba `sudo bin/install-metrics`.
   Nepavykus perrašymui ar sveikatos patikrai, kartu su checkout'ais grąžinamos ir ankstesnės kopijos.
-- **Ref'as** – tag'as (pageidautina), `origin` šaka arba commit'o id. setup-server gali būti ir ne ant tag'o
+- **Ref'as** – tag'as (pageidautina), `origin` šaka (`master` arba `origin/master`) arba commit'o id. setup-server gali būti ir ne ant tag'o
   (tag'ų dar nėra). setup ne ant `vX.Y.Z` tag'o tinka **tik stage**: prod release'ui setup turi būti ant
   release tag'o – peržiūra tai parodo kaip pastabą.
 - `--check` parsiunčia (`git fetch`) ir parodo kiekvieno checkout'o dabartinį ir naują ref'ą, commit'ų

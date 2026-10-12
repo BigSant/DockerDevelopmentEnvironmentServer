@@ -857,6 +857,10 @@ class UpdateTest(ScriptTest):
         self.assertEqual(by_commit.returncode, 0, by_commit.stdout + by_commit.stderr)
         self.assertEqual(self.git("-C", str(self.server), "rev-parse", "HEAD"), commit)
         self.assertNotIn("stage only", by_commit.stdout, "setup-server itself may run untagged")
+        for ref in ("master", "origin/master"):  # a branch of origin, with or without the remote's name
+            with self.subTest(ref=ref):
+                branch = self.update("--server-ref", ref, "--check")
+                self.assertEqual(branch.returncode, 0, branch.stdout + branch.stderr)
 
 
 UBUNTU = os.environ.get("SETUP_SERVER_UBUNTU_IMAGE")

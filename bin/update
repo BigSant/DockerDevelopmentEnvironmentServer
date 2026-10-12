@@ -50,9 +50,9 @@ label() {  # label SIDE COMMIT — its tag, or its short id
     git_in "$1" describe --tags --exact-match "$2" 2>/dev/null || git_in "$1" rev-parse --short "$2"
 }
 commits() { if [ "$1" = 1 ]; then echo "1 commit"; else echo "$1 commits"; fi; }
-resolve() {  # resolve SIDE REF — the commit of a tag, else of origin's branch, else a commit id
+resolve() {  # resolve SIDE REF — the commit of a tag, else of origin's branch (BRANCH or origin/BRANCH), else a commit id
     local candidate
-    for candidate in "refs/tags/$2" "refs/remotes/origin/$2"; do
+    for candidate in "refs/tags/$2" "refs/remotes/origin/${2#origin/}"; do
         git_in "$1" rev-parse -q --verify "$candidate^{commit}" 2>/dev/null && return
     done
     [[ "$2" =~ ^[0-9a-f]{7,40}$ ]] && git_in "$1" rev-parse -q --verify "$2^{commit}" 2>/dev/null
