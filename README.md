@@ -674,6 +674,26 @@ journalctl -u setup-server-ui -n 50                 # atmesti prisijungimai ir C
 sudo tail -n 20 /srv/setup-server/ui-actions.log
 ```
 
+## Projektų konteineriai serveryje
+
+- **Kuris Docker.** Projektus paleidžia paskyra `setup` per `DEPLOY_CONTEXT=default`, t. y. serverio sistemos
+  Docker (`/var/run/docker.sock`). Ubuntu Desktop'e administratoriaus `docker` dažnai rodo į Docker Desktop
+  (`docker context ls` žvaigždute pažymėtas `desktop-linux`) – tai kita VM su kitais konteineriais, todėl
+  projektų ten nematyti. Projektų konteineriai, log'ai ir `exec`:
+  ```sh
+  sudo docker --context default ps -a --filter name=<projektas>-prod
+  sudo docker --context default logs --tail 50 <konteineris>
+  ```
+  zsh nekaido kintamojo į žodžius: `D="sudo docker --context default"; $D ps` neveikia, rašyk komandą visą.
+- **Prievadai 80/443.** Jei taikinyje juos laiko kompiuterio web serveris (pvz. ankstesnio stack'o nginx),
+  projekto nginx-proxy jų negauna. Naujesnis nei 2.7.1 setup tai patikrina prieš paleisdamas konteinerius ir sustoja;
+  atlaisvink prievadą (`sudo ss -ltnp 'sport = :80'`, tada pvz. `sudo systemctl disable --now nginx`) ir deploy'ink
+  iš naujo.
+- **Duomenų katalogų keitimas.** Prieš keisdamas ar pervadindamas projekto duomenų katalogą
+  (`data/<env>/mysql`, `…/meilisearch` ir pan.), sustabdyk tą konteinerį: veikiantis konteineris lieka prijungtas
+  prie pervadinto katalogo (ištrynus jį – `No such file or directory`), o naują katalogą pamato tik po
+  `docker restart`.
+
 ## Saugumas
 
 - Paskyra `setup` yra Docker grupėje, o tai šiame serveryje prilygsta root teisėms. Tai priimta,
@@ -711,7 +731,6 @@ sudo tail -n 20 /srv/setup-server/ui-actions.log
 
 - Prometheus prijungimas per VPN ir Grafana įspėjimai (kopija senesnė nei 26 val., „no data“);
 - GitHub Actions workflow'ų paleidimas iš valdymo sąsajos (Bitbucket pipeline'ai jau paleidžiami);
-- asana.local setup v2 forma ir perjungimas tame pačiame serveryje.
 
 ## Testai
 
