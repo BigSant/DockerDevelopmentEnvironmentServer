@@ -26,7 +26,7 @@ LIBRARY=${SETUP_SERVER_LIBRARY:-/usr/local/lib/setup-server}
 NAME=setup-server-ui
 ADDRESS=127.0.0.1
 # What the UI runs as root, from $LIBRARY/bin; bin/update runs as the owner of this checkout instead.
-ROOT_COMMANDS=(add-project remove-project install-backups install-metrics install-runner add-backup-key prepare-host server-status)
+ROOT_COMMANDS=(add-project remove-project install-backups install-metrics install-runner add-backup-key prepare-host server-status update-setup)
 
 check=0
 refresh=0

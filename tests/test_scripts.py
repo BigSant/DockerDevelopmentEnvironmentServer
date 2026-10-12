@@ -570,6 +570,69 @@ class AddProjectTargetTest(ScriptTest):
             self.assertIn(line + "\n", text)
 
 
+class UpdateSetupTest(ScriptTest):
+    """bin/update-setup: the shared setup checkout to a release tag, as the setup account, without a password."""
+
+    def setUp(self):
+        super().setUp()
+        self.root_bin = self.fake_root()
+        self.stub("pgrep", '[ -n "${FAKE_MAKE:-}" ] && echo 777\n')
+        work, remote = self.root / "setup-work", self.root / "setup.git"
+        git = lambda *arguments: subprocess.run(["git", *arguments], env=GIT_ENV, check=True, capture_output=True, text=True)
+        git("init", "-q", "-b", "master", str(work))
+        git("init", "-q", "--bare", str(remote))
+        git("-C", str(work), "remote", "add", "origin", str(remote))
+        self.setup = self.root / "srv/setup"
+        for index, version in enumerate(("2.4.0", "2.6.0", "2.7.0", "3.0.0")):
+            (work / "VERSION").write_text(version + "\n")
+            git("-C", str(work), "add", "-A")
+            git("-C", str(work), "commit", "-q", "-m", f"Release {version}")
+            git("-C", str(work), "tag", f"v{version}")
+            git("-C", str(work), "push", "-q", "--tags", "origin", "master")
+            if index == 0:
+                git("clone", "-q", str(remote), str(self.setup))
+                git("-C", str(self.setup), "checkout", "-q", "--detach", "v2.4.0")
+
+    def update(self, *arguments, **env):
+        return self.run_script("update-setup", *arguments, PATH=f"{self.root_bin}:{self.bin}:{os.environ['PATH']}",
+                               SETUP_SERVER_USER=getpass.getuser(), **env)
+
+    def version(self):
+        return (self.setup / "VERSION").read_text().strip()
+
+    def test_check_shows_the_newest_release_of_the_major_and_changes_nothing(self):
+        result = self.update("--check")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("==> setup 2.4.0 (v2.4.0) -> v2.7.0", result.stdout)
+        self.assertIn("+ ", result.stdout)
+        self.assertEqual(self.version(), "2.4.0")
+
+    def test_it_moves_to_the_newest_or_the_given_release_and_says_so(self):
+        newest = self.update()
+        self.assertEqual(newest.returncode, 0, newest.stdout + newest.stderr)
+        self.assertIn("==> setup at v2.7.0 (2.7.0)", newest.stdout)
+        self.assertEqual(self.version(), "2.7.0")
+        self.assertIn("Nothing to do", self.update().stdout)
+        major = self.update("v3.0.0")
+        self.assertEqual(major.returncode, 0, major.stdout + major.stderr)
+        self.assertIn("new MAJOR version", major.stdout)
+        self.assertEqual(self.version(), "3.0.0")
+
+    def test_only_release_tags_a_clean_checkout_and_no_running_pipeline(self):
+        self.assertEqual(self.update("master").returncode, 64)
+        self.assertEqual(self.update("v2.7").returncode, 64)
+        unknown = self.update("v2.9.9")
+        self.assertEqual(unknown.returncode, 65)
+        self.assertIn("Unknown setup release v2.9.9", unknown.stderr)
+        busy = self.update(FAKE_MAKE="1")
+        self.assertEqual(busy.returncode, 75)
+        self.assertIn("pipeline step", busy.stderr)
+        (self.setup / "VERSION").write_text("edited\n")
+        dirty = self.update()
+        self.assertEqual(dirty.returncode, 65)
+        self.assertIn("local changes", dirty.stderr)
+
+
 class AddGitHubProjectTest(ScriptTest):
     """add-project with GitHub repositories: a deploy key and host alias per repository (GitHub refuses one
     deploy key on several repositories), or the account's key with --shared-key."""

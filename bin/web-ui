@@ -352,6 +352,12 @@ def plan_update(form, status):
     return Plan('update', 'Atnaujinti', base + ['--check'] + arguments, base + arguments, timeout=3600)
 
 
+def plan_update_setup(form, status):
+    tag = value(form, 'setup_tag', re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+'), 'setup tag\'as')
+    return Plan('update-setup', f'Atnaujinti setup{" į " + tag if tag else ""}', *command('update-setup', [tag] if tag else []),
+                timeout=600)
+
+
 def plan_pipeline(form, status):
     name = value(form, 'project', NAME, 'Projektas', required=True)
     entry = next((item for item in (status or {}).get('projects', []) if item.get('name') == name), None)
@@ -378,7 +384,8 @@ ACTIONS = {'add-project': plan_add_project, 'remove-project': plan_remove_projec
            'install-runner': plan_install_runner, 'install-backups': plan_install_backups,
            'install-metrics': plan_install_metrics, 'add-backup-key': plan_add_backup_key,
            'remove-backup-key': plan_remove_backup_key, 'list-backup-keys': plan_list_backup_keys,
-           'prepare-host': plan_prepare_host, 'update': plan_update, 'pipeline': plan_pipeline}
+           'prepare-host': plan_prepare_host, 'update': plan_update, 'update-setup': plan_update_setup,
+           'pipeline': plan_pipeline}
 
 
 # --- Running commands ----------------------------------------------------------------------------
@@ -702,7 +709,7 @@ class Page:
                 f'<span class="muted">{e(self.user)}</span></header><main><h1>{e(title)}</h1>{body}</main></body></html>')
 
     def form(self, action, title, fields, button='Peržiūrėti', note=''):
-        return (f'<form class="action" method="post" action="/preview"><h3>{e(title)}</h3>'
+        return (f'<form id="form-{e(action)}" class="action" method="post" action="/preview"><h3>{e(title)}</h3>'
                 f'<input type="hidden" name="csrf" value="{e(self.token)}"><input type="hidden" name="action" value="{e(action)}">'
                 f'{fields}{f"<p class=note>{note}</p>" if note else ""}<button>{e(button)}</button></form>')
 
@@ -718,7 +725,8 @@ class Page:
                                         'įdiegtos kopijos atnaujinamos per bin/update)</span>'
                                         if checkout and installed and checkout != installed else '')
         rows.append(('setup-server', server))
-        rows.append(('setup (bendras checkout\'as)', e(versions.get('setup') or '?')))
+        rows.append(('setup (bendras checkout\'as)', e(versions.get('setup') or '?') +
+                     ' <a href="/actions#form-update-setup">atnaujinti</a>'))
         rows.append(("Bitbucket runner'is", unit_state(units, 'setup-server-runner.service')))
         for scope in data.get('github_runners', []):
             rows.append((f"GitHub runner'is {scope}", unit_state(units, f'setup-server-github-runner@{scope}.service')))
@@ -945,6 +953,10 @@ class Page:
         body += '<h2>Serveris</h2>' + self.form(
             'prepare-host', 'Paruošti serverį (bin/prepare-host)', text('setup_ref', 'setup tag\'as (nebūtina)', 'v2.6.0'),
             note='Paketai, Docker, paskyra setup, git raktas, setup checkout\'as. Esamas Docker nekeičiamas.')
+        body += self.form(
+            'update-setup', 'Atnaujinti setup (bin/update-setup)', text('setup_tag', 'setup tag\'as (tuščia – naujausias)', 'v2.7.0'),
+            note='Tik bendras setup checkout\'as, tik release tag\'ai; be slaptažodžio. Peržiūra parodo dabartinę ir naują versiją. '
+                 'Deploy\'us tai daro ir pats, kai projektui reikia naujesnio setup (tas pats MAJOR).')
         if where['checkout']:
             body += self.form(
                 'update', 'Atnaujinti (bin/update)',

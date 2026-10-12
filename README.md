@@ -387,6 +387,24 @@ Nepavykus patikrai abu checkout'ai grąžinami į ankstesnius commit'us (ar šak
 jos), o įdiegtos komandų kopijos – į ankstesnes; išvedama, kuri patikra nepavyko, ir grąžinamas kodas 1. Kodas 2 reiškia, kad nepavyko ir grįžimas –
 išvedamos komandos rankiniam atstatymui.
 
+### Tik setup (be slaptažodžio)
+
+Bendrą setup checkout'ą (`/srv/setup-server/setup`) atnaujina viena komanda, be administratoriaus slaptažodžio ir be
+setup-server atnaujinimo – arba sąsajoje *Veiksmai → Atnaujinti setup*:
+
+```bash
+sudo bin/update-setup --check          # dabartinė versija, naujausias to paties MAJOR release'as, commit'ai
+sudo bin/update-setup                  # perjungia į jį
+sudo bin/update-setup v2.6.0           # arba į nurodytą release tag'ą
+```
+
+- Tik release tag'ai (`vX.Y.Z`), tik švarus checkout'as, ne pipeline žingsnio metu (`make` paskyros `setup`).
+  Nepavykus perjungti checkout'as grįžta. Git darbą atlieka paskyra `setup`.
+- Naujas MAJOR – tik nurodžius tag'ą; peržiūra perspėja, kad projektams gali reikėti pakeitimų.
+- **Deploy'us tai daro ir pats:** kai deploy'inamo commit'o `SETUP_MIN_VERSION` naujesnis už serverio setup, setup 2.7.0+
+  `pipeline-deploy` perjungia setup į naujausią to paties MAJOR release'ą ir žingsnį paleidžia iš naujo.
+- Pilnas atnaujinimas (setup-server ir setup kartu, su sveikatos patikra) – `bin/update`, žemiau.
+
 ### Rankinis atstatymas
 
 Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo nutrauktas netikėtai:

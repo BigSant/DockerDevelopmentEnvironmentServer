@@ -28,7 +28,7 @@ PROJECT_TOKEN = "project-token-ABCdef0123456789"
 GENERAL_TOKEN = "general-token-XYZxyz9876543210"
 SECRET = "ATOAfake_secret-VALUE_9"  # the OAuthClientSecret of test_scripts.DIALOG
 ROOT_COMMANDS = ("add-project", "remove-project", "install-backups", "install-metrics", "install-runner",
-                 "add-backup-key", "prepare-host", "server-status")
+                 "add-backup-key", "prepare-host", "server-status", "update-setup")
 
 
 def load_web_ui():
@@ -544,6 +544,18 @@ class WebUiTest(Worker):
         pending = re.search(r'name="pending" value="([^"]+)"', body)[1]
         self.assertEqual(self.request("POST", "/run", {"csrf": self.csrf(), "pending": pending})[0], 400)
         self.assertEqual(len(self.sudo_calls("add-project")), 2)
+
+    def test_setup_updates_to_a_release_tag_without_a_password(self):
+        command = f"-n {self.library}/bin/update-setup"
+        status, _, body = self.preview("update-setup", setup_tag="v2.7.0")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.sudo_calls("update-setup"), [f"{command} --check v2.7.0"])
+        newest = self.preview("update-setup", setup_tag="")
+        self.assertEqual(newest[0], 200, newest[2])
+        self.assertEqual(self.sudo_calls("update-setup")[-1], f"{command} --check", "empty: the newest release")
+        for tag in ("master", "v2.7", "v2.7.0; rm -rf /"):
+            with self.subTest(tag=tag):
+                self.assertEqual(self.preview("update-setup", setup_tag=tag)[0], 400)
 
     def test_a_failed_check_offers_no_run_and_prepare_host_may_need_attention(self):
         (self.stubs / "exit").write_text("65\n")
