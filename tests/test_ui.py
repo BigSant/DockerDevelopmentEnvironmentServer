@@ -221,6 +221,13 @@ class InstallUiTest(ScriptTest):
                      "NoNewPrivileges=false", f"ExecStart={self.root}/sbin/setup-server-ui",
                      f"Environment=SETUP_SERVER_LIBRARY={self.root}/lib", "StateDirectory=setup-server-ui"):
             self.assertIn(f"    {line}\n", out)
+        # systemd sets NoNewPrivileges for any of these (systemd.exec), and then sudo cannot run as root.
+        unit = out.split(f"would write {self.root}/systemd/setup-server-ui.service", 1)[1].split("==>", 1)[0]
+        for option in ("SystemCallFilter", "SystemCallArchitectures", "RestrictAddressFamilies", "RestrictNamespaces",
+                       "PrivateDevices", "ProtectKernelTunables", "ProtectKernelModules", "ProtectKernelLogs",
+                       "ProtectClock", "MemoryDenyWriteExecute", "RestrictRealtime", "RestrictSUIDSGID",
+                       "DynamicUser", "LockPersonality", "CapabilityBoundingSet"):
+            self.assertNotRegex(unit, rf"(?m)^\s*{option}=", f"{option} would turn NoNewPrivileges on")
         self.assertIn("UI_PASSWORD_HASH=<new, hidden>", out)
         self.assertIn("UI_PORT=9102", out)
         self.assertNotRegex(out, r"pbkdf2_sha256:\d+:", "the hash is not shown")

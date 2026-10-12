@@ -167,17 +167,17 @@ RestartPreventExitStatus=78
 # An action is a child of this service and must outlive a restart of the UI: bin/update rewrites this
 # program and restarts the service while it runs. Only the UI's own process is stopped.
 KillMode=process
-# Every action goes through sudo, which gains privileges: NoNewPrivileges (like an empty
-# CapabilityBoundingSet or RestrictSUIDSGID) would make every sudo fail, so it stays off.
+# Every action goes through sudo, which gains privileges: NoNewPrivileges would make every sudo fail.
+# systemd also turns it on, whatever this line says, for a non-root User= with any of SystemCallFilter,
+# SystemCallArchitectures, RestrictAddressFamilies, RestrictNamespaces, PrivateDevices, ProtectKernelTunables,
+# ProtectKernelModules, ProtectKernelLogs, ProtectClock, MemoryDenyWriteExecute, RestrictRealtime,
+# RestrictSUIDSGID, DynamicUser or LockPersonality (systemd.exec): none of them may be set here.
 NoNewPrivileges=false
 # The actions run in this service's namespaces, so these stay off as well: ProtectSystem (prepare-host and
 # the installers write /usr and /etc), ProtectHome (bin/update runs in the admin's clone), PrivateTmp
 # (bin/update keeps the previous copies in /tmp for a manual return) and ProtectProc (bin/update looks for
 # pipeline steps of $ACCOUNT). What does not stand in their way:
-ProtectKernelModules=true
 ProtectControlGroups=true
-LockPersonality=true
-RestrictRealtime=true
 
 [Install]
 WantedBy=multi-user.target
