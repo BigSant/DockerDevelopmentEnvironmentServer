@@ -88,8 +88,8 @@ def entry(ref, commit, at, rollback=False, **extra):
 
 
 class SharedHelpersTest(unittest.TestCase):
-    """bin/backup-projects and bin/worker-metrics each carry the build-root lookup and the backup name
-    patterns (the installed copies are single files); they must not drift apart."""
+    """bin/backup-projects, bin/worker-metrics and bin/server-status each carry the build-root lookup and the
+    backup name patterns (the installed copies are single files); they must not drift apart."""
 
     SHARED = ("environment_directory", "NAME", "SERIES")
 
@@ -105,11 +105,13 @@ class SharedHelpersTest(unittest.TestCase):
         return found
 
     def test_the_duplicated_helpers_are_identical(self):
-        backups, metrics = self.definitions("backup-projects"), self.definitions("worker-metrics")
+        backups = self.definitions("backup-projects")
         self.assertEqual(sorted(backups), sorted(self.SHARED))
-        for name in self.SHARED:
-            with self.subTest(name=name):
-                self.assertEqual(metrics.get(name), backups[name])
+        for other in ("worker-metrics", "server-status"):
+            found = self.definitions(other)
+            for name in self.SHARED:
+                with self.subTest(command=other, name=name):
+                    self.assertEqual(found.get(name), backups[name])
 
 
 class EndpointTest(ScriptTest):

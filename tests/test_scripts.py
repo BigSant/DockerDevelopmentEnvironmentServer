@@ -8,6 +8,7 @@ runner (a stand-in archive) for systemd-analyze verify of its unit.
 import getpass
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -731,11 +732,11 @@ class UpdateTest(ScriptTest):
         return self.git("-C", str(checkout), "describe", "--tags", "--always")
 
     def update(self, *arguments, **env):
-        return self.run_script("update", *arguments, SETUP_SERVER_CHECKOUT=str(self.server),
-                               SETUP_SERVER_USER=getpass.getuser(), SETUP_SERVER_SBIN=str(self.root / "sbin"),
-                               SETUP_SERVER_SYSTEMD=str(self.root / "systemd"),
-                               SETUP_SERVER_CONFIG=str(self.root / "etc"),
-                               SETUP_SERVER_SUDOERS=str(self.root / "sudoers.d"), **env)
+        settings = dict(SETUP_SERVER_CHECKOUT=str(self.server), SETUP_SERVER_USER=getpass.getuser(),
+                        SETUP_SERVER_SBIN=str(self.root / "sbin"), SETUP_SERVER_SYSTEMD=str(self.root / "systemd"),
+                        SETUP_SERVER_CONFIG=str(self.root / "etc"), SETUP_SERVER_SUDOERS=str(self.root / "sudoers.d"),
+                        SETUP_SERVER_LIBRARY=str(self.root / "lib"))
+        return self.run_script("update", *arguments, **{**settings, **env})
 
     def runner_untouched(self):
         calls = self.calls.read_text() if self.calls.exists() else ""
@@ -789,6 +790,61 @@ class UpdateTest(ScriptTest):
         (sbin / "setup-server-metrics").unlink()
         self.assertEqual(self.update("--server-ref", "v0.2.0").returncode, 0)
         self.assertFalse((sbin / "setup-server-metrics").exists())
+
+    def release_with_ui(self, tag, tests, marker):
+        """A setup-server release with the whole real bin/ (what install-ui copies); its web-ui is marked."""
+        files = {"tests/test_health.py": tests}
+        for path in (ROOT / "bin").iterdir():
+            if path.is_file():
+                files[f"bin/{path.name}"] = path.read_text() + (f"# {marker}\n" if path.name == "web-ui" else "")
+        self.commit("server", tag, files, f"Release {tag}")
+
+    def test_an_update_refreshes_the_ui_copies_and_a_return_restores_them(self):
+        self.fake_root()
+        self.stub("systemctl", f'echo "$*" >> {self.calls}\ncase "$1" in show) echo 4242;; esac\n')
+        sbin, library = self.root / "sbin", self.root / "lib/bin"
+        sbin.mkdir()
+        library.mkdir(parents=True)
+        (sbin / "setup-server-ui").write_text("previous ui copy\n")
+        (library / "add-project").write_text("previous add-project\n")
+        (library / "server-status").write_text("previous server-status\n")
+        self.release_with_ui("v0.5.0", PASSING_TESTS, "release 0.5.0")
+        self.release_with_ui("v0.6.0", FAILING_TESTS, "release 0.6.0")
+
+        check = self.update("--check", "--server-ref", "v0.5.0")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn(f"refresh the installed copies: {sbin}/setup-server-ui", check.stdout)
+
+        broken = self.update("--server-ref", "v0.6.0")
+        self.assertEqual(broken.returncode, 1, broken.stdout + broken.stderr)
+        self.assertIn(f"wrote {sbin}/setup-server-ui", broken.stdout, "copied before the health check")
+        self.assertIn(f"restored {self.root}/lib/bin", broken.stdout)
+        self.assertEqual((sbin / "setup-server-ui").read_text(), "previous ui copy\n")
+        self.assertEqual(sorted(path.name for path in library.iterdir()), ["add-project", "server-status"])
+        self.assertEqual((library / "add-project").read_text(), "previous add-project\n")
+        self.assertEqual(self.head(self.server), "v0.1.0")
+
+        result = self.update("--server-ref", "v0.5.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("# release 0.5.0", (sbin / "setup-server-ui").read_text())
+        self.assertIn("# release 0.5.0", (library / "web-ui").read_text())
+        self.assertIn(f"ROOT=${{SETUP_SERVER_ROOT:-{self.root}/srv}}", (library / "add-project").read_text(),
+                      "the host's paths are kept")
+        self.assertIn(f"CHECKOUT={self.server}", (self.root / "lib/install.env").read_text())
+        self.assertIn("install-ui --refresh", self.sudo_log.read_text())
+        restarts = re.findall(r"(?m)^try-restart setup-server-ui\.service$", self.calls.read_text())
+        self.assertEqual(len(restarts), 3, "refreshed, restored, refreshed: the UI runs the copy in place")
+        self.runner_untouched()
+
+    def test_without_a_terminal_sudo_never_waits_for_a_password(self):
+        # The web UI runs bin/update without a terminal: every sudo call is sudo -n, and a missing NOPASSWD
+        # right is a clear refusal before anything changes.
+        self.stub("sudo", f'echo "$*" >> {self.root}/sudo.calls\necho "sudo: a password is required" >&2\nexit 1\n')
+        result = self.update("--server-ref", "v0.2.0", SETUP_SERVER_USER="setup-test-account-missing")
+        self.assertEqual(result.returncode, 77, result.stdout + result.stderr)
+        self.assertIn("Without a terminal sudo cannot ask for", result.stderr)
+        self.assertEqual((self.root / "sudo.calls").read_text(), "-n -u setup-test-account-missing -H true\n")
+        self.assertEqual(self.head(self.server), "v0.1.0")
 
     def test_check_shows_what_would_change_and_changes_nothing(self):
         result = self.update("--check", "--server-ref", "v0.2.0", "--setup-ref", "v1.1.0")

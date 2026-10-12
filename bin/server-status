@@ -1,0 +1,397 @@
+#!/usr/bin/python3
+"""Read-only status of this worker as JSON: for the web UI (bin/web-ui) and by hand.
+
+The web UI's account (setup-ui) runs the root-owned copy as root through its sudo rule (bin/install-ui):
+    sudo -n /usr/local/lib/setup-server/bin/server-status [--logs [LINES]]
+It changes nothing. As root it asks systemd for the setup-server units and timers (systemctl show) and the
+journal, reads the versions of the checkouts and the disk. Everything under the build roots — repository
+URLs, env and target files, deploy histories, backups and, through Docker, the project containers and
+secret stores — it reads as the setup account (their owner, in the docker group, with its Docker contexts),
+so a file a pipeline step planted there is read with that account's rights, never root's; only listed
+values leave (never a whole env file). Run by another account it reports what that account can read.
+
+Usage: server-status                 versions, units, backup timer, disk and every project
+       server-status --logs [LINES]  the journal of the setup-server units and the tail of backup-pulls.log
+                                     (default 50 lines each, at most 500)
+       server-status --projects      only the projects (the part that runs as the setup account)
+"""
+
+from datetime import datetime, timezone
+import errno
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import time
+
+ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
+ACCOUNT = os.environ.get('SETUP_SERVER_USER', 'setup')
+LIBRARY = Path(os.environ.get('SETUP_SERVER_LIBRARY', '/usr/local/lib/setup-server'))
+PROJECTS = ROOT / 'projects'
+GITHUB_RUNNERS = ROOT / 'github-runner'
+ENVIRONMENTS = ('stage', 'prod')
+# NAME, SERIES and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
+NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
+SERIES = re.compile(r'worker-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
+SCOPE = re.compile(r'[a-z0-9][a-z0-9._-]*')
+# What leaves the env and target files: the deploy target and the names, nothing secret.
+TARGET_KEYS = ('DEPLOY_CONTEXT', 'DEPLOY_SSH', 'DEPLOY_PATH', 'APP_UID', 'APP_GID')
+UNITS = ('setup-server-runner.service', 'setup-server-backup.service', 'setup-server-backup.timer',
+         'setup-server-metrics.service', 'setup-server-ui.service')
+GITHUB_UNIT = 'setup-server-github-runner@{}.service'
+# The journal of these only (a glob for the GitHub runners).
+JOURNAL_UNITS = ('setup-server-runner.service', 'setup-server-github-runner@*.service', 'setup-server-backup.service',
+                 'setup-server-metrics.service', 'setup-server-ui.service')
+PROPERTIES = ('Id', 'LoadState', 'ActiveState', 'SubState', 'Result', 'NRestarts', 'ActiveEnterTimestamp',
+              'ExecMainExitTimestamp', 'ExecMainStatus', 'LastTriggerUSec', 'NextElapseUSecRealtime')
+CONTAINERS = '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.State}}\t{{.Status}}'
+READ_LIMIT = 4 * 1024 * 1024
+DEFAULT_LINES, MAXIMUM_LINES = 50, 500
+PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+
+def environment_directory(build_root):
+    """The environment repository of a build root: app/, or app/docker/ in older layouts."""
+    for directory in (build_root / 'app', build_root / 'app/docker'):
+        if (directory / 'Makefile').is_file() and (directory / 'env').is_dir():
+            return directory
+    return None
+
+
+def run(command, timeout=20, **options):
+    """(exit code, stdout, stderr) of a read-only command; 127 when it cannot start, 124 on a timeout."""
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=timeout, **options)
+    except FileNotFoundError:
+        return 127, '', f'{command[0]}: not found'
+    except subprocess.TimeoutExpired:
+        return 124, '', f'{command[0]}: no answer within {timeout} s'
+    except OSError as error:
+        return 126, '', f'{command[0]}: {error.strerror}'
+    return result.returncode, result.stdout, result.stderr
+
+
+def as_user(name):
+    """subprocess options that run a command as that account when this one runs as root ({} otherwise)."""
+    if os.geteuid() != 0:
+        return {}
+    account = pwd.getpwnam(name)
+    return dict(user=account.pw_uid, group=account.pw_gid, extra_groups=os.getgrouplist(name, account.pw_gid),
+                env={'PATH': PATH, 'HOME': account.pw_dir, 'LANG': 'C.UTF-8'}, cwd='/')
+
+
+ERRORS = []  # what could not be read, for the "errors" of the output
+
+
+def read_text(path):
+    """A regular file's text (never through a symlink, at most READ_LIMIT); None when it is missing or cannot
+    be read (then named in ERRORS: nothing of its content)."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        ERRORS.append(f'{path}: ' + ('a symlink; not read' if error.errno == errno.ELOOP else error.strerror))
+        return None
+    with os.fdopen(descriptor, 'rb') as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            ERRORS.append(f'{path}: not a regular file; not read')
+            return None
+        return handle.read(READ_LIMIT).decode('utf-8', 'replace')
+
+
+def parse_env(text):
+    """NAME=value lines (as bin/backup-projects reads them); other lines are skipped."""
+    values = {}
+    for line in (text or '').splitlines():
+        line = line.strip()
+        if line.startswith('export '):
+            line = line[len('export '):].lstrip()
+        key, separator, value = line.partition('=')
+        key, value = key.strip(), value.strip()
+        if not separator or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def origin(checkout):
+    """The origin URL of a git checkout, from its .git/config (no git: it would run the checkout's config)."""
+    text = read_text(checkout / '.git/config')
+    if text is None:
+        return None
+    section = None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('['):
+            section = re.sub(r'\s+', ' ', line.strip('[]').strip())
+        elif section == 'remote "origin"' and re.match(r'url\s*=', line):
+            return line.split('=', 1)[1].strip()[:300]
+    return None
+
+
+def default_branch(checkout):
+    text = read_text(checkout / '.git/refs/remotes/origin/HEAD') or ''
+    match = re.fullmatch(r'ref: refs/remotes/origin/([A-Za-z0-9._/-]{1,100})\s*', text)
+    return match[1] if match else None
+
+
+def timestamp(text):
+    """Unix time of a deployments.json "at" (ISO 8601 with an offset), as bin/worker-metrics reads it."""
+    moment = datetime.fromisoformat(text[:-1] + '+00:00' if text.endswith('Z') else text)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return int(moment.timestamp())
+
+
+def deploys(directory, environment):
+    """The last deploy, the last completed one and how many there were (setup's deployments.json)."""
+    text = read_text(directory / f'.generated/release/{environment}/deployments.json')
+    if text is None:
+        return None
+    entries = json.loads(text)
+    if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+        raise ValueError('not a list of deploys')
+    if not entries:
+        return None
+
+    def shown(entry):
+        return {'ref': str(entry.get('ref') or '')[:64], 'commit': str(entry.get('commit') or '')[:12],
+                'at': timestamp(str(entry['at'])), 'rollback': bool(entry.get('rollback')),
+                'failed': str(entry['failed'])[:40] if entry.get('failed') else None}
+    completed = [entry for entry in entries if not entry.get('failed')]
+    return {'last': shown(entries[-1]), 'last_success': shown(completed[-1]) if completed else None,
+            'count': len(entries)}
+
+
+def backups(directory, environment):
+    """The nightly and "backup now" series (worker-<env>-…Z.sql.gz): how many, the newest one's time and size."""
+    folder = directory / '.generated/backups'
+    found = []
+    if folder.is_dir() and not folder.is_symlink():
+        with os.scandir(folder) as entries:
+            for item in entries:
+                match = SERIES.fullmatch(item.name)
+                if match and match[1] == environment and item.is_file(follow_symlinks=False):
+                    info = item.stat(follow_symlinks=False)
+                    found.append((info.st_mtime, info.st_size, item.name))
+    if not found:
+        return {'count': 0, 'newest': None}
+    modified, size, name = max(found)
+    return {'count': len(found), 'newest': {'name': name, 'time': int(modified), 'size': size}}
+
+
+def containers(contexts, errors):
+    """{(context, compose project): [container]} of every context: the project containers (compose label)."""
+    found = {}
+    for context in sorted(contexts):
+        command = ['docker', *([] if context == 'default' else ['--context', context]),
+                   'ps', '--all', '--filter', 'label=com.docker.compose.project', '--format', CONTAINERS]
+        code, output, error = run(command, timeout=30)
+        if code:
+            errors.append(f'docker ({context}): {error.strip()[:300] or f"exit {code}"}')
+            continue
+        for line in output.splitlines():
+            parts = line.split('\t')
+            if len(parts) != 4:
+                continue
+            project, name, state, status = parts
+            health = re.search(r'\((healthy|unhealthy|health: starting)\)', status)
+            found.setdefault((context, project), []).append({
+                'name': name[:120], 'state': state[:20], 'status': status[:80],
+                'health': health[1].replace('health: ', '') if health else None})
+    return found
+
+
+def project(build_root, errors):
+    name = build_root.name
+    directory = environment_directory(build_root)
+    entry = {'name': name, 'layout': None, 'repository': None, 'code_repository': None, 'branch': None,
+             'project_name': name, 'targets': {}, 'environments': {}}
+    if directory is None:
+        errors.append(f'{name}: no environment repository (app/ with a Makefile and env/)')
+        return entry
+    entry['layout'] = str(directory.relative_to(build_root))
+    checkout = build_root / 'app'
+    entry['repository'] = origin(checkout)
+    entry['branch'] = default_branch(checkout)
+    entry['code_repository'] = origin(checkout / 'public') if (checkout / 'public/.git').exists() else None
+    common = {**parse_env(read_text(directory / 'env/common.env'))}
+    entry['project_name'] = common.get('PROJECT_NAME') if NAME.fullmatch(common.get('PROJECT_NAME', '')) else name
+    # The deploy target bin/add-project registered: target.env for both, target.<env>.env for one.
+    targets = {'': parse_env(read_text(build_root / 'target.env'))}
+    for environment in ENVIRONMENTS:
+        targets[environment] = parse_env(read_text(build_root / f'target.{environment}.env'))
+    entry['targets'] = {scope or 'all': {key: values[key] for key in TARGET_KEYS if key in values}
+                        for scope, values in targets.items() if values}
+    for environment in ENVIRONMENTS:
+        declared = (directory / f'env/{environment}.env').is_file()
+        values = {**common, **parse_env(read_text(directory / f'env/{environment}.env')), **targets[''],
+                  **targets[environment]}
+        state = {'declared': declared, 'compose_project': f"{entry['project_name']}-{environment}",
+                 'context': values.get('DEPLOY_CONTEXT') or 'default', 'deploys': None, 'backups': None,
+                 'containers': [], 'secrets': None}
+        try:
+            state['deploys'] = deploys(directory, environment)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            errors.append(f'{name} {environment}: deployments.json: {type(error).__name__}')
+        try:
+            state['backups'] = backups(directory, environment)
+        except OSError as error:
+            errors.append(f'{name} {environment}: backups: {error.strerror}')
+        entry['environments'][environment] = state
+    return entry
+
+
+def projects():
+    """Every build root under projects/ (as bin/backup-projects and bin/worker-metrics find them)."""
+    errors, found = ERRORS, []
+    try:
+        roots = sorted(PROJECTS.iterdir()) if PROJECTS.is_dir() else []
+    except OSError as error:
+        return {'projects': [], 'errors': [*errors, f'{PROJECTS}: {error.strerror}']}
+    for build_root in roots:
+        if build_root.is_symlink() or not build_root.is_dir() or not NAME.fullmatch(build_root.name):
+            continue
+        try:
+            found.append(project(build_root, errors))
+        except OSError as error:
+            errors.append(f'{build_root.name}: {error.strerror}')
+    contexts = {state['context'] for entry in found for state in entry['environments'].values()
+                if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', state['context'])}
+    running = containers(contexts, errors) if found else {}
+    for entry in found:
+        for environment, state in list(entry['environments'].items()):
+            state['containers'] = running.get((state['context'], state['compose_project']), [])
+            store = [item for item in state['containers'] if item['name'] == state['compose_project'] + '-secrets']
+            state['secrets'] = (('running' if store[0]['state'] == 'running' else 'stopped') if store else 'missing')
+            # An environment that is neither deployed from here nor has anything of its own is left out.
+            if not (state['declared'] or state['deploys'] or (state['backups'] or {}).get('count') or state['containers']):
+                del entry['environments'][environment]
+    return {'projects': found, 'errors': errors}
+
+
+# --- What root reads ------------------------------------------------------------------------------
+def units(errors):
+    """systemctl show of the setup-server units and every registered GitHub runner; read, never changed."""
+    scopes = []
+    try:
+        scopes = sorted(item.name for item in GITHUB_RUNNERS.iterdir()
+                        if SCOPE.fullmatch(item.name) and item.is_dir() and not item.is_symlink()
+                        and (item / '.runner').is_file()) if GITHUB_RUNNERS.is_dir() else []
+    except OSError as error:
+        errors.append(f'{GITHUB_RUNNERS}: {error.strerror}')
+    names = [*UNITS, *(GITHUB_UNIT.format(scope) for scope in scopes)]
+    code, output, error = run(['systemctl', 'show', '--timestamp=utc', '--property=' + ','.join(PROPERTIES), *names])
+    found = {}
+    if code:
+        errors.append(f'systemctl show: {error.strip()[:300] or f"exit {code}"}')
+    for block in output.split('\n\n'):
+        properties = dict(line.partition('=')[::2] for line in block.splitlines() if '=' in line)
+        unit = properties.pop('Id', None)
+        if unit in names:
+            found[unit] = {key: value for key, value in properties.items() if value not in ('', 'n/a')}
+    return found, scopes
+
+
+def describe(checkout, owner=None):
+    """git describe of a checkout, as its owner (root never runs git in a checkout another account writes)."""
+    if not (checkout / '.git').exists():
+        return None
+    try:
+        owner = owner or pwd.getpwuid(checkout.stat().st_uid).pw_name
+        options = as_user(owner)
+    except (KeyError, OSError):
+        return None
+    code, output, _ = run(['git', '-C', str(checkout), 'describe', '--tags', '--always'], timeout=15, **options)
+    return output.strip()[:80] if code == 0 else None
+
+
+def versions():
+    installed = parse_env(read_text(LIBRARY / 'install.env'))
+    checkout = installed.get('CHECKOUT')
+    return {'installed': installed.get('VERSION'), 'checkout_path': checkout,
+            'checkout': describe(Path(checkout)) if checkout and checkout.startswith('/') else None,
+            'setup': describe(ROOT / 'setup', ACCOUNT)}
+
+
+def disk():
+    try:
+        stats = os.statvfs(ROOT)
+    except OSError:
+        return None
+    return {'path': str(ROOT), 'size': stats.f_blocks * stats.f_frsize, 'available': stats.f_bavail * stats.f_frsize}
+
+
+def projects_as_account():
+    """The projects part, as the setup account when this runs as root."""
+    if os.geteuid() != 0:
+        return projects()
+    try:
+        options = as_user(ACCOUNT)
+    except KeyError:
+        return {'projects': [], 'errors': [f'no account {ACCOUNT}']}
+    options['env'].update(SETUP_SERVER_ROOT=str(ROOT), SETUP_SERVER_USER=ACCOUNT)
+    code, output, error = run([sys.executable, os.path.realpath(__file__), '--projects'], timeout=120, **options)
+    try:
+        return json.loads(output) if code == 0 else {'projects': [], 'errors': [f'projects: {error.strip()[:300]}']}
+    except ValueError:
+        return {'projects': [], 'errors': ['projects: no JSON']}
+
+
+def overview():
+    errors = []
+    found, scopes = units(errors)
+    part = projects_as_account()
+    shown = versions()
+    return {'generated': int(time.time()), 'root': str(ROOT), 'versions': shown, 'units': found, 'github_runners': scopes,
+            'disk': disk(), 'projects': part['projects'], 'errors': list(dict.fromkeys(errors + part['errors'] + ERRORS))}
+
+
+def logs(lines):
+    """The journal of the setup-server units and the tail of backup-pulls.log, at most `lines` each."""
+    journal = {}
+    for unit in JOURNAL_UNITS:
+        code, output, error = run(['journalctl', '--no-pager', '--quiet', '--output=short-iso', f'--lines={lines}',
+                                   f'--unit={unit}'], timeout=30)
+        journal[unit] = output.splitlines()[-lines:] if code == 0 else [f'(journalctl: {error.strip()[:200]})']
+    pulls = []
+    try:
+        options = as_user(ACCOUNT)  # the account's file: read with its rights
+        code, output, _ = run(['tail', '-n', str(lines), str(ROOT / 'backup-pulls.log')], **options)
+        pulls = output.splitlines() if code == 0 else []
+    except KeyError:
+        pass
+    return {'journal': journal, 'backup_pulls': pulls}
+
+
+def main(arguments):
+    if arguments == ['--projects']:
+        if os.geteuid() == 0:
+            result = projects_as_account()
+        else:
+            result = projects()
+    elif arguments[:1] == ['--logs'] and len(arguments) <= 2:
+        count = arguments[1] if len(arguments) == 2 else str(DEFAULT_LINES)
+        if not count.isdigit() or not 1 <= int(count) <= MAXIMUM_LINES:
+            print(f'LINES must be 1 to {MAXIMUM_LINES}', file=sys.stderr)
+            return 64
+        result = logs(int(count))
+    elif not arguments:
+        result = overview()
+    else:
+        print(__doc__.split('\n\n')[-1], file=sys.stderr)
+        return 64
+    json.dump(result, sys.stdout, indent=1, sort_keys=True)
+    sys.stdout.write('\n')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

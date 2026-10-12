@@ -1,0 +1,364 @@
+#!/usr/bin/env bash
+# Install the web UI of setup-server: the systemd service setup-server-ui runs /usr/local/sbin/setup-server-ui
+# (a root-owned copy of bin/web-ui) as its own account setup-ui, on 127.0.0.1 only (default port 9102; from a
+# laptop through an SSH tunnel). The UI acts only through sudo: /etc/sudoers.d/setup-server-ui lets setup-ui
+# run, as root, the root-owned copies of this checkout's commands in /usr/local/lib/setup-server/bin (never
+# the checkout itself, which its owner can change) and, as the owner of this checkout, its bin/update.
+# setup-ui is in the setup group (to reach /srv/setup-server) but not in the docker group, and it is not
+# setup: pipeline steps run as setup and get none of the UI's rights.
+# The login (a user and the PBKDF2 hash of a generated password, shown once) and the Bitbucket tokens live in
+# the root-only file /etc/setup-server/ui.env. Idempotent: a rerun keeps the login, the port and the tokens
+# unless told otherwise and restarts the service only when a file changed. --check shows everything and
+# changes nothing. --refresh only rewrites the installed copies, when installed, and restarts the service if
+# they changed: bin/update runs it.
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")" && pwd)
+CLONE=$(cd "$here/.." && pwd -P)
+ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+ACCOUNT=${SETUP_SERVER_USER:-setup}
+UI_ACCOUNT=${SETUP_SERVER_UI_USER:-setup-ui}
+CONFIG=${SETUP_SERVER_CONFIG:-/etc/setup-server}
+SBIN=${SETUP_SERVER_SBIN:-/usr/local/sbin}
+SYSTEMD=${SETUP_SERVER_SYSTEMD:-/etc/systemd/system}
+SUDOERS=${SETUP_SERVER_SUDOERS:-/etc/sudoers.d}
+LIBRARY=${SETUP_SERVER_LIBRARY:-/usr/local/lib/setup-server}
+NAME=setup-server-ui
+ADDRESS=127.0.0.1
+# What the UI runs as root, from $LIBRARY/bin; bin/update runs as the owner of this checkout instead.
+ROOT_COMMANDS=(add-project remove-project install-backups install-metrics install-runner add-backup-key prepare-host server-status)
+
+check=0
+refresh=0
+new_password=0
+port=
+user=
+usage() {
+    cat <<EOF
+Usage: sudo $0 [--check] [--port PORT] [--user NAME] [--new-password] | --refresh
+  --port          TCP port on $ADDRESS (default 9102); the UI listens on no other address
+  --user          the login name (default admin)
+  --new-password  make a new password (shown once); the old one stops working
+  --check         show the account, unit, sudo rule and settings (secrets hidden) and what would change;
+                  change nothing
+  --refresh       only rewrite $SBIN/$NAME and $LIBRARY/bin from this checkout, when installed, and
+                  restart the service if they changed (bin/update runs it)
+Settings not given are kept from $CONFIG/ui.env.
+EOF
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) check=1 ;;
+        --refresh) refresh=1 ;;
+        --new-password) new_password=1 ;;
+        --port) port=${2:-}; shift ;;
+        --user) user=${2:-}; shift ;;
+        --address)
+            [ "${2:-}" = "$ADDRESS" ] || { echo "The UI listens on $ADDRESS only; reach it through an SSH tunnel (README: Valdymo sąsaja)" >&2; exit 64; }
+            shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 64 ;;
+    esac
+    shift
+done
+for value in "$ROOT" "$CONFIG" "$SBIN" "$SYSTEMD" "$SUDOERS" "$LIBRARY" "$ACCOUNT" "$UI_ACCOUNT"; do
+    [[ "$value" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "Unexpected characters in $value" >&2; exit 65; }
+done
+if [ -n "$port" ] && ! { [[ "$port" =~ ^[0-9]{4,5}$ ]] && [ "$port" -ge 1024 ] && [ "$port" -le 65535 ]; }; then
+    echo "--port needs a TCP port from 1024 to 65535 (on $ADDRESS)" >&2
+    exit 64
+fi
+if [ -n "$user" ] && ! [[ "$user" =~ ^[A-Za-z0-9._-]{1,32}$ ]]; then
+    echo "--user: 1-32 letters, digits, . _ or -" >&2
+    exit 64
+fi
+if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
+    echo "Run with sudo (or use --check)" >&2
+    exit 77
+fi
+
+settings="$CONFIG/ui.env"
+command="$SBIN/$NAME"
+staging=$(mktemp -d)
+trap 'rm -rf "$staging"' EXIT
+umask 077
+
+# --- The copies: this checkout's bin/ with this host's settings as defaults (sudo resets the environment) ---
+defaults() {  # defaults SOURCE TARGET
+    sed -e "s|\${SETUP_SERVER_ROOT:-/srv/setup-server}|\${SETUP_SERVER_ROOT:-$ROOT}|g" \
+        -e "s|os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server')|os.environ.get('SETUP_SERVER_ROOT', '$ROOT')|g" \
+        -e "s|\${SETUP_SERVER_USER:-setup}|\${SETUP_SERVER_USER:-$ACCOUNT}|g" \
+        -e "s|os.environ.get('SETUP_SERVER_USER', 'setup')|os.environ.get('SETUP_SERVER_USER', '$ACCOUNT')|g" \
+        -e "s|\${SETUP_SERVER_CONFIG:-/etc/setup-server}|\${SETUP_SERVER_CONFIG:-$CONFIG}|g" \
+        -e "s|os.environ.get('SETUP_SERVER_CONFIG', '/etc/setup-server')|os.environ.get('SETUP_SERVER_CONFIG', '$CONFIG')|g" \
+        -e "s|\${SETUP_SERVER_SBIN:-/usr/local/sbin}|\${SETUP_SERVER_SBIN:-$SBIN}|g" \
+        -e "s|os.environ.get('SETUP_SERVER_SBIN', '/usr/local/sbin')|os.environ.get('SETUP_SERVER_SBIN', '$SBIN')|g" \
+        -e "s|\${SETUP_SERVER_SYSTEMD:-/etc/systemd/system}|\${SETUP_SERVER_SYSTEMD:-$SYSTEMD}|g" \
+        -e "s|\${SETUP_SERVER_SUDOERS:-/etc/sudoers.d}|\${SETUP_SERVER_SUDOERS:-$SUDOERS}|g" \
+        -e "s|\${SETUP_SERVER_LIBRARY:-/usr/local/lib/setup-server}|\${SETUP_SERVER_LIBRARY:-$LIBRARY}|g" \
+        -e "s|os.environ.get('SETUP_SERVER_LIBRARY', '/usr/local/lib/setup-server')|os.environ.get('SETUP_SERVER_LIBRARY', '$LIBRARY')|g" \
+        "$1" > "$2"
+}
+mkdir "$staging/library"
+for file in "$here"/*; do
+    [ -f "$file" ] && [ ! -L "$file" ] || continue
+    defaults "$file" "$staging/library/${file##*/}"
+done
+for name in web-ui "${ROOT_COMMANDS[@]}"; do
+    [ -f "$staging/library/$name" ] || { echo "bin/$name is missing in $here" >&2; exit 70; }
+done
+grep -qF "SETUP_SERVER_ROOT', '$ROOT'" "$staging/library/web-ui" || { echo "bin/web-ui no longer has the default of SETUP_SERVER_ROOT" >&2; exit 70; }
+cp "$staging/library/web-ui" "$staging/command"
+
+# The admin clone: its owner runs bin/update (it refuses root), and the UI shows its version.
+owner=$(stat -c %U "$CLONE")
+if [ "$owner" = root ] || ! [[ "$owner" =~ ^[a-z_][a-z0-9_.-]*$ ]] || ! [[ "$CLONE" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+    echo "==> note: $CLONE (owner $owner) cannot be the admin clone of bin/update; the UI will not offer the update" >&2
+    owner=
+elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "$owner" ]; then
+    echo "==> note: run by $SUDO_USER, but $CLONE belongs to $owner: the UI runs its bin/update as $owner" >&2
+fi
+version=$(git -c safe.directory="$CLONE" -C "$CLONE" describe --tags --always 2>/dev/null || echo unknown)
+printf '# bin/install-ui: where the copies in %s/bin come from (read by the UI and bin/server-status).\nVERSION=%s\nCHECKOUT=%s\nADMIN=%s\n' \
+    "$LIBRARY" "$version" "$CLONE" "$owner" > "$staging/install.env"
+
+# --- The sudo rule: these copies as root, bin/update of the clone as its owner; nothing else ---
+{
+    echo "# bin/install-ui: the web UI's account runs only these root-owned copies as root (README: Valdymo sąsaja)."
+    echo "# Their arguments are checked by the UI and again by each command."
+    printf '%s ALL=(root) NOPASSWD:' "$UI_ACCOUNT"
+    for index in "${!ROOT_COMMANDS[@]}"; do
+        if [ "$index" -gt 0 ]; then printf ', \\\n   '; fi
+        printf ' %s' "$LIBRARY/bin/${ROOT_COMMANDS[$index]}"
+    done
+    echo
+    if [ -n "$owner" ]; then
+        echo "# bin/update of the admin clone as its owner (it refuses root); its own sudo must then work without a password."
+        printf '%s ALL=(%s) NOPASSWD: %s/bin/update\n' "$UI_ACCOUNT" "$owner" "$CLONE"
+    fi
+} > "$staging/sudoers"
+if command -v visudo >/dev/null; then
+    visudo -cqf "$staging/sudoers" || { echo "The sudoers rule does not validate" >&2; exit 70; }
+fi
+
+cat > "$staging/service" <<EOF
+[Unit]
+Description=Web UI of setup-server (status and actions, on $ADDRESS only)
+Documentation=https://github.com/BigSant/DockerDevelopmentEnvironmentServer
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=$UI_ACCOUNT
+Group=$UI_ACCOUNT
+# Login and Bitbucket tokens: read by systemd as root, the file stays unreadable to $UI_ACCOUNT.
+EnvironmentFile=$settings
+Environment=SETUP_SERVER_ROOT=$ROOT
+Environment=SETUP_SERVER_LIBRARY=$LIBRARY
+ExecStart=$command
+# Output of the actions (jobs/): $UI_ACCOUNT only.
+StateDirectory=$NAME
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=10
+# Exit 78: the settings are wrong; restarting would not help (journalctl -u $NAME).
+RestartPreventExitStatus=78
+# An action is a child of this service and must outlive a restart of the UI: bin/update rewrites this
+# program and restarts the service while it runs. Only the UI's own process is stopped.
+KillMode=process
+# Every action goes through sudo, which gains privileges: NoNewPrivileges (like an empty
+# CapabilityBoundingSet or RestrictSUIDSGID) would make every sudo fail, so it stays off.
+NoNewPrivileges=false
+# The actions run in this service's namespaces, so these stay off as well: ProtectSystem (prepare-host and
+# the installers write /usr and /etc), ProtectHome (bin/update runs in the admin's clone), PrivateTmp
+# (bin/update keeps the previous copies in /tmp for a manual return) and ProtectProc (bin/update looks for
+# pipeline steps of $ACCOUNT). What does not stand in their way:
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+changed=0
+place() {  # place SOURCE TARGET MODE [quiet|DISPLAY] — write only what differs
+    if cmp -s "$1" "$2" 2>/dev/null; then
+        echo "==> $2: unchanged"
+        return
+    fi
+    changed=1
+    if [ "$check" = 1 ]; then
+        echo "==> would write $2"
+        case "${4:-}" in
+            quiet) ;;
+            '') sed 's/^/    /' "$1" ;;
+            *) sed 's/^/    /' "$4" ;;
+        esac
+    else
+        install -D -o root -g root -m "$3" "$1" "$2"
+        echo "==> wrote $2"
+    fi
+}
+place_library() {  # $LIBRARY/bin: every command of this checkout; one that is gone here is removed there
+    local file name written=() removed=()
+    [ "$check" = 1 ] || install -d -o root -g root -m 0755 "$LIBRARY" "$LIBRARY/bin"
+    for file in "$staging/library"/*; do
+        name=${file##*/}
+        cmp -s "$file" "$LIBRARY/bin/$name" 2>/dev/null && continue
+        written+=("$name")
+        [ "$check" = 1 ] || install -o root -g root -m 0755 "$file" "$LIBRARY/bin/$name"
+    done
+    for file in "$LIBRARY/bin"/*; do
+        [ -e "$file" ] && [ ! -e "$staging/library/${file##*/}" ] || continue
+        removed+=("${file##*/}")
+        [ "$check" = 1 ] || rm -f -- "$file"
+    done
+    if [ $((${#written[@]} + ${#removed[@]})) = 0 ]; then
+        echo "==> $LIBRARY/bin: unchanged"
+        return
+    fi
+    changed=1
+    echo "==> $([ "$check" = 1 ] && echo would write || echo wrote) $LIBRARY/bin (root-owned copies of bin/):" \
+        "${written[*]:-}${removed[*]:+; $([ "$check" = 1 ] && echo would remove || echo removed) ${removed[*]}}"
+}
+
+if [ "$refresh" = 1 ]; then
+    [ -e "$command" ] || { echo "==> $command is not installed; nothing to refresh"; exit 0; }
+    place "$staging/command" "$command" 0755 quiet
+    place_library
+    place "$staging/install.env" "$LIBRARY/install.env" 0644 quiet
+    for file in "service:$SYSTEMD/$NAME.service" "sudoers:$SUDOERS/$NAME"; do
+        cmp -s "$staging/${file%%:*}" "${file#*:}" 2>/dev/null \
+            || echo "==> note: ${file#*:} differs from this version; apply it with: sudo bin/install-ui"
+    done
+    if [ "$changed" = 1 ]; then
+        if [ "$check" = 1 ]; then
+            echo "==> would restart $NAME.service if it runs"
+        else
+            # Only the UI's process: a running action (this very update) goes on (KillMode=process).
+            systemctl try-restart "$NAME.service"
+        fi
+    fi
+    exit 0
+fi
+
+# --- Settings: kept unless given ------------------------------------------------------------------
+current() {  # current KEY — its value in the existing settings file, without quotes
+    [ -r "$settings" ] || return 0
+    sed -n "s/^$1=//p" "$settings" | tail -n 1 | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
+if [ -e "$settings" ] && [ ! -r "$settings" ]; then
+    echo "==> $settings needs sudo to read: its settings are not compared here"
+fi
+user=${user:-$(current UI_USER)}
+user=${user:-admin}
+port=${port:-$(current UI_PORT)}
+port=${port:-9102}
+hash=$(current UI_PASSWORD_HASH)
+password=
+password_state=kept
+if [ "$new_password" = 1 ] || [ -z "$hash" ]; then
+    password=$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')
+    hash=$(printf '%s\n' "$password" | "$here/web-ui" --hash)
+    password_state=new
+fi
+# The tokens the admin added (one per build root or one for all) are kept as they are.
+tokens=$( { [ -r "$settings" ] && grep -E '^BITBUCKET_ACCESS_TOKEN(_[A-Z0-9_]+)?=' "$settings"; } || true)
+[ -n "$tokens" ] || tokens='BITBUCKET_ACCESS_TOKEN='
+api=$(current BITBUCKET_API)
+
+# One validation for both: the service itself refuses settings it would not start with (exit 78).
+UI_USER="$user" UI_PASSWORD_HASH="$hash" UI_PORT="$port" UI_ADDRESS="$ADDRESS" BITBUCKET_API="$api" \
+    "$here/web-ui" --check >/dev/null || exit $?
+
+cat > "$staging/settings" <<EOF
+# $NAME (bin/install-ui). Read by systemd as root and given to the service; root only (0600).
+# The login: UI_USER and the PBKDF2 hash of its password (sudo bin/install-ui --new-password makes a new one).
+UI_USER=$user
+UI_PASSWORD_HASH=$hash
+UI_PORT=$port
+# Bitbucket access tokens (Bearer; Repositories Read, Pipelines Read and Write) for deploys, "backup now" and
+# the runner test: BITBUCKET_ACCESS_TOKEN_<NAME> for one build root (NAME in upper case, - as _),
+# BITBUCKET_ACCESS_TOKEN for the others. After a change: sudo systemctl restart $NAME
+$tokens
+EOF
+[ -z "$api" ] || echo "BITBUCKET_API=$api" >> "$staging/settings"
+sed -e "s/^UI_PASSWORD_HASH=.*/UI_PASSWORD_HASH=<$password_state, hidden>/" \
+    -e 's/^\(BITBUCKET_ACCESS_TOKEN[A-Z0-9_]*=\).\{1,\}$/\1<hidden>/' "$staging/settings" > "$staging/settings.shown"
+
+# --- The account: its own, in the setup group, never in the docker group ---------------------------
+if id "$UI_ACCOUNT" >/dev/null 2>&1; then
+    echo "==> account $UI_ACCOUNT: present"
+    groups=" $(id -nG "$UI_ACCOUNT") "
+    if [[ "$groups" == *" docker "* ]]; then
+        echo "$UI_ACCOUNT is in the docker group (root-equivalent); remove it first: sudo gpasswd -d $UI_ACCOUNT docker" >&2
+        exit 65
+    fi
+else
+    echo "==> $([ "$check" = 1 ] && echo would create || echo creating) the system account $UI_ACCOUNT (no login shell, no home, not in the docker group)"
+    [ "$check" = 1 ] || useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$UI_ACCOUNT"
+    groups=" "
+fi
+if [[ "$groups" != *" $ACCOUNT "* ]]; then
+    echo "==> $([ "$check" = 1 ] && echo would add || echo adding) $UI_ACCOUNT to the group $ACCOUNT (it reaches $ROOT, 0750, for ui-actions.log)"
+    [ "$check" = 1 ] || usermod -aG "$ACCOUNT" "$UI_ACCOUNT"
+fi
+log="$ROOT/ui-actions.log"
+if [ ! -e "$log" ]; then
+    echo "==> $([ "$check" = 1 ] && echo would create || echo creating) $log ($UI_ACCOUNT, 0640; every action of the UI)"
+    if [ "$check" = 0 ]; then
+        [ -d "$ROOT" ] || { echo "No $ROOT: run bin/prepare-host first" >&2; exit 65; }
+        install -o "$UI_ACCOUNT" -g "$UI_ACCOUNT" -m 0640 /dev/null "$log"
+    fi
+fi
+
+[ "$check" = 1 ] || install -d -o root -g root -m 0700 "$CONFIG"
+place "$staging/command" "$command" 0755 quiet  # a copy of bin/web-ui
+place_library
+place "$staging/install.env" "$LIBRARY/install.env" 0644
+place "$staging/settings" "$settings" 0600 "$staging/settings.shown"
+place "$staging/service" "$SYSTEMD/$NAME.service" 0644
+place "$staging/sudoers" "$SUDOERS/$NAME" 0440
+names=$(printf '%s\n' "$tokens" | sed -n 's/^\(BITBUCKET_ACCESS_TOKEN[A-Z0-9_]*\)=.\{1,\}$/\1/p' | paste -sd ' ')
+listen="http://$ADDRESS:$port/ for $user; Bitbucket tokens: ${names:-none}"
+
+if [ "$check" = 1 ]; then
+    echo "==> would listen on $listen"
+    echo "==> would enable $NAME.service and $([ "$changed" = 1 ] && echo restart || echo start) it"
+    exit 0
+fi
+
+systemctl daemon-reload
+systemctl enable "$NAME.service" >/dev/null
+if [ "$changed" = 1 ]; then
+    systemctl restart "$NAME.service"
+else
+    systemctl start "$NAME.service"
+fi
+echo "==> $NAME: $(systemctl is-active "$NAME.service" || true); listening on $listen"
+# Without the login it must answer 401.
+status=$(python3 - "http://$ADDRESS:$port/" <<'PYTHON' || true
+import sys, time, urllib.error, urllib.request
+for attempt in range(20):
+    try:
+        urllib.request.urlopen(sys.argv[1], timeout=3)
+        print('200 (without the login!)')
+        break
+    except urllib.error.HTTPError as error:
+        print(error.code)
+        break
+    except OSError:
+        time.sleep(0.5)
+else:
+    print('no answer (journalctl -u setup-server-ui)')
+PYTHON
+)
+echo "==> without the login it answers: $status"
+if [ "$password_state" = new ]; then
+    echo "==> login: $user / $password"
+    echo "    (shown once, kept only as a hash; sudo bin/install-ui --new-password makes a new one)"
+fi
+echo "==> from a laptop: ssh -L $port:$ADDRESS:$port $(hostname -s), then open http://localhost:$port/"

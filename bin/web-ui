@@ -1,0 +1,1303 @@
+#!/usr/bin/python3
+"""The web UI of setup-server: the worker's status and the bin/ commands, on 127.0.0.1 only.
+
+bin/install-ui installs this as /usr/local/sbin/setup-server-ui and runs it as the systemd service
+setup-server-ui of its own account, setup-ui (not setup: pipeline steps run as setup and must not reach
+it). It listens on 127.0.0.1 only (UI_PORT, default 9102); from a laptop: ssh -L 9102:127.0.0.1:9102 server.
+
+Access. Every request needs the Basic-auth login of /etc/setup-server/ui.env (UI_USER, UI_PASSWORD_HASH: PBKDF2,
+compared in constant time) and a Host of 127.0.0.1/localhost (a DNS-rebound name is refused). Every POST also
+needs the CSRF token of its form: an HMAC of the user with a key made at start (a restart invalidates the open
+forms) and, when the browser sends one, an Origin of 127.0.0.1/localhost.
+
+What it runs. Status: `sudo -n $LIBRARY/bin/server-status` (read-only, JSON). Actions: the root-owned copies
+in $LIBRARY/bin (never a writable checkout) through sudo, and bin/update of the admin clone as its owner;
+the sudo rule of bin/install-ui allows nothing else. Arguments are checked here against strict patterns and
+always passed as an argv list. Every action first runs with --check; only that previewed command (kept
+in memory, single use) runs on "Vykdyti". A run is a detached job (output in $STATE_DIRECTORY/jobs, polled
+by its page) that outlives a restart of this service: bin/update refreshes this program while it runs.
+Deploys, "backup now" and the runner test start Bitbucket custom pipelines through the API (history stays
+in Bitbucket), with BITBUCKET_ACCESS_TOKEN_<NAME> or BITBUCKET_ACCESS_TOKEN; redirects are not followed
+and the token is never printed or logged. Every action — time, user, client, argv, exit code; never stdin
+or a token — is appended to $SETUP_SERVER_ROOT/ui-actions.log; without that log nothing runs.
+
+Usage: setup-server-ui            serve (settings from the environment, see bin/install-ui)
+       setup-server-ui --check    validate the settings and show where it would listen
+       setup-server-ui --hash     read a password on stdin and print its UI_PASSWORD_HASH (bin/install-ui)
+       setup-server-ui --job DIR  run one action (internal: the UI starts it detached)
+"""
+
+import base64
+from datetime import datetime, timezone
+import hashlib
+import hmac
+import html
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+from urllib.parse import parse_qs, quote, urlsplit
+import urllib.request
+
+ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
+LIBRARY = Path(os.environ.get('SETUP_SERVER_LIBRARY', '/usr/local/lib/setup-server'))
+STATE = Path(os.environ.get('STATE_DIRECTORY') or '/var/lib/setup-server-ui')
+JOBS = STATE / 'jobs'
+ACTIONS_LOG = ROOT / 'ui-actions.log'
+PROGRAM = os.path.realpath(__file__)
+ADDRESS = '127.0.0.1'
+DEFAULT_PORT = 9102
+CONFIGURATION_ERROR = 78  # EX_CONFIG: systemd does not restart the service for it
+LOOPBACK_HOSTS = ('127.0.0.1', 'localhost', '[::1]')
+HASH_ITERATIONS = 600_000
+STATUS_TTL, PIPELINES_TTL, PENDING_TTL = 10, 60, 15 * 60
+CHECK_TIMEOUT = 180
+BODY_LIMIT = 256 * 1024
+KEEP_JOBS = 100
+BITBUCKET_WEB = 'https://bitbucket.org'
+TOKEN_VARIABLE = 'BITBUCKET_ACCESS_TOKEN'
+
+NAME = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}')
+GIT_URL = re.compile(r'(?:git@[A-Za-z0-9.-]+:|ssh://git@[A-Za-z0-9.-]+(?::[0-9]{1,5})?/|https://[A-Za-z0-9.-]+/)'
+                     r'[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*')
+# bin/add-project's own pattern of a target, with the optional ENV= of one environment.
+TARGET = re.compile(r'(?:(?:stage|prod)=)?(?:local|ssh://(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+)')
+REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,99}')
+RUNNER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
+KEY_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
+PUBLIC_KEY = re.compile(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|'
+                        r'sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}(?: [^\s]{1,100})?')
+JOB_ID = re.compile(r'\d{8}T\d{6}Z-[0-9a-f]{6}')
+BITBUCKET_URL = re.compile(r'(?:git@bitbucket\.org:|ssh://git@bitbucket\.org/|https://(?:[^@/\s]+@)?bitbucket\.org/)'
+                           r'([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*?)(?:\.git)?/?')
+PIPELINES = {'deploy-stage': 'Deploy į stage', 'deploy-production': 'Deploy į prod', 'backup-now': 'Backup dabar',
+             'runner-test': "Runner'io testas"}
+DEPLOY_PIPELINES = ('deploy-stage', 'deploy-production')
+
+
+def log(text):
+    print(text, file=sys.stderr, flush=True)
+
+
+class Refused(Exception):
+    """Settings the service will not start with (exit 78)."""
+
+
+class Invalid(ValueError):
+    """A form value that is not accepted; the message is shown to the user."""
+
+
+# --- Settings ------------------------------------------------------------------------------------
+def password_hash(password, salt=None, iterations=HASH_ITERATIONS):
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, iterations)
+    encode = lambda data: base64.urlsafe_b64encode(data).decode().rstrip('=')
+    return f'pbkdf2_sha256:{iterations}:{encode(salt)}:{encode(digest)}'
+
+
+def password_matches(password, stored):
+    try:
+        scheme, iterations, salt, _ = stored.split(':')
+        if scheme != 'pbkdf2_sha256':
+            return False
+        salt = base64.urlsafe_b64decode(salt + '=' * (-len(salt) % 4))
+        return hmac.compare_digest(password_hash(password, salt, int(iterations)), stored)
+    except (ValueError, TypeError):
+        return False
+
+
+def settings():
+    user = os.environ.get('UI_USER', '')
+    if not re.fullmatch(r'[A-Za-z0-9._-]{1,32}', user):
+        raise Refused('UI_USER must be 1-32 letters, digits, . _ or - (bin/install-ui sets it)')
+    stored = os.environ.get('UI_PASSWORD_HASH', '')
+    if not re.fullmatch(r'pbkdf2_sha256:[0-9]{5,7}:[A-Za-z0-9_-]{16,}:[A-Za-z0-9_-]{40,}', stored):
+        raise Refused('UI_PASSWORD_HASH is missing or not a pbkdf2_sha256 hash (sudo bin/install-ui --new-password)')
+    address = os.environ.get('UI_ADDRESS') or ADDRESS
+    if address != ADDRESS:
+        raise Refused(f'UI_ADDRESS must be {ADDRESS}: the UI is reached through an SSH tunnel, never directly; got {address!r}')
+    port = os.environ.get('UI_PORT') or str(DEFAULT_PORT)
+    if not port.isdigit() or not (int(port) == 0 or 1024 <= int(port) <= 65535):
+        raise Refused(f'UI_PORT must be a TCP port number from 1024 to 65535; got {port!r}')
+    api = bitbucket_api()
+    if not (api.startswith('https://') or re.match(r'http://127\.0\.0\.1:[0-9]+/', api + '/')):
+        raise Refused('BITBUCKET_API must be an https:// address')
+    return user, stored, int(port)
+
+
+def bitbucket_api():
+    return (os.environ.get('BITBUCKET_API') or 'https://api.bitbucket.org/2.0').rstrip('/')
+
+
+def child_environment():
+    """The environment of every command: this one's, without the login hash and the tokens."""
+    return {key: value for key, value in os.environ.items()
+            if not key.startswith(TOKEN_VARIABLE) and key != 'UI_PASSWORD_HASH'}
+
+
+def installation():
+    """The admin clone bin/install-ui was run from and its owner ($LIBRARY/install.env)."""
+    values = {}
+    try:
+        for line in (LIBRARY / 'install.env').read_text().splitlines():
+            key, separator, value = line.partition('=')
+            if separator and re.fullmatch(r'[A-Z]+', key):
+                values[key] = value.strip()
+    except OSError:
+        pass
+    checkout, admin = values.get('CHECKOUT', ''), values.get('ADMIN', '')
+    if not re.fullmatch(r'/[A-Za-z0-9._/-]+', checkout) or not re.fullmatch(r'[a-z_][a-z0-9_.-]*', admin):
+        checkout = admin = None
+    return {'version': values.get('VERSION'), 'checkout': checkout, 'admin': admin}
+
+
+# --- The action log ------------------------------------------------------------------------------
+def record(user, client, kind, text):
+    """One line in ui-actions.log (append only, never through a symlink); raises OSError when it cannot."""
+    stamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    line = f'{stamp} user={user} client={client} {kind} {text}'.replace('\n', ' ')[:4000] + '\n'
+    descriptor = os.open(ACTIONS_LOG, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o640)
+    with os.fdopen(descriptor, 'a') as handle:
+        handle.write(line)
+
+
+# --- Form values ---------------------------------------------------------------------------------
+def value(form, key, pattern=None, label=None, required=False, limit=200):
+    text = form.get(key, '').strip()
+    if not text:
+        if required:
+            raise Invalid(f'Užpildyk lauką „{label or key}“.')
+        return ''
+    if len(text) > limit or (pattern is not None and not pattern.fullmatch(text)):
+        raise Invalid(f'Netinkama reikšmė lauke „{label or key}“: {text[:80]}')
+    return text
+
+
+def git_ref(form, key, label, required=False):
+    text = value(form, key, REF, label, required)
+    if text and ('..' in text or '//' in text or text.endswith(('/', '.lock', '.'))):
+        raise Invalid(f'Netinkama reikšmė lauke „{label}“: {text[:80]}')
+    return text
+
+
+def git_url(form, key, label, required=False):
+    text = value(form, key, GIT_URL, label, required, limit=300)
+    if text.endswith('.git.git'):
+        raise Invalid(f'Netinkama reikšmė lauke „{label}“: {text[:80]}')
+    return text
+
+
+def networks(text, label):
+    found = []
+    for part in [part for part in re.split(r'[\s,]+', text) if part]:
+        try:
+            network = ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            raise Invalid(f'„{label}“: {part[:60]} nėra IP adresas ar tinklas.') from None
+        if network.prefixlen == 0:
+            raise Invalid(f'„{label}“: nurodyk konkretų tinklą, ne visus adresus.')
+        found.append(part)
+    return found
+
+
+def flag(form, key):
+    return form.get(key) == 'yes'
+
+
+# --- Actions: what each form runs ----------------------------------------------------------------
+class Plan:
+    """One action: the --check command, the command "Vykdyti" runs, and its stdin (kept in memory only)."""
+
+    def __init__(self, action, title, check, run, stdin=None, timeout=600, run_codes=(0,)):
+        self.action, self.title, self.check, self.run = action, title, check, run
+        self.stdin, self.timeout, self.run_codes = stdin, timeout, run_codes
+        self.kind = 'command'
+
+
+class PipelinePlan:
+    """A Bitbucket custom pipeline: the request is shown first, sent on "Vykdyti"."""
+
+    def __init__(self, project, workspace, slug, pipeline, branch, variables):
+        self.action, self.kind = 'pipeline', 'pipeline'
+        self.project, self.workspace, self.slug = project, workspace, slug
+        self.pipeline, self.branch, self.variables = pipeline, branch, variables
+        self.title = f'{PIPELINES[pipeline]}: {project}'
+        self.path = f'/repositories/{quote(workspace)}/{quote(slug)}/pipelines/'
+        self.body = {'target': {'type': 'pipeline_ref_target', 'ref_type': 'branch', 'ref_name': branch,
+                                'selector': {'type': 'custom', 'pattern': pipeline}},
+                     'variables': [{'key': key, 'value': text} for key, text in variables]}
+
+
+def command(script, arguments):
+    """sudo of a root-owned copy in $LIBRARY/bin: (with --check, without)."""
+    base = ['sudo', '-n', str(LIBRARY / 'bin' / script)]
+    return base + ['--check'] + arguments, base + arguments
+
+
+def plan_add_project(form, status):
+    name = value(form, 'name', NAME, 'Vardas')
+    env_repo = git_url(form, 'env_repo', 'Aplinkos repo', required=True)
+    code_repo = git_url(form, 'code_repo', 'Kodo repo')
+    targets = [line.strip() for line in form.get('targets', '').splitlines() if line.strip()]
+    if len(targets) > 3:
+        raise Invalid('Taikinių – ne daugiau kaip trys (bendras, stage=, prod=).')
+    for target in targets:
+        if len(target) > 200 or not TARGET.fullmatch(target):
+            raise Invalid(f'Netinkamas taikinys: {target[:80]} (local arba ssh://VARTOTOJAS@SERVERIS/KELIAS, '
+                          'prieš jį gali būti stage= ar prod=).')
+    arguments = (['--shared-key'] if flag(form, 'shared_key') else []) + [part for target in targets for part in ('--target', target)]
+    arguments += ([name] if name else []) + [env_repo] + ([code_repo] if code_repo else [])
+    return Plan('add-project', 'Pridėti projektą', *command('add-project', arguments), timeout=1800)
+
+
+def plan_remove_project(form, status):
+    name = value(form, 'name', NAME, 'Projektas', required=True)
+    arguments = (['--with-backups'] if flag(form, 'with_backups') else []) + [name]
+    return Plan('remove-project', f'Pašalinti projektą {name}', *command('remove-project', arguments))
+
+
+def plan_install_runner(form, status):
+    provider = form.get('provider', 'bitbucket')
+    if provider not in ('bitbucket', 'github'):
+        raise Invalid('Runner\'is: bitbucket arba github.')
+    name = value(form, 'runner_name', RUNNER_NAME, 'Vardas GitHub\'e') if provider == 'github' else ''
+    text = form.get('dialog', '')
+    if not text.strip():
+        raise Invalid('Įklijuok Bitbucket dialogo (GitHub puslapio) tekstą.')
+    if len(text) > 64 * 1024:
+        raise Invalid('Tekstas per ilgas.')
+    arguments = ['--provider', provider] + (['--name', name] if name else [])
+    title = 'Įdiegti GitHub runner\'į' if provider == 'github' else 'Įdiegti Bitbucket runner\'į'
+    return Plan('install-runner', title, *command('install-runner', arguments), stdin=text, timeout=1800)
+
+
+def plan_install_backups(form, status):
+    at = value(form, 'at', re.compile(r'([01][0-9]|2[0-3]):[0-5][0-9]'), 'Laikas')
+    return Plan('install-backups', 'Naktinės DB kopijos', *command('install-backups', ['--at', at] if at else []))
+
+
+def plan_install_metrics(form, status):
+    arguments = []
+    address = value(form, 'address', re.compile(r'[0-9a-fA-F:.]{2,45}'), 'Adresas')
+    if address:
+        try:
+            ipaddress.ip_address(address)
+        except ValueError:
+            raise Invalid(f'„Adresas“: {address} nėra IP adresas.') from None
+        arguments += ['--address', address]
+    allow = networks(form.get('allow', ''), 'Leidžiami adresai')
+    if allow:
+        arguments += ['--allow', ' '.join(allow)]
+    port = value(form, 'port', re.compile(r'[0-9]{1,5}'), 'Port\'as')
+    if port:
+        arguments += ['--port', port]
+    token = form.get('token', 'keep')
+    if token not in ('keep', 'new', 'none'):
+        raise Invalid('Token\'as: palikti, naujas arba be jo.')
+    arguments += {'keep': [], 'new': ['--new-token'], 'none': ['--no-token']}[token]
+    return Plan('install-metrics', 'Worker\'io metrikos', *command('install-metrics', arguments))
+
+
+def plan_add_backup_key(form, status):
+    lines = [line.strip() for line in form.get('public_key', '').splitlines() if line.strip()]
+    if len(lines) != 1 or not PUBLIC_KEY.fullmatch(lines[0]):
+        raise Invalid('Įklijuok vieną viešąjį raktą (.pub eilutę, pvz. „ssh-ed25519 AAAA… vardas“), ne privatų.')
+    name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
+    sources = networks(form.get('sources', ''), 'Iš kur')
+    if not sources:
+        raise Invalid('„Iš kur“: nurodyk VPN tinklą, pvz. 10.8.0.0/24.')
+    arguments = ['-', '--name', name, '--from', ','.join(sources)]
+    return Plan('add-backup-key', f'Kopijų raktas {name}', *command('add-backup-key', arguments), stdin=lines[0] + '\n')
+
+
+def plan_remove_backup_key(form, status):
+    name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
+    return Plan('remove-backup-key', f'Atimti kopijų raktą {name}', *command('add-backup-key', ['--remove', name]))
+
+
+def plan_list_backup_keys(form, status):
+    # Read-only: the listing is the preview, nothing runs after it.
+    return Plan('list-backup-keys', 'Kopijų raktai', ['sudo', '-n', str(LIBRARY / 'bin/add-backup-key'), '--list'], None)
+
+
+def plan_prepare_host(form, status):
+    ref = git_ref(form, 'setup_ref', 'setup tag\'as')
+    # Exit 1 of --check is "Needs attention" (e.g. less RAM): the run still prepares the rest.
+    return Plan('prepare-host', 'Paruošti serverį', *command('prepare-host', ['--setup-ref', ref] if ref else []),
+                timeout=3600, run_codes=(0, 1))
+
+
+def plan_update(form, status):
+    where = installation()
+    if not where['checkout']:
+        raise Invalid('Nežinomas administratoriaus klonas: paleisk sudo bin/install-ui iš jo.')
+    server_ref = git_ref(form, 'server_ref', 'setup-server ref\'as')
+    setup_ref = git_ref(form, 'setup_ref', 'setup ref\'as')
+    if not server_ref and not setup_ref:
+        raise Invalid('Nurodyk bent vieną ref\'ą (setup-server arba setup).')
+    arguments = (['--server-ref', server_ref] if server_ref else []) + (['--setup-ref', setup_ref] if setup_ref else [])
+    base = ['sudo', '-n', '-H', '-u', where['admin'], f"{where['checkout']}/bin/update"]
+    return Plan('update', 'Atnaujinti', base + ['--check'] + arguments, base + arguments, timeout=3600)
+
+
+def plan_pipeline(form, status):
+    name = value(form, 'project', NAME, 'Projektas', required=True)
+    entry = next((item for item in (status or {}).get('projects', []) if item.get('name') == name), None)
+    if entry is None:
+        raise Invalid(f'Nėra projekto {name}.')
+    repository = bitbucket_repository(entry.get('repository') or '')
+    if repository is None:
+        raise Invalid('Pipeline\'ai paleidžiami tik Bitbucket projektams (GitHub dar nepalaikomas).')
+    pipeline = form.get('pipeline', '')
+    if pipeline not in PIPELINES:
+        raise Invalid('Nežinomas pipeline\'as.')
+    branch = git_ref(form, 'branch', 'Šaka') or entry.get('branch') or 'master'
+    variables = []
+    if pipeline in DEPLOY_PIPELINES:
+        ref = git_ref(form, 'ref', 'REF')
+        if ref:
+            variables.append(('REF', ref))
+        for key in ('IMAGES', 'ROLLBACK', 'BACKUP'):
+            variables.append((key, 'yes' if flag(form, key.lower()) else 'no'))
+    return PipelinePlan(name, *repository, pipeline, branch, variables)
+
+
+ACTIONS = {'add-project': plan_add_project, 'remove-project': plan_remove_project,
+           'install-runner': plan_install_runner, 'install-backups': plan_install_backups,
+           'install-metrics': plan_install_metrics, 'add-backup-key': plan_add_backup_key,
+           'remove-backup-key': plan_remove_backup_key, 'list-backup-keys': plan_list_backup_keys,
+           'prepare-host': plan_prepare_host, 'update': plan_update, 'pipeline': plan_pipeline}
+
+
+# --- Running commands ----------------------------------------------------------------------------
+def hidden_values(stdin):
+    """The secrets of a pasted runner dialog or page (--OAuthClientSecret, --token): never shown back."""
+    return [found for found in re.findall(r'(?:--OAuthClientSecret|--token)[\s=]+([^\s\\]+)', stdin or '') if len(found) >= 4]
+
+
+def redact(text, hidden):
+    for secret in hidden:
+        text = text.replace(secret, '<hidden>')
+    return text
+
+
+def check(plan):
+    """The --check run: (exit code, output); a secret of its stdin never appears in the output."""
+    try:
+        process = subprocess.Popen(plan.check, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True, errors='replace', env=child_environment(), start_new_session=True)
+    except OSError as error:
+        return 126, f'{plan.check[0]}: {error.strerror}'
+    try:
+        output, _ = process.communicate(plan.stdin or '', timeout=CHECK_TIMEOUT)
+        code = process.returncode
+    except subprocess.TimeoutExpired:
+        stop(process)
+        output, code = f'(no answer within {CHECK_TIMEOUT} s; stopped)', 124
+    return code, redact(output, hidden_values(plan.stdin))
+
+
+def stop(process, grace=30):
+    """SIGTERM to the command's process group (sudo relays it to the command), then SIGKILL."""
+    for sent, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 10)):
+        try:
+            os.killpg(process.pid, sent)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            process.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def job_main(directory):
+    """--job DIR: run job.json's argv with this process's stdin, write output.log and result.json, log the end."""
+    directory = Path(directory)
+    meta = json.loads((directory / 'job.json').read_text())
+    given = sys.stdin.buffer.read()  # e.g. a runner dialog: kept in memory, never written anywhere
+    (directory / 'pid').write_text(f'{os.getpid()}\n')
+    started = time.time()
+    hidden = [found.encode() for found in hidden_values(given.decode('utf-8', 'replace'))]
+    with open(directory / 'output.log', 'ab', buffering=0) as output:
+        try:
+            process = subprocess.Popen(meta['argv'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT, start_new_session=True, env=child_environment())
+        except OSError as error:
+            output.write(f'{meta["argv"][0]}: {error.strerror}\n'.encode())
+            code = 126
+        else:
+            def feed():
+                try:
+                    process.stdin.write(given)
+                    process.stdin.close()
+                except OSError:
+                    pass
+            expired = threading.Event()
+            timer = threading.Timer(meta['timeout'], lambda: (expired.set(), stop(process)))
+            threading.Thread(target=feed, daemon=True).start()
+            timer.start()
+            # Line by line, so that a secret of the stdin is masked before it reaches the file.
+            for line in process.stdout:
+                for secret in hidden:
+                    line = line.replace(secret, b'<hidden>')
+                output.write(line)
+            code = process.wait()
+            timer.cancel()
+            if expired.is_set():
+                output.write(f'\n(sustabdyta po {meta["timeout"] // 60} min.)\n'.encode())
+                code = 124
+    (directory / 'result.json').write_text(json.dumps({'exit': code, 'finished': int(time.time()),
+                                                       'seconds': int(time.time() - started)}))
+    try:
+        record(meta['user'], meta['client'], 'finished', f'job={directory.name} {meta["action"]} -> exit {code}')
+    except OSError as error:
+        log(f'ui-actions.log: {error}')
+    return 0
+
+
+def job_state(directory):
+    """(meta, result or None, running?) of a job directory."""
+    meta = json.loads((directory / 'job.json').read_text())
+    try:
+        return meta, json.loads((directory / 'result.json').read_text()), False
+    except (OSError, ValueError):
+        pass
+    try:
+        os.kill(int((directory / 'pid').read_text()), 0)
+        return meta, None, True
+    except (OSError, ValueError):
+        # Started a moment ago (no pid yet) or gone without a result (killed).
+        return meta, None, time.time() - meta['started'] < 30
+
+
+def jobs(limit=None):
+    if not JOBS.is_dir():
+        return []
+    found = sorted((path for path in JOBS.iterdir() if JOB_ID.fullmatch(path.name)), reverse=True)
+    return found[:limit] if limit else found
+
+
+def running_job():
+    for directory in jobs(20):
+        try:
+            if job_state(directory)[2]:
+                return directory.name
+        except (OSError, ValueError, KeyError):
+            continue
+    return None
+
+
+def start_job(plan, identifier, user, client):
+    JOBS.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for old in jobs()[KEEP_JOBS:]:
+        if (old / 'result.json').exists():
+            shutil.rmtree(old, ignore_errors=True)
+    directory = JOBS / identifier
+    directory.mkdir(mode=0o700)
+    (directory / 'job.json').write_text(json.dumps({'argv': plan.run, 'action': plan.action, 'title': plan.title,
+                                                    'user': user, 'client': client, 'timeout': plan.timeout,
+                                                    'started': int(time.time())}))
+    process = subprocess.Popen([sys.executable, PROGRAM, '--job', str(directory)], stdin=subprocess.PIPE,
+                               stdout=subprocess.DEVNULL, start_new_session=True, env=child_environment())
+    try:
+        process.stdin.write((plan.stdin or '').encode())
+        process.stdin.close()
+    except OSError:
+        pass
+    threading.Thread(target=process.wait, daemon=True).start()  # reaped here; it outlives a restart of the UI
+
+
+# --- Status --------------------------------------------------------------------------------------
+class Cache:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.values = {}
+
+    def get(self, key, ttl, compute, fresh=False):
+        with self.lock:
+            stored = self.values.get(key)
+            if stored and not fresh and time.monotonic() - stored[0] < ttl:
+                return stored[1]
+        result = compute()
+        with self.lock:
+            self.values[key] = (time.monotonic(), result)
+        return result
+
+    def forget(self, key):
+        with self.lock:
+            self.values.pop(key, None)
+
+
+CACHE = Cache()
+
+
+def helper(*arguments, timeout=150):
+    """The read-only status helper through its sudo rule: (JSON, None) or (None, error)."""
+    argv = ['sudo', '-n', str(LIBRARY / 'bin/server-status'), *arguments]
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=child_environment())
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return None, f'server-status: {error}'
+    if result.returncode:
+        return None, f'server-status: exit {result.returncode}: {result.stderr.strip()[:300]}'
+    try:
+        return json.loads(result.stdout), None
+    except ValueError:
+        return None, 'server-status: no JSON'
+
+
+def status(fresh=False):
+    return CACHE.get('status', STATUS_TTL, helper, fresh)
+
+
+# --- Bitbucket -----------------------------------------------------------------------------------
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an error: the token is never sent anywhere but the configured API."""
+
+    def redirect_request(self, request, fp, code, message, headers, url):
+        return None
+
+
+OPENER = urllib.request.build_opener(NoRedirect)
+
+
+def bitbucket_repository(url):
+    match = BITBUCKET_URL.fullmatch(url.strip())
+    return (match[1], match[2]) if match else None
+
+
+def token_for(project):
+    """(variable, token) for a build root: BITBUCKET_ACCESS_TOKEN_<NAME>, else BITBUCKET_ACCESS_TOKEN."""
+    for variable in (f'{TOKEN_VARIABLE}_{re.sub(r"[^A-Z0-9]", "_", project.upper())}', TOKEN_VARIABLE):
+        token = os.environ.get(variable, '')
+        if token and re.fullmatch(r'[A-Za-z0-9._~+/=-]{8,512}', token):
+            return variable, token
+    return None, None
+
+
+def bitbucket(method, path, token, body=None, timeout=20):
+    """(HTTP status, JSON or None, error text or None); the token is only in the Authorization header."""
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(bitbucket_api() + path, data=data, method=method)
+    request.add_header('Authorization', f'Bearer {token}')
+    request.add_header('Accept', 'application/json')
+    request.add_header('User-Agent', 'setup-server-ui')
+    if data is not None:
+        request.add_header('Content-Type', 'application/json')
+    try:
+        with OPENER.open(request, timeout=timeout) as response:
+            return response.status, json.loads(response.read(2 * 1024 * 1024) or b'null'), None
+    except urllib.error.HTTPError as error:
+        try:
+            message = json.loads(error.read(65536)).get('error', {}).get('message', '')
+        except (ValueError, AttributeError, OSError):
+            message = ''
+        text = f'HTTP {error.code}' + (f': {message}' if message else '') + \
+            (' (nukreipimas nesekamas)' if 300 <= error.code < 400 else '')
+        return error.code, None, text.replace(token, '<token>')[:300]
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        return None, None, str(getattr(error, 'reason', error)).replace(token, '<token>')[:300]
+
+
+def pipeline_runs(project, repository, fresh=False):
+    """The 10 newest pipeline runs of a repository: (runs, error)."""
+    variable, token = token_for(project)
+    if not token:
+        return None, f'nėra token\'o ({TOKEN_VARIABLE}_{re.sub(r"[^A-Z0-9]", "_", project.upper())} ar {TOKEN_VARIABLE})'
+
+    def compute():
+        code, data, error = bitbucket('GET', f'/repositories/{quote(repository[0])}/{quote(repository[1])}'
+                                             '/pipelines/?sort=-created_on&pagelen=10', token, timeout=8)
+        if error or not isinstance(data, dict):
+            return None, error or f'HTTP {code}'
+        return data.get('values', []), None
+    return CACHE.get(('pipelines', project), PIPELINES_TTL, compute, fresh)
+
+
+# --- HTML ----------------------------------------------------------------------------------------
+def e(text):
+    return html.escape(str(text), quote=True)
+
+
+STYLE = """
+body{font:14px/1.45 system-ui,sans-serif;margin:0;color:#1d2433;background:#f6f7f9}
+header{background:#1d2433;color:#fff;padding:.6em 1.2em;display:flex;gap:1.5em;align-items:baseline}
+header a{color:#cfe0ff;text-decoration:none}header strong{margin-right:auto}
+main{padding:1em 1.2em;max-width:1200px}
+h1{font-size:1.3em}h2{font-size:1.1em;margin-top:1.6em}
+table{border-collapse:collapse;background:#fff;margin:.4em 0;width:100%}
+th,td{border:1px solid #d9dde5;padding:.3em .5em;text-align:left;vertical-align:top}
+th{background:#eef1f6;font-weight:600}
+pre{background:#10141c;color:#e6e6e6;padding:.8em;overflow:auto;max-height:70vh;white-space:pre-wrap}
+.ok{color:#17733a}.warn{color:#9a6200}.bad{color:#b3261e;font-weight:600}.muted{color:#6b7280}
+form.action{background:#fff;border:1px solid #d9dde5;padding:.8em 1em;margin:.6em 0}
+form.action h3{margin:.1em 0 .5em;font-size:1em}
+label{display:block;margin:.35em 0}label span{display:inline-block;min-width:13em}
+input[type=text],textarea,select{font:inherit;padding:.25em;width:28em;max-width:100%}
+textarea{height:7em}button{font:inherit;padding:.35em 1em;cursor:pointer}
+button.run{background:#b3261e;color:#fff;border:0}.note{color:#4b5563;font-size:.92em}
+.box{background:#fff;border:1px solid #d9dde5;padding:.6em 1em;margin:.6em 0}
+"""
+
+
+def ago(moment, now=None):
+    seconds = max(0, int((now or time.time()) - moment))
+    if seconds < 3600:
+        return f'prieš {seconds // 60} min.'
+    if seconds < 48 * 3600:
+        return f'prieš {seconds // 3600} val.'
+    return f'prieš {seconds // 86400} d.'
+
+
+def size(count):
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if count < 1024 or unit == 'TB':
+            return (f'{count:.1f}'.replace('.', ',') if unit != 'B' else str(count)) + f' {unit}'
+        count /= 1024
+
+
+def local_time(moment):
+    return time.strftime('%Y-%m-%d %H:%M', time.localtime(moment))
+
+
+def badge(text, kind):
+    return f'<span class="{kind}">{e(text)}</span>'
+
+
+def unit_state(units, name):
+    unit = units.get(name)
+    if not unit or unit.get('LoadState') == 'not-found':
+        return badge('neįdiegta', 'muted')
+    active = unit.get('ActiveState', '?')
+    kind = 'ok' if active == 'active' else 'bad' if active == 'failed' else 'warn'
+    text = {'active': 'veikia', 'inactive': 'neveikia', 'failed': 'klaida', 'activating': 'paleidžiama'}.get(active, active)
+    return badge(text, kind) + (f' <span class="muted">nuo {e(unit["ActiveEnterTimestamp"])}</span>'
+                                if active == 'active' and unit.get('ActiveEnterTimestamp') else '')
+
+
+class Page:
+    """Renders the pages; `token` is the CSRF token of the logged-in user."""
+
+    def __init__(self, user, token):
+        self.user, self.token = user, token
+
+    def layout(self, title, body, refresh=None):
+        head = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ''
+        return (f'<!doctype html><html lang="lt"><head><meta charset="utf-8">{head}<title>{e(title)} · setup-server</title>'
+                f'<link rel="stylesheet" href="/ui.css"></head><body><header><strong>setup-server · {e(socket.gethostname())}</strong>'
+                '<a href="/">Apžvalga</a><a href="/actions">Veiksmai</a><a href="/logs">Žurnalai</a>'
+                f'<span class="muted">{e(self.user)}</span></header><main><h1>{e(title)}</h1>{body}</main></body></html>')
+
+    def form(self, action, title, fields, button='Peržiūrėti', note=''):
+        return (f'<form class="action" method="post" action="/preview"><h3>{e(title)}</h3>'
+                f'<input type="hidden" name="csrf" value="{e(self.token)}"><input type="hidden" name="action" value="{e(action)}">'
+                f'{fields}{f"<p class=note>{note}</p>" if note else ""}<button>{e(button)}</button></form>')
+
+    # --- Overview ---
+    def overview(self, data, error):
+        if data is None:
+            return self.layout('Apžvalga', f'<p class="bad">Būsenos nepavyko gauti: {e(error)}</p>')
+        units = data.get('units', {})
+        versions = data.get('versions') or {}
+        rows = []
+        installed, checkout = versions.get('installed'), versions.get('checkout')
+        server = e(installed or '?') + (f' <span class="warn">(klonas: {e(checkout)}; '
+                                        'įdiegtos kopijos atnaujinamos per bin/update)</span>'
+                                        if checkout and installed and checkout != installed else '')
+        rows.append(('setup-server', server))
+        rows.append(('setup (bendras checkout\'as)', e(versions.get('setup') or '?')))
+        rows.append(("Bitbucket runner'is", unit_state(units, 'setup-server-runner.service')))
+        for scope in data.get('github_runners', []):
+            rows.append((f"GitHub runner'is {scope}", unit_state(units, f'setup-server-github-runner@{scope}.service')))
+        timer, service = units.get('setup-server-backup.timer', {}), units.get('setup-server-backup.service', {})
+        if timer and timer.get('LoadState') != 'not-found':
+            result = service.get('Result')
+            last = timer.get('LastTriggerUSec') or service.get('ExecMainExitTimestamp')
+            text = unit_state(units, 'setup-server-backup.timer') + (f'; paskutinė {e(last)}' if last else '; dar nevyko')
+            if result:
+                text += ' – ' + (badge('pavyko', 'ok') if result == 'success' else badge(f'nepavyko ({result})', 'bad'))
+            if timer.get('NextElapseUSecRealtime'):
+                text += f'; kita {e(timer["NextElapseUSecRealtime"])}'
+        else:
+            text = badge('neįdiegtos', 'muted')
+        rows.append(('Naktinės DB kopijos', text))
+        rows.append(('Metrikos (/metrics)', unit_state(units, 'setup-server-metrics.service')))
+        disk = data.get('disk')
+        if disk and disk.get('size'):
+            share = disk['available'] / disk['size']
+            rows.append((f'Diskas ({e(disk["path"])})', badge(f'laisva {size(disk["available"])} iš {size(disk["size"])} '
+                                                            f'({share:.0%})', 'ok' if share > 0.15 else 'bad')))
+        body = '<h2>Serveris</h2><table>' + ''.join(f'<tr><th>{e(name)}</th><td>{cell}</td></tr>' for name, cell in rows) + '</table>'
+        body += '<h2>Projektai</h2>' + self.projects_table(data)
+        if data.get('errors'):
+            body += '<h2>Ko nepavyko perskaityti</h2><ul>' + ''.join(f'<li class="warn">{e(item)}</li>' for item in data['errors']) + '</ul>'
+        body += f'<p class="muted">Būsena: {e(local_time(data.get("generated", time.time())))}. <a href="/?fresh=1">Atnaujinti</a></p>'
+        return self.layout('Apžvalga', body)
+
+    def projects_table(self, data):
+        projects = data.get('projects', [])
+        if not projects:
+            return '<p>Projektų dar nėra. <a href="/actions#add-project">Pridėti projektą</a></p>'
+        rows = []
+        for entry in projects:
+            environments = entry.get('environments', {}) or {'': None}
+            repository = bitbucket_repository(entry.get('repository') or '')
+            runs = ''
+            if repository:
+                found, error = pipeline_runs(entry['name'], repository)
+                runs = self.run_cell(found[0], repository) if found else e(error) if error else 'dar nebuvo'
+            elif entry.get('repository'):
+                runs = '<span class="muted">GitHub: dar nepalaikoma</span>'
+            first = True
+            for environment, state in environments.items():
+                cells = ''
+                if first:
+                    span = len(environments)
+                    cells += (f'<td rowspan="{span}"><a href="/project/{e(entry["name"])}">{e(entry["name"])}</a></td>'
+                              f'<td rowspan="{span}">{e(entry.get("repository") or "?")}'
+                              f'{"<br>" + e(entry["code_repository"]) if entry.get("code_repository") else ""}</td>')
+                if state is None:
+                    cells += '<td colspan="6" class="muted">nedeploy\'inta iš čia (nėra env/stage.env ar env/prod.env)</td>'
+                else:
+                    cells += (f'<td>{e(environment)}</td><td>{self.target(entry, environment)}</td><td>{self.deploy_cell(state)}</td>'
+                              f'<td>{self.backup_cell(state)}</td><td>{self.secrets_cell(state)}</td><td>{self.containers_cell(state)}</td>')
+                if first:
+                    cells += f'<td rowspan="{len(environments)}">{runs}</td>'
+                    first = False
+                rows.append(f'<tr>{cells}</tr>')
+        return ('<table><tr><th>Projektas</th><th>Repo</th><th>Aplinka</th><th>Taikinys</th><th>Paskutinis deploy\'us</th>'
+                '<th>Naujausia kopija</th><th>Secrets</th><th>Konteineriai</th><th>Pipeline</th></tr>' + ''.join(rows) + '</table>')
+
+    @staticmethod
+    def target(entry, environment):
+        targets = entry.get('targets', {})
+        values = {**targets.get('all', {}), **targets.get(environment, {})}
+        if not values:
+            return badge('neįregistruotas', 'warn')
+        if values.get('DEPLOY_CONTEXT', 'default') == 'default':
+            return 'šis serveris'
+        return e(f'{values.get("DEPLOY_SSH", "?")}:{values.get("DEPLOY_PATH", "?")}')
+
+    @staticmethod
+    def deploy_cell(state):
+        deploys = state.get('deploys')
+        if not deploys:
+            return '<span class="muted">nebuvo</span>'
+        last = deploys['last']
+        text = f'{e(last["ref"] or "?")} <span class="muted">{e(last["commit"])}</span> {e(ago(last["at"]))}'
+        if last.get('failed'):
+            text += ' ' + badge(f'nepavyko ({last["failed"]})', 'bad')
+        else:
+            text += ' ' + badge('pavyko', 'ok')
+        if last.get('rollback'):
+            text += ' ' + badge('rollback', 'warn')
+        return text
+
+    @staticmethod
+    def backup_cell(state):
+        backups = state.get('backups') or {}
+        newest = backups.get('newest')
+        if not newest:
+            return badge('nėra', 'bad' if state.get('declared') else 'muted')
+        age = time.time() - newest['time']
+        return badge(ago(newest['time']), 'ok' if age < 26 * 3600 else 'bad') + \
+            f', {e(size(newest["size"]))}, laikoma {backups.get("count", 0)}'
+
+    @staticmethod
+    def secrets_cell(state):
+        return {'running': badge('veikia', 'ok'), 'stopped': badge('sustojęs', 'bad')}.get(
+            state.get('secrets'), badge('nėra', 'warn' if state.get('declared') else 'muted'))
+
+    @staticmethod
+    def containers_cell(state):
+        found = state.get('containers', [])
+        if not found:
+            return '<span class="muted">nėra</span>'
+        running = sum(1 for item in found if item['state'] == 'running')
+        unhealthy = [item['name'] for item in found if item.get('health') == 'unhealthy']
+        text = badge(f'{running}/{len(found)} veikia', 'ok' if running == len(found) else 'warn')
+        return text + (' ' + badge('nesveiki: ' + ', '.join(unhealthy), 'bad') if unhealthy else '')
+
+    @staticmethod
+    def run_cell(run, repository):
+        state = run.get('state', {}) or {}
+        result = (state.get('result') or {}).get('name') or state.get('name', '?')
+        kind = 'ok' if result == 'SUCCESSFUL' else 'bad' if result in ('FAILED', 'ERROR') else 'warn'
+        target = run.get('target', {}) or {}
+        pattern = (target.get('selector') or {}).get('pattern') or target.get('ref_name') or ''
+        link = f'{BITBUCKET_WEB}/{quote(repository[0])}/{quote(repository[1])}/pipelines/results/{int(run.get("build_number", 0))}'
+        return (f'<a href="{e(link)}">#{e(run.get("build_number", "?"))}</a> {e(pattern)} {badge(result, kind)} '
+                f'<span class="muted">{e((run.get("created_on") or "")[:16].replace("T", " "))}</span>')
+
+    # --- One project ---
+    def project(self, data, name):
+        entry = next((item for item in (data or {}).get('projects', []) if item.get('name') == name), None)
+        if entry is None:
+            return None
+        body = (f'<table><tr><th>Aplinkos repo</th><td>{e(entry.get("repository") or "?")}</td></tr>'
+                f'<tr><th>Kodo repo</th><td>{e(entry.get("code_repository") or "—")}</td></tr>'
+                f'<tr><th>Build katalogas</th><td>{e(data.get("root", ""))}/projects/{e(name)}/{e(entry.get("layout") or "")}</td></tr>'
+                f'<tr><th>PROJECT_NAME</th><td>{e(entry.get("project_name"))}</td></tr></table>')
+        for environment, state in entry.get('environments', {}).items():
+            body += (f'<h2>{e(environment)}</h2><table><tr><th>Taikinys</th><td>{self.target(entry, environment)}'
+                     f' <span class="muted">(Docker context {e(state["context"])})</span></td></tr>'
+                     f'<tr><th>Paskutinis deploy\'us</th><td>{self.deploy_cell(state)}</td></tr>')
+            success = (state.get('deploys') or {}).get('last_success')
+            if success and success != state['deploys']['last']:
+                body += f'<tr><th>Paskutinis pavykęs</th><td>{e(success["ref"])} {e(success["commit"])} {e(ago(success["at"]))}</td></tr>'
+            body += (f'<tr><th>Naujausia kopija</th><td>{self.backup_cell(state)}'
+                     f'{" <span class=muted>" + e(state["backups"]["newest"]["name"]) + "</span>" if (state.get("backups") or {}).get("newest") else ""}</td></tr>'
+                     f'<tr><th>Secret store</th><td>{self.secrets_cell(state)} <span class="muted">{e(state["compose_project"])}-secrets</span></td></tr></table>')
+            if state.get('containers'):
+                body += '<table><tr><th>Konteineris</th><th>Būsena</th><th>Sveikata</th><th>Status</th></tr>' + ''.join(
+                    f'<tr><td>{e(item["name"])}</td><td>{badge(item["state"], "ok" if item["state"] == "running" else "warn")}</td>'
+                    f'<td>{badge(item.get("health") or "—", {"healthy": "ok", "unhealthy": "bad"}.get(item.get("health"), "muted"))}</td>'
+                    f'<td class="muted">{e(item["status"])}</td></tr>' for item in state['containers']) + '</table>'
+        body += '<h2>Pipeline\'ai</h2>' + self.pipelines(entry)
+        body += '<h2>Pašalinti</h2>' + self.form('remove-project', f'Pašalinti build katalogą {name}',
+                                                  f'<input type="hidden" name="name" value="{e(name)}">'
+                                                  '<label><input type="checkbox" name="with_backups" value="yes"> kartu su DB kopijomis ir '
+                                                  'deploy\'ų istorija (dingsta rollback\'as)</label>',
+                                                  note='Peržiūra (--check) parodo dydį, kopijas ir ar katalogą naudoja konteineris.')
+        return self.layout(f'Projektas {name}', body)
+
+    def pipelines(self, entry):
+        repository = bitbucket_repository(entry.get('repository') or '')
+        if repository is None:
+            return ('<p class="muted">Pipeline\'ų paleidimas – tik Bitbucket projektams; GitHub dar nepalaikomas. '
+                    'Deploy\'us paleisk GitHub Actions.</p>')
+        found, error = pipeline_runs(entry['name'], repository)
+        body = ''
+        if error:
+            body += f'<p class="warn">Bitbucket: {e(error)}</p>'
+        elif found:
+            body += '<table><tr><th>Nr.</th><th>Pipeline\'as</th><th>Rezultatas</th><th>Kas</th></tr>' + ''.join(
+                f'<tr><td colspan="3">{self.run_cell(run, repository)}</td><td>{e(((run.get("creator") or {}).get("display_name")) or "")}</td></tr>'
+                for run in found) + '</table>'
+        name, branch = e(entry['name']), e(entry.get('branch') or 'master')
+        hidden = f'<input type="hidden" name="project" value="{name}">'
+        branch_field = f'<label><span>Šaka (pipeline\'o apibrėžimas)</span><input type="text" name="branch" value="{branch}"></label>'
+        for pipeline in DEPLOY_PIPELINES:
+            body += self.form('pipeline', PIPELINES[pipeline],
+                              hidden + f'<input type="hidden" name="pipeline" value="{pipeline}">' + branch_field +
+                              '<label><span>REF (tag\'as ar commit\'as)</span><input type="text" name="ref"></label>'
+                              '<label><input type="checkbox" name="images" value="yes"> IMAGES – perkurti image\'us</label>'
+                              '<label><input type="checkbox" name="backup" value="yes" checked> BACKUP – kopija prieš deploy\'ų</label>'
+                              '<label><input type="checkbox" name="rollback" value="yes"> ROLLBACK – grįžti į ankstesnį</label>',
+                              note=f'Custom pipeline\'as {pipeline} per Bitbucket API: istorija lieka Bitbucket Deployments.')
+        for pipeline in ('backup-now', 'runner-test'):
+            body += self.form('pipeline', PIPELINES[pipeline], hidden + f'<input type="hidden" name="pipeline" value="{pipeline}">' + branch_field,
+                              note=f'Custom pipeline\'as {pipeline}.')
+        return body
+
+    # --- Actions ---
+    def actions(self, where):
+        def text(name, label, placeholder='', value=''):
+            return (f'<label><span>{e(label)}</span><input type="text" name="{name}" value="{e(value)}" '
+                    f'placeholder="{e(placeholder)}"></label>')
+        body = '<p class="note">Kiekvienas veiksmas pirmiausia paleidžiamas su --check: matai, ką jis darytų, ir tik tada spaudi „Vykdyti“.</p>'
+        body += '<h2 id="add-project">Projektai</h2>' + self.form(
+            'add-project', 'Pridėti projektą (bin/add-project)',
+            text('env_repo', 'Aplinkos repo URL', 'git@bitbucket.org:darbo-erdve/projektas.git') +
+            text('code_repo', 'Kodo repo URL (nebūtina)', 'git@bitbucket.org:darbo-erdve/kodas.git') +
+            text('name', 'Vardas (nebūtina)', 'numatyta – repo vardas') +
+            '<label><span>Taikinys (po vieną eilutėje)</span><textarea name="targets" placeholder="local&#10;prod=ssh://deploy@shop.example/home/deploy/shop"></textarea></label>'
+            '<label><input type="checkbox" name="shared_key" value="yes"> GitHub: paskyros raktas (--shared-key)</label>',
+            note='Tuščias taikinys – šis serveris, kai projektas naujas; esamo nekeičia. Projekto pašalinimas – projekto puslapyje.')
+        body += '<h2>Runner\'iai</h2>' + self.form(
+            'install-runner', 'Įdiegti runner\'į (bin/install-runner)',
+            '<label><span>Runner\'is</span><select name="provider"><option value="bitbucket">Bitbucket</option>'
+            '<option value="github">GitHub Actions</option></select></label>' +
+            text('runner_name', 'Vardas GitHub\'e (nebūtina)', 'numatyta – serverio vardas') +
+            '<label><span>Dialogo / puslapio tekstas</span><textarea name="dialog" autocomplete="off" spellcheck="false"></textarea></label>',
+            note='Įklijuok visą Bitbucket „Runner installation“ dialogo arba GitHub „New self-hosted runner“ puslapio tekstą. '
+                 'Jis perduodamas komandai per stdin, niekur neįrašomas ir nerodomas; paslaptis lieka tik serverio atmintyje iki „Vykdyti“.')
+        body += '<h2>Kopijos ir metrikos</h2>' + self.form(
+            'install-backups', 'Naktinės DB kopijos (bin/install-backups)', text('at', 'Laikas (nebūtina)', '03:30'),
+            note='Be laiko paliekamas įdiegtas (numatyta 03:30).')
+        body += self.form(
+            'install-metrics', 'Worker\'io metrikos (bin/install-metrics)',
+            text('address', 'Adresas (nebūtina)', '10.8.0.14') + text('allow', 'Leidžiami adresai', '10.8.0.20') +
+            text('port', 'Port\'as (nebūtina)', '9101') +
+            '<label><span>Token\'as</span><select name="token"><option value="keep">palikti, kaip yra</option>'
+            '<option value="new">naujas (--new-token)</option><option value="none">be token\'o (--no-token)</option></select></label>',
+            note='Nenurodyti nustatymai paliekami iš /etc/setup-server/metrics.env.')
+        body += self.form(
+            'add-backup-key', 'Kopijų atsisiuntimo raktas (bin/add-backup-key)',
+            '<label><span>Viešasis raktas (.pub)</span><textarea name="public_key" spellcheck="false"></textarea></label>' +
+            text('key_name', 'Vardas', 'tomas') + text('sources', 'Iš kur (VPN tinklas)', '10.8.0.0/24'))
+        body += self.form('remove-backup-key', 'Atimti kopijų raktą', text('key_name', 'Vardas', 'tomas'))
+        body += self.form('list-backup-keys', 'Kopijų raktai (--list)', '', button='Rodyti')
+        body += '<h2>Serveris</h2>' + self.form(
+            'prepare-host', 'Paruošti serverį (bin/prepare-host)', text('setup_ref', 'setup tag\'as (nebūtina)', 'v2.6.0'),
+            note='Paketai, Docker, paskyra setup, git raktas, setup checkout\'as. Esamas Docker nekeičiamas.')
+        if where['checkout']:
+            body += self.form(
+                'update', 'Atnaujinti (bin/update)',
+                text('server_ref', 'setup-server ref\'as', 'v0.3.0') + text('setup_ref', 'setup ref\'as', 'v2.6.0'),
+                note=f'Vykdoma kaip {e(where["admin"])} iš {e(where["checkout"])}. Jo sudo turi veikti be slaptažodžio '
+                     '(be terminalo jo paklausti negalima); kitaip – terminale. Sąsaja atnaujinimo metu persikrauna, darbas tęsiasi.')
+        else:
+            body += '<p class="warn">bin/update: nežinomas administratoriaus klonas (paleisk sudo bin/install-ui iš jo).</p>'
+        return self.layout('Veiksmai', body)
+
+    def invalid(self, message):
+        return self.layout('Netinkami duomenys', f'<p class="bad">{e(message)}</p><p><a href="/actions">Atgal į veiksmus</a></p>')
+
+    def preview(self, plan, code, output, pending):
+        body = f'<p>Komanda: <code>{e(shlex.join(plan.check))}</code></p>'
+        if plan.stdin and plan.action == 'install-runner':
+            body += '<p class="note">Įklijuotas tekstas perduotas per stdin (nerodomas).</p>'
+        body += f'<p>Kodas: {badge("—" if code is None else code, "ok" if code == 0 else "bad")}</p><pre>{e(output)}</pre>'
+        if plan.run is None:
+            return self.layout(plan.title, body)
+        if pending:
+            body += (f'<form method="post" action="/run"><input type="hidden" name="csrf" value="{e(self.token)}">'
+                     f'<input type="hidden" name="pending" value="{e(pending)}">'
+                     f'<p>Vykdys: <code>{e(shlex.join(plan.run))}</code></p><button class="run">Vykdyti</button> '
+                     '<a href="/actions">Atšaukti</a></form>')
+        else:
+            body += '<p class="bad">Peržiūra baigėsi klaida: vykdyti negalima. Pataisyk, ką ji rodo, ir bandyk dar kartą.</p>'
+        return self.layout(f'Peržiūra: {plan.title}', body)
+
+    def pipeline_preview(self, plan, pending, token_variable):
+        body = (f'<p>Bitbucket repo: <code>{e(plan.workspace)}/{e(plan.slug)}</code>; token\'as: '
+                f'{e(token_variable) if token_variable else badge("nėra (" + TOKEN_VARIABLE + ")", "bad")}</p>'
+                f'<p>Užklausa: <code>POST {e(bitbucket_api() + plan.path)}</code></p><pre>{e(json.dumps(plan.body, indent=2))}</pre>')
+        if token_variable:
+            body += (f'<form method="post" action="/run"><input type="hidden" name="csrf" value="{e(self.token)}">'
+                     f'<input type="hidden" name="pending" value="{e(pending)}"><button class="run">Vykdyti</button> '
+                     f'<a href="/project/{e(plan.project)}">Atšaukti</a></form>')
+        return self.layout(f'Peržiūra: {plan.title}', body)
+
+    def pipeline_result(self, plan, code, data, error):
+        if error or code != 201 or not isinstance(data, dict):
+            body = f'<p class="bad">Bitbucket atsakė: {e(error or f"HTTP {code}")}</p>'
+        else:
+            number = data.get('build_number')
+            link = f'{BITBUCKET_WEB}/{quote(plan.workspace)}/{quote(plan.slug)}/pipelines/results/{int(number or 0)}'
+            body = f'<p class="ok">Paleista: <a href="{e(link)}">#{e(number)}</a> ({e(plan.pipeline)}, šaka {e(plan.branch)}).</p>'
+        body += f'<p><a href="/project/{e(plan.project)}">Atgal į projektą</a></p>'
+        return self.layout(plan.title, body)
+
+    def job(self, identifier, meta, result, running, output):
+        if running:
+            state = badge('vykdoma', 'warn')
+        elif result is None:
+            state = badge('nutrūko (be rezultato)', 'bad')
+        else:
+            state = badge(f'baigta, kodas {result["exit"]}', 'ok' if result['exit'] == 0 else 'bad')
+        body = (f'<p>{state} · pradėta {e(local_time(meta["started"]))} · {e(meta["user"])}</p>'
+                f'<p><code>{e(shlex.join(meta["argv"]))}</code></p><pre>{e(output)}</pre>')
+        if running:
+            body += '<p class="muted">Puslapis atsinaujina kas 3 s.</p>'
+        return self.layout(meta.get('title', 'Veiksmas'), body, refresh=3 if running else None)
+
+    def logs(self, actions, recent, data, error):
+        body = '<h2>Paskutiniai veiksmai</h2>'
+        if recent:
+            body += '<table><tr><th>Pradėta</th><th>Veiksmas</th><th>Kas</th><th>Būsena</th></tr>' + ''.join(
+                f'<tr><td><a href="/job/{e(name)}">{e(local_time(meta["started"]))}</a></td><td>{e(meta.get("title", ""))}</td>'
+                f'<td>{e(meta["user"])}</td><td>{state}</td></tr>' for name, meta, state in recent) + '</table>'
+        body += f'<h2>ui-actions.log</h2><pre>{e(actions)}</pre>'
+        if data is None:
+            body += f'<p class="bad">{e(error)}</p>'
+        else:
+            body += f'<h2>backup-pulls.log</h2><pre>{e(chr(10).join(data.get("backup_pulls", [])) or "(tuščia)")}</pre>'
+            for unit, lines in data.get('journal', {}).items():
+                body += f'<h2>journalctl -u {e(unit)}</h2><pre>{e(chr(10).join(lines) or "(tuščia)")}</pre>'
+        return self.layout('Žurnalai', body)
+
+
+# --- HTTP ----------------------------------------------------------------------------------------
+class Pending:
+    """Previewed actions waiting for "Vykdyti": in memory only (a restart forgets them), single use."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.items = {}
+
+    def add(self, plan, user):
+        key = secrets.token_urlsafe(18)
+        with self.lock:
+            now = time.monotonic()
+            self.items = {name: item for name, item in self.items.items() if now - item[2] < PENDING_TTL}
+            self.items[key] = (plan, user, now)
+        return key
+
+    def take(self, key, user):
+        with self.lock:
+            item = self.items.pop(key, None)
+        if item and item[1] == user and time.monotonic() - item[2] < PENDING_TTL:
+            return item[0]
+        return None
+
+
+def tail(path, limit=200):
+    try:
+        with open(path, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - 256 * 1024))
+            return '\n'.join(handle.read().decode('utf-8', 'replace').splitlines()[-limit:])
+    except OSError as error:
+        return f'({error.strerror})'
+
+
+def handler(user, stored):
+    csrf_key = secrets.token_bytes(32)
+    verified = set()  # sha256 of Authorization headers already checked: PBKDF2 runs once per login
+    pending = Pending()
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = 'setup-server-ui'
+        sys_version = ''
+        timeout = 60
+
+        def reply(self, status, body, content_type='text/html; charset=utf-8', headers=()):
+            data = body.encode()
+            self.send_response(status)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Frame-Options', 'DENY')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Referrer-Policy', 'no-referrer')
+            self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'self'; form-action 'self'; "
+                                                        "frame-ancestors 'none'; base-uri 'none'")
+            for header in headers:
+                self.send_header(*header)
+            self.end_headers()
+            if self.command != 'HEAD':
+                self.wfile.write(data)
+
+        def client(self):
+            return self.client_address[0]
+
+        def login(self):
+            """The user of a valid Basic-auth header, or None (the reply is sent)."""
+            host = self.headers.get('Host', '')
+            if re.sub(r':[0-9]+$', '', host) not in LOOPBACK_HOSTS:
+                log(f'refused {self.client()}: Host {host[:60]!r} (400)')
+                self.reply(400, 'Unexpected Host\n', 'text/plain; charset=utf-8')
+                return None
+            header = self.headers.get('Authorization', '')
+            digest = hashlib.sha256(header.encode('utf-8', 'surrogateescape')).digest()
+            with lock:
+                known = digest in verified
+            if not known:
+                given_user, given_password = '', ''
+                if header.startswith('Basic '):
+                    try:
+                        given_user, _, given_password = base64.b64decode(header[6:], validate=True).decode().partition(':')
+                    except (ValueError, UnicodeDecodeError):
+                        pass
+                # Both are compared, whatever the first gives: the time tells nothing about the user name.
+                user_ok = hmac.compare_digest(given_user.encode(), user.encode())
+                password_ok = password_matches(given_password, stored)
+                if not (user_ok and password_ok):
+                    if header:
+                        log(f'refused {self.client()}: wrong login (401)')
+                    self.reply(401, self.page_text('Reikia prisijungti.'),
+                               headers=[('WWW-Authenticate', 'Basic realm="setup-server", charset="UTF-8"')])
+                    return None
+                with lock:
+                    if len(verified) > 64:
+                        verified.clear()
+                    verified.add(digest)
+            return user
+
+        @staticmethod
+        def page_text(text):
+            return f'<!doctype html><html lang="lt"><meta charset="utf-8"><p>{e(text)}</p></html>'
+
+        def token(self, name):
+            return hmac.new(csrf_key, b'csrf\0' + name.encode(), hashlib.sha256).hexdigest()
+
+        def do_GET(self):
+            name = self.login()
+            if name is None:
+                return
+            page = Page(name, self.token(name))
+            url = urlsplit(self.path)
+            path, query = url.path, parse_qs(url.query)
+            if path == '/ui.css':
+                return self.reply(200, STYLE, 'text/css; charset=utf-8')
+            if path == '/':
+                data, error = status(fresh='fresh' in query)
+                return self.reply(200, page.overview(data, error))
+            match = re.fullmatch(r'/project/([a-z0-9][a-z0-9_-]{0,63})', path)
+            if match:
+                data, error = status(fresh='fresh' in query)
+                rendered = page.project(data, match[1]) if data else page.layout('Projektas', f'<p class="bad">{e(error)}</p>')
+                return self.reply(200, rendered) if rendered else self.reply(404, page.layout('Nėra projekto', ''))
+            if path == '/actions':
+                return self.reply(200, page.actions(installation()))
+            if path == '/logs':
+                recent = []
+                for directory in jobs(20):
+                    try:
+                        meta, result, running = job_state(directory)
+                    except (OSError, ValueError, KeyError):
+                        continue
+                    state = badge('vykdoma', 'warn') if running else badge('nutrūko', 'bad') if result is None else \
+                        badge(f'kodas {result["exit"]}', 'ok' if result['exit'] == 0 else 'bad')
+                    recent.append((directory.name, meta, state))
+                data, error = helper('--logs', '50')
+                return self.reply(200, page.logs(tail(ACTIONS_LOG), recent, data, error))
+            match = re.fullmatch(r'/job/(' + JOB_ID.pattern + ')', path)
+            if match and (JOBS / match[1] / 'job.json').is_file():
+                meta, result, running = job_state(JOBS / match[1])
+                return self.reply(200, page.job(match[1], meta, result, running, tail(JOBS / match[1] / 'output.log', 3000)))
+            self.reply(404, page.layout('Nerasta', '<p><a href="/">Į apžvalgą</a></p>'))
+
+        do_HEAD = do_GET
+
+        def do_POST(self):
+            name = self.login()
+            if name is None:
+                return
+            origin = self.headers.get('Origin')
+            if origin is not None and (urlsplit(origin).hostname or '') not in ('127.0.0.1', 'localhost', '::1'):
+                log(f'refused {self.client()}: POST from Origin {origin[:60]!r} (403)')
+                return self.reply(403, self.page_text('Užklausa ne iš šios sąsajos.'))
+            length = self.headers.get('Content-Length', '')
+            if not length.isdigit() or int(length) > BODY_LIMIT:
+                return self.reply(413, self.page_text('Per didelė užklausa.'))
+            fields = parse_qs(self.rfile.read(int(length)).decode('utf-8', 'replace'), keep_blank_values=True)
+            form = {key: values[0] for key, values in fields.items()}
+            if not hmac.compare_digest(form.get('csrf', '').encode(), self.token(name).encode()):
+                log(f'refused {self.client()}: POST {urlsplit(self.path).path} without a valid CSRF token (403)')
+                return self.reply(403, self.page_text('Pasenusi forma: atnaujink puslapį ir bandyk dar kartą.'))
+            page = Page(name, self.token(name))
+            path = urlsplit(self.path).path
+            if path == '/preview':
+                return self.preview(page, name, form)
+            if path == '/run':
+                return self.run(page, name, form)
+            self.reply(404, page.layout('Nerasta', ''))
+
+        def preview(self, page, name, form):
+            builder = ACTIONS.get(form.get('action', ''))
+            if builder is None:
+                return self.reply(400, page.invalid('Nežinomas veiksmas.'))
+            try:
+                plan = builder(form, status()[0] if form.get('action') == 'pipeline' else None)
+            except Invalid as error:
+                return self.reply(400, page.invalid(str(error)))
+            if plan.kind == 'pipeline':
+                variable, _ = token_for(plan.project)
+                return self.reply(200, page.pipeline_preview(plan, pending.add(plan, name), variable))
+            kind = 'read' if plan.run is None else 'check'
+            code, output = check(plan)
+            try:
+                record(name, self.client(), kind, f'{plan.action}: {shlex.join(plan.check)} -> exit {code}')
+            except OSError as error:
+                # Nothing runs without its line in the log: no "Vykdyti" either.
+                output += f'\n\n(ui-actions.log: {error.strerror}; vykdyti negalima)'
+                code = None
+            key = pending.add(plan, name) if plan.run is not None and code in plan.run_codes else None
+            self.reply(200, page.preview(plan, code, output, key))
+
+        def run(self, page, name, form):
+            plan = pending.take(form.get('pending', ''), name)
+            if plan is None:
+                return self.reply(400, page.invalid('Peržiūra nebegalioja (pasibaigė, jau vykdyta ar sąsaja persikrovė): pradėk iš naujo.'))
+            if plan.kind == 'pipeline':
+                return self.pipeline(page, name, plan)
+            busy = running_job()
+            if busy:
+                return self.reply(409, page.layout('Užimta', f'<p class="warn">Dar vykdomas kitas veiksmas: '
+                                                            f'<a href="/job/{e(busy)}">{e(busy)}</a>. Palauk, kol baigsis.</p>'))
+            identifier = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + secrets.token_hex(3)
+            try:
+                record(name, self.client(), 'run', f'job={identifier} {plan.action}: {shlex.join(plan.run)}')
+            except OSError as error:
+                return self.reply(500, page.invalid(f'Veiksmų žurnalas {ACTIONS_LOG} neįrašomas ({error.strerror}): nieko nevykdyta.'))
+            start_job(plan, identifier, name, self.client())
+            CACHE.forget('status')
+            self.send_response(303)
+            self.send_header('Location', f'/job/{identifier}')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
+        def pipeline(self, page, name, plan):
+            variable, token = token_for(plan.project)
+            if not token:
+                return self.reply(400, page.invalid(f'Nėra Bitbucket token\'o ({TOKEN_VARIABLE}).'))
+            what = (f'POST {plan.path} {plan.pipeline} branch={plan.branch} ' +
+                    ' '.join(f'{key}={text}' for key, text in plan.variables) + f' (token {variable})')
+            try:
+                record(name, self.client(), 'pipeline', f'{plan.project}: {what} (sending)')
+            except OSError as error:
+                return self.reply(500, page.invalid(f'Veiksmų žurnalas {ACTIONS_LOG} neįrašomas ({error.strerror}): nieko nevykdyta.'))
+            code, data, error = bitbucket('POST', plan.path, token, plan.body)
+            number = data.get('build_number') if isinstance(data, dict) else None
+            try:
+                record(name, self.client(), 'pipeline', f'{plan.project}: {what} -> ' +
+                       (f'HTTP {code} #{number}' if not error else error))
+            except OSError as failure:
+                log(f'ui-actions.log: {failure}')
+            CACHE.forget(('pipelines', plan.project))
+            self.reply(200 if not error else 502, page.pipeline_result(plan, code, data, error))
+
+        def log_message(self, format, *arguments):  # refusals and errors only (log() above)
+            pass
+
+    return Handler
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+
+def main(arguments):
+    if arguments[:1] == ['--job'] and len(arguments) == 2:
+        return job_main(arguments[1])
+    if arguments == ['--hash']:
+        password = sys.stdin.readline().rstrip('\n')
+        if len(password) < 12:
+            log('The password needs 12+ characters')
+            return 65
+        print(password_hash(password))
+        return 0
+    if arguments not in ([], ['--check']):
+        log(__doc__.split('\n\n')[-1])
+        return 64
+    try:
+        user, stored, port = settings()
+    except Refused as error:
+        log(str(error))
+        return CONFIGURATION_ERROR
+    tokens = sorted(key for key in os.environ if key.startswith(TOKEN_VARIABLE) and os.environ[key])
+    if arguments == ['--check']:
+        print(f'would listen on http://{ADDRESS}:{port}/ for {user} (Bitbucket tokens: {", ".join(tokens) or "none"})')
+        return 0
+    try:
+        server = Server((ADDRESS, port), handler(user, stored))
+    except OSError as error:
+        log(f'Cannot listen on {ADDRESS}:{port}: {error}')
+        return 1
+    log(f'listening on {ADDRESS}:{server.server_address[1]} (Bitbucket tokens: {", ".join(tokens) or "none"})')
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

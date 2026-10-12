@@ -4,8 +4,10 @@
 # The runner services (Bitbucket's and every GitHub one) are never restarted or reloaded: pipeline steps
 # read the setup checkout when they run.
 # Run it as the owner of this checkout (the admin who cloned it), without sudo; the setup account's part
-# runs through sudo -u. The installed command copies ($SBIN/setup-server-backup and setup-server-metrics,
-# when installed) are rewritten from the new checkout through sudo and returned with the checkouts.
+# runs through sudo -u. The installed command copies ($SBIN/setup-server-backup, setup-server-metrics,
+# setup-server-backup-pull and the web UI's setup-server-ui with $LIBRARY/bin, when installed) are rewritten
+# from the new checkout through sudo and returned with the checkouts. Without a terminal (the web UI runs it
+# so) sudo cannot ask for a password: its calls are then sudo -n and fail at once instead of waiting.
 # --check fetches and shows what would change; it changes no checkout.
 set -euo pipefail
 
@@ -17,8 +19,11 @@ GITHUB_RUNNERS='setup-server-github-runner@*.service'
 CHECKOUT=${SETUP_SERVER_CHECKOUT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)}
 SETUP="$ROOT/setup"
 SBIN=${SETUP_SERVER_SBIN:-/usr/local/sbin}
+# The web UI's root-owned copies of bin/ (bin/install-ui): refreshed and returned with setup-server-ui.
+LIBRARY=${SETUP_SERVER_LIBRARY:-/usr/local/lib/setup-server}
 # Installed copy of a command : the installer whose --refresh rewrites it.
-COPIES=(setup-server-backup:install-backups setup-server-metrics:install-metrics setup-server-backup-pull:add-backup-key)
+COPIES=(setup-server-backup:install-backups setup-server-metrics:install-metrics setup-server-backup-pull:add-backup-key
+        setup-server-ui:install-ui)
 RELEASE_TAG='^v[0-9]+\.[0-9]+\.[0-9]+$'
 
 usage() {
@@ -31,16 +36,19 @@ REF is a tag (preferred), a branch of origin or a commit id. setup off a vX.Y.Z 
 prod releases need setup on a release tag. Exit: 0 updated, 1 health check failed and both checkouts
 returned, 2 the return failed too (see the printed commands), 64 usage, 65 refused, 75 a pipeline runs.
 Environment: SETUP_SERVER_ROOT ($ROOT), SETUP_SERVER_USER ($ACCOUNT), SETUP_SERVER_RUNNER ($RUNNER),
-SETUP_SERVER_CHECKOUT (this checkout), SETUP_SERVER_SBIN ($SBIN); SETUP_SERVER_CONFIG,
-SETUP_SERVER_SYSTEMD and SETUP_SERVER_SUDOERS are passed to the installers
+SETUP_SERVER_CHECKOUT (this checkout), SETUP_SERVER_SBIN ($SBIN), SETUP_SERVER_LIBRARY ($LIBRARY);
+SETUP_SERVER_CONFIG, SETUP_SERVER_SYSTEMD and SETUP_SERVER_SUDOERS are passed to the installers
 EOF
 }
 
 say() { printf '==> %s\n' "$*"; }
+# In a terminal sudo asks for the password; without one it must fail at once, not wait for an answer.
+SUDO=(sudo)
+[ -t 0 ] || SUDO=(sudo -n)
 fail() { echo "$1" >&2; exit "${2:-65}"; }
 # The setup account owns the shared checkout; others reach it through sudo. Run from / so that git
 # does not start in a directory the account cannot read (a caller's 0750 home breaks git).
-as_account() { if [ "$(id -un)" = "$ACCOUNT" ]; then "$@"; else (cd / && sudo -u "$ACCOUNT" -H "$@"); fi; }
+as_account() { if [ "$(id -un)" = "$ACCOUNT" ]; then "$@"; else (cd / && "${SUDO[@]}" -u "$ACCOUNT" -H "$@"); fi; }
 git_in() {  # git_in server|setup ARGS — git in that checkout, as its owner
     local side=$1; shift
     if [ "$side" = setup ]; then as_account git -C "$SETUP" "$@"; else git -C "$CHECKOUT" "$@"; fi
@@ -57,7 +65,7 @@ resolve() {  # resolve SIDE REF — the commit of a tag, else of origin's branch
     done
     [[ "$2" =~ ^[0-9a-f]{7,40}$ ]] && git_in "$1" rev-parse -q --verify "$2^{commit}" 2>/dev/null
 }
-as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi; }
+as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else "${SUDO[@]}" "$@"; fi; }
 installed_copies() {  # the installed command copies, as NAME:INSTALLER
     local copy
     for copy in "${COPIES[@]}"; do
@@ -73,7 +81,7 @@ refresh_copies() {  # rewrite the installed copies from this (new) checkout; fai
             echo "    note: this version has no bin/${copy#*:} --refresh; the installed copy is left as it is"
             continue
         fi
-        as_root env SETUP_SERVER_ROOT="$ROOT" SETUP_SERVER_USER="$ACCOUNT" SETUP_SERVER_SBIN="$SBIN" \
+        as_root env SETUP_SERVER_ROOT="$ROOT" SETUP_SERVER_USER="$ACCOUNT" SETUP_SERVER_SBIN="$SBIN" SETUP_SERVER_LIBRARY="$LIBRARY" \
             SETUP_SERVER_CONFIG="${SETUP_SERVER_CONFIG:-/etc/setup-server}" \
             SETUP_SERVER_SYSTEMD="${SETUP_SERVER_SYSTEMD:-/etc/systemd/system}" \
             SETUP_SERVER_SUDOERS="${SETUP_SERVER_SUDOERS:-/etc/sudoers.d}" "$installer" --refresh 2>&1 \
@@ -81,13 +89,31 @@ refresh_copies() {  # rewrite the installed copies from this (new) checkout; fai
         [ "${PIPESTATUS[0]}" = 0 ] || return 1
     done
 }
+restore_library() {  # $LIBRARY/bin as it was: written beside it, then swapped in
+    local file
+    as_root rm -rf "$LIBRARY/bin.previous" && as_root install -d -o root -g root -m 0755 "$LIBRARY/bin.previous" || return 1
+    for file in "$saved/library-bin"/*; do
+        as_root install -o root -g root -m 0755 "$file" "$LIBRARY/bin.previous/" || return 1
+    done
+    as_root rm -rf "$LIBRARY/bin" && as_root mv "$LIBRARY/bin.previous" "$LIBRARY/bin"
+}
 restore_copies() {  # put the saved copies back where they changed; the failed ones go to manual
     local copy name restored=1
+    if [ -d "$saved/library-bin" ] && ! diff -rq "$saved/library-bin" "$LIBRARY/bin" >/dev/null 2>&1; then
+        if restore_library; then
+            echo "    restored $LIBRARY/bin"
+        else
+            manual+=("sudo install -o root -g root -m 0755 $saved/library-bin/* $LIBRARY/bin/")
+            restored=0
+        fi
+    fi
     for copy in "${copies[@]}"; do
         name=${copy%%:*}
         cmp -s "$saved/$name" "$SBIN/$name" && continue
         if as_root install -o root -g root -m 0755 "$saved/$name" "$SBIN/$name"; then
-            [ "$name" != setup-server-metrics ] || as_root systemctl try-restart setup-server-metrics.service || true
+            case "$name" in
+                setup-server-metrics|setup-server-ui) as_root systemctl try-restart "$name.service" || true ;;
+            esac
             echo "    restored $SBIN/$name"
         else
             manual+=("sudo install -o root -g root -m 0755 $saved/$name $SBIN/$name")
@@ -166,7 +192,7 @@ health() {  # every check runs; the result fails when one of them fails
     log=$(mktemp)
     if (cd "$CHECKOUT" && env -u SETUP_SERVER_ROOT -u SETUP_SERVER_USER -u SETUP_SERVER_RUNNER \
             -u SETUP_SERVER_CHECKOUT -u SETUP_SERVER_UBUNTU_IMAGE -u SETUP_SERVER_SBIN -u SETUP_SERVER_CONFIG \
-            -u SETUP_SERVER_SYSTEMD -u SETUP_SERVER_SUDOERS python3 -m unittest discover -s tests) >"$log" 2>&1; then
+            -u SETUP_SERVER_SYSTEMD -u SETUP_SERVER_SUDOERS -u SETUP_SERVER_LIBRARY python3 -m unittest discover -s tests) >"$log" 2>&1; then
         echo "    setup-server tests: ok ($(grep -m1 '^Ran ' "$log"))"
     else
         echo "    setup-server tests: FAILED"
@@ -238,6 +264,9 @@ main() {
     git -C "$CHECKOUT" rev-parse --git-dir >/dev/null 2>&1 || fail "$CHECKOUT is not a git checkout"
     local owner; owner=$(stat -c %U "$CHECKOUT")
     [ "$(id -un)" = "$owner" ] || fail "Run this as $owner, the owner of $CHECKOUT, without sudo (the setup account's part uses sudo itself)" 77
+    if [ ! -t 0 ] && [ "$(id -un)" != "$ACCOUNT" ] && ! as_account true 2>/dev/null; then
+        fail "Without a terminal sudo cannot ask for $owner's password, and the part of $ACCOUNT needs it: run bin/update in a terminal (or let $owner use sudo without a password)" 77
+    fi
     as_account test -d "$SETUP/.git" || fail "No setup checkout at $SETUP (run bin/prepare-host first)"
     local side changes
     for side in server setup; do
@@ -299,11 +328,17 @@ $changes"
     fi
 
     # --- Update -----------------------------------------------------------------------------------
+    if [ ${#copies[@]} -gt 0 ] && [ ! -t 0 ] && [ "$(id -u)" != 0 ] && ! "${SUDO[@]}" true 2>/dev/null; then
+        fail "Without a terminal sudo cannot ask for $owner's password, and refreshing the installed copies needs it: run bin/update in a terminal" 77
+    fi
     say "Previous commits (for a manual return): setup-server $server_previous, setup $setup_previous"
     saved=$(mktemp -d)
     local copy
     for copy in "${copies[@]}"; do
         cp -p "$SBIN/${copy%%:*}" "$saved/" || fail "Cannot read $SBIN/${copy%%:*}"
+        if [ "${copy%%:*}" = setup-server-ui ] && [ -d "$LIBRARY/bin" ]; then
+            cp -pR "$LIBRARY/bin" "$saved/library-bin" || fail "Cannot read $LIBRARY/bin"
+        fi
     done
     trap 'echo "Interrupted" >&2; give_back' INT TERM
     local switched=1
