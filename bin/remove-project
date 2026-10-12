@@ -2,11 +2,9 @@
 # Remove a project's build root ($ROOT/projects/<name>). It holds the project's database backups,
 # release history and deploy log, so those are only deleted on request, and a build root that a
 # running container still uses is never removed. --check shows what would go and changes nothing.
-# The project's secrets ($CONFIG/projects/<name>) are not removed.
 set -euo pipefail
 
 ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
-CONFIG=${SETUP_SERVER_CONFIG:-/etc/setup-server}
 
 check=0
 with_backups=0
@@ -66,14 +64,9 @@ if [ $((backups + deploys)) -gt 0 ] && [ "$with_backups" = 0 ]; then
     exit 65
 fi
 
-secrets="==> $CONFIG/projects/$name (the secrets of its nightly backups) is not removed; when it is not needed any more: sudo rm -r $CONFIG/projects/$name"
-# Only root sees whether it exists ($CONFIG is 0700); without root it is always named.
-if [ "$(id -u)" = 0 ] && [ ! -e "$CONFIG/projects/$name" ]; then secrets=; fi
 if [ "$check" = 1 ]; then
     echo "==> would remove $build_root; nothing was changed"
-    [ -z "$secrets" ] || echo "$secrets"
     exit 0
 fi
 rm -rf -- "$build_root"
 echo "==> removed $build_root"
-[ -z "$secrets" ] || echo "$secrets"

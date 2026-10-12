@@ -553,7 +553,7 @@ class RemoveProjectTest(ScriptTest):
         self.assertIn("add --with-backups", refused.stderr)
         self.assertEqual(self.run_script("remove-project", "--check", "--with-backups", "demo").returncode, 0)
 
-    def test_the_older_app_docker_layout_counts_too_and_the_secrets_are_named(self):
+    def test_the_older_app_docker_layout_counts_too(self):
         # backup-projects and worker-metrics also use app/docker/: its backups are not lost silently.
         (self.build_root / "app/docker/env").mkdir(parents=True)
         (self.build_root / "app/docker/Makefile").write_text("include x\n")
@@ -567,8 +567,6 @@ class RemoveProjectTest(ScriptTest):
         allowed = self.run_script("remove-project", "--check", "--with-backups", "demo",
                                   SETUP_SERVER_CONFIG=str(self.root / "etc"))
         self.assertEqual(allowed.returncode, 0, allowed.stdout + allowed.stderr)
-        self.assertIn(f"{self.root}/etc/projects/demo (the secrets of its nightly backups) is not removed",
-                      allowed.stdout)
 
     def test_a_build_root_used_by_a_running_container_is_kept(self):
         env_root = self.build_root

@@ -71,7 +71,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# Root reads each project's secrets ($CONFIG/projects/<name>/<env>.env); the backups run as $ACCOUNT.
+# Root plans; the backups run as $ACCOUNT and setup takes the secrets from each stack's secret store.
 ExecStart=$command
 Nice=10
 IOSchedulingClass=best-effort
@@ -133,15 +133,14 @@ place "$staging/timer" "$SYSTEMD/$NAME.timer" 0644
 place "$staging/sudoers" "$SUDOERS/$NAME" 0440
 
 if [ "$check" = 1 ]; then
-    echo "==> would create $CONFIG/projects (root, 0700) for the projects' secrets, enable $NAME.timer"
-    echo "==> Tonight's run (secrets are checked only with sudo):"
+    echo "==> would enable $NAME.timer"
+    echo "==> Tonight's run:"
     "$here/backup-projects" --check || true
     exit 0
 fi
 
-install -d -o root -g root -m 0700 "$CONFIG" "$CONFIG/projects"
 systemctl daemon-reload
 systemctl enable --now "$NAME.timer"
 echo "==> $NAME.timer: $(systemctl is-active "$NAME.timer"); next: $(systemctl show -P NextElapseUSecRealtime "$NAME.timer")"
 echo "==> Tonight's run:"
-"$command" --check || echo "Needs attention: add the missing secrets files (README, Kopijos)" >&2
+"$command" --check || echo "Needs attention: deploy the projects named above with setup 2.5.0+ (secret store; README, Kopijos)" >&2

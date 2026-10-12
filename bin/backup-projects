@@ -6,14 +6,15 @@ Every night setup-server-backup.timer runs this as root (installed by bin/instal
 repository in the build root ($ROOT/projects/<name>/app, or app/docker) has env/stage.env or
 env/prod.env: the file its deploy pipeline writes, so "deployed from here" is the declaration. Each
 backup is `make db-backup ENV=<env>` (setup: every schema of DATABASE_EXTRA_SCHEMAS in one dump), run as
-the setup account with the Deployment variables of /etc/setup-server/projects/<name>/<env>.env (root,
-0600) and written to .generated/backups/worker-<env>-<UTC time>Z.sql.gz. After a successful backup that
+the setup account and written to .generated/backups/worker-<env>-<UTC time>Z.sql.gz. No secret is kept
+here: setup takes the Deployment variables from the stack's secret store (<PROJECT_NAME>-<env>-secrets,
+setup 2.5.0+), the values the last deploy brought from Bitbucket. After a successful backup that
 series is rotated; a failed one deletes nothing. A failing project does not stop the others: they all
 run, and the command then exits 1 naming them (the unit shows failed, the journal has the details).
 
 "Backup now" for one project (Bitbucket custom pipeline on the runner):
     sudo -n /usr/local/sbin/setup-server-backup "$BUILD_ROOT" [stage|prod]
-Without root it uses the caller's environment for the secrets (e.g. a deployment step's variables).
+Variables in the caller's environment (e.g. a deployment step's) win over the store.
 """
 
 from datetime import datetime, timezone
@@ -22,7 +23,6 @@ from pathlib import Path
 import pwd
 import re
 import signal
-import stat
 import subprocess
 import sys
 
@@ -122,18 +122,51 @@ def parse_env(text, path):
     return values
 
 
-def secrets(name, environment):
-    """(path, values): the project's Deployment variables for ENV, None when there is no readable file."""
-    path = CONFIG / 'projects' / name / f'{environment}.env'
+def read_env(path):
+    """NAME=value lines of an env file the project commits (no secrets); {} when there is none."""
     try:
-        info = path.lstat()
+        return parse_env(path.read_text(), path)
     except (FileNotFoundError, PermissionError):
-        # Without root the runner account cannot see the file: the caller's environment applies.
-        return path, None
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-        owner = 'root' if os.geteuid() == 0 else 'you'
-        raise Refused(f'{path} must be a regular file owned by {owner} with mode 0600')
-    return path, parse_env(path.read_text(), path)
+        return {}
+
+
+def secret_store(name, environment):
+    """(container, state): setup's secret store of the project ENV; state running, stopped or missing."""
+    directory = environment_directory(PROJECTS / name)
+    values = {**read_env(directory / 'env/common.env'), **read_env(directory / f'env/{environment}.env')} if directory else {}
+    container = f"{values.get('PROJECT_NAME', name)}-{environment}-secrets"
+    context = values.get('DEPLOY_CONTEXT')
+    command = ['docker', *(['--context', context] if context else []), 'inspect', '--type', 'container',
+               '--format', '{{.State.Running}}', container]
+    try:
+        # As the setup account: its Docker contexts are the ones setup uses (DEPLOY_CONTEXT).
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30, **as_account())
+    except (OSError, subprocess.TimeoutExpired, KeyError):
+        return container, 'missing'
+    if result.returncode:
+        return container, 'missing'
+    return container, 'running' if result.stdout.strip() == 'true' else 'stopped'
+
+
+def as_account():
+    """subprocess options that run a command as the setup account when this one runs as root."""
+    if os.geteuid() != 0:
+        return {}
+    account = pwd.getpwnam(ACCOUNT)
+    return dict(user=account.pw_uid, group=account.pw_gid, extra_groups=os.getgrouplist(ACCOUNT, account.pw_gid),
+                env={'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': account.pw_dir},
+                cwd='/')
+
+
+def store_refusal(name, environment):
+    """Why a backup cannot get its secrets, or None."""
+    if os.environ.get('DATABASE_ROOT_PASSWORD') and os.geteuid() != 0:
+        return None  # the caller's environment (a deployment step) has them
+    container, state = secret_store(name, environment)
+    if state == 'missing':
+        return (f'no secret store {container}: deploy {name} {environment} once with setup 2.5.0 or newer, '
+                'which keeps the Deployment variables in the stack')
+    return None
 
 
 def stamp():
@@ -215,14 +248,15 @@ def check(jobs):
         new = f'worker-{environment}-{stamp()}Z.sql.gz'
         say(f'==> would back up {name} {environment} into {backups / new}')
         try:
-            path, values = secrets(name, environment)
-            if values is not None:
-                say(f'    secrets: {path} ({len(values)} values)')
-            elif os.geteuid() == 0:
-                say(f'    secrets: {path} is missing — the backup would fail', error=True)
+            container, state = secret_store(name, environment)
+            if state == 'missing':
+                say(f'    secrets: {store_refusal(name, environment) or "no secret store " + container}', error=True)
                 problems += 1
             else:
-                say(f'    secrets: not readable without sudo; the caller\'s environment applies')
+                say(f'    secrets: from {container} ({state})')
+            legacy = CONFIG / 'projects' / name / f'{environment}.env'
+            if os.geteuid() == 0 and legacy.exists():
+                say(f'    note: {legacy} is not used any more; remove it: sudo rm {legacy}')
             _, remove = rotation(series(backups, environment) + [new])
         except Refused as error:
             say(f'    {error}', error=True)
@@ -233,11 +267,10 @@ def check(jobs):
 
 
 def child_environment(name, environment):
-    path, values = secrets(name, environment)
+    refusal = store_refusal(name, environment)
+    if refusal:
+        raise Refused(refusal)
     if os.geteuid() == 0:
-        if values is None:
-            raise Refused(f'No secrets file {path}: put the Deployment variables of {name} {environment} '
-                          'there (root, 0600), see README')
         account = pwd.getpwnam(ACCOUNT)
         env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8',
                'HOME': account.pw_dir, 'USER': ACCOUNT, 'LOGNAME': ACCOUNT, 'SHELL': '/bin/bash'}
@@ -246,9 +279,9 @@ def child_environment(name, environment):
                 env[key] = os.environ[key]
     else:
         env = dict(os.environ)
+        env.pop('CI', None)  # a pipeline step's call: setup may read the store for what the step lacks
     env.update(SETUP_SERVER_ROOT=str(ROOT), SETUP_SERVER_USER=ACCOUNT, SETUP_SERVER_CONFIG=str(CONFIG))
     env.setdefault('SETUP_DIRECTORY', str(ROOT / 'setup'))
-    env.update(values or {})
     return env
 
 
@@ -263,9 +296,7 @@ def run(jobs):
             continue
         options = {}
         if os.geteuid() == 0:
-            account = pwd.getpwnam(ACCOUNT)
-            options = dict(user=account.pw_uid, group=account.pw_gid,
-                           extra_groups=os.getgrouplist(ACCOUNT, account.pw_gid))
+            options = {key: value for key, value in as_account().items() if key in ('user', 'group', 'extra_groups')}
         process = subprocess.Popen([sys.executable, os.path.realpath(__file__), '--job', name, environment],
                                    env=env, cwd=str(PROJECTS / name), start_new_session=True, **options)
         try:

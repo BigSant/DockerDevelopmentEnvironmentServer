@@ -45,6 +45,14 @@ echo "Database backup: $file"
 '''
 
 
+# Docker stub: `inspect` finds the secret stores named in STORES (running), any other container is missing.
+DOCKER_STUB = r'''
+eval "last=\${$#}"
+echo "$*" >> "${DOCKER_LOG:-/dev/null}"
+case " ${STORES-} " in *" $last "*) echo true ;; *) echo "Error: No such container: $last" >&2; exit 1 ;; esac
+'''
+
+
 class RotationTest(unittest.TestCase):
     """Keep the newest backup of each of the 7 latest days, then of 4 more ISO weeks; delete the rest."""
 
@@ -82,12 +90,18 @@ class BackupProjectsTest(ScriptTest):
         super().setUp()
         self.projects = self.root / "srv/projects"
         self.stub("make", MAKE_STUB)
+        self.stub("docker", DOCKER_STUB)
         self.make_log = self.root / "make.log"
+        self.docker_log = self.root / "docker.log"
         os.environ["MAKE_LOG"] = str(self.make_log)
+        os.environ["DOCKER_LOG"] = str(self.docker_log)
         os.environ["SETUP_SERVER_BACKUP_TIME"] = "20261009T013000"
         os.environ["SETUP_SERVER_CONFIG"] = str(self.root / "etc")
-        for key in ("MAKE_LOG", "SETUP_SERVER_BACKUP_TIME", "SETUP_SERVER_CONFIG"):
+        os.environ["STORES"] = "demo-prod-secrets demo-stage-secrets"
+        for key in ("MAKE_LOG", "DOCKER_LOG", "SETUP_SERVER_BACKUP_TIME", "SETUP_SERVER_CONFIG", "STORES"):
             self.addCleanup(os.environ.pop, key)
+        for key in ("DATABASE_ROOT_PASSWORD", "CI"):
+            os.environ.pop(key, None)
 
     def project(self, name, *environments, layout="app"):
         directory = self.projects / name / layout
@@ -108,7 +122,7 @@ class BackupProjectsTest(ScriptTest):
 
     def tree(self):
         return sorted(str(path.relative_to(self.root)) for path in self.root.rglob("*")
-                      if path.name != "make.log")
+                      if path.name not in ("make.log", "docker.log"))
 
     def test_every_deployed_environment_is_backed_up_and_rotated(self):
         asana = self.project("asana_tracker", "prod")
@@ -172,23 +186,37 @@ class BackupProjectsTest(ScriptTest):
                 self.assertEqual(refused.returncode, 65, refused.stdout + refused.stderr)
                 self.assertIn(message, refused.stderr)
 
-    def test_the_secrets_file_reaches_make_and_a_loose_one_is_refused(self):
+    def test_the_secrets_come_from_the_stack_store_and_a_missing_store_is_named(self):
+        import gzip
         directory = self.project("asana_tracker", "prod")
-        secrets = self.root / "etc/projects/asana_tracker"
-        secrets.mkdir(parents=True)
-        (secrets / "prod.env").write_text("# Deployment variables\nDATABASE_ROOT_PASSWORD='r00t pass'\n")
-        (secrets / "prod.env").chmod(0o600)
+        check = self.run_script("backup-projects", "--check")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn("secrets: from demo-prod-secrets (running)", check.stdout)
         result = self.run_script("backup-projects")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        import gzip
         backup = directory / ".generated/backups/worker-prod-20261009T013000Z.sql.gz"
-        self.assertIn("secret=r00t pass", gzip.decompress(backup.read_bytes()).decode())
-        self.assertNotIn("r00t", result.stdout + result.stderr, "secrets are never printed")
-        (secrets / "prod.env").chmod(0o644)
+        self.assertIn("prod secret= setup=", gzip.decompress(backup.read_bytes()).decode(),
+                      "no secret is handed to make: setup reads the store itself")
+        # Not deployed with a store yet: named, nothing runs.
+        os.environ["STORES"] = ""
         os.environ["SETUP_SERVER_BACKUP_TIME"] = "20261010T013000"
-        loose = self.run_script("backup-projects")
-        self.assertEqual(loose.returncode, 1)
-        self.assertIn("must be a regular file owned by", loose.stderr)
+        missing = self.run_script("backup-projects")
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("no secret store demo-prod-secrets: deploy asana_tracker prod once with setup 2.5.0", missing.stderr)
+        self.assertNotIn("20261010", self.make_log.read_text())
+        self.assertEqual(self.run_script("backup-projects", "--check").returncode, 1)
+        # A deployment step's own variables need no store.
+        step = self.run_script("backup-projects", "asana_tracker", "prod", DATABASE_ROOT_PASSWORD="from-the-step", CI="true")
+        self.assertEqual(step.returncode, 0, step.stdout + step.stderr)
+        backup = directory / ".generated/backups/worker-prod-20261010T013000Z.sql.gz"
+        self.assertIn("secret=from-the-step", gzip.decompress(backup.read_bytes()).decode())
+        self.assertNotIn("from-the-step", step.stdout + step.stderr, "secrets are never printed")
+
+    def test_the_store_is_looked_up_through_the_deploy_context(self):
+        directory = self.project("forsena_docker", "prod")
+        (directory / "env/prod.env").write_text("DEPLOY_CONTEXT=shop-live\n")
+        self.assertEqual(self.run_script("backup-projects", "--check").returncode, 0)
+        self.assertIn("--context shop-live inspect --type container", self.docker_log.read_text())
 
     def test_unknown_options_are_a_usage_error(self):
         self.assertEqual(self.run_script("backup-projects", "--bogus").returncode, 64)
@@ -251,7 +279,8 @@ mkdir -p /stubs
 cat > /stubs/make <<'STUB'
 #!/bin/sh""" + MAKE_STUB + """STUB
 printf '#!/bin/sh\\nexit 0\\n' > /stubs/systemctl
-chmod +x /stubs/make /stubs/systemctl
+printf '#!/bin/sh\\necho true\\n' > /stubs/docker
+chmod +x /stubs/make /stubs/systemctl /stubs/docker
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null && apt-get install -y -qq systemd sudo python3 make >/dev/null
 useradd --system --create-home --home-dir /srv/setup-server --shell /bin/bash setup
@@ -274,12 +303,9 @@ for arguments in "$build_root" "$build_root prod" "" "--check" "/etc" "--job asa
     fi
 done
 grep -q ' \^/srv' /etc/sudoers.d/setup-server-backup && echo SUDO_REGEX
-cp /stubs/make /usr/local/bin/make
+cp /stubs/make /stubs/docker /usr/local/bin/
 app=/srv/setup-server/projects/asana_tracker/app
 mkdir -p $app/env && touch $app/Makefile $app/env/prod.env && chown -R setup:setup /srv/setup-server/projects
-install -d -m 0700 /etc/setup-server/projects/asana_tracker
-printf 'DATABASE_ROOT_PASSWORD=from-root-file\\n' > /etc/setup-server/projects/asana_tracker/prod.env
-chmod 0600 /etc/setup-server/projects/asana_tracker/prod.env
 cd /srv/setup-server
 # The "backup now" pipeline step, as the runner account with Bitbucket's DOCKER_HOST.
 sudo -u setup env DOCKER_HOST=tcp://localhost:2375 sh -c \\
@@ -303,9 +329,9 @@ zcat $app/.generated/backups/worker-prod-*.sql.gz
         for arguments in refused:
             self.assertIn(f"SUDO REFUSED [{arguments}]", result.stdout)
         self.assertRegex(result.stdout, r"setup 600 /srv/setup-server/projects/asana_tracker/app/\.generated/backups/worker-prod-")
-        self.assertIn("prod secret=from-root-file setup=/srv/setup-server/setup", result.stdout)
+        self.assertIn("prod secret= setup=/srv/setup-server/setup", result.stdout)
         self.assertIn("Backups: 1 ok, 0 failed", result.stdout)
-        self.assertIn("secrets: /etc/setup-server/projects/asana_tracker/prod.env (1 values)", result.stdout)
+        self.assertIn("secrets: from asana_tracker-prod-secrets (running)", result.stdout)
 
 
 if __name__ == "__main__":

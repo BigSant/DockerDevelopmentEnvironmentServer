@@ -35,7 +35,6 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 ├── .ssh/id_ed25519             git raktas (tik skaitymui): setup repo ir Bitbucket projektai
 └── .ssh/github-<savininkas>.<repo>   GitHub projekto deploy key (tik skaitymui); host alias'ai – .ssh/config
 /etc/setup-server/runner.env    Bitbucket runner'io OAuth duomenys (root, 0600)
-/etc/setup-server/projects/<vardas>/<env>.env   projekto slaptažodžiai naktinėms kopijoms (root, 0600)
 /etc/setup-server/metrics.env   worker'io /metrics adresas, leidžiami adresai ir neprivalomas token'as (root, 0600)
 ```
 
@@ -199,9 +198,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 
    Jei kataloge yra DB kopijų ar deploy'ų istorijos (`app/.generated` arba senesniame išdėstyme
    `app/docker/.generated`), reikia `--with-backups` – tada prarandamos kopijos ir rollback'as. Katalogo,
-   kurį naudoja veikiantis konteineris, scriptas netrina. Projekto slaptažodžių katalogo
-   `/etc/setup-server/projects/<vardas>` (naktinėms kopijoms) scriptas netrina – jis tai parodo; kai nebereikia,
-   `sudo rm -r /etc/setup-server/projects/<vardas>`.
+   kurį naudoja veikiantis konteineris, scriptas netrina.
 
 6. **Naktinės DB kopijos** (worker'is, ne Bitbucket):
 
@@ -218,19 +215,15 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    (asana.local). Kopijuojama tik duomenų bazė: `data/` katalogai (paieškos indeksai ir pan.) nekopijuojami,
    o kurios schemos ir lentelės patenka į dump'ą, nusprendžia projekto `DATABASE_EXTRA_SCHEMAS` ir registras.
 
-   **Slaptažodžiai.** Laikmatis veikia be Bitbucket, todėl Deployment variables jam reikia serveryje.
-   Kiekvienai aplinkai – root failas (tie patys `VARDAS=reikšmė`, kaip Bitbucket Deployment variables:
-   `DATABASE_PASSWORD`, `DATABASE_ROOT_PASSWORD`, `METRICS_TOKEN` (jei naudojamas), PS raktai …):
-
-   ```bash
-   sudo install -d -m 0700 /etc/setup-server/projects/asana_tracker
-   sudo install -m 0600 /dev/null /etc/setup-server/projects/asana_tracker/prod.env
-   sudoedit /etc/setup-server/projects/asana_tracker/prod.env
-   ```
-
-   Failą skaito tik root; `make db-backup` vykdomas paskyra `setup`, slaptažodžiai jai perduodami per
-   aplinką (ne argumentais), išvestyje jie nerodomi. Failas, kuris ne root ar ne 0600, atmetamas. Pašalinus
-   projektą (`remove-project`) jo katalogą `/etc/setup-server/projects/<vardas>` ištrink rankomis.
+   **Slaptažodžiai – tik Bitbucket'e.** Serveryje jų kopijos nėra. Laikmatis veikia be Bitbucket'o, todėl
+   `make db-backup` (paskyra `setup`) juos ima iš projekto stack'o: setup 2.5.0+ kiekvienoje stage/prod
+   aplinkoje laiko servisą `<PROJECT_NAME>-<env>-secrets`, kurį kiekvienas deploy'us užpildo Bitbucket
+   Deployment variables reikšmėmis (setup `doc/lt/09-aplinkos.md`, „Komandos serveryje be pipeline'o“).
+   Pakeitus slaptažodį Bitbucket'e, kopija naudoja naują po kito deploy'aus – nieko daugiau keisti nereikia.
+   Projektas, kuris dar nedeploy'intas su setup 2.5.0+ (store'o nėra), kopijuojamas nebus: `--check` ir
+   žurnalas tai įvardija (`no secret store …`). Su `DEPLOY_CONTEXT` store'as ieškomas per jį (paskyros
+   `setup` Docker context'ai). Senas `/etc/setup-server/projects/<vardas>/<env>.env` nebenaudojamas –
+   `--check` (su sudo) primena jį ištrinti.
 
    **Rotacija.** Kiekvienam projektui ir aplinkai paliekama naujausia kiekvienos iš 7 paskutinių dienų,
    kurios turi kopiją, kopija ir dar 4 savaičių (ISO savaitė) naujausios kopijos – iš viso iki 11, maždaug
@@ -246,11 +239,11 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    sudo systemctl start setup-server-backup.service     # paleisti dabar (laukia pabaigos)
    systemctl status setup-server-backup.service         # paskutinio paleidimo būsena
    journalctl -u setup-server-backup.service -n 100     # kas nukopijuota, kas nepavyko
-   sudo setup-server-backup --check                     # ką kopijuotų, ar yra slaptažodžių failai
+   sudo setup-server-backup --check                     # ką kopijuotų, ar yra kiekvieno projekto secret store
    ```
 
    **„Backup dabar“** – Bitbucket custom pipeline'as, vykdomas runner'io šiame serveryje. Jis kviečia tą pačią
-   komandą per `sudo`, todėl naudoja tuos pačius root slaptažodžių failus, rotaciją ir nekuria įrašo
+   komandą per `sudo`, todėl naudoja tą patį secret store, rotaciją ir nekuria įrašo
    Deployments istorijoje. Sudo taisyklė leidžia paskyrai `setup` tik šią formą:
    `/usr/local/sbin/setup-server-backup /srv/setup-server/projects/<vardas> [stage|prod]` (sudo 1.9.10+,
    pvz. Ubuntu 24.04, tikrina reguliariąja išraiška). Senesnis sudo (Ubuntu 22.04: 1.9.9) turi tik
@@ -516,9 +509,9 @@ Papildomai verta: `up{job="setup-worker"} == 0` arba „no data“ (VPN ar pasla
 - GitHub runner'io registracijos token'as niekur neįrašomas; užsiregistravusio runner'io raktas yra jo kataloge
   (paskyra `setup`, todėl pasiekiamas ir job'ams). Self-hosted runner'is – tik privatiems repo.
 - GitHub projektų deploy key – po vieną kiekvienam repo, tik skaitymui (`/srv/setup-server/.ssh/github-…`).
-- Slaptažodžiai į šį repo ir į projekto katalogus nerašomi. Naktinėms kopijoms jie laikomi tik
-  `/etc/setup-server/projects/` (root, 0600). Sudo taisyklė `setup` paskyrai naujų teisių neprideda: ji ir
-  taip Docker grupėje.
+- Slaptažodžiai į šį repo, į projekto katalogus ir į serverio failus nerašomi: jie tik Bitbucket'e ir veikiančių
+  konteinerių aplinkoje (Docker konfigūracija, kaip ir DB slaptažodžiai DB konteineryje); naktinės kopijos juos ima
+  iš projekto `secrets` konteinerio. Sudo taisyklė `setup` paskyrai naujų teisių neprideda: ji ir taip Docker grupėje.
 - Kopijų atsisiuntimo raktai (`bin/add-backup-key`) prisijungia prie paskyros `setup`, bet tik iš nurodyto tinklo
   ir tik su priverstine komanda, kuri atiduoda vien kopijas (`restrict`: be terminalo ir persiuntimų). Kopijose
   yra tikri klientų duomenys; kiekvienas atsisiuntimas registruojamas `backup-pulls.log`.
