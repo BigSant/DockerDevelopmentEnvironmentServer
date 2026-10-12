@@ -4,8 +4,8 @@
 bin/install-metrics installs this as /usr/local/sbin/setup-server-metrics and runs it as the systemd
 service setup-server-metrics of the setup account (the owner of the build roots). There is no proxy in
 front: the service answers HTTP itself on METRICS_ADDRESS (default 127.0.0.1; the VPN address for
-Prometheus), checks the client address against METRICS_ALLOWED_IPS (403) and then the bearer token
-METRICS_TOKEN (401), like the target /metrics of setup. It changes nothing: it reads the build roots
+Prometheus), checks the client address against METRICS_ALLOWED_IPS (403) and then, when METRICS_TOKEN is
+set, the bearer token (401), like the target /metrics of setup. It changes nothing: it reads the build roots
 under $SETUP_SERVER_ROOT/projects, asks systemd for the runners' state and the filesystem for its size.
 
 Groups (setup_metrics_group_up{group} is 0 when a part of the group could not be read; details in the journal):
@@ -318,9 +318,9 @@ def allowlist(text):
 
 
 def settings():
-    token = os.environ.get('METRICS_TOKEN', '')
-    if len(token) < TOKEN_MINIMUM:
-        raise Refused(f'METRICS_TOKEN ({TOKEN_MINIMUM}+ characters) is not configured')
+    token = os.environ.get('METRICS_TOKEN', '')  # optional: empty, the allowlist alone guards the endpoint
+    if token and len(token) < TOKEN_MINIMUM:
+        raise Refused(f'METRICS_TOKEN must have {TOKEN_MINIMUM}+ characters (or stay empty)')
     address = os.environ.get('METRICS_ADDRESS') or '127.0.0.1'
     try:
         ipaddress.ip_address(address)
@@ -373,7 +373,7 @@ def handler(token, networks):
                 log(f'refused {client}: not in METRICS_ALLOWED_IPS (403)')
                 return self.reply(403, 'forbidden\n')
             given = self.headers.get('Authorization', '').encode('utf-8', 'surrogateescape')
-            if not hmac.compare_digest(expected, given):
+            if token and not hmac.compare_digest(expected, given):
                 log(f'refused {client}: no or wrong token (401)')
                 return self.reply(401, 'unauthorized\n', [('WWW-Authenticate', 'Bearer')])
             if urlsplit(self.path).path != '/metrics':
@@ -403,7 +403,7 @@ def main(arguments):
     host = f'[{address}]' if ':' in address else address
     if arguments == ['--check']:
         print(f'would listen on http://{host}:{port}/metrics for {" ".join(map(str, networks))} '
-              f'(token {len(token)} characters)')
+              f'({f"token {len(token)} characters" if token else "no token: the allowlist alone"})')
         return 0
     Server.address_family = socket.AF_INET6 if ':' in address else socket.AF_INET
     try:

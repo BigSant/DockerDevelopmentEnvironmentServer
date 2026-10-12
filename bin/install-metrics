@@ -2,7 +2,7 @@
 # Install the worker's Prometheus /metrics: the systemd service setup-server-metrics runs
 # /usr/local/sbin/setup-server-metrics (a root-owned copy of bin/worker-metrics) as the setup account,
 # read-only, on one address (default 127.0.0.1; the VPN address for Prometheus). Its settings — the
-# bearer token, the address and the allowlist — live in the root-only file /etc/setup-server/metrics.env.
+# address, the allowlist and an optional bearer token — live in the root-only file /etc/setup-server/metrics.env.
 # Idempotent: a rerun keeps the settings it is not given and restarts the service only when a file
 # changed; the runner service is never touched. --check shows everything and changes nothing. --refresh
 # only rewrites an installed command copy and restarts the service when it changed: bin/update runs it.
@@ -20,17 +20,19 @@ LOOPBACK="127.0.0.1 ::1"
 check=0
 refresh=0
 new_token=0
+no_token=0
 address=
 port=
 allow=
 usage() {
     cat <<EOF
-Usage: sudo $0 [--check] [--address IP] [--allow "IP/CIDR ..."] [--port PORT] [--new-token]
+Usage: sudo $0 [--check] [--address IP] [--allow "IP/CIDR ..."] [--port PORT] [--new-token|--no-token]
   --address    where the endpoint listens (default 127.0.0.1); on the VPN server its VPN address, e.g. 10.8.0.14
   --allow      who may connect: the Prometheus address(es), IP/CIDR separated by spaces or commas
                (needed with any address but 127.0.0.1/::1, where it defaults to "$LOOPBACK")
   --port       TCP port (default 9101)
-  --new-token  replace the bearer token (Prometheus needs the new one)
+  --new-token  set a new bearer token (Prometheus needs it); without one the allowlist alone guards it
+  --no-token   remove the bearer token: only the allowlist guards the endpoint
   --check      show the unit and settings (token hidden) and what would change; change nothing
   --refresh    only rewrite $SBIN/$NAME from this checkout, when it is installed, and restart the
                service if it changed (bin/update runs it)
@@ -42,6 +44,7 @@ while [ $# -gt 0 ]; do
         --check) check=1 ;;
         --refresh) refresh=1 ;;
         --new-token) new_token=1 ;;
+        --no-token) no_token=1 ;;
         --address) address=${2:-}; shift ;;
         --allow) allow=${2:-}; shift ;;
         --port) port=${2:-}; shift ;;
@@ -100,15 +103,26 @@ case "$address" in
            exit 64
        fi ;;
 esac
+if [ "$new_token" = 1 ] && [ "$no_token" = 1 ]; then
+    echo "Give --new-token or --no-token, not both" >&2
+    exit 64
+fi
+# The token is optional (the allowlist guards the endpoint): kept as it is unless one of the options is given.
 token=$(current METRICS_TOKEN)
 token_state=kept
-if [ "$new_token" = 1 ] || [ ${#token} -lt 24 ]; then
+if [ "$no_token" = 1 ]; then
+    token=
+elif [ "$new_token" = 1 ]; then
     token=$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
     token_state=new
-elif ! [[ "$token" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
-    echo "METRICS_TOKEN in $settings has unexpected characters; use --new-token" >&2
+elif [ -n "$token" ] && [ ${#token} -lt 24 ]; then
+    echo "METRICS_TOKEN in $settings is shorter than 24 characters; use --new-token or --no-token" >&2
+    exit 65
+elif [ -n "$token" ] && ! [[ "$token" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+    echo "METRICS_TOKEN in $settings has unexpected characters; use --new-token or --no-token" >&2
     exit 65
 fi
+[ -n "$token" ] || token_state=none
 
 # One validation for both: the service itself refuses settings it would not start with (exit 78).
 listen=$(METRICS_TOKEN="$token" METRICS_ADDRESS="$address" METRICS_PORT="$port" METRICS_ALLOWED_IPS="$allow" \
@@ -122,7 +136,7 @@ stage_command "$staging/command"
 
 cat > "$staging/settings" <<EOF
 # $NAME (bin/install-metrics). Read by systemd as root and given to the service.
-# Prometheus sends METRICS_TOKEN as a bearer token; only METRICS_ALLOWED_IPS may connect.
+# Only METRICS_ALLOWED_IPS may connect; Prometheus sends METRICS_TOKEN as a bearer token when it is set.
 METRICS_TOKEN=$token
 METRICS_ADDRESS=$address
 METRICS_PORT=$port
@@ -183,7 +197,11 @@ place() {  # place SOURCE TARGET MODE [quiet|DISPLAY] — write only what differ
         echo "==> wrote $2"
     fi
 }
-sed "s/^METRICS_TOKEN=.*/METRICS_TOKEN=<$token_state, hidden>/" "$staging/settings" > "$staging/settings.shown"
+if [ -n "$token" ]; then
+    sed "s/^METRICS_TOKEN=.*/METRICS_TOKEN=<$token_state, hidden>/" "$staging/settings" > "$staging/settings.shown"
+else
+    cp "$staging/settings" "$staging/settings.shown"
+fi
 [ "$check" = 1 ] || install -d -o root -g root -m 0700 "$CONFIG"
 place "$staging/command" "$command" 0755 quiet  # a copy of bin/worker-metrics
 place "$staging/settings" "$settings" 0600 "$staging/settings.shown"
@@ -205,13 +223,13 @@ fi
 echo "==> $NAME: $(systemctl is-active "$NAME.service" || true); $listen"
 host=$address
 [[ "$address" == *:* ]] && host="[$address]"
-# Without the token it must refuse: 401 (or 403 when this host is not in the allowlist).
-status=$(python3 - "http://$host:$port/metrics" <<'PYTHON' || true
+# Without a token header: 401 with a token, 403 when this host is not in the allowlist, else 200.
+status=$(python3 - "http://$host:$port/metrics" "$token_state" <<'PYTHON' || true
 import sys, time, urllib.error, urllib.request
 for attempt in range(10):
     try:
         urllib.request.urlopen(sys.argv[1], timeout=3)
-        print('200 (without the token!)')
+        print('200 (without the token!)' if sys.argv[2] != 'none' else '200 (no token: the allowlist alone)')
         break
     except urllib.error.HTTPError as error:
         print(error.code)
@@ -222,5 +240,9 @@ else:
     print('no answer (journalctl -u setup-server-metrics)')
 PYTHON
 )
-echo "==> without the token it answers: $status"
-echo "==> the token for Prometheus: sudo sed -n 's/^METRICS_TOKEN=//p' $settings"
+echo "==> without a token it answers: $status"
+if [ -n "$token" ]; then
+    echo "==> the token for Prometheus: sudo sed -n 's/^METRICS_TOKEN=//p' $settings"
+else
+    echo "==> no token: only $allow may read it"
+fi

@@ -36,7 +36,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 └── .ssh/github-<savininkas>.<repo>   GitHub projekto deploy key (tik skaitymui); host alias'ai – .ssh/config
 /etc/setup-server/runner.env    Bitbucket runner'io OAuth duomenys (root, 0600)
 /etc/setup-server/projects/<vardas>/<env>.env   projekto slaptažodžiai naktinėms kopijoms (root, 0600)
-/etc/setup-server/metrics.env   worker'io /metrics token'as, adresas ir leidžiami adresai (root, 0600)
+/etc/setup-server/metrics.env   worker'io /metrics adresas, leidžiami adresai ir neprivalomas token'as (root, 0600)
 ```
 
 ## Eiga
@@ -220,7 +220,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 
    **Slaptažodžiai.** Laikmatis veikia be Bitbucket, todėl Deployment variables jam reikia serveryje.
    Kiekvienai aplinkai – root failas (tie patys `VARDAS=reikšmė`, kaip Bitbucket Deployment variables:
-   `DATABASE_PASSWORD`, `DATABASE_ROOT_PASSWORD`, `METRICS_TOKEN`, PS raktai …):
+   `DATABASE_PASSWORD`, `DATABASE_ROOT_PASSWORD`, `METRICS_TOKEN` (jei naudojamas), PS raktai …):
 
    ```bash
    sudo install -d -m 0700 /etc/setup-server/projects/asana_tracker
@@ -425,17 +425,20 @@ domene; šis jų nedubliuoja.
 cd ~/setup-server
 sudo bin/install-metrics --check --address 10.8.0.14 --allow 10.8.0.20   # parodo unit'ą ir nustatymus; nieko nekeičia
 sudo bin/install-metrics --address 10.8.0.14 --allow 10.8.0.20           # įdiegia ir paleidžia
-sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env         # token'as Prometheus'ui
 ```
 
 - `--address` – kur klausoma: VPN serveryje jo VPN adresas (`10.8.0.14`); numatytas `127.0.0.1` (tik iš paties
   serverio). `--allow` – Prometheus adresas(-ai), IP/CIDR, atskirti tarpais ar kableliais; privalomas su bet
-  kuriuo adresu, išskyrus `127.0.0.1`/`::1`. `--port` – numatytas `9101`. `--new-token` – naujas token'as.
-- Nustatymai laikomi `/etc/setup-server/metrics.env` (root, 0600): pirmą kartą sugeneruojamas 43 simbolių
-  token'as. Pakartotinai paleidus nenurodyti nustatymai lieka, paslauga perkraunama tik pasikeitus failui;
-  runner'io paslauga neliečiama. Įdiegtą komandos kopiją atnaujina `bin/update` (žr. „Atnaujinimas“).
-- Prieiga kaip taikinio `/metrics`: ne iš sąrašo – `403`, be token'o ar su neteisingu – `401`, kitas kelias – `404`.
-  Be 24+ simbolių token'o ar be sąrašo paslauga nepasileidžia (`journalctl -u setup-server-metrics`).
+  kuriuo adresu, išskyrus `127.0.0.1`/`::1`. `--port` – numatytas `9101`.
+- **Token'as neprivalomas.** Prieigą saugo IP sąrašas; be token'o atsako kiekvienam sąrašo adresui.
+  `--new-token` – sugeneruoja 43 simbolių token'ą (arba pakeičia esamą; Prometheus'ui:
+  `sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env`), `--no-token` – pašalina esamą.
+  Token'as naudingas, kai sąraše daugiau adresų nei Prometheus (pvz. visas VPN potinklis).
+- Nustatymai laikomi `/etc/setup-server/metrics.env` (root, 0600). Pakartotinai paleidus nenurodyti nustatymai
+  (ir token'as) lieka, paslauga perkraunama tik pasikeitus failui; runner'io paslauga neliečiama. Įdiegtą komandos
+  kopiją atnaujina `bin/update` (žr. „Atnaujinimas“).
+- Prieiga kaip taikinio `/metrics`: ne iš sąrašo – `403`, su token'u – be jo ar su neteisingu `401`, kitas kelias –
+  `404`. Be sąrašo ar su trumpesniu nei 24 simbolių token'u paslauga nepasileidžia (`journalctl -u setup-server-metrics`).
   `X-Forwarded-For` ignoruojamas: priešais nėra proxy, klientai jungiasi tiesiogiai.
 
 **Kodėl atskira paslauga, ne nginx-proxy.** Worker'is neturi savo nginx-proxy (projektų nginx-proxy priklauso
@@ -471,10 +474,11 @@ deploy'us neuždengtų sustojusio laikmačio. Deploy'ai – iš setup istorijos
 ```bash
 systemctl status setup-server-metrics
 sudo -u setup /usr/local/sbin/setup-server-metrics --once          # metrikos be serverio ir token'o
-curl -H "Authorization: Bearer $(sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env)" http://10.8.0.14:9101/metrics
+curl http://10.8.0.14:9101/metrics                                  # iš sąrašo adreso, be token'o
+curl -H "Authorization: Bearer $(sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env)" http://10.8.0.14:9101/metrics   # su token'u
 ```
 
-**Prometheus** (serveris prijungtas prie VPN, token'as faile):
+**Prometheus** (serveris prijungtas prie VPN; `authorization` – tik su token'u):
 
 ```yaml
 scrape_configs:
@@ -518,9 +522,9 @@ Papildomai verta: `up{job="setup-worker"} == 0` arba „no data“ (VPN ar pasla
 - Kopijų atsisiuntimo raktai (`bin/add-backup-key`) prisijungia prie paskyros `setup`, bet tik iš nurodyto tinklo
   ir tik su priverstine komanda, kuri atiduoda vien kopijas (`restrict`: be terminalo ir persiuntimų). Kopijose
   yra tikri klientų duomenys; kiekvienas atsisiuntimas registruojamas `backup-pulls.log`.
-- Worker'io `/metrics` token'as yra tik `/etc/setup-server/metrics.env` (root, 0600); paslauga jį gauna per
-  aplinką. Endpoint'as klauso tik nurodytu adresu (VPN), atsako tik leidžiamiems adresams su token'u ir nieko
-  nekeičia.
+- Worker'io `/metrics` token'as (jei naudojamas) yra tik `/etc/setup-server/metrics.env` (root, 0600); paslauga
+  jį gauna per aplinką. Endpoint'as klauso tik nurodytu adresu (VPN), atsako tik leidžiamiems adresams (ir, kai
+  token'as nustatytas, tik su juo) ir nieko nekeičia.
 
 ## Dar neįtraukta
 

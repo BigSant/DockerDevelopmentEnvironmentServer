@@ -1,4 +1,4 @@
-"""Worker /metrics: backups, deploys, runner and disk from the build roots, behind a token and an allowlist.
+"""Worker /metrics: backups, deploys, runner and disk from the build roots, behind an allowlist and an optional token.
 
 The endpoint runs for real on 127.0.0.1 over a temporary projects tree; systemctl is a stub.
 Format check (opt-in where promtool is missing): SETUP_PROMTOOL_IMAGE=prom/prometheus:latest.
@@ -180,6 +180,15 @@ class EndpointTest(ScriptTest):
         self.assertEqual(fetch(base, "/other", token=TOKEN)[0], 404)
         self.assertEqual(fetch(base, "/other")[0], 401, "nothing is told without the token")
 
+    def test_without_a_token_setting_the_allowlist_alone_guards_it(self):
+        base = self.start(METRICS_TOKEN="")
+        status, _, body = fetch(base)
+        self.assertEqual(status, 200, body)
+        self.assertIn("setup_worker", body)
+        self.assertEqual(fetch(base, "/other")[0], 404)
+        outside = self.start(METRICS_TOKEN="", METRICS_ALLOWED_IPS="10.8.0.20")
+        self.assertEqual(fetch(outside)[0], 403)
+
     def test_an_address_outside_the_allowlist_is_refused_even_with_the_token(self):
         base = self.start(METRICS_ALLOWED_IPS="10.8.0.20 192.168.1.0/24")
         status, _, body = fetch(base, token=TOKEN)
@@ -188,10 +197,10 @@ class EndpointTest(ScriptTest):
         allowed = self.start(METRICS_ALLOWED_IPS="10.8.0.20,127.0.0.0/8")
         self.assertEqual(fetch(allowed, token=TOKEN)[0], 200)
 
-    def test_it_does_not_start_without_a_usable_token_or_allowlist(self):
+    def test_it_does_not_start_with_a_short_token_or_without_an_allowlist(self):
         env = {**os.environ, "SETUP_SERVER_ROOT": str(self.tree.root), "METRICS_ADDRESS": "127.0.0.1", "METRICS_PORT": "0"}
-        for settings, message in (({"METRICS_ALLOWED_IPS": "127.0.0.1"}, "METRICS_TOKEN (24+ characters)"),
-                                  ({"METRICS_TOKEN": "short", "METRICS_ALLOWED_IPS": "127.0.0.1"}, "METRICS_TOKEN (24+"),
+        for settings, message in (({"METRICS_TOKEN": "short", "METRICS_ALLOWED_IPS": "127.0.0.1"}, "METRICS_TOKEN must have 24+"),
+                                  ({"METRICS_TOKEN": ""}, "METRICS_ALLOWED_IPS"),
                                   ({"METRICS_TOKEN": TOKEN}, "METRICS_ALLOWED_IPS"),
                                   ({"METRICS_TOKEN": TOKEN, "METRICS_ALLOWED_IPS": "all"}, "Invalid IP/CIDR"),
                                   ({"METRICS_TOKEN": TOKEN, "METRICS_ALLOWED_IPS": "10.8.0.0/8; deny"}, "Invalid IP/CIDR"),
@@ -366,8 +375,9 @@ class InstallMetricsTest(ScriptTest):
         self.assertIn("ProtectSystem=strict", result.stdout)
         self.assertIn("METRICS_ADDRESS=10.8.0.14", result.stdout)
         self.assertIn('METRICS_ALLOWED_IPS="10.8.0.20"', result.stdout)
-        self.assertIn("METRICS_TOKEN=<new, hidden>", result.stdout)
+        self.assertIn("METRICS_TOKEN=\n", result.stdout, "no token unless one is asked for")
         self.assertIn("would listen on http://10.8.0.14:9101/metrics", result.stdout)
+        self.assertIn("no token: the allowlist alone", result.stdout)
         for name in ("systemd", "sbin", "etc", "srv"):
             self.assertFalse((self.root / name).exists(), "--check changes nothing")
 
@@ -379,6 +389,23 @@ class InstallMetricsTest(ScriptTest):
         refused = self.run_script("install-metrics", "--check", "--address", "10.8.0.14")
         self.assertEqual(refused.returncode, 64)
         self.assertIn("--allow", refused.stderr)
+
+    def test_a_token_is_set_on_request_and_a_short_one_is_refused(self):
+        result = self.run_script("install-metrics", "--check", "--new-token")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("METRICS_TOKEN=<new, hidden>", result.stdout)
+        self.assertIn("(token 43 characters)", result.stdout)
+        both = self.run_script("install-metrics", "--check", "--new-token", "--no-token")
+        self.assertEqual(both.returncode, 64)
+        (self.root / "etc").mkdir()
+        (self.root / "etc/metrics.env").write_text("METRICS_TOKEN=short\n")
+        short = self.run_script("install-metrics", "--check")
+        self.assertEqual(short.returncode, 65, short.stdout + short.stderr)
+        self.assertIn("--new-token or --no-token", short.stderr)
+        self.assertNotIn("short\n", short.stdout)
+        removed = self.run_script("install-metrics", "--check", "--no-token")
+        self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+        self.assertIn("METRICS_TOKEN=\n", removed.stdout)
 
     def test_bad_settings_are_refused(self):
         for arguments, code, message in ((["--allow", "all"], 78, "Invalid IP/CIDR"),
@@ -414,7 +441,7 @@ printf '[{"ref":"v1","commit":"%040d","at":"2026-10-09T10:00:00+00:00","rollback
     > $app/.generated/release/prod/deployments.json
 chown -R setup:setup /srv/setup-server/projects && chmod -R go-rwx /srv/setup-server/projects
 # systemctl is a stub (no systemd in the container); the unit is verified below.
-PATH=/stubs:$PATH /setup-server/bin/install-metrics --address 127.0.0.1
+PATH=/stubs:$PATH /setup-server/bin/install-metrics --address 127.0.0.1 --new-token
 PATH=/stubs:$PATH /setup-server/bin/install-metrics | grep -c unchanged
 # verify only warns (exit 0) about a bad setting: any output is a finding.
 systemd-analyze verify /etc/systemd/system/setup-server-metrics.service >/tmp/verify.log 2>&1 || true
