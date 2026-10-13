@@ -59,6 +59,23 @@ class RotationTest(unittest.TestCase):
     def setUp(self):
         self.module = load_backup_projects()
 
+    def test_env_files_are_read_as_setup_reads_them(self):
+        module = load_backup_projects()
+        text = ('# comment\nPROJECT_NAME=asana  # inline\nexport DOMAIN = asana.local\n'
+                'APP_ENVIRONMENT="\n  ASANA_TOKEN ERP_API_KEY\n  HTPASSWD_WEB\n"\n'
+                "CACHE_CLEAR_COMMAND=\"sh -c 'kill -USR2 1'\"\nHASH='$apr1$x$y'\nEMPTY=\nESCAPED=\"a\\\"b\\nc\"\n")
+        values = module.parse_env(text, "common.env")
+        self.assertEqual(values["PROJECT_NAME"], "asana")
+        self.assertEqual(values["DOMAIN"], "asana.local")
+        self.assertEqual(values["APP_ENVIRONMENT"].split(), ["ASANA_TOKEN", "ERP_API_KEY", "HTPASSWD_WEB"])
+        self.assertEqual(values["CACHE_CLEAR_COMMAND"], "sh -c 'kill -USR2 1'")
+        self.assertEqual(values["HASH"], "$apr1$x$y")
+        self.assertEqual(values["EMPTY"], "")
+        self.assertEqual(values["ESCAPED"], 'a"b\nc')
+        for broken, line in (("just words\n", 1), ("A=1\nB=\"never closed\nC=2\n", 2)):
+            with self.subTest(text=broken), self.assertRaisesRegex(module.Refused, f"line {line} is not NAME=value"):
+                module.parse_env(broken, "common.env")
+
     def test_sixty_nights_keep_seven_daily_and_four_weekly(self):
         last = datetime(2026, 10, 9)  # a Friday, ISO week 41
         names = [nightly(last - timedelta(days=n)) for n in range(60)]

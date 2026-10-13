@@ -104,6 +104,20 @@ class SharedHelpersTest(unittest.TestCase):
                 found[node.targets[0].id] = ast.get_source_segment(source, node)
         return found
 
+    ENV_HELPERS = ("ENV_ENTRY", "ENV_ESCAPES", "env_closing", "env_entries")
+
+    def test_the_env_reader_is_the_same_in_backups_and_the_status_page(self):
+        saved = self.SHARED
+        self.SHARED = self.ENV_HELPERS
+        try:
+            backups, status = self.definitions("backup-projects"), self.definitions("server-status")
+        finally:
+            self.SHARED = saved
+        self.assertEqual(sorted(backups), sorted(self.ENV_HELPERS))
+        for name in self.ENV_HELPERS:
+            with self.subTest(name=name):
+                self.assertEqual(status.get(name), backups[name])
+
     def test_the_duplicated_helpers_are_identical(self):
         backups = self.definitions("backup-projects")
         self.assertEqual(sorted(backups), sorted(self.SHARED))

@@ -104,20 +104,65 @@ def series(backups, environment):
     return names
 
 
-def parse_env(text, path):
-    values = {}
-    for number, line in enumerate(text.splitlines(), 1):
-        line = line.strip()
+ENV_ENTRY = re.compile(r'(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*')
+ENV_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r'}
+
+
+def env_closing(text, quote):
+    """Index of the quote that closes a value (after the opening one) in text, or -1."""
+    if quote == "'":
+        return text.find("'")
+    index = 0
+    while index < len(text):
+        if text[index] == '\\':
+            index += 2
+            continue
+        if text[index] == quote:
+            return index
+        index += 1
+    return -1
+
+
+def env_entries(text):
+    """(line number, NAME, value) of an env file, read as setup reads it (project_env_files.parse_dotenv):
+    a quoted value may run over several lines (asana.local's APP_ENVIRONMENT), double quotes take \n \t \r
+    escapes, an unquoted value ends at ' #'. NAME is None for a line that is no entry or a quote never closed."""
+    lines = (text or '').splitlines()
+    index = 0
+    while index < len(lines):
+        number, line = index + 1, lines[index].strip()
+        index += 1
         if not line or line.startswith('#'):
             continue
-        if line.startswith('export '):
-            line = line[len('export '):].lstrip()
-        key, separator, value = line.partition('=')
-        key, value = key.strip(), value.strip()
-        if not separator or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
+        match = ENV_ENTRY.match(line)
+        if not match:
+            yield number, None, None
+            continue
+        raw = line[match.end():]
+        quote = raw[:1] if raw[:1] in ('"', "'") else ''
+        if not quote:
+            yield number, match[1], '' if raw.startswith('#') else re.split(r'\s#', raw, maxsplit=1)[0].strip()
+            continue
+        body = raw[1:]
+        end = env_closing(body, quote)
+        while end < 0 and index < len(lines):
+            body += '\n' + lines[index]
+            index += 1
+            end = env_closing(body, quote)
+        if end < 0:
+            yield number, None, None
+            continue
+        value = body[:end]
+        if quote == '"':
+            value = re.sub(r'\\(.)', lambda escape: ENV_ESCAPES.get(escape[1], escape[1]), value, flags=re.S)
+        yield number, match[1], value
+
+
+def parse_env(text, path):
+    values = {}
+    for number, key, value in env_entries(text):
+        if key is None:
             raise Refused(f'{path} line {number} is not NAME=value')
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
-            value = value[1:-1]
         values[key] = value
     return values
 
