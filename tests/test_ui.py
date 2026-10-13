@@ -190,8 +190,8 @@ class ServerStatusTest(Worker):
         data = json.loads(result.stdout)
         self.assertEqual(data["backup_pulls"], [f"line {n}" for n in range(95, 100)])
         self.assertEqual(sorted(data["journal"]), sorted(["setup-server-runner.service", "setup-server-github-runner@*.service",
-                                                          "setup-server-backup.service", "setup-server-metrics.service",
-                                                          "setup-server-ui.service"]))
+                                                          "setup-server-backup.service", "setup-server-backup-full.service",
+                                                          "setup-server-metrics.service", "setup-server-ui.service"]))
         self.assertTrue(all("--lines=5" in call for call in self.calls("journalctl")))
         for arguments in (["--logs", "9999"], ["--logs", "0"], ["--logs", "5;ls"], ["--unit", "ssh"], ["--logs", "5", "x"]):
             with self.subTest(arguments=arguments):
@@ -578,6 +578,7 @@ class WebUiTest(Worker):
                  ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "dev=local"}, "Netinkamas taikinys"),
                  ("remove-project", {"name": "../etc"}, "Projektas"),
                  ("install-backups", {"at": "25:00"}, "Laikas"),
+                 ("install-backups", {"full_at": "Sunday 04:30"}, "Pilnos kopijos diena"),
                  ("install-metrics", {"address": "vpn.example"}, "Adresas"),
                  ("install-metrics", {"allow": "0.0.0.0/0"}, "ne visus adresus"),
                  ("add-backup-key", {"public_key": "-----BEGIN OPENSSH PRIVATE KEY-----", "key_name": "tomas",
@@ -635,6 +636,21 @@ class WebUiTest(Worker):
                 break
             time.sleep(0.1)
         self.assertIn("finished", self.log.read_text())
+
+    def test_backup_forms_pass_the_weekly_time_the_fresh_permission_and_full(self):
+        self.preview("install-backups", at="02:15", full_at="Sat 05:00")
+        self.assertEqual(self.sudo_calls("install-backups"),
+                         [f"-n {self.library}/bin/install-backups --check --at 02:15 --full-at Sat 05:00"])
+        key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1 tomas@laptop"
+        self.preview("add-backup-key", public_key=key, key_name="tomas", sources="10.8.0.0/24", allow_fresh="yes")
+        self.assertEqual(self.sudo_calls("add-backup-key")[-1],
+                         f"-n {self.library}/bin/add-backup-key --check - --name tomas --from 10.8.0.0/24 --allow-fresh")
+        status, _, body = self.preview("pipeline", project="shop-two", pipeline="backup-now", branch="master", full="yes")
+        self.assertEqual(status, 200, body)
+        self.assertIn("&quot;key&quot;: &quot;FULL&quot;,\n      &quot;value&quot;: &quot;yes&quot;", body)
+        # Not asked for: no variable, so a project whose backup-now has no FULL keeps working.
+        self.assertIn("&quot;variables&quot;: []", self.preview("pipeline", project="shop-two", pipeline="backup-now",
+                                                                branch="master")[2])
 
     def test_nothing_runs_without_the_action_log(self):
         self.log.mkdir()  # a directory where the log should be: it cannot be appended to

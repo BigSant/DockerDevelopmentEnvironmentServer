@@ -17,8 +17,8 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<repo vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`. GitHub repo – su savo deploy key. |
 | `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
 | `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
-| `bin/install-backups` | Naktinės DB kopijos: systemd laikmatis `setup-server-backup.timer`, komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
-| `bin/add-backup-key` | Programuotojo SSH raktas naujausioms DB kopijoms atsisiųsti (`make db-pull`): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. |
+| `bin/install-backups` | DB kopijos: naktinė (`setup-server-backup.timer`, pagal lentelių registrą) ir savaitinė pilna (`setup-server-backup-full.timer`, visų lentelių duomenys), komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
+| `bin/add-backup-key` | Programuotojo SSH raktas DB kopijoms atsisiųsti (`make db-pull`), su `--allow-fresh` – ir naujai kopijai užsakyti (`make db-pull fresh=1`): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. |
 | `bin/install-metrics` | Worker'io Prometheus `/metrics`: systemd paslauga `setup-server-metrics` (paskyra `setup`, tik skaito), komanda `/usr/local/sbin/setup-server-metrics` (kopija iš `bin/worker-metrics`), nustatymai `/etc/setup-server/metrics.env`. |
 | `bin/install-ui` | Valdymo sąsaja naršyklėje (tik `127.0.0.1`, per SSH tunelį): paslauga `setup-server-ui` (atskira paskyra `setup-ui`), komanda `/usr/local/sbin/setup-server-ui` (kopija iš `bin/web-ui`), komandų kopijos `/usr/local/lib/setup-server/bin/`, sudo taisyklė, nustatymai `/etc/setup-server/ui.env`. |
 | `bin/server-status` | Serverio būsena JSON formatu (tik skaito): paslaugos, laikmačiai, versijos, diskas, projektai, konteineriai. Ją naudoja valdymo sąsaja; galima leisti ir ranka. |
@@ -31,7 +31,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 /srv/setup-server/              paskyros setup namai
 ├── setup/                      bendras setup checkout'as (serveriuose – ant release tag'o)
 ├── projects/<vardas>/app/      projekto build katalogas (BUILD_ROOT = projects/<vardas>)
-│   └── .generated/backups/     DB kopijos (worker-<env>-<UTC laikas>Z.sql.gz – naktinės ir „backup dabar“)
+│   └── .generated/backups/     DB kopijos: worker-<env>-<UTC laikas>Z.sql.gz – naktinės ir „backup dabar“,
+│                               full-<env>-…Z – savaitinės pilnos, fresh(-full)-<env>-…Z – programuotojų „fresh“
 ├── runner/current/             Bitbucket runner'io versija; runner/temp – jo darbo katalogas
 ├── github-runner/<scope>/      GitHub runner'is (organizacijai `bigsant`, repo `bigsant.<repo>`); _work – darbo katalogas
 ├── ui-actions.log              valdymo sąsajos veiksmų žurnalas (setup-ui, 0640)
@@ -233,12 +234,23 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    `app/docker/.generated`), reikia `--with-backups` – tada prarandamos kopijos ir rollback'as. Katalogo,
    kurį naudoja veikiantis konteineris, scriptas netrina.
 
-6. **Naktinės DB kopijos** (worker'is, ne Bitbucket):
+6. **DB kopijos: naktinės ir savaitinės pilnos** (worker'is, ne Bitbucket):
 
    ```bash
    sudo bin/install-backups --check          # unit'ai ir ką šią naktį kopijuotų; nieko nekeičia
-   sudo bin/install-backups                  # įdiegia; --at 03:30 – paleidimo laikas (numatytas)
+   sudo bin/install-backups                  # įdiegia; --at 03:30 ir --full-at "Sun 04:30" – laikai (numatyti)
    ```
+
+   | Kopija | Laikmatis | Kas joje | Failai | Laikoma |
+   | --- | --- | --- | --- | --- |
+   | Naktinė | `setup-server-backup.timer`, kasdien `--at` | pagal lentelių registrą: visų lentelių struktūra, `import` lentelių duomenys | `worker-<env>-…Z.sql.gz` | 7 dienų + 4 savaičių |
+   | Savaitinė pilna | `setup-server-backup-full.timer`, kartą per savaitę `--full-at` | visų lentelių duomenys (`make db-backup full=1`) | `full-<env>-…Z.sql.gz` | 2 naujausios |
+   | „Fresh“ | programuotojo `make db-pull fresh=1 [full=1]` (žr. 7 punktą) | registro arba pilna | `fresh-<env>-…Z`, `fresh-full-<env>-…Z` | po 2 naujausias |
+
+   Kiekviena serija rotuojama atskirai, kitų failų rotacija neliečia. Vienam projektui ir aplinkai vienu metu
+   daroma viena kopija (užraktas `.generated/backups/.lock-<env>`): jei naktinė dar vyksta, savaitinė ar „fresh“
+   jos palaukia. Pilna kopija gali užtrukti iki 8 val., kitos – iki 4. Terminale (`sudo setup-server-backup --full
+   asana_tracker prod`) rodoma juosta: parašyti baitai, palyginti su ankstesnės tokios pat kopijos dydžiu.
 
    **Kurie projektai ir aplinkos.** Kopijuojama kiekviena `/srv/setup-server/projects/<vardas>` aplinka,
    kuriai aplinkos repo (`app/`, senesniame išdėstyme `app/docker/`) turi `env/stage.env` arba `env/prod.env`.
@@ -268,19 +280,22 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    o paslauga baigiasi klaida (`failed`). Patikrinti:
 
    ```bash
-   systemctl list-timers setup-server-backup.timer      # kada kitas paleidimas
-   sudo systemctl start setup-server-backup.service     # paleisti dabar (laukia pabaigos)
+   systemctl list-timers 'setup-server-backup*'          # kada kitas naktinis ir savaitinis paleidimas
+   sudo systemctl start setup-server-backup.service     # naktinė dabar (laukia pabaigos)
+   sudo systemctl start setup-server-backup-full.service  # savaitinė pilna dabar
    systemctl status setup-server-backup.service         # paskutinio paleidimo būsena
-   journalctl -u setup-server-backup.service -n 100     # kas nukopijuota, kas nepavyko
+   journalctl -u setup-server-backup.service -n 100     # kas nukopijuota, kas nepavyko (-full – savaitinės)
    sudo setup-server-backup --check                     # ką kopijuotų, ar yra kiekvieno projekto secret store
+   sudo setup-server-backup --check --full              # tas pats savaitinei pilnai kopijai
    ```
 
    **„Backup dabar“** – Bitbucket custom pipeline'as, vykdomas runner'io šiame serveryje. Jis kviečia tą pačią
    komandą per `sudo`, todėl naudoja tą patį secret store, rotaciją ir nekuria įrašo
    Deployments istorijoje. Sudo taisyklė leidžia paskyrai `setup` tik šią formą:
-   `/usr/local/sbin/setup-server-backup /srv/setup-server/projects/<vardas> [stage|prod]` (sudo 1.9.10+,
+   `/usr/local/sbin/setup-server-backup [--full] /srv/setup-server/projects/<vardas> [stage|prod]` (sudo 1.9.10+,
    pvz. Ubuntu 24.04, tikrina reguliariąja išraiška). Senesnis sudo (Ubuntu 22.04: 1.9.9) turi tik
-   šablonus: pirmas argumentas privalo būti build katalogas, o kitus argumentus atmeta pati komanda.
+   šablonus: pirmas argumentas privalo būti build katalogas (ar `--full` ir build katalogas), o kitus
+   argumentus atmeta pati komanda.
    Atnaujinus setup-server, pakartok `sudo bin/install-backups`, jei `bin/update` parodo pastabą, kad
    sudo taisyklė skiriasi.
 
@@ -288,27 +303,33 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    pipelines:
      custom:
        backup-now:            # „backup dabar“
+         - variables:
+             - name: FULL
+               default: "no"
+               allowed-values: ["no", "yes"]
          - step:
              name: Backup now
              runs-on: [self.hosted, linux.shell, setup.build]
              script:
                - unset DOCKER_HOST
                - BUILD_ROOT=${BUILD_ROOT:-${SETUP_SERVER_ROOT:-/srv/setup-server}/projects/$BITBUCKET_REPO_SLUG}
-               - sudo -n /usr/local/sbin/setup-server-backup "$BUILD_ROOT"
+               - sudo -n /usr/local/sbin/setup-server-backup $([ "${FULL:-no}" = yes ] && echo --full) "$BUILD_ROOT"
    ```
 
-   Antras argumentas (`stage` arba `prod`) apriboja aplinką. Įdiegtą komandos kopiją atnaujina `bin/update`
-   (žr. „Atnaujinimas“). Pakartotinai paleistas `sudo bin/install-backups` palieka įdiegtą laiką, jei
-   nenurodytas `--at`.
+   Antras argumentas (`stage` arba `prod`) apriboja aplinką, `FULL=yes` – pilna kopija (į `full-<env>` seriją).
+   Įdiegtą komandos kopiją atnaujina `bin/update` (žr. „Atnaujinimas“). Pakartotinai paleistas
+   `sudo bin/install-backups` palieka įdiegtus laikus, jei nenurodyti `--at` ir `--full-at`.
 
 7. **Kopijų atsisiuntimas programuotojams (neprivaloma).** Programuotojas savo kompiuteryje setup komanda
    `make db-pull` parsisiunčia naujausią šio serverio išsaugotą projekto kopiją (naktinę, „backup dabar“ ar
-   prieš deploy'ų – kuri naujausia) ir iš jos pasiruošia veikiančią aplinką. LIVE nepasiekiamas.
+   prieš deploy'ų – kuri naujausia; su `full=1` – savaitinę pilną) ir iš jos pasiruošia veikiančią aplinką.
+   Su `fresh=1` serveris kopiją padaro tuo metu. LIVE nepasiekiamas.
 
    ```bash
    sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --check   # parodo, ką keistų
-   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24           # įrašo raktą
-   sudo bin/add-backup-key --list                                                # kam leista ir iš kur
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24           # įrašo raktą (tik atsisiuntimas)
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --allow-fresh   # ir „fresh“ kopijos
+   sudo bin/add-backup-key --list                                                # kam leista, iš kur, ar „fresh“
    sudo bin/add-backup-key --remove tomas                                        # atima leidimą
    ```
 
@@ -319,10 +340,20 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    negauna. Tas pats vardas pakartotinai – raktas pakeičiamas; kiti `authorized_keys` įrašai nekeičiami.
    Prisijungiama tik raktu (paskyra `setup` slaptažodžio neturi).
 
-   Komanda moka du dalykus: `latest <projektas> <stage|prod>` – naujausios kopijos vardas, `get <projektas>
-   <stage|prod> <failas>` – tos kopijos turinys. Kiekvienas prašymas (ir atmestas) įrašomas į
-   `/srv/setup-server/backup-pulls.log`: laikas, rakto vardas, adresas, prašymas, rezultatas. Projekto vardas –
-   build katalogo vardas (`projects/<vardas>`, pvz. `asana_tracker`).
+   Komanda moka:
+
+   | Prašymas | Atsakymas |
+   | --- | --- |
+   | `latest <projektas> <stage\|prod> [full]` | naujausios kopijos vardas: be `full` – registro kopija (naktinė, „fresh“, prieš deploy'ų), su `full` – pilna (savaitinė ar „fresh“ pilna) |
+   | `info <projektas> <stage\|prod> [full]` | tas pats ir dydis baitais: `<failas> <dydis>` (atsisiuntimo progresui) |
+   | `get <projektas> <stage\|prod> <failas>` | tos kopijos turinys |
+   | `fresh <projektas> <stage\|prod> [full]` | tik raktui su `--allow-fresh`: paleidžia `setup-server-backup --fresh [--full]` paskyra `setup`, eigą siunčia į stderr (`progress backup BAITAI TIKĖTINA`), pabaigoje – `<failas> <dydis>` |
+
+   „Fresh“ apkrauna projekto DB, todėl jo nedaro du kartus: jei tos pačios rūšies (registro ar pilna) kopija
+   jaunesnė nei 30 min., atiduodama ji; jei kopija tuo metu daroma, laukiama jos pabaigos (užraktas). Reikia
+   įdiegtos `/usr/local/sbin/setup-server-backup` (`sudo bin/install-backups`). Kiekvienas prašymas (ir atmestas)
+   įrašomas į `/srv/setup-server/backup-pulls.log`: laikas, rakto vardas, adresas, prašymas, rezultatas. Projekto
+   vardas – build katalogo vardas (`projects/<vardas>`, pvz. `asana_tracker`).
 
    Kopijose yra tikri klientų duomenys (stage/prod pagal lentelių registrą): leisk tik tiems, kam jų reikia,
    ir atimk leidimą (`--remove`), kai nebereikia. Įdiegtą komandos kopiją atnaujina `bin/update`.
@@ -517,8 +548,11 @@ viešai jis nematomas; VPN adresą jis užima ir tada, kai VPN sąsaja pakyla v�
 Bitbucket runner'io metrikos paliktos kaip buvo (be žymų), kad esami įspėjimai ir grafikai nesikeistų; GitHub
 runner'iai – atskiros metrikos su žyma `scope`, nes jų gali būti keli.
 
-Kopijos – tik `worker-<env>-…Z.sql.gz` (naktinės ir „backup dabar“). Deploy'aus kopijos neskaičiuojamos, kad
-deploy'us neuždengtų sustojusio laikmačio. Deploy'ai – iš setup istorijos
+Kopijos – tik `worker-<env>-…Z.sql.gz` (naktinės ir „backup dabar“). Deploy'aus ir „fresh“ kopijos
+neskaičiuojamos, kad neuždengtų sustojusio laikmačio. Savaitinė pilna serija (`full-<env>-…Z.sql.gz`) turi savo
+metrikas `setup_worker_full_backups`, `setup_worker_full_backup_newest_age_seconds` ir
+`setup_worker_full_backup_newest_size_bytes`; `0` aplinkai be pilnos kopijos rodomas tik įdiegus
+`setup-server-backup-full.timer`, kad serveris be savaitinių kopijų nekeltų įspėjimo. Deploy'ai – iš setup istorijos
 `app/.generated/release/<env>/deployments.json` (paskutinis įrašas). Patikrinti be Prometheus:
 
 ```bash
@@ -547,6 +581,13 @@ scrape_configs:
 ```promql
 max by (project, environment) (setup_worker_backup_newest_age_seconds) > 26 * 3600
   or setup_worker_backups == 0
+```
+
+Savaitinei pilnai kopijai – „senesnė nei 8 dienos“:
+
+```promql
+max by (project, environment) (setup_worker_full_backup_newest_age_seconds) > 8 * 24 * 3600
+  or setup_worker_full_backups == 0
 ```
 
 Papildomai verta: `up{job="setup-worker"} == 0` arba „no data“ (VPN ar paslauga neveikia),
@@ -582,10 +623,11 @@ laikomas tik jo PBKDF2 hash'as `/etc/setup-server/ui.env` (root, 0600). Pamiršu
 **Ką rodo.**
 
 - *Apžvalga* – setup-server versija (įdiegta ir administratoriaus klono), bendro setup checkout'o versija, Bitbucket ir
-  GitHub runner'ių paslaugos, naktinių kopijų laikmatis (paskutinis paleidimas, rezultatas, kitas), metrikų paslauga,
+  GitHub runner'ių paslaugos, naktinių ir savaitinių pilnų kopijų laikmačiai (paskutinis paleidimas, rezultatas, kitas), metrikų paslauga,
   laisva vieta diske, kuriame `/srv/setup-server`.
 - *Projektai* – kiekvienas build katalogas: repo URL, aplinkos (stage/prod), taikinys (`target*.env`, ne paslaptis),
-  paskutinis deploy'us (laikas, commit'as, pavyko ar ne, rollback), naujausia naktinė kopija (amžius, dydis, kiek laikoma),
+  paskutinis deploy'us (laikas, commit'as, pavyko ar ne, rollback), naujausia naktinė ir savaitinė pilna kopija (amžius,
+  dydis, kiek laikoma; projekto puslapyje – ir paskutinė „fresh“),
   ar veikia `<PROJECT_NAME>-<env>-secrets`, konteineriai (būsena, sveikata) ir paskutiniai Bitbucket pipeline'ai.
 - *Žurnalai* – `ui-actions.log`, `backup-pulls.log`, setup-server paslaugų journal (po 50 eilučių) ir paskutiniai
   veiksmai su jų išvestimi.
@@ -599,9 +641,9 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 | Pridėti projektą | `sudo -n L/add-project [--shared-key] --target … [VARDAS] URL [KODO_URL]` (naujam projektui taikinys privalomas) |
 | Pašalinti projektą (projekto puslapyje) | `sudo -n L/remove-project [--with-backups] VARDAS` |
 | Įdiegti runner'į | `sudo -n L/install-runner --provider bitbucket\|github [--name …]`; dialogo tekstas – per stdin |
-| Naktinės DB kopijos | `sudo -n L/install-backups [--at HH:MM]` |
+| DB kopijos (naktinės ir savaitinės pilnos) | `sudo -n L/install-backups [--at HH:MM] [--full-at "DAY HH:MM"]` |
 | Worker'io metrikos | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |
-| Kopijų raktai | `sudo -n L/add-backup-key - --name … --from …` (raktas per stdin), `--remove VARDAS`, `--list` |
+| Kopijų raktai | `sudo -n L/add-backup-key - --name … --from … [--allow-fresh]` (raktas per stdin), `--remove VARDAS`, `--list` |
 | Paruošti serverį | `sudo -n L/prepare-host [--setup-ref …]` (`--check` kodas 1 – „Needs attention“ – vykdyti leidžia) |
 | Atnaujinti | `sudo -n -H -u <klono savininkas> <klonas>/bin/update [--server-ref …] [--setup-ref …]` |
 | Deploy'us, „backup dabar“, runner'io testas | Bitbucket API (žr. žemiau) |
@@ -616,7 +658,8 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
   slaptažodžio (žr. „Atnaujinimas“), kitaip – terminale.
 
 **Deploy'ai per Bitbucket.** Projekto puslapyje – „Deploy į stage“ ir „Deploy į prod“ (custom pipeline'ai `deploy-stage`,
-`deploy-production` su kintamaisiais `REF`, `IMAGES`, `BACKUP`, `ROLLBACK`), „Backup dabar“ (`backup-now`) ir „Runner'io
+`deploy-production` su kintamaisiais `REF`, `IMAGES`, `BACKUP`, `ROLLBACK`), „Backup dabar“ (`backup-now`, pažymėjus
+FULL – su kintamuoju `FULL=yes`; nepažymėjus kintamasis nesiunčiamas) ir „Runner'io
 testas“ (`runner-test`). Sąsaja juos paleidžia per Bitbucket API, todėl istorija lieka Bitbucket'e (Pipelines,
 Deployments), o darbą atlieka runner'is šiame serveryje. Repo – build katalogo `app/` `origin` URL, šaka – jo
 `origin/HEAD` (formoje galima pakeisti). Peržiūra parodo užklausą (JSON), „Vykdyti“ ją išsiunčia ir parodo nuorodą į

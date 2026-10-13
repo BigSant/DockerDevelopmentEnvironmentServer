@@ -246,6 +246,29 @@ class EndpointTest(ScriptTest):
                           (("environment", "stage"), ("project", "forsena_docker"))), samples)
         self.assertFalse([key for key in samples if ("project", "not_deployed") in key[1]])
 
+    def test_the_weekly_full_series_has_metrics_of_its_own_and_fresh_backups_count_nowhere(self):
+        self.fixtures()
+        asana = self.tree.projects / "asana_tracker/app"
+        day = 24 * 3600
+        for age, size in ((2 * day, 9000), (9 * day, 8000)):
+            stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - age))
+            self.tree.backup(asana, f"full-prod-{stamp}Z.sql.gz", age, size)
+        self.tree.backup(asana, "fresh-prod-20261013T120000Z.sql.gz", 60, 5)
+        samples = parse(self.scrape())
+        labels = {"project": "asana_tracker", "environment": "prod"}
+        self.assertEqual(value(samples, "setup_worker_full_backups", **labels), 2)
+        self.assertEqual(value(samples, "setup_worker_full_backup_newest_size_bytes", **labels), 9000)
+        self.assertAlmostEqual(value(samples, "setup_worker_full_backup_newest_age_seconds", **labels), 2 * day, delta=60)
+        self.assertEqual(value(samples, "setup_worker_backups", **labels), 3, "fresh and full backups are not nightly ones")
+        self.assertEqual(value(samples, "setup_worker_backup_newest_size_bytes", **labels), 4096)
+        # Without the weekly timer an ENV with no full backup has no full metrics (no alert on a worker without them).
+        self.assertFalse([key for key in samples if key[0] == "setup_worker_full_backups" and ("project", "forsena_docker") in key[1]])
+        systemd = self.root / "systemd"
+        systemd.mkdir()
+        (systemd / "setup-server-backup-full.timer").write_text("[Timer]\n")
+        samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
+        self.assertEqual(value(samples, "setup_worker_full_backups", project="forsena_docker", environment="stage"), 0)
+
     def test_the_last_deploy_tells_a_rollback_and_a_failed_deploy_apart(self):
         self.fixtures()
         samples = parse(self.scrape())

@@ -2,9 +2,10 @@
 """Let a developer download the newest database backups over SSH, from the VPN only, with their key.
 
 Writes the key into the setup account's authorized_keys as
-  from="<networks>",command="/usr/local/sbin/setup-server-backup-pull --key <name>",restrict <key> <name>
+  from="<networks>",command="/usr/local/sbin/setup-server-backup-pull --key <name> [--allow-fresh]",restrict <key> <name>
 so the key logs in only from the given networks and runs nothing but that command (no shell, no
-forwarding, no Docker). Installs the command (a root-owned copy of bin/backup-pull) first.
+forwarding, no Docker). --allow-fresh also lets it ask for a new backup now (make db-pull fresh=1), which
+loads the project's database. Installs the command (a root-owned copy of bin/backup-pull) first.
 Idempotent: a key of the same name is replaced. --refresh only rewrites an installed copy (bin/update).
 """
 
@@ -88,12 +89,17 @@ def public_key(path):
     return f'{match[1]} {match[2]}'
 
 
-def marker(name):
-    return f'command="{COMMAND} --key {name}"'
+def marker(name, fresh=False):
+    return f'command="{COMMAND} --key {name}{" --allow-fresh" if fresh else ""}"'
 
 
-def entry(name, sources, key):
-    return f'from="{",".join(sources)}",{marker(name)},restrict {key} {name}'
+def owned(line, name):
+    """True when the authorized_keys line is this command's entry for `name` (with or without --allow-fresh)."""
+    return marker(name) in line or marker(name, True) in line
+
+
+def entry(name, sources, key, fresh=False):
+    return f'from="{",".join(sources)}",{marker(name, fresh)},restrict {key} {name}'
 
 
 def current_lines():
@@ -128,6 +134,8 @@ def main(argv=None):
     parser.add_argument('key', nargs='?', help='the developer\'s public key file (.pub), or - for stdin')
     parser.add_argument('--name', help='who the key belongs to, e.g. tomas (logged with every download)')
     parser.add_argument('--from', dest='sources', help='networks it may connect from, e.g. the VPN 10.8.0.0/24')
+    parser.add_argument('--allow-fresh', action='store_true',
+                        help='the key may also ask for a new backup now (make db-pull fresh=1); it loads the database')
     parser.add_argument('--remove', metavar='NAME', help='remove the key of this name')
     parser.add_argument('--list', action='store_true', help='show the backup keys')
     parser.add_argument('--check', action='store_true', help='show what would change; change nothing')
@@ -145,13 +153,13 @@ def main(argv=None):
     ours = [line for line in lines if f'command="{COMMAND} --key ' in line]
     if args.list:
         for line in ours:
-            match = re.search(r'from="([^"]*)".*--key ([^"]+)"', line)
-            print(f'{match[2]}  from {match[1]}' if match else line)
+            match = re.search(r'from="([^"]*)".*--key ([^" ]+)( --allow-fresh)?"', line)
+            print(f'{match[2]}  from {match[1]}{"  fresh backups allowed" if match[3] else ""}' if match else line)
         if not ours:
             print('No backup keys.')
         return 0
     if args.remove:
-        kept = [line for line in lines if marker(args.remove) not in line]
+        kept = [line for line in lines if not owned(line, args.remove)]
         if len(kept) == len(lines):
             raise SystemExit(f'No backup key named {args.remove}')
         write_keys(kept, args.check)
@@ -160,15 +168,18 @@ def main(argv=None):
         parser.error('give the public key file, --name and --from (or --remove NAME / --list)')
     if not NAME.fullmatch(args.name):
         raise SystemExit('--name: letters, digits, . _ @ - (up to 64)')
-    line = entry(args.name, networks(args.sources), public_key(args.key))
+    line = entry(args.name, networks(args.sources), public_key(args.key), args.allow_fresh)
     key_part = line.split(',restrict ', 1)[1].rsplit(' ', 1)[0]
-    if any(key_part in other for other in lines if marker(args.name) not in other):
+    if any(key_part in other for other in lines if not owned(other, args.name)):
         raise SystemExit('This public key is already in authorized_keys under another entry; remove that one first')
     place_command(args.check)
-    kept = [other for other in lines if marker(args.name) not in other]
+    kept = [other for other in lines if not owned(other, args.name)]
     write_keys(kept + [line], args.check)
     host = os.environ.get('SETUP_SERVER_ADDRESS', '<server VPN address>')
-    print(f'==> {args.name} downloads with: make db-pull (BACKUP_SSH={ACCOUNT}@{host} in the project\'s env/common.env)')
+    print(f'==> {args.name} downloads with: make db-pull (asks for {ACCOUNT}@{host} the first time)'
+          + ('; make db-pull fresh=1 asks for a new backup' if args.allow_fresh else ''))
+    if args.allow_fresh and not (SBIN / 'setup-server-backup').exists():
+        print('==> note: fresh backups need the backup command; install it with: sudo bin/install-backups')
     return 0
 
 

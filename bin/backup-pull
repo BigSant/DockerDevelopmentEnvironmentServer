@@ -2,12 +2,19 @@
 """Hand a developer the newest database backup of one project environment, over SSH.
 
 The forced command of a developer key in the setup account's authorized_keys (bin/add-backup-key writes
-`from="<VPN>",command="setup-server-backup-pull --key <name>",restrict <key>`): the key runs nothing else.
-SSH_ORIGINAL_COMMAND is one of
-  latest PROJECT ENV        print the file name of the newest backup of ENV (stage or prod)
-  get PROJECT ENV FILE      write that backup to stdout
-Backups are the ones in the project's .generated/backups: the nightly ones (worker-<env>-<time>Z.sql.gz)
-and the pre-deploy ones (<project>-<env>-<time>.sql.gz). Every answer is logged with the key's name.
+`from="<VPN>",command="setup-server-backup-pull --key <name> [--allow-fresh]",restrict <key>`): the key
+runs nothing else. SSH_ORIGINAL_COMMAND is one of
+  latest PROJECT ENV [full]   print the file name of the newest backup of ENV (stage or prod)
+  info PROJECT ENV [full]     print "<file name> <size in bytes>" of that backup
+  get PROJECT ENV FILE        write that backup to stdout
+  fresh PROJECT ENV [full]    make a new backup now (keys with --allow-fresh only), streaming its progress on
+                              stderr ("progress backup BYTES EXPECTED"), then print "<file name> <size>"
+Without `full` a backup is setup's registry backup (structure of every table, the import tables' data): the
+nightly ones (worker-<env>-…Z.sql.gz), "fresh" ones (fresh-<env>-…Z) and the pre-deploy ones
+(<project>-<env>-<time>.sql.gz). With `full` every table's data: the weekly ones (full-<env>-…Z) and fresh
+full ones (fresh-full-<env>-…Z). A fresh backup runs /usr/local/sbin/setup-server-backup (bin/backup-projects)
+as this account; one younger than 30 minutes with the same content is handed out instead of a new one.
+Every answer is logged with the key's name.
 """
 
 from datetime import datetime, timezone
@@ -15,16 +22,23 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
+import time
 
 ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
 PROJECTS = ROOT / 'projects'
 LOG = ROOT / 'backup-pulls.log'
+BACKUP_COMMAND = os.environ.get('SETUP_SERVER_BACKUP_COMMAND', '/usr/local/sbin/setup-server-backup')
 ENVIRONMENTS = ('stage', 'prod')
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
 KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
-# The nightly series of bin/backup-projects and the pre-deploy backups of setup's make db-backup.
-BACKUP = re.compile(r'(?:worker-(stage|prod)-\d{8}T\d{6}Z|[a-z0-9][a-z0-9_-]*-(stage|prod)-\d{8}T\d{6}\d*)\.sql\.gz')
+# The series of bin/backup-projects and the pre-deploy backups of setup's make db-backup.
+BACKUP = re.compile(r'(?:(worker|full|fresh|fresh-full)-(stage|prod)-\d{8}T\d{6}Z'
+                    r'|[a-z0-9][a-z0-9_-]*-(stage|prod)-\d{8}T\d{6}\d*)\.sql\.gz')
+FULL = ('full', 'fresh-full')
+# The fresh backup bin/backup-projects hands out instead of a new one (its FRESH_REUSE), and how long it may run.
+FRESH_REUSE, FRESH_TIMEOUT = 30 * 60, 8 * 3600
 
 
 class Refused(Exception):
@@ -39,22 +53,59 @@ def environment_directory(build_root):
     return None
 
 
-def backups(project, environment):
-    """The backups of one project environment, newest first."""
+def project_directory(project, environment):
     if not NAME.fullmatch(project) or environment not in ENVIRONMENTS:
         raise Refused('expected a project name and stage or prod')
     directory = environment_directory(PROJECTS / project)
     if directory is None:
         raise Refused(f'no project {project} on this server')
-    folder = directory / '.generated/backups'
+    return directory
+
+
+def backups(project, environment, content=None):
+    """The backups of one project environment, newest first; content 'registry' or 'full' narrows them."""
+    folder = project_directory(project, environment) / '.generated/backups'
     if folder.is_symlink():
         raise Refused('the backup directory is a symlink')
     found = []
     for path in folder.iterdir() if folder.is_dir() else []:
         match = BACKUP.fullmatch(path.name)
-        if match and environment in match.groups() and path.is_file() and not path.is_symlink():
-            found.append(path)
+        if not match or environment not in match.groups() or not path.is_file() or path.is_symlink():
+            continue
+        if content and (match[1] in FULL) != (content == 'full'):
+            continue
+        found.append(path)
     return sorted(found, key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
+
+
+def content(words):
+    """The optional last word of latest/info/fresh: nothing (the registry backups) or full."""
+    if len(words) == 3:
+        return 'registry'
+    if words[3:] == ['full']:
+        return 'full'
+    raise Refused('the last word may only be full')
+
+
+def fresh(project, environment, kind, allowed):
+    """A new backup now, made by bin/backup-projects; its progress goes to stderr as it comes."""
+    if not allowed:
+        raise Refused('this key may not ask for a fresh backup (bin/add-backup-key --allow-fresh)')
+    project_directory(project, environment)
+    if not os.access(BACKUP_COMMAND, os.X_OK):
+        raise Refused('fresh backups need the backup command on this server (bin/install-backups)')
+    requested = time.time()
+    command = [BACKUP_COMMAND, '--fresh', *(['--full'] if kind == 'full' else []), '--progress', project, environment]
+    # Everything it says goes to the developer's terminal; stdout stays for the answer.
+    result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr,
+                            timeout=FRESH_TIMEOUT)
+    if result.returncode:
+        raise Refused(f'the backup failed (exit {result.returncode}); see the lines above')
+    found = [path for path in backups(project, environment, kind)
+             if path.stat().st_mtime >= requested - FRESH_REUSE]
+    if not found:
+        raise Refused('the backup finished but no new backup file is there')
+    return found[0]
 
 
 def log(key, request, answer):
@@ -67,14 +118,20 @@ def log(key, request, answer):
         pass  # the log is a record, not a gate
 
 
-def answer(key, request):
+def answer(key, request, allow_fresh=False):
     words = request.split()
-    if len(words) == 3 and words[0] == 'latest':
-        found = backups(words[1], words[2])
+    if len(words) in (3, 4) and words[0] in ('latest', 'info'):
+        kind = content(words)
+        found = backups(words[1], words[2], kind)
         if not found:
-            raise Refused(f'no {words[2]} backup of {words[1]} yet')
-        print(found[0].name)
+            raise Refused(f'no {words[2]} {"full " if kind == "full" else ""}backup of {words[1]} yet')
+        size = found[0].stat().st_size
+        print(found[0].name if words[0] == 'latest' else f'{found[0].name} {size}', flush=True)
         return found[0].name
+    if len(words) in (3, 4) and words[0] == 'fresh':
+        path = fresh(words[1], words[2], content(words), allow_fresh)
+        print(f'{path.name} {path.stat().st_size}', flush=True)
+        return f'fresh {path.name}'
     if len(words) == 4 and words[0] == 'get':
         found = {path.name: path for path in backups(words[1], words[2])}
         if words[3] not in found:
@@ -83,20 +140,26 @@ def answer(key, request):
             shutil.copyfileobj(source, sys.stdout.buffer, 1024 * 1024)
         sys.stdout.buffer.flush()
         return f'sent {found[words[3]].stat().st_size} bytes'
-    raise Refused('expected: latest PROJECT ENV | get PROJECT ENV FILE')
+    raise Refused('expected: latest|info PROJECT ENV [full] | get PROJECT ENV FILE | fresh PROJECT ENV [full]')
 
 
 def main(arguments):
-    key = arguments[1] if len(arguments) == 2 and arguments[0] == '--key' and KEY.fullmatch(arguments[1]) else '-'
+    allow_fresh = arguments[2:] == ['--allow-fresh']
+    named = len(arguments) in (2, 3) and arguments[0] == '--key' and KEY.fullmatch(arguments[1])
+    key = arguments[1] if named and (len(arguments) == 2 or allow_fresh) else '-'
     request = os.environ.get('SSH_ORIGINAL_COMMAND', '')
     if len(request) > 300:
         request = request[:300]
     try:
-        result = answer(key, request)
+        result = answer(key, request, allow_fresh and key != '-')
     except Refused as refusal:
         log(key, request, f'refused: {refusal}')
         print(f'setup-server-backup-pull: {refusal}', file=sys.stderr)
         return 65
+    except subprocess.TimeoutExpired:
+        log(key, request, 'failed: the backup ran too long')
+        print('setup-server-backup-pull: the backup ran too long', file=sys.stderr)
+        return 74
     except OSError as error:
         log(key, request, f'failed: {error.strerror}')
         print(f'setup-server-backup-pull: {error.strerror}', file=sys.stderr)

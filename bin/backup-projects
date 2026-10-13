@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Database backups of the projects on this worker, kept as 7 daily + 4 weekly copies.
+"""Database backups of the projects on this worker: nightly (7 daily + 4 weekly), weekly full and fresh ones.
 
 Every night setup-server-backup.timer runs this as root (installed by bin/install-backups as
 /usr/local/sbin/setup-server-backup). A project's environment is backed up when its environment
@@ -13,18 +13,30 @@ series is rotated; a failed one deletes nothing. A failing project does not stop
 run, and the command then exits 1 naming them (the unit shows failed, the journal has the details).
 
 "Backup now" for one project (Bitbucket custom pipeline on the runner):
-    sudo -n /usr/local/sbin/setup-server-backup "$BUILD_ROOT" [stage|prod]
+    sudo -n /usr/local/sbin/setup-server-backup [--full] "$BUILD_ROOT" [stage|prod]
 Variables in the caller's environment (e.g. a deployment step's) win over the store.
+
+Kinds (one series each, rotated on its own; anything else in .generated/backups is never touched):
+  daily       worker-<env>-…Z.sql.gz      setup's registry backup: structure of every table, data of the import
+                                          ones (nightly timer and "backup now"); 7 daily + 4 weekly kept
+  full        full-<env>-…Z.sql.gz        every table's data (make db-backup full=1; the weekly timer, --full); 2 kept
+  fresh       fresh-<env>-…Z.sql.gz       a registry backup a developer asked for (bin/backup-pull fresh); 2 kept
+  fresh-full  fresh-full-<env>-…Z.sql.gz  the same, every table's data; 2 kept
+One backup per project and ENV runs at a time (a lock in .generated/backups); the others wait for it. A fresh
+backup is not made again when one with the same content (registry or full) is younger than 30 minutes.
 """
 
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import fcntl
 import pwd
 import re
 import signal
 import subprocess
 import sys
+import threading
+import time
 
 ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
 ACCOUNT = os.environ.get('SETUP_SERVER_USER', 'setup')
@@ -32,17 +44,26 @@ CONFIG = Path(os.environ.get('SETUP_SERVER_CONFIG', '/etc/setup-server'))
 PROJECTS = ROOT / 'projects'
 ENVIRONMENTS = ('stage', 'prod')
 KEEP_DAILY, KEEP_WEEKLY = 7, 4
-JOB_TIMEOUT = 4 * 3600
+KEEP_FULL, KEEP_FRESH = 2, 2
+FRESH_REUSE = 30 * 60
+JOB_TIMEOUT, FULL_TIMEOUT = 4 * 3600, 8 * 3600
+# kind: (file name prefix, make db-backup arguments, how many rotation keeps; None = daily + weekly)
+KINDS = {'daily': ('worker', [], None), 'full': ('full', ['full=1'], KEEP_FULL),
+         'fresh': ('fresh', [], KEEP_FRESH), 'fresh-full': ('fresh-full', ['full=1'], KEEP_FRESH)}
 # NAME, SERIES and environment_directory are identical in bin/worker-metrics (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
-SERIES = re.compile(r'worker-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
+SERIES = re.compile(r'(worker|full|fresh|fresh-full)-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
 STAMP = '%Y%m%dT%H%M%S'
-USAGE = f"""Usage: {Path(sys.argv[0]).name} [--check] [PROJECT [ENV]]
-  (none)    every project under {PROJECTS} with env/stage.env or env/prod.env (the nightly timer)
-  PROJECT   one project: its name or build root, e.g. "$BUILD_ROOT" in a pipeline ("backup now")
-  ENV       stage or prod; by default every one the project has
-  --check   show what would be backed up and which old backups rotation would delete; change nothing
-Keeps per project and ENV the newest backup of each of the last {KEEP_DAILY} days that have one and of
+USAGE = f"""Usage: {Path(sys.argv[0]).name} [--check] [--full] [--fresh] [--progress] [PROJECT [ENV]]
+  (none)      every project under {PROJECTS} with env/stage.env or env/prod.env (the nightly timer)
+  PROJECT     one project: its name or build root, e.g. "$BUILD_ROOT" in a pipeline ("backup now")
+  ENV         stage or prod; by default every one the project has
+  --full      every table's data, the full-<env> series (the weekly timer); keeps {KEEP_FULL}
+  --fresh     the fresh-<env> series a developer asked for (bin/backup-pull); with --full fresh-full-<env>.
+              Not made again while a backup with the same content is younger than {FRESH_REUSE // 60} minutes
+  --progress  machine-readable progress on stderr ("progress backup BYTES EXPECTED"); a terminal gets a bar
+  --check     show what would be backed up and which old backups rotation would delete; change nothing
+The nightly series keeps the newest backup of each of the last {KEEP_DAILY} days that have one and of
 {KEEP_WEEKLY} more weeks; pre-deploy backups and other files in .generated/backups are not touched."""
 
 
@@ -57,7 +78,7 @@ def rotation(names, daily=KEEP_DAILY, weekly=KEEP_WEEKLY):
     `weekly` latest ISO weeks whose newest backup is not already kept (borg/restic style: a gap in
     the backups never costs the last good ones).
     """
-    stamped = sorted(((datetime.strptime(SERIES.fullmatch(name)[2], STAMP), name) for name in names), reverse=True)
+    stamped = sorted(((datetime.strptime(SERIES.fullmatch(name)[3], STAMP), name) for name in names), reverse=True)
     keep = []
     for count, period in ((daily, lambda time: time.date()), (weekly, lambda time: time.isocalendar()[:2])):
         current, kept = None, 0
@@ -87,21 +108,114 @@ def declared(build_root):
     return directory, environments
 
 
-def series(backups, environment):
-    """This command's backups of one ENV; anything else in the directory is never touched."""
+def series(backups, environment, kind='daily'):
+    """This command's backups of one ENV and kind; anything else in the directory is never touched."""
     if backups.is_symlink():
         raise Refused(f'{backups} is a symlink; not rotated')
+    prefix = KINDS[kind][0]
     names = []
     for path in sorted(backups.iterdir()) if backups.is_dir() else []:
         match = SERIES.fullmatch(path.name)
-        if not match or match[1] != environment or path.is_symlink() or not path.is_file():
+        if not match or match[1] != prefix or match[2] != environment or path.is_symlink() or not path.is_file():
             continue
         try:
-            datetime.strptime(match[2], STAMP)
+            datetime.strptime(match[3], STAMP)
         except ValueError:
             continue
         names.append(path.name)
     return names
+
+
+def rotate(names, kind):
+    """(keep, remove) of one series: daily + weekly for the nightly one, the newest N for the others."""
+    count = KINDS[kind][2]
+    if count is None:
+        return rotation(names)
+    stamped = sorted(names, key=lambda name: SERIES.fullmatch(name)[3], reverse=True)
+    return stamped[:count], stamped[count:]
+
+
+def same_content(kind):
+    """The kinds whose backups hold the same data: the registry ones, or the full ones."""
+    return ('full', 'fresh-full') if KINDS[kind][1] else ('daily', 'fresh')
+
+
+def newest_backup(backups, environment, kind):
+    """(path, modified) of the newest backup with the content of `kind`, or (None, 0)."""
+    found = []
+    for other in same_content(kind):
+        for name in series(backups, environment, other):
+            path = backups / name
+            found.append((path.stat().st_mtime, path))
+    return (max(found)[1], max(found)[0]) if found else (None, 0)
+
+
+def size_text(value):
+    for unit in ('B', 'KB', 'MB', 'GB'):
+        if value < 1024 or unit == 'GB':
+            return f'{value:.0f} {unit}' if unit == 'B' else f'{value:.1f} {unit}'
+        value /= 1024
+    return ''
+
+
+class Progress:
+    """Watches setup's temporary backup file grow while make runs: bytes written against the size of the
+    previous backup with the same content (an estimate; none for the first one). --progress writes
+    machine-readable lines for bin/backup-pull, a terminal gets a bar, the journal gets nothing."""
+
+    def __init__(self, backups, expected, machine):
+        self.backups, self.expected, self.machine = backups, expected, machine
+        self.terminal = not machine and sys.stderr.isatty()
+        self.started = time.time()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.watch, daemon=True)
+
+    def __enter__(self):
+        if self.machine or self.terminal:
+            self.thread.start()
+        return self
+
+    def __exit__(self, *exception):
+        self.stop.set()
+        if self.thread.is_alive():
+            self.thread.join()
+        if self.terminal:
+            print(file=sys.stderr, flush=True)
+
+    def written(self):
+        # setup writes into tempfile.NamedTemporaryFile(dir=<backups>) and renames it when it is complete.
+        sizes = [0]
+        for path in self.backups.glob('tmp*'):
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            if info.st_mtime >= self.started - 5:
+                sizes.append(info.st_size)
+        return max(sizes)
+
+    def watch(self):
+        while not self.stop.wait(2):
+            done = self.written()
+            if self.machine:
+                print(f'progress backup {done} {self.expected}', file=sys.stderr, flush=True)
+            else:
+                share = min(done / self.expected, 0.99) if self.expected else 0
+                bar = ('#' * int(share * 30)).ljust(30, '.') if self.expected else '.' * 30
+                total = f' of ~{size_text(self.expected)}' if self.expected else ''
+                print(f'\r    [{bar}] {size_text(done)}{total}  {int(time.time() - self.started)} s ',
+                      end='', file=sys.stderr, flush=True)
+
+
+def locked(backups, environment):
+    """An exclusive lock per project and ENV: one backup at a time; a second one waits for it."""
+    handle = open(backups / f'.lock-{environment}', 'a')
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        say(f'    waiting for the backup of {environment} that is running')
+        fcntl.flock(handle, fcntl.LOCK_EX)
+    return handle
 
 
 ENV_ENTRY = re.compile(r'(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*')
@@ -228,25 +342,43 @@ def say(text, error=False):
 
 
 # --- One backup, run as the setup account --------------------------------------------------------
-def job(name, environment):
+def job(name, environment, kind='daily', progress=False):
     if os.geteuid() == 0:
         raise Refused('--job runs as the setup account, not as root')
+    if kind not in KINDS:
+        raise Refused(f'Unknown backup kind {kind}')
     os.umask(0o077)
     directory = environment_directory(PROJECTS / name)
     if directory is None:
         raise Refused(f'No environment repository in {PROJECTS / name}')
     backups = directory / '.generated/backups'
-    target = backups / f'worker-{environment}-{stamp()}Z.sql.gz'
-    say(f'==> {name} {environment}: backing up into {target}')
-    result = subprocess.run(['make', '--no-print-directory', '-C', str(directory), 'db-backup',
-                             f'ENV={environment}', f'file={target}'])
-    if result.returncode or not target.is_file() or target.is_symlink():
-        say(f'{name} {environment}: backup failed (make exit {result.returncode}); old backups kept', error=True)
-        return 1
-    keep, remove = rotation(series(backups, environment))
-    for old in remove:
-        (backups / old).unlink()
-    say(f'    {name} {environment}: kept {len(keep)}, removed {len(remove)}' + (f': {" ".join(remove)}' if remove else ''))
+    backups.mkdir(mode=0o700, parents=True, exist_ok=True)
+    requested = time.time()
+    with locked(backups, environment):
+        previous, modified = newest_backup(backups, environment, kind)
+        if kind.startswith('fresh') and previous and modified >= requested - FRESH_REUSE:
+            say(f'==> {name} {environment}: {previous.name} is {int((time.time() - modified) // 60)} min old; '
+                f'used instead of a new {kind} backup')
+            return 0
+        prefix, arguments, _ = KINDS[kind]
+        target = backups / f'{prefix}-{environment}-{stamp()}Z.sql.gz'
+        say(f'==> {name} {environment}: backing up into {target}')
+        expected = previous.stat().st_size if previous else 0
+        with Progress(backups, expected, progress):
+            # make's own lines go to stderr: with --progress stdout is not shown to anybody.
+            result = subprocess.run(['make', '--no-print-directory', '-C', str(directory), 'db-backup',
+                                     f'ENV={environment}', f'file={target}', *arguments],
+                                    stdout=sys.stderr if progress else None)
+        if result.returncode or not target.is_file() or target.is_symlink():
+            say(f'{name} {environment}: backup failed (make exit {result.returncode}); old backups kept', error=True)
+            return 1
+        if progress:
+            size = target.stat().st_size
+            print(f'progress backup {size} {size}', file=sys.stderr, flush=True)
+        keep, remove = rotate(series(backups, environment, kind), kind)
+        for old in remove:
+            (backups / old).unlink()
+        say(f'    {name} {environment}: kept {len(keep)}, removed {len(remove)}' + (f': {" ".join(remove)}' if remove else ''))
     return 0
 
 
@@ -287,13 +419,13 @@ def plan(arguments):
     return jobs
 
 
-def check(jobs):
+def check(jobs, kind='daily'):
     """--check: what tonight's run would do; nothing is written or deleted."""
     problems = 0
     for name, environment in jobs:
         directory = environment_directory(PROJECTS / name)
         backups = directory / '.generated/backups'
-        new = f'worker-{environment}-{stamp()}Z.sql.gz'
+        new = f'{KINDS[kind][0]}-{environment}-{stamp()}Z.sql.gz'
         say(f'==> would back up {name} {environment} into {backups / new}')
         try:
             container, state = secret_store(name, environment)
@@ -305,7 +437,7 @@ def check(jobs):
             legacy = CONFIG / 'projects' / name / f'{environment}.env'
             if os.geteuid() == 0 and legacy.exists():
                 say(f'    note: {legacy} is not used any more; remove it: sudo rm {legacy}')
-            _, remove = rotation(series(backups, environment) + [new])
+            _, remove = rotate(series(backups, environment, kind) + [new], kind)
         except Refused as error:
             say(f'    {error}', error=True)
             problems += 1
@@ -333,7 +465,7 @@ def child_environment(name, environment):
     return env
 
 
-def run(jobs):
+def run(jobs, kind='daily', progress=False):
     failed = []
     for name, environment in jobs:
         try:
@@ -345,10 +477,12 @@ def run(jobs):
         options = {}
         if os.geteuid() == 0:
             options = {key: value for key, value in as_account().items() if key in ('user', 'group', 'extra_groups')}
-        process = subprocess.Popen([sys.executable, os.path.realpath(__file__), '--job', name, environment],
-                                   env=env, cwd=str(PROJECTS / name), start_new_session=True, **options)
+        command = [sys.executable, os.path.realpath(__file__), '--job', name, environment, kind]
+        process = subprocess.Popen(command + (['--progress'] if progress else []), env=env, cwd=str(PROJECTS / name),
+                                   start_new_session=True, stdout=sys.stderr if progress else None, **options)
+        timeout = FULL_TIMEOUT if KINDS[kind][1] else JOB_TIMEOUT
         try:
-            code = process.wait(timeout=JOB_TIMEOUT)
+            code = process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGTERM)
             try:
@@ -356,7 +490,7 @@ def run(jobs):
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-            say(f'{name} {environment}: stopped after {JOB_TIMEOUT // 3600} h', error=True)
+            say(f'{name} {environment}: stopped after {timeout // 3600} h', error=True)
             code = 1
         if code:
             failed.append(f'{name}/{environment}')
@@ -365,13 +499,19 @@ def run(jobs):
 
 
 def main(arguments):
-    checking = False
+    checking = full = fresh = progress = False
     positional = []
-    if arguments[:1] == ['--job'] and len(arguments) == 3:
-        return job(*arguments[1:])
+    if arguments[:1] == ['--job'] and len(arguments) in (4, 5) and arguments[4:] in ([], ['--progress']):
+        return job(*arguments[1:4], progress=arguments[4:] == ['--progress'])
     for argument in arguments:
         if argument == '--check':
             checking = True
+        elif argument == '--full':
+            full = True
+        elif argument == '--fresh':
+            fresh = True
+        elif argument == '--progress':
+            progress = True
         elif argument in ('-h', '--help'):
             say(USAGE)
             return 0
@@ -385,11 +525,14 @@ def main(arguments):
             pwd.getpwnam(ACCOUNT)
         except KeyError:
             raise Refused(f'No account {ACCOUNT}; run bin/prepare-host first') from None
+    kind = ('fresh-full' if full else 'fresh') if fresh else ('full' if full else 'daily')
+    if progress:
+        sys.stdout = sys.stderr  # bin/backup-pull keeps stdout for its answer
     jobs = plan(positional)
     if not jobs:
         say(f'==> No project under {PROJECTS} has env/stage.env or env/prod.env; nothing to back up')
         return 0
-    return check(jobs) if checking else run(jobs)
+    return check(jobs, kind) if checking else run(jobs, kind, progress)
 
 
 if __name__ == '__main__':

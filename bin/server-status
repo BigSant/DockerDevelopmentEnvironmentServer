@@ -36,16 +36,17 @@ GITHUB_RUNNERS = ROOT / 'github-runner'
 ENVIRONMENTS = ('stage', 'prod')
 # NAME, SERIES and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
-SERIES = re.compile(r'worker-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
+SERIES = re.compile(r'(worker|full|fresh|fresh-full)-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
 SCOPE = re.compile(r'[a-z0-9][a-z0-9._-]*')
 # What leaves the env and target files: the deploy target and the names, nothing secret.
 TARGET_KEYS = ('DEPLOY_CONTEXT', 'DEPLOY_SSH', 'DEPLOY_PATH', 'APP_UID', 'APP_GID')
 UNITS = ('setup-server-runner.service', 'setup-server-backup.service', 'setup-server-backup.timer',
+         'setup-server-backup-full.service', 'setup-server-backup-full.timer',
          'setup-server-metrics.service', 'setup-server-ui.service')
 GITHUB_UNIT = 'setup-server-github-runner@{}.service'
 # The journal of these only (a glob for the GitHub runners).
 JOURNAL_UNITS = ('setup-server-runner.service', 'setup-server-github-runner@*.service', 'setup-server-backup.service',
-                 'setup-server-metrics.service', 'setup-server-ui.service')
+                 'setup-server-backup-full.service', 'setup-server-metrics.service', 'setup-server-ui.service')
 PROPERTIES = ('Id', 'LoadState', 'ActiveState', 'SubState', 'Result', 'NRestarts', 'ActiveEnterTimestamp',
               'ExecMainExitTimestamp', 'ExecMainStatus', 'LastTriggerUSec', 'NextElapseUSecRealtime')
 CONTAINERS = '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.State}}\t{{.Status}}'
@@ -212,15 +213,16 @@ def deploys(directory, environment):
             'count': len(entries)}
 
 
-def backups(directory, environment):
-    """The nightly and "backup now" series (worker-<env>-…Z.sql.gz): how many, the newest one's time and size."""
+def backups(directory, environment, prefix='worker'):
+    """One series: worker (nightly and "backup now"), full (weekly) or fresh (developers' db-pull fresh=1):
+    how many, the newest one's time and size."""
     folder = directory / '.generated/backups'
     found = []
     if folder.is_dir() and not folder.is_symlink():
         with os.scandir(folder) as entries:
             for item in entries:
                 match = SERIES.fullmatch(item.name)
-                if match and match[1] == environment and item.is_file(follow_symlinks=False):
+                if match and match[1] == prefix and match[2] == environment and item.is_file(follow_symlinks=False):
                     info = item.stat(follow_symlinks=False)
                     found.append((info.st_mtime, info.st_size, item.name))
     if not found:
@@ -278,13 +280,15 @@ def project(build_root, errors):
                   **targets[environment]}
         state = {'declared': declared, 'compose_project': f"{entry['project_name']}-{environment}",
                  'context': values.get('DEPLOY_CONTEXT') or 'default', 'deploys': None, 'backups': None,
-                 'containers': [], 'secrets': None}
+                 'full_backups': None, 'fresh_backups': None, 'containers': [], 'secrets': None}
         try:
             state['deploys'] = deploys(directory, environment)
         except (OSError, ValueError, KeyError, TypeError) as error:
             errors.append(f'{name} {environment}: deployments.json: {type(error).__name__}')
         try:
             state['backups'] = backups(directory, environment)
+            state['full_backups'] = backups(directory, environment, 'full')
+            state['fresh_backups'] = backups(directory, environment, 'fresh')
         except OSError as error:
             errors.append(f'{name} {environment}: backups: {error.strerror}')
         entry['environments'][environment] = state

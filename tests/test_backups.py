@@ -238,6 +238,44 @@ class BackupProjectsTest(ScriptTest):
     def test_unknown_options_are_a_usage_error(self):
         self.assertEqual(self.run_script("backup-projects", "--bogus").returncode, 64)
 
+    def test_full_backups_are_a_series_of_their_own_with_two_kept(self):
+        directory = self.project("asana_tracker", "prod")
+        backups = self.seed(directory, "prod", 3)
+        for day in (1, 8, 15):
+            (backups / f"full-prod-202609{day:02d}T043000Z.sql.gz").write_text("old full")
+        result = self.run_script("backup-projects", "--full", "asana_tracker", "prod")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("full=1", self.make_log.read_text())
+        self.assertEqual(sorted(path.name for path in backups.glob("full-prod-*")),
+                         ["full-prod-20260915T043000Z.sql.gz", "full-prod-20261009T013000Z.sql.gz"])
+        self.assertEqual(len(list(backups.glob("worker-prod-*"))), 3, "the nightly series is not touched")
+        nightly = self.run_script("backup-projects", "asana_tracker", "prod")
+        self.assertEqual(nightly.returncode, 0)
+        self.assertEqual(len(list(backups.glob("full-prod-*"))), 2, "the nightly run does not rotate the full series")
+        check = self.run_script("backup-projects", "--check", "--full")
+        self.assertIn("into", check.stdout)
+        self.assertIn("full-prod-20261009T013000Z.sql.gz", check.stdout)
+
+    def test_a_fresh_backup_is_made_once_and_a_recent_one_is_handed_out(self):
+        directory = self.project("asana_tracker", "prod")
+        result = self.run_script("backup-projects", "--fresh", "--progress", "asana_tracker", "prod")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        backups = directory / ".generated/backups"
+        made = backups / "fresh-prod-20261009T013000Z.sql.gz"
+        self.assertTrue(made.is_file())
+        self.assertIn(f"progress backup {made.stat().st_size} {made.stat().st_size}", result.stderr)
+        self.assertEqual(result.stdout, "", "with --progress everything goes to stderr")
+        calls = self.make_log.read_text().count("db-backup")
+        again = self.run_script("backup-projects", "--fresh", "asana_tracker", "prod")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("used instead of a new fresh backup", again.stdout)
+        self.assertEqual(self.make_log.read_text().count("db-backup"), calls, "no second backup within 30 minutes")
+        # A full fresh backup is not answered by a registry one.
+        full = self.run_script("backup-projects", "--fresh", "--full", "asana_tracker", "prod")
+        self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
+        self.assertTrue((backups / "fresh-full-prod-20261009T013000Z.sql.gz").is_file())
+        self.assertTrue((backups / ".lock-prod").is_file())
+
 
 class InstallBackupsTest(ScriptTest):
     def setUp(self):
@@ -262,15 +300,33 @@ class InstallBackupsTest(ScriptTest):
     def test_the_sudo_rule_allows_only_the_backup_now_form(self):
         rule = f"setup-test-account-missing ALL=(root) NOPASSWD: {self.root}/sbin/setup-server-backup "
         projects = f"{self.root}/srv/projects/"
-        # sudo 1.9.10+ matches the arguments with a regular expression: the build root, optionally stage/prod.
+        # sudo 1.9.10+ matches the arguments with a regular expression: optionally --full, the build root,
+        # optionally stage/prod.
         self.stub("sudo", 'echo "Sudo version 1.9.15p5"\n')
         exact = self.run_script("install-backups", "--check")
-        self.assertIn(rule + f"^{projects}[a-z0-9][a-z0-9_-]*( (stage|prod))?$\n", exact.stdout)
-        # Older sudo (Ubuntu 22.04: 1.9.9) has only wildcards: the first argument must be a build root, the
-        # command refuses anything else after it.
+        self.assertIn(rule + f"^(--full )?{projects}[a-z0-9][a-z0-9_-]*( (stage|prod))?$\n", exact.stdout)
+        # Older sudo (Ubuntu 22.04: 1.9.9) has only wildcards: the first argument must be a build root (or
+        # --full and then a build root), the command refuses anything else after it.
         self.stub("sudo", 'echo "Sudo version 1.9.9"\n')
         wildcard = self.run_script("install-backups", "--check")
-        self.assertIn(rule + f"{projects}[a-z0-9]*\n", wildcard.stdout)
+        self.assertIn(rule + f"{projects}[a-z0-9]*, {self.root}/sbin/setup-server-backup --full {projects}[a-z0-9]*\n",
+                      wildcard.stdout)
+
+    def test_the_weekly_full_timer_runs_the_full_backup_and_keeps_its_day(self):
+        result = self.run_script("install-backups", "--check", "--full-at", "Sat 05:15")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"ExecStart={self.root}/sbin/setup-server-backup --full\n", result.stdout)
+        self.assertIn("OnCalendar=Sat *-*-* 05:15:00", result.stdout)
+        self.assertIn("would enable setup-server-backup.timer and setup-server-backup-full.timer", result.stdout)
+        default = self.run_script("install-backups", "--check")
+        self.assertIn("OnCalendar=Sun *-*-* 04:30:00", default.stdout)
+        # A rerun without --full-at keeps the installed day and time.
+        (self.root / "systemd").mkdir()
+        (self.root / "systemd/setup-server-backup-full.timer").write_text("[Timer]\nOnCalendar=Wed *-*-* 01:05:00\n")
+        self.assertIn("OnCalendar=Wed *-*-* 01:05:00", self.run_script("install-backups", "--check").stdout)
+        for bad in ("Sunday 04:30", "Sun 4:30", "04:30", "Sun 04:30; rm"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.run_script("install-backups", "--check", "--full-at", bad).returncode, 64)
 
     def test_a_rerun_keeps_the_installed_time_and_refresh_only_touches_an_installed_copy(self):
         (self.root / "systemd").mkdir()
@@ -305,21 +361,23 @@ useradd --system --create-home --home-dir /srv/setup-server --shell /bin/bash se
 PATH=/stubs:$PATH /setup-server/bin/install-backups
 PATH=/stubs:$PATH /setup-server/bin/install-backups | grep -c unchanged
 # verify only warns (exit 0) about a bad setting: any output is a finding.
-systemd-analyze verify /etc/systemd/system/setup-server-backup.service /etc/systemd/system/setup-server-backup.timer >/tmp/verify.log 2>&1 || true
+systemd-analyze verify /etc/systemd/system/setup-server-backup.service /etc/systemd/system/setup-server-backup.timer \\
+    /etc/systemd/system/setup-server-backup-full.service /etc/systemd/system/setup-server-backup-full.timer >/tmp/verify.log 2>&1 || true
 cat /tmp/verify.log; [ ! -s /tmp/verify.log ]
 echo UNITS_VERIFIED
 visudo -cf /etc/sudoers.d/setup-server-backup && echo SUDOERS_VALID
 # What the rule lets the runner account start (sudo -l: allowed or not, nothing runs).
 build_root=/srv/setup-server/projects/asana_tracker
-for arguments in "$build_root" "$build_root prod" "" "--check" "/etc" "--job asana_tracker prod" \
-        "/srv/setup-server/projects/../../etc" "$build_root --check"; do
+for arguments in "$build_root" "$build_root prod" "--full $build_root" "--full $build_root prod" "" "--check" "/etc" \\
+        "--job asana_tracker prod" "/srv/setup-server/projects/../../etc" "$build_root --check" "--fresh $build_root" \\
+        "--full --check"; do
     if sudo -u setup sudo -n -l /usr/local/sbin/setup-server-backup $arguments >/dev/null 2>&1; then
         echo "SUDO ALLOWED [$arguments]"
     else
         echo "SUDO REFUSED [$arguments]"
     fi
 done
-grep -q ' \^/srv' /etc/sudoers.d/setup-server-backup && echo SUDO_REGEX
+grep -q ' \^' /etc/sudoers.d/setup-server-backup && echo SUDO_REGEX
 cp /stubs/make /stubs/docker /usr/local/bin/
 app=/srv/setup-server/projects/asana_tracker/app
 mkdir -p $app/env && touch $app/Makefile $app/env/prod.env && chown -R setup:setup /srv/setup-server/projects
@@ -334,13 +392,14 @@ zcat $app/.generated/backups/worker-prod-*.sql.gz
         result = subprocess.run([*DOCKER_RUN, "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script], capture_output=True, text=True, timeout=900)
         output = result.stdout + result.stderr
         self.assertEqual(result.returncode, 0, output)
-        self.assertIn("\n4\n", result.stdout, "a second install changes nothing")
+        self.assertIn("\n6\n", result.stdout, "a second install changes nothing")
         self.assertIn("UNITS_VERIFIED", output)
         self.assertIn("SUDOERS_VALID", output)
         build_root = "/srv/setup-server/projects/asana_tracker"
-        for arguments in (build_root, f"{build_root} prod"):
+        for arguments in (build_root, f"{build_root} prod", f"--full {build_root}", f"--full {build_root} prod"):
             self.assertIn(f"SUDO ALLOWED [{arguments}]", result.stdout)
-        refused = ["", "--check", "/etc", "--job asana_tracker prod", "/srv/setup-server/projects/../../etc"]
+        refused = ["", "--check", "/etc", "--job asana_tracker prod", "/srv/setup-server/projects/../../etc",
+                   f"--fresh {build_root}", "--full --check"]
         if "SUDO_REGEX" in result.stdout:  # sudo 1.9.10+: nothing after the build root but stage or prod
             refused.append(f"{build_root} --check")
         for arguments in refused:

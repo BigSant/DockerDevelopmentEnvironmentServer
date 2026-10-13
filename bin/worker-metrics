@@ -9,7 +9,8 @@ set, the bearer token (401), like the target /metrics of setup. It changes nothi
 under $SETUP_SERVER_ROOT/projects, asks systemd for the runners' state and the filesystem for its size.
 
 Groups (setup_metrics_group_up{group} is 0 when a part of the group could not be read; details in the journal):
-  backups  per project and ENV: age and size of the newest worker-<env>-…Z.sql.gz backup, how many are kept
+  backups  per project and ENV: age and size of the newest worker-<env>-…Z.sql.gz backup, how many are kept,
+           and the same of the weekly full-<env>-…Z.sql.gz series (setup_worker_full_backup*)
   deploys  per project and ENV: the last entry of .generated/release/<env>/deployments.json
   runner   the systemd state of setup-server-runner.service (Bitbucket)
   github_runner  per registered GitHub runner ($SETUP_SERVER_ROOT/github-runner/<scope>): the systemd state of
@@ -46,7 +47,7 @@ SCOPE = re.compile(r'[a-z0-9][a-z0-9._-]*')
 ENVIRONMENTS = ('stage', 'prod')
 # NAME, SERIES and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
-SERIES = re.compile(r'worker-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
+SERIES = re.compile(r'(worker|full|fresh|fresh-full)-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
 TOKEN_MINIMUM = 24
 DEFAULT_PORT = 9101
 CONFIGURATION_ERROR = 78  # EX_CONFIG: systemd does not restart the service for it
@@ -115,10 +116,12 @@ def projects():
 
 
 def backups(metrics, found, now):
-    """Nightly and "backup now" backups (worker-<env>-…Z.sql.gz); pre-deploy backups do not count, so a
-    deploy never hides a stopped timer. An ENV deployed from here (env/<env>.env) without any backup
-    gets a count of 0 and no age."""
+    """Nightly and "backup now" backups (worker-<env>-…Z.sql.gz); pre-deploy and fresh backups do not count,
+    so neither hides a stopped timer. An ENV deployed from here (env/<env>.env) without any backup gets a
+    count of 0 and no age. The weekly full series (full-<env>-…Z.sql.gz) has metrics of its own, with a
+    count of 0 only once its timer is installed, so a worker without weekly backups raises no alert."""
     complete = True
+    full_timer = (Path(os.environ.get('SETUP_SERVER_SYSTEMD', '/etc/systemd/system')) / 'setup-server-backup-full.timer').is_file()
     for name, directory in found:
         try:
             folder = directory / '.generated/backups'
@@ -127,25 +130,28 @@ def backups(metrics, found, now):
                 with os.scandir(folder) as entries:
                     for item in entries:
                         match = SERIES.fullmatch(item.name)
-                        if match and item.is_file(follow_symlinks=False):
+                        if match and match[1] in ('worker', 'full') and item.is_file(follow_symlinks=False):
                             info = item.stat(follow_symlinks=False)
-                            series.setdefault(match[1], []).append((info.st_mtime, info.st_size))
+                            series.setdefault((match[1], match[2]), []).append((info.st_mtime, info.st_size))
             declared = {env for env in ENVIRONMENTS if (directory / f'env/{env}.env').is_file()}
         except OSError as error:
             log(f'backups {name}: {error}')
             complete = False
             continue
-        for environment in sorted(set(series) | declared):
-            labels = {'project': name, 'environment': environment}
-            files = series.get(environment, [])
-            metrics.add('setup_worker_backups', 'Backups of the worker kept for the project and environment '
-                        '(nightly and "backup now"; pre-deploy backups excluded)', len(files), labels)
-            if files:
-                modified, size = max(files)
-                metrics.add('setup_worker_backup_newest_age_seconds',
-                            'Seconds since the newest backup of the project and environment was written',
-                            round(max(0.0, now - modified)), labels)
-                metrics.add('setup_worker_backup_newest_size_bytes', 'Size of the newest backup in bytes', size, labels)
+        for prefix, metric, what in (('worker', 'setup_worker_backup', 'nightly and "backup now"'),
+                                     ('full', 'setup_worker_full_backup', 'weekly full')):
+            present = {environment for kind, environment in series if kind == prefix}
+            for environment in sorted(present | (declared if prefix == 'worker' or full_timer else set())):
+                labels = {'project': name, 'environment': environment}
+                files = series.get((prefix, environment), [])
+                metrics.add(f'{metric}s', f'Backups of the worker kept for the project and environment ({what}; '
+                            'pre-deploy and fresh backups excluded)', len(files), labels)
+                if files:
+                    modified, size = max(files)
+                    metrics.add(f'{metric}_newest_age_seconds',
+                                f'Seconds since the newest {what} backup of the project and environment was written',
+                                round(max(0.0, now - modified)), labels)
+                    metrics.add(f'{metric}_newest_size_bytes', f'Size of the newest {what} backup in bytes', size, labels)
     return complete
 
 

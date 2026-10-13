@@ -285,7 +285,10 @@ def plan_install_runner(form, status):
 
 def plan_install_backups(form, status):
     at = value(form, 'at', re.compile(r'([01][0-9]|2[0-3]):[0-5][0-9]'), 'Laikas')
-    return Plan('install-backups', 'Naktinės DB kopijos', *command('install-backups', ['--at', at] if at else []))
+    full_at = value(form, 'full_at', re.compile(r'(Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([01][0-9]|2[0-3]):[0-5][0-9]'),
+                    'Pilnos kopijos diena ir laikas')
+    arguments = (['--at', at] if at else []) + (['--full-at', full_at] if full_at else [])
+    return Plan('install-backups', 'DB kopijos (naktinės ir savaitinės pilnos)', *command('install-backups', arguments))
 
 
 def plan_install_metrics(form, status):
@@ -318,7 +321,7 @@ def plan_add_backup_key(form, status):
     sources = networks(form.get('sources', ''), 'Iš kur')
     if not sources:
         raise Invalid('„Iš kur“: nurodyk VPN tinklą, pvz. 10.8.0.0/24.')
-    arguments = ['-', '--name', name, '--from', ','.join(sources)]
+    arguments = ['-', '--name', name, '--from', ','.join(sources)] + (['--allow-fresh'] if flag(form, 'allow_fresh') else [])
     return Plan('add-backup-key', f'Kopijų raktas {name}', *command('add-backup-key', arguments), stdin=lines[0] + '\n')
 
 
@@ -377,6 +380,9 @@ def plan_pipeline(form, status):
             variables.append(('REF', ref))
         for key in ('IMAGES', 'ROLLBACK', 'BACKUP'):
             variables.append((key, 'yes' if flag(form, key.lower()) else 'no'))
+    elif pipeline == 'backup-now' and flag(form, 'full'):
+        # Sent only when asked for: a project whose backup-now predates FULL keeps working as it did.
+        variables.append(('FULL', 'yes'))
     return PipelinePlan(name, *repository, pipeline, branch, variables)
 
 
@@ -730,18 +736,20 @@ class Page:
         rows.append(("Bitbucket runner'is", unit_state(units, 'setup-server-runner.service')))
         for scope in data.get('github_runners', []):
             rows.append((f"GitHub runner'is {scope}", unit_state(units, f'setup-server-github-runner@{scope}.service')))
-        timer, service = units.get('setup-server-backup.timer', {}), units.get('setup-server-backup.service', {})
-        if timer and timer.get('LoadState') != 'not-found':
-            result = service.get('Result')
-            last = timer.get('LastTriggerUSec') or service.get('ExecMainExitTimestamp')
-            text = unit_state(units, 'setup-server-backup.timer') + (f'; paskutinė {e(last)}' if last else '; dar nevyko')
-            if result:
-                text += ' – ' + (badge('pavyko', 'ok') if result == 'success' else badge(f'nepavyko ({result})', 'bad'))
-            if timer.get('NextElapseUSecRealtime'):
-                text += f'; kita {e(timer["NextElapseUSecRealtime"])}'
-        else:
-            text = badge('neįdiegtos', 'muted')
-        rows.append(('Naktinės DB kopijos', text))
+        for unit, label in (('setup-server-backup', 'Naktinės DB kopijos'),
+                            ('setup-server-backup-full', 'Savaitinės pilnos DB kopijos')):
+            timer, service = units.get(f'{unit}.timer', {}), units.get(f'{unit}.service', {})
+            if timer and timer.get('LoadState') != 'not-found':
+                result = service.get('Result')
+                last = timer.get('LastTriggerUSec') or service.get('ExecMainExitTimestamp')
+                text = unit_state(units, f'{unit}.timer') + (f'; paskutinė {e(last)}' if last else '; dar nevyko')
+                if result:
+                    text += ' – ' + (badge('pavyko', 'ok') if result == 'success' else badge(f'nepavyko ({result})', 'bad'))
+                if timer.get('NextElapseUSecRealtime'):
+                    text += f'; kita {e(timer["NextElapseUSecRealtime"])}'
+            else:
+                text = badge('neįdiegtos', 'muted') + ' <a href="/actions#form-install-backups">įdiegti</a>'
+            rows.append((label, text))
         rows.append(('Metrikos (/metrics)', unit_state(units, 'setup-server-metrics.service')))
         disk = data.get('disk')
         if disk and disk.get('size'):
@@ -778,16 +786,18 @@ class Page:
                               f'<td rowspan="{span}">{e(entry.get("repository") or "?")}'
                               f'{"<br>" + e(entry["code_repository"]) if entry.get("code_repository") else ""}</td>')
                 if state is None:
-                    cells += '<td colspan="6" class="muted">nedeploy\'inta iš čia (nėra env/stage.env ar env/prod.env)</td>'
+                    cells += '<td colspan="7" class="muted">nedeploy\'inta iš čia (nėra env/stage.env ar env/prod.env)</td>'
                 else:
                     cells += (f'<td>{e(environment)}</td><td>{self.target(entry, environment)}</td><td>{self.deploy_cell(state)}</td>'
-                              f'<td>{self.backup_cell(state)}</td><td>{self.secrets_cell(state)}</td><td>{self.containers_cell(state)}</td>')
+                              f'<td>{self.backup_cell(state)}</td><td>{self.full_backup_cell(state)}</td>'
+                              f'<td>{self.secrets_cell(state)}</td><td>{self.containers_cell(state)}</td>')
                 if first:
                     cells += f'<td rowspan="{len(environments)}">{runs}</td>'
                     first = False
                 rows.append(f'<tr>{cells}</tr>')
         return ('<table><tr><th>Projektas</th><th>Repo</th><th>Aplinka</th><th>Taikinys</th><th>Paskutinis deploy\'us</th>'
-                '<th>Naujausia kopija</th><th>Secrets</th><th>Konteineriai</th><th>Pipeline</th></tr>' + ''.join(rows) + '</table>')
+                '<th>Naujausia kopija</th><th>Pilna kopija</th><th>Secrets</th><th>Konteineriai</th><th>Pipeline</th></tr>'
+                + ''.join(rows) + '</table>')
 
     @staticmethod
     def target(entry, environment):
@@ -823,6 +833,25 @@ class Page:
         age = time.time() - newest['time']
         return badge(ago(newest['time']), 'ok' if age < 26 * 3600 else 'bad') + \
             f', {e(size(newest["size"]))}, laikoma {backups.get("count", 0)}'
+
+    @staticmethod
+    def full_backup_cell(state):
+        """The weekly full series (full-<env>): fine up to 8 days, so a missed week shows."""
+        backups = state.get('full_backups') or {}
+        newest = backups.get('newest')
+        if not newest:
+            return badge('nėra', 'muted')
+        age = time.time() - newest['time']
+        return badge(ago(newest['time']), 'ok' if age < 8 * 24 * 3600 else 'bad') + \
+            f', {e(size(newest["size"]))}, laikoma {backups.get("count", 0)}'
+
+    @staticmethod
+    def fresh_backup_cell(state):
+        backups = state.get('fresh_backups') or {}
+        newest = backups.get('newest')
+        if not newest:
+            return '<span class="muted">nebuvo</span>'
+        return f'{e(ago(newest["time"]))}, {e(size(newest["size"]))}, laikoma {backups.get("count", 0)}'
 
     @staticmethod
     def secrets_cell(state):
@@ -868,6 +897,9 @@ class Page:
                 body += f'<tr><th>Paskutinis pavykęs</th><td>{e(success["ref"])} {e(success["commit"])} {e(ago(success["at"]))}</td></tr>'
             body += (f'<tr><th>Naujausia kopija</th><td>{self.backup_cell(state)}'
                      f'{" <span class=muted>" + e(state["backups"]["newest"]["name"]) + "</span>" if (state.get("backups") or {}).get("newest") else ""}</td></tr>'
+                     f'<tr><th>Pilna kopija (savaitinė)</th><td>{self.full_backup_cell(state)}'
+                     f'{" <span class=muted>" + e(state["full_backups"]["newest"]["name"]) + "</span>" if (state.get("full_backups") or {}).get("newest") else ""}</td></tr>'
+                     f'<tr><th>Šviežia kopija (db-pull fresh=1)</th><td>{self.fresh_backup_cell(state)}</td></tr>'
                      f'<tr><th>Secret store</th><td>{self.secrets_cell(state)} <span class="muted">{e(state["compose_project"])}-secrets</span></td></tr></table>')
             if state.get('containers'):
                 body += '<table><tr><th>Konteineris</th><th>Būsena</th><th>Sveikata</th><th>Status</th></tr>' + ''.join(
@@ -906,9 +938,13 @@ class Page:
                               '<label><input type="checkbox" name="backup" value="yes" checked> BACKUP – kopija prieš deploy\'ų</label>'
                               '<label><input type="checkbox" name="rollback" value="yes"> ROLLBACK – grįžti į ankstesnį</label>',
                               note=f'Custom pipeline\'as {pipeline} per Bitbucket API: istorija lieka Bitbucket Deployments.')
-        for pipeline in ('backup-now', 'runner-test'):
-            body += self.form('pipeline', PIPELINES[pipeline], hidden + f'<input type="hidden" name="pipeline" value="{pipeline}">' + branch_field,
-                              note=f'Custom pipeline\'as {pipeline}.')
+        body += self.form('pipeline', PIPELINES['backup-now'],
+                          hidden + '<input type="hidden" name="pipeline" value="backup-now">' + branch_field +
+                          '<label><input type="checkbox" name="full" value="yes"> FULL – pilna kopija (visų lentelių duomenys)</label>',
+                          note='Custom pipeline\'as backup-now. Be FULL – kopija pagal lentelių registrą (kaip naktinė).')
+        body += self.form('pipeline', PIPELINES['runner-test'],
+                          hidden + '<input type="hidden" name="pipeline" value="runner-test">' + branch_field,
+                          note='Custom pipeline\'as runner-test.')
         return body
 
     # --- Actions ---
@@ -935,8 +971,11 @@ class Page:
             note='Įklijuok visą Bitbucket „Runner installation“ dialogo arba GitHub „New self-hosted runner“ puslapio tekstą. '
                  'Jis perduodamas komandai per stdin, niekur neįrašomas ir nerodomas; paslaptis lieka tik serverio atmintyje iki „Vykdyti“.')
         body += '<h2>Kopijos ir metrikos</h2>' + self.form(
-            'install-backups', 'Naktinės DB kopijos (bin/install-backups)', text('at', 'Laikas (nebūtina)', '03:30'),
-            note='Be laiko paliekamas įdiegtas (numatyta 03:30).')
+            'install-backups', 'DB kopijos (bin/install-backups)',
+            text('at', 'Naktinės kopijos laikas (nebūtina)', '03:30') +
+            text('full_at', 'Savaitinės pilnos kopijos diena ir laikas (nebūtina)', 'Sun 04:30'),
+            note='Naktinė – pagal lentelių registrą (7 dienos + 4 savaitės), savaitinė – visų lentelių duomenys (laikomos 2). '
+                 'Be reikšmių paliekamos įdiegtos (numatyta 03:30 ir Sun 04:30).')
         body += self.form(
             'install-metrics', 'Worker\'io metrikos (bin/install-metrics)',
             text('address', 'Adresas (nebūtina)', '10.8.0.14') + text('allow', 'Leidžiami adresai', '10.8.0.20') +
@@ -947,7 +986,10 @@ class Page:
         body += self.form(
             'add-backup-key', 'Kopijų atsisiuntimo raktas (bin/add-backup-key)',
             '<label><span>Viešasis raktas (.pub)</span><textarea name="public_key" spellcheck="false"></textarea></label>' +
-            text('key_name', 'Vardas', 'tomas') + text('sources', 'Iš kur (VPN tinklas)', '10.8.0.0/24'))
+            text('key_name', 'Vardas', 'tomas') + text('sources', 'Iš kur (VPN tinklas)', '10.8.0.0/24') +
+            '<label><input type="checkbox" name="allow_fresh" value="yes"> gali prašyti šviežios kopijos '
+            '(make db-pull fresh=1; apkrauna projekto DB)</label>',
+            note='Raktas gali tik parsisiųsti kopijas (naktinę, pilną); su varnele – ir paprašyti naujos kopijos dabar.')
         body += self.form('remove-backup-key', 'Atimti kopijų raktą', text('key_name', 'Vardas', 'tomas'))
         body += self.form('list-backup-keys', 'Kopijų raktai (--list)', '', button='Rodyti')
         body += '<h2>Serveris</h2>' + self.form(

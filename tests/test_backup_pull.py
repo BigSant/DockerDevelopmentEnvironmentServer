@@ -41,11 +41,66 @@ class BackupPullTest(unittest.TestCase):
             path.write_bytes(name.encode())
             os.utime(path, (1_760_000_000 + index * 100, 1_760_000_000 + index * 100))
 
-    def pull(self, request, key="tomas"):
+    def pull(self, request, key="tomas", fresh=False, command=None):
         environment = {**os.environ, "SETUP_SERVER_ROOT": str(self.root), "SSH_ORIGINAL_COMMAND": request,
-                       "SSH_CONNECTION": "10.8.0.20 50000 10.8.0.14 22"}
-        return subprocess.run([sys.executable, str(ROOT / "bin/backup-pull"), "--key", key], env=environment,
-                              capture_output=True, timeout=30)
+                       "SSH_CONNECTION": "10.8.0.20 50000 10.8.0.14 22",
+                       "SETUP_SERVER_BACKUP_COMMAND": str(command or self.root / "missing-backup-command")}
+        return subprocess.run([sys.executable, str(ROOT / "bin/backup-pull"), "--key", key,
+                               *(["--allow-fresh"] if fresh else [])], env=environment, capture_output=True, timeout=30)
+
+    def backup_command(self, body):
+        command = self.root / "setup-server-backup"
+        command.write_text("#!/bin/sh\n" + body)
+        command.chmod(0o755)
+        return command
+
+    def test_full_backups_and_info_answer_the_newest_with_its_size(self):
+        (self.backups / "full-prod-20261004T043000Z.sql.gz").write_bytes(b"full")
+        os.utime(self.backups / "full-prod-20261004T043000Z.sql.gz", (1_760_000_500, 1_760_000_500))
+        newest = self.backups / "fresh-full-prod-20261005T120000Z.sql.gz"
+        newest.write_bytes(b"fresh full!")
+        os.utime(newest, (1_760_000_900, 1_760_000_900))
+        self.assertEqual(self.pull("latest shop prod full").stdout.decode().strip(), newest.name)
+        self.assertEqual(self.pull("info shop prod full").stdout.decode().strip(), f"{newest.name} 11")
+        self.assertEqual(self.pull("info shop prod").stdout.decode().strip(),
+                         "shop-prod-20261011T120000123456.sql.gz 38", "registry backups only without full")
+        self.assertEqual(self.pull(f"get shop prod {newest.name}").stdout, b"fresh full!")
+        self.assertEqual(self.pull("latest shop stage full").returncode, 65)
+        self.assertIn(b"no stage full backup of shop yet", self.pull("latest shop stage full").stderr)
+        self.assertEqual(self.pull("latest shop prod everything").returncode, 65)
+
+    def test_fresh_needs_the_key_permission_and_streams_the_progress(self):
+        command = self.backup_command(
+            'echo "$*" >> "$(dirname "$0")/calls"\n'
+            'echo "progress backup 10 20" >&2\n'
+            'echo "==> shop prod: backing up"\n'
+            f'printf fresh > "{self.backups}/fresh-prod-20261013T150000Z.sql.gz"\n')
+        refused = self.pull("fresh shop prod", command=command)
+        self.assertEqual(refused.returncode, 65)
+        self.assertIn(b"may not ask for a fresh backup", refused.stderr)
+        self.assertFalse((self.root / "calls").exists())
+        result = self.pull("fresh shop prod", fresh=True, command=command)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.decode(), "fresh-prod-20261013T150000Z.sql.gz 5\n", "stdout holds the answer only")
+        self.assertIn(b"progress backup 10 20", result.stderr)
+        self.assertIn(b"==> shop prod: backing up", result.stderr)
+        self.assertEqual((self.root / "calls").read_text(), "--fresh --progress shop prod\n")
+        self.pull("fresh shop prod full", fresh=True, command=self.backup_command(
+            f'echo "$*" >> "{self.root}/calls"\nprintf f > "{self.backups}/fresh-full-prod-20261013T150500Z.sql.gz"\n'))
+        self.assertIn("--fresh --full --progress shop prod", (self.root / "calls").read_text())
+        log = (self.root / "backup-pulls.log").read_text()
+        self.assertIn("fresh shop prod -> refused: this key may not ask", log)
+        self.assertIn("-> fresh fresh-prod-20261013T150000Z.sql.gz", log)
+
+    def test_a_failed_fresh_backup_is_refused_and_logged(self):
+        failing = self.backup_command('echo "Database backup failed" >&2\nexit 1\n')
+        result = self.pull("fresh shop prod", fresh=True, command=failing)
+        self.assertEqual(result.returncode, 65)
+        self.assertIn(b"the backup failed (exit 1)", result.stderr)
+        self.assertIn(b"Database backup failed", result.stderr)
+        self.assertEqual(result.stdout, b"")
+        missing = self.pull("fresh shop prod", fresh=True)
+        self.assertIn(b"need the backup command", missing.stderr)
 
     def test_latest_names_the_newest_backup_of_the_environment_nightly_or_pre_deploy(self):
         result = self.pull("latest shop prod")
@@ -108,6 +163,12 @@ class AddBackupKeyTest(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn('from="10.8.0.0/24,10.9.0.5/32"', lines[1])
         self.assertIn("tomas  from 10.8.0.0/24,10.9.0.5/32", self.run_as_root("--list"))
+        # --allow-fresh replaces the same name's entry and is listed.
+        self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24", "--allow-fresh")
+        lines = keys.read_text().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn(f'command="{command} --key tomas --allow-fresh"', lines[1])
+        self.assertIn("tomas  from 10.8.0.0/24  fresh backups allowed", self.run_as_root("--list"))
         self.run_as_root("--remove", "tomas")
         self.assertEqual(keys.read_text(), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOther other@admin\n")
 
