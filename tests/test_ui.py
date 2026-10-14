@@ -27,8 +27,8 @@ PASSWORD = "correct-horse-battery-staple"
 PROJECT_TOKEN = "project-token-ABCdef0123456789"
 GENERAL_TOKEN = "general-token-XYZxyz9876543210"
 SECRET = "ATOAfake_secret-VALUE_9"  # the OAuthClientSecret of test_scripts.DIALOG
-ROOT_COMMANDS = ("add-project", "remove-project", "install-backups", "install-metrics", "install-runner",
-                 "add-backup-key", "prepare-host", "server-status", "update-setup")
+ROOT_COMMANDS = ("add-project", "remove-project", "install-backups", "install-metrics", "install-runner", "install-ssh",
+                 "add-backup-key", "backup-projects", "prepare-host", "server-status", "server-unit", "update-setup")
 
 
 def load_web_ui():
@@ -61,6 +61,8 @@ exit "$(cat "$STUB_DIR/exit" 2>/dev/null || echo 0)"
 # Docker: the project containers of the default context (compose label, name, state, status).
 DOCKER_STUB = r'''
 echo "$*" >> "$STUB_DIR/docker.calls"
+case " $* " in *" logs "*) for last; do :; done; echo "2026-10-12T00:00:01Z first line of $last"
+  echo "2026-10-12T00:00:02Z second line of $last" >&2; exit 0;; esac
 printf 'asana-prod\tasana-prod-secrets\trunning\tUp 3 hours\n'
 printf 'asana-prod\tasana-prod-php-fpm\trunning\tUp 3 hours (healthy)\n'
 printf 'asana-prod\tasana-prod-cron\texited\tExited (1) 2 minutes ago\n'
@@ -79,6 +81,10 @@ for unit; do
   esac
 done
 '''
+# The installed setup-server-metrics: --once prints an exposition.
+METRICS_STUB = ('[ "$*" = --once ] || exit 64\n'
+                'printf "# HELP setup_metrics_group_up Whether every part\\nsetup_metrics_group_up{group=\\"backups\\"} 1\\n'
+                'setup_metrics_group_up{group=\\"runner\\"} 0\\nsetup_worker_backup_size_bytes{project=\\"asana\\"} 4096\\n"\n')
 JOURNALCTL_STUB = 'echo "$*" >> "$STUB_DIR/journalctl.calls"\nfor unit; do :; done\necho "2026-10-12T00:30:00+0000 host journal of ${unit#--unit=}"\n'
 
 
@@ -183,6 +189,50 @@ class ServerStatusTest(Worker):
         data = json.loads(result.stdout)
         self.assertEqual(len(data["projects"]), 3, "the other files of the project are still read")
 
+    def test_the_project_lists_every_backup_of_an_environment_newest_first(self):
+        asana = self.tree.projects / "asana_tracker/app"
+        stamp = lambda age: time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - age))
+        self.tree.backup(asana, f"full-prod-{stamp(3600)}Z.sql.gz", 3600, 9000)
+        self.tree.backup(asana, f"asana-prod-{stamp(7200)}123.sql.gz", 30 * 60, 500)
+        self.tree.backup(asana, f"worker-stage-{stamp(60)}Z.sql.gz", 60, 10)  # another environment
+        self.tree.backup(asana, ".lock-prod", 10, 0)
+        self.tree.backup(asana, "notes.txt", 10, 5)
+        data = json.loads(self.status().stdout)
+        prod = next(item for item in data["projects"] if item["name"] == "asana_tracker")["environments"]["prod"]
+        self.assertEqual([(item["kind"], item["size"]) for item in prod["backup_files"]],
+                         [("predeploy", 500), ("full", 9000), ("worker", 4096), ("worker", 3000), ("worker", 2000)])
+
+    def test_container_logs_only_of_a_container_of_that_project_environment(self):
+        result = self.status("--container-logs", "asana_tracker", "prod", "asana-prod-cron", "20")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["lines"], ["2026-10-12T00:00:01Z first line of asana-prod-cron",
+                                         "2026-10-12T00:00:02Z second line of asana-prod-cron"])
+        self.assertIn("logs --timestamps --tail 20 asana-prod-cron", self.calls("docker"))
+        foreign = json.loads(self.status("--container-logs", "asana_tracker", "prod", "other-prod-web").stdout)
+        self.assertIn("is not a container of asana-prod", foreign["error"])
+        missing = json.loads(self.status("--container-logs", "forsena_docker", "prod", "x").stdout)
+        self.assertIn("has no prod environment", missing["error"])
+        self.assertEqual([call for call in self.calls("docker") if " logs " in f" {call} "],
+                         ["logs --timestamps --tail 20 asana-prod-cron"], "nothing else was asked for its logs")
+        for arguments in (["--container-logs", "asana_tracker", "dev", "c"], ["--container-logs", "../x", "prod", "c"],
+                          ["--container-logs", "asana_tracker", "prod", "-f"], ["--container-logs", "asana_tracker", "prod", "c", "9999"],
+                          ["--container-logs", "asana_tracker", "prod"]):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.status(*arguments).returncode, 64)
+
+    def test_metrics_are_the_installed_commands_exposition(self):
+        sbin = self.root / "sbin"
+        missing = json.loads(self.status("--metrics").stdout)
+        self.assertIn("is not installed", missing["error"])
+        sbin.mkdir()
+        (sbin / "setup-server-metrics").write_text("#!/bin/sh\n" + METRICS_STUB)
+        (sbin / "setup-server-metrics").chmod(0o755)
+        result = subprocess.run([str(ROOT / "bin/server-status"), "--metrics"], capture_output=True, text=True, timeout=60,
+                                env={**os.environ, "SETUP_SERVER_ROOT": str(self.tree.root), "SETUP_SERVER_SBIN": str(sbin)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('setup_metrics_group_up{group="runner"} 0', json.loads(result.stdout)["text"])
+
     def test_logs_are_bounded_and_only_of_the_setup_server_units(self):
         (self.tree.root / "backup-pulls.log").write_text("".join(f"line {n}\n" for n in range(100)))
         result = self.status("--logs", "5")
@@ -196,6 +246,62 @@ class ServerStatusTest(Worker):
         for arguments in (["--logs", "9999"], ["--logs", "0"], ["--logs", "5;ls"], ["--unit", "ssh"], ["--logs", "5", "x"]):
             with self.subTest(arguments=arguments):
                 self.assertEqual(self.status(*arguments).returncode, 64)
+
+
+# systemctl for bin/server-unit: every unit is loaded but the metrics one; records every call.
+UNIT_SYSTEMCTL_STUB = r'''
+echo "$*" >> "$STUB_DIR/systemctl.calls"
+case "$1" in show) for unit; do :; done
+  case "$*" in *--property=LoadState\ *|*--property=LoadState) [ "$unit" = setup-server-metrics.service ] && echo not-found || echo loaded;;
+    *) printf 'loaded\nactive\nrunning\n\n\n';; esac;; esac
+'''
+
+
+class ServerUnitTest(Worker):
+    def setUp(self):
+        super().setUp()
+        self.stub("systemctl", UNIT_SYSTEMCTL_STUB)
+        self.stub("pgrep", '[ -n "${FAKE_MAKE:-}" ] && echo 777\n')
+
+    def unit(self, *arguments, root=False, **env):
+        path = f"{self.fake_root()}:{self.bin}" if root else str(self.bin)
+        return subprocess.run([str(ROOT / "bin/server-unit"), *arguments], capture_output=True, text=True, timeout=60,
+                              env={**os.environ, "PATH": f"{path}:{os.environ['PATH']}", "SETUP_SERVER_ROOT": str(self.tree.root),
+                                   "SETUP_SERVER_USER": getpass.getuser(), **env})
+
+    def changes(self):
+        return [call for call in self.calls("systemctl") if not call.startswith("show ")]
+
+    def test_check_shows_the_unit_and_changes_nothing(self):
+        result = self.unit("--check", "restart", "runner", FAKE_MAKE="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("==> setup-server-runner.service: loaded active running", result.stdout)
+        self.assertIn("a pipeline step of", result.stdout)
+        self.assertIn("would: systemctl restart setup-server-runner.service", result.stdout)
+        self.assertEqual(self.changes(), [])
+
+    def test_only_the_listed_units_and_what_may_be_done_to_each(self):
+        for arguments in (["start", "ui"], ["stop", "ui"], ["restart", "backup"], ["stop", "backup-full"], ["restart", "ssh"],
+                          ["restart", "setup-server-runner.service"], ["restart", "github-runner@other"],
+                          ["restart", "github-runner@../bigsant"], ["kill", "runner"], ["restart", "metrics"]):
+            with self.subTest(arguments=arguments):
+                result = self.unit("--check", *arguments)
+                self.assertEqual(result.returncode, 65, result.stdout + result.stderr)
+        self.assertIn("is not installed", self.unit("--check", "restart", "metrics").stderr)
+        for arguments in ([], ["restart"], ["restart", "runner", "now"], ["--now", "restart", "runner"]):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.unit(*arguments).returncode, 64)
+        self.assertEqual(self.unit("restart", "runner").returncode, 77, "without --check it needs root")
+        self.assertEqual(self.changes(), [])
+
+    def test_a_run_does_exactly_that_to_that_unit(self):
+        result = self.unit("stop", "github-runner@bigsant", root=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.changes(), ["stop setup-server-github-runner@bigsant.service"])
+        self.assertTrue(any("--unit setup-server-github-runner@bigsant.service" in call for call in self.calls("journalctl")))
+        self.unit("start", "backup-full", root=True)
+        self.unit("restart", "ui", root=True)
+        self.assertEqual(self.changes()[1:], ["start setup-server-backup-full.service", "restart setup-server-ui.service"])
 
 
 class InstallUiTest(ScriptTest):
@@ -368,6 +474,10 @@ class WebUiTest(Worker):
         self.addCleanup(self.api.shutdown)
         self.state = self.root / "state"
         self.log = self.tree.root / "ui-actions.log"
+        self.sbin = self.root / "sbin"
+        self.sbin.mkdir()
+        (self.sbin / "setup-server-metrics").write_text("#!/bin/sh\n" + METRICS_STUB)
+        (self.sbin / "setup-server-metrics").chmod(0o755)
         self.port = self.start()
 
     def environment(self, **settings):
@@ -376,7 +486,8 @@ class WebUiTest(Worker):
                 "SETUP_SERVER_LIBRARY": str(self.library), "STATE_DIRECTORY": str(self.state),
                 "SERVER_STATUS": str(ROOT / "bin/server-status"), "UI_USER": "admin", "UI_PASSWORD_HASH": PASSWORD_HASH,
                 "UI_PORT": "0", "BITBUCKET_API": f"http://127.0.0.1:{self.api.server_port}/2.0",
-                "BITBUCKET_ACCESS_TOKEN_ASANA_TRACKER": PROJECT_TOKEN, "BITBUCKET_ACCESS_TOKEN": GENERAL_TOKEN, **settings}
+                "BITBUCKET_ACCESS_TOKEN_ASANA_TRACKER": PROJECT_TOKEN, "BITBUCKET_ACCESS_TOKEN": GENERAL_TOKEN,
+                "SETUP_SERVER_SBIN": str(self.sbin), **settings}
 
     def start(self, **settings):
         self.stderr = self.root / "ui.stderr"
@@ -589,6 +700,21 @@ class WebUiTest(Worker):
                  ("install-runner", {"provider": "gitlab", "dialog": "x"}, "bitbucket arba github"),
                  ("pipeline", {"project": "asana_tracker", "pipeline": "deploy-production", "ref": "$(id)"}, "REF"),
                  ("pipeline", {"project": "asana_tracker", "pipeline": "custom-anything"}, "Nežinomas pipeline"),
+                 ("backup-local", {"environment": "prod"}, "tik kartu su projektu"),
+                 ("backup-local", {"project": "asana_tracker", "environment": "dev"}, "stage arba prod"),
+                 ("backup-local", {"project": "--full"}, "Projektas"),
+                 ("unit", {"unit": "ssh", "operation": "restart"}, "Nežinoma paslauga"),
+                 ("unit", {"unit": "github-runner@../x", "operation": "stop"}, "Nežinoma paslauga"),
+                 ("unit", {"unit": "ui", "operation": "stop"}, "galima tik"),
+                 ("unit", {"unit": "backup", "operation": "restart"}, "galima tik"),
+                 ("install-ssh", {"sources": "0.0.0.0/0"}, "ne visus adresus"),
+                 ("install-ssh", {"sources": "10.8.0.0/24 -oX"}, "nėra IP adresas"),
+                 ("install-runner", {"provider": "bitbucket", "tarball": "https://dl.example/r.tar.gz", "sha256": "a" * 64,
+                                     "dialog": "x"}, "tik GitHub"),
+                 ("install-runner", {"provider": "github", "sha256": "a" * 64, "dialog": "x"}, "tik kartu su archyvu"),
+                 ("install-runner", {"provider": "github", "tarball": "ftp://dl.example/r.tar.gz", "dialog": "x"}, "Archyvas"),
+                 ("install-runner", {"provider": "github", "tarball": "/tmp/../etc/shadow", "dialog": "x"}, "Archyvas"),
+                 ("install-runner", {"provider": "github", "tarball": "/r.tgz", "sha256": "XYZ", "dialog": "x"}, "SHA-256"),
                  ("no-such-action", {}, "Nežinomas veiksmas"))
         for action, fields, message in cases:
             with self.subTest(action=action, fields=fields):
@@ -657,6 +783,61 @@ class WebUiTest(Worker):
         body = self.preview("install-backups")[2]
         self.assertIn("vykdyti negalima", body)
         self.assertNotIn('name="pending"', body)
+
+    def test_every_command_line_action_has_its_form(self):
+        library = f"-n {self.library}/bin"
+        self.preview("backup-local", project="asana_tracker", environment="prod", full="yes")
+        self.preview("backup-local")
+        self.assertEqual(self.sudo_calls("backup-projects"), [f"{library}/backup-projects --check --full asana_tracker prod",
+                                                               f"{library}/backup-projects --check"])
+        status, _, body = self.preview("unit", unit="runner", operation="restart")
+        self.assertEqual(status, 200, body)
+        self.assertIn("pipeline&#x27;o žingsnis nutrūktų", body, "what can go wrong is shown above Vykdyti")
+        self.preview("unit", unit="github-runner@bigsant", operation="stop")
+        self.preview("unit", unit="backup", operation="start")
+        self.assertEqual(self.sudo_calls("server-unit"), [f"{library}/server-unit --check restart runner",
+                                                          f"{library}/server-unit --check stop github-runner@bigsant",
+                                                          f"{library}/server-unit --check start backup"])
+        self.preview("install-ssh", sources="10.8.0.0/24, 10.9.0.0/24")
+        self.preview("install-ssh")
+        self.assertEqual(self.sudo_calls("install-ssh"), [f"{library}/install-ssh --check --from 10.8.0.0/24,10.9.0.0/24",
+                                                          f"{library}/install-ssh --check"])
+        sha = "0123456789abcdef" * 4
+        self.preview("install-runner", provider="github", runner_name="worker1", tarball="https://dl.example/actions-runner.tar.gz",
+                     sha256=sha, dialog="./config.sh --url https://github.com/BigSant --token ABCDEFGH")
+        self.assertEqual(self.sudo_calls("install-runner"),
+                         [f"{library}/install-runner --check --provider github --name worker1 "
+                          f"--tarball https://dl.example/actions-runner.tar.gz --sha256 {sha}"])
+        status, page = self.confirm(self.preview("unit", unit="ui", operation="restart")[2])
+        self.assertIn("baigta, kodas 0", page)
+        self.assertIn(f"stub ran: {self.library}/bin/server-unit restart ui", page)
+
+    def test_the_overview_and_the_project_offer_the_controls_and_read_only_views(self):
+        overview = self.request("GET", "/")[2]
+        for unit, operation in (("runner", "restart"), ("github-runner@bigsant", "stop"), ("backup", "start")):
+            with self.subTest(unit=unit):
+                self.assertRegex(overview, rf'name="unit" value="{re.escape(unit)}"><input type="hidden" name="operation" '
+                                           rf'value="{operation}">')
+        self.assertNotIn('name="unit" value="ui"', overview, "no controls for a unit that is not installed")
+        self.assertNotIn('name="unit" value="metrics"', overview)
+        self.assertIn('value="github-runner@bigsant"', self.request("GET", "/actions")[2])
+        project = self.request("GET", "/project/asana_tracker")[2]
+        self.assertIn("Visos kopijos (3)", project)
+        self.assertIn("/project/asana_tracker/logs?env=prod&amp;container=asana-prod-cron", project)
+        self.assertIn('name="action" value="backup-local"', project)
+        status, _, logs = self.request("GET", "/project/asana_tracker/logs?env=prod&container=asana-prod-cron&lines=500")
+        self.assertEqual(status, 200, logs)
+        self.assertIn("second line of asana-prod-cron", logs)
+        self.assertIn(f"-n {self.library}/bin/server-status --container-logs asana_tracker prod asana-prod-cron 500",
+                      self.sudo_calls())
+        self.assertIn("is not a container of", self.request("GET", "/project/asana_tracker/logs?env=prod&container=other-prod-web")[2])
+        for query in ("env=dev&container=x", "env=prod&container=-f", "env=prod&container=x&lines=10", "env=prod"):
+            with self.subTest(query=query):
+                self.assertEqual(self.request("GET", f"/project/asana_tracker/logs?{query}")[0], 400)
+        status, _, metrics = self.request("GET", "/worker-metrics")
+        self.assertEqual(status, 200, metrics)
+        self.assertIn("setup_worker_backup_size_bytes{project=&quot;asana&quot;} 4096", metrics)
+        self.assertIn("trūksta", metrics, "the runner group is not up")
 
     # --- Bitbucket -------------------------------------------------------------------------------
     def test_a_deploy_starts_the_custom_pipeline_with_its_variables_and_the_projects_token(self):

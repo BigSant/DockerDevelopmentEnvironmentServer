@@ -13,6 +13,11 @@ values leave (never a whole env file). Run by another account it reports what th
 Usage: server-status                 versions, units, backup timer, disk and every project
        server-status --logs [LINES]  the journal of the setup-server units and the tail of backup-pulls.log
                                      (default 50 lines each, at most 500)
+       server-status --container-logs PROJECT ENV CONTAINER [LINES]
+                                     the last LINES (default 200, at most 2000) of docker logs of one container
+                                     of that project environment (as the setup account, with its context)
+       server-status --metrics       the worker's /metrics exposition (setup-server-metrics --once, as the
+                                     setup account; no server, no token)
        server-status --projects      only the projects (the part that runs as the setup account)
 """
 
@@ -31,6 +36,7 @@ import time
 ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
 ACCOUNT = os.environ.get('SETUP_SERVER_USER', 'setup')
 LIBRARY = Path(os.environ.get('SETUP_SERVER_LIBRARY', '/usr/local/lib/setup-server'))
+SBIN = Path(os.environ.get('SETUP_SERVER_SBIN', '/usr/local/sbin'))
 PROJECTS = ROOT / 'projects'
 GITHUB_RUNNERS = ROOT / 'github-runner'
 ENVIRONMENTS = ('stage', 'prod')
@@ -52,6 +58,11 @@ PROPERTIES = ('Id', 'LoadState', 'ActiveState', 'SubState', 'Result', 'NRestarts
 CONTAINERS = '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.State}}\t{{.Status}}'
 READ_LIMIT = 4 * 1024 * 1024
 DEFAULT_LINES, MAXIMUM_LINES = 50, 500
+CONTAINER_LINES, MAXIMUM_CONTAINER_LINES = 200, 2000
+# Every backup file of an environment the project page lists: the series above and setup's pre-deploy
+# backups (<PROJECT_NAME>-<env>-<time>.sql.gz, as bin/backup-pull knows them).
+PREDEPLOY = re.compile(r'[a-z0-9][a-z0-9_-]*-(stage|prod)-\d{8}T\d{6}\d*\.sql\.gz')
+LISTED_BACKUPS = 100
 PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 
@@ -231,6 +242,28 @@ def backups(directory, environment, prefix='worker'):
     return {'count': len(found), 'newest': {'name': name, 'time': int(modified), 'size': size}}
 
 
+def backup_files(directory, environment):
+    """Every backup of one environment, newest first (at most LISTED_BACKUPS): name, kind, time and size."""
+    folder = directory / '.generated/backups'
+    found = []
+    if folder.is_dir() and not folder.is_symlink():
+        with os.scandir(folder) as entries:
+            for item in entries:
+                match = SERIES.fullmatch(item.name)
+                if match and match[2] == environment:
+                    kind = match[1]
+                else:
+                    predeploy = PREDEPLOY.fullmatch(item.name)
+                    if not predeploy or predeploy[1] != environment:
+                        continue
+                    kind = 'predeploy'
+                if item.is_file(follow_symlinks=False):
+                    info = item.stat(follow_symlinks=False)
+                    found.append({'name': item.name, 'kind': kind, 'time': int(info.st_mtime), 'size': info.st_size})
+    found.sort(key=lambda item: (item['time'], item['name']), reverse=True)
+    return found[:LISTED_BACKUPS]
+
+
 def containers(contexts, errors):
     """{(context, compose project): [container]} of every context: the project containers (compose label)."""
     found = {}
@@ -280,7 +313,7 @@ def project(build_root, errors):
                   **targets[environment]}
         state = {'declared': declared, 'compose_project': f"{entry['project_name']}-{environment}",
                  'context': values.get('DEPLOY_CONTEXT') or 'default', 'deploys': None, 'backups': None,
-                 'full_backups': None, 'fresh_backups': None, 'containers': [], 'secrets': None}
+                 'full_backups': None, 'fresh_backups': None, 'backup_files': [], 'containers': [], 'secrets': None}
         try:
             state['deploys'] = deploys(directory, environment)
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -289,6 +322,7 @@ def project(build_root, errors):
             state['backups'] = backups(directory, environment)
             state['full_backups'] = backups(directory, environment, 'full')
             state['fresh_backups'] = backups(directory, environment, 'fresh')
+            state['backup_files'] = backup_files(directory, environment)
         except OSError as error:
             errors.append(f'{name} {environment}: backups: {error.strerror}')
         entry['environments'][environment] = state
@@ -375,20 +409,63 @@ def disk():
     return {'path': str(ROOT), 'size': stats.f_blocks * stats.f_frsize, 'available': stats.f_bavail * stats.f_frsize}
 
 
+def as_account(arguments, failed, timeout=120):
+    """This command with these arguments as the setup account (root re-runs itself): its JSON, or
+    failed(error text) when it gives none."""
+    try:
+        options = as_user(ACCOUNT)
+    except KeyError:
+        return failed(f'no account {ACCOUNT}')
+    options['env'].update(SETUP_SERVER_ROOT=str(ROOT), SETUP_SERVER_USER=ACCOUNT, SETUP_SERVER_SBIN=str(SBIN))
+    code, output, error = run([sys.executable, os.path.realpath(__file__), *arguments], timeout=timeout, **options)
+    try:
+        return json.loads(output) if code == 0 else failed(error.strip()[:300] or f'exit {code}')
+    except ValueError:
+        return failed('no JSON')
+
+
 def projects_as_account():
     """The projects part, as the setup account when this runs as root."""
     if os.geteuid() != 0:
         return projects()
+    return as_account(['--projects'], lambda error: {'projects': [], 'errors': [f'projects: {error}']})
+
+
+def container_logs(name, environment, container, lines):
+    """docker logs of one container of a project environment; only a container the project's compose
+    project has (the same list the overview shows), in the environment's Docker context."""
+    build_root = PROJECTS / name
+    if build_root.is_symlink() or not build_root.is_dir():
+        return {'error': f'no build root {name}'}
+    errors = []
+    state = project(build_root, errors)['environments'].get(environment)
+    found = containers({state['context']}, errors).get((state['context'], state['compose_project']), []) \
+        if state and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', state['context']) else []
+    if state is None or not (state['declared'] or found):
+        return {'error': f'{name} has no {environment} environment here'}
+    if container not in [item['name'] for item in found]:
+        return {'error': f'{container} is not a container of {state["compose_project"]}' +
+                         (f' ({"; ".join(errors)})' if errors else '')}
+    command = ['docker', *([] if state['context'] == 'default' else ['--context', state['context']]),
+               'logs', '--timestamps', '--tail', str(lines), container]
     try:
-        options = as_user(ACCOUNT)
-    except KeyError:
-        return {'projects': [], 'errors': [f'no account {ACCOUNT}']}
-    options['env'].update(SETUP_SERVER_ROOT=str(ROOT), SETUP_SERVER_USER=ACCOUNT)
-    code, output, error = run([sys.executable, os.path.realpath(__file__), '--projects'], timeout=120, **options)
-    try:
-        return json.loads(output) if code == 0 else {'projects': [], 'errors': [f'projects: {error.strip()[:300]}']}
-    except ValueError:
-        return {'projects': [], 'errors': ['projects: no JSON']}
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {'error': f'docker logs: {error}'}
+    text = result.stdout[-READ_LIMIT:].decode('utf-8', 'replace')
+    return {'container': container, 'context': state['context'], 'exit': result.returncode,
+            'lines': text.splitlines()[-lines:]}
+
+
+def metrics():
+    """The exposition of the installed setup-server-metrics (--once: no server, no token)."""
+    command = SBIN / 'setup-server-metrics'
+    if not command.is_file():
+        return {'error': f'{command} is not installed (bin/install-metrics)'}
+    code, output, error = run([str(command), '--once'], timeout=60)
+    if code:
+        return {'error': f'setup-server-metrics --once: exit {code}: {error.strip()[:300]}'}
+    return {'text': output[:READ_LIMIT]}
 
 
 def overview():
@@ -423,6 +500,20 @@ def main(arguments):
             result = projects_as_account()
         else:
             result = projects()
+    elif arguments[:1] == ['--container-logs'] and len(arguments) in (4, 5):
+        name, environment, container = arguments[1:4]
+        count = arguments[4] if len(arguments) == 5 else str(CONTAINER_LINES)
+        if not NAME.fullmatch(name) or environment not in ENVIRONMENTS or \
+                not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', container) or \
+                not count.isdigit() or not 1 <= int(count) <= MAXIMUM_CONTAINER_LINES:
+            print(f'Expected PROJECT stage|prod CONTAINER [LINES 1 to {MAXIMUM_CONTAINER_LINES}]', file=sys.stderr)
+            return 64
+        if os.geteuid() == 0:
+            result = as_account([*arguments[:4], count], lambda error: {'error': f'container logs: {error}'})
+        else:
+            result = container_logs(name, environment, container, int(count))
+    elif arguments == ['--metrics']:
+        result = as_account(arguments, lambda error: {'error': f'metrics: {error}'}) if os.geteuid() == 0 else metrics()
     elif arguments[:1] == ['--logs'] and len(arguments) <= 2:
         count = arguments[1] if len(arguments) == 2 else str(DEFAULT_LINES)
         if not count.isdigit() or not 1 <= int(count) <= MAXIMUM_LINES:

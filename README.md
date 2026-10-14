@@ -651,11 +651,16 @@ laikomas tik jo PBKDF2 hash'as `/etc/setup-server/ui.env` (root, 0600). Pamiršu
 
 - *Apžvalga* – setup-server versija (įdiegta ir administratoriaus klono), bendro setup checkout'o versija, Bitbucket ir
   GitHub runner'ių paslaugos, naktinių ir savaitinių pilnų kopijų laikmačiai (paskutinis paleidimas, rezultatas, kitas), metrikų paslauga,
-  laisva vieta diske, kuriame `/srv/setup-server`.
+  pati sąsaja, laisva vieta diske, kuriame `/srv/setup-server`. Prie kiekvienos įdiegtos paslaugos – jos mygtukai
+  (paleisti, sustabdyti, perkrauti; kopijoms – „Paleisti dabar“), kurie veda į tą pačią peržiūrą kaip kiti veiksmai.
 - *Projektai* – kiekvienas build katalogas: repo URL, aplinkos (stage/prod), taikinys (`target*.env`, ne paslaptis),
   paskutinis deploy'us (laikas, commit'as, pavyko ar ne, rollback), naujausia naktinė ir savaitinė pilna kopija (amžius,
   dydis, kiek laikoma; projekto puslapyje – ir paskutinė „fresh“),
   ar veikia `<PROJECT_NAME>-<env>-secrets`, konteineriai (būsena, sveikata) ir paskutiniai Bitbucket pipeline'ai.
+  Projekto puslapyje – ir visos aplinkos kopijos (naktinės, pilnos, šviežios, prieš deploy'ų: failas, laikas, dydis),
+  kiekvieno konteinerio `docker logs` (200, 500 ar 2000 paskutinių eilučių) ir „Kopija dabar serveryje“.
+- *Metrikos* – worker'io `/metrics`, kaip jį mato Prometheus (`setup-server-metrics --once`, be token'o), ir kurios
+  grupės surinktos.
 - *Žurnalai* – `ui-actions.log`, `backup-pulls.log`, setup-server paslaugų journal (po 50 eilučių) ir paskutiniai
   veiksmai su jų išvestimi.
 
@@ -667,11 +672,15 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 | --- | --- |
 | Pridėti projektą | `sudo -n L/add-project [--shared-key] --target … [VARDAS] URL [KODO_URL]` (naujam projektui taikinys privalomas) |
 | Pašalinti projektą (projekto puslapyje) | `sudo -n L/remove-project [--with-backups] VARDAS` |
-| Įdiegti runner'į | `sudo -n L/install-runner --provider bitbucket\|github [--name …]`; dialogo tekstas – per stdin |
-| DB kopijos (naktinės ir savaitinės pilnos) | `sudo -n L/install-backups [--at HH:MM] [--full-at "DAY HH:MM"]` |
+| Įdiegti runner'į | `sudo -n L/install-runner --provider bitbucket\|github [--name …] [--tarball URL\|FAILAS [--sha256 …]]`; dialogo tekstas – per stdin |
+| DB kopijų laikmačiai (naktinės ir savaitinės pilnos) | `sudo -n L/install-backups [--at HH:MM] [--full-at "DAY HH:MM"]` |
+| Kopija dabar serveryje (ir projekto puslapyje) | `sudo -n L/backup-projects [--full] [PROJEKTAS [ENV]]` – be Bitbucket, veikia ir GitHub projektams |
+| SSH iš VPN | `sudo -n L/install-ssh [--from TINKLAI]` |
+| Paslaugos (ir Apžvalgoje) | `sudo -n L/server-unit start\|stop\|restart UNIT` (žr. žemiau) |
 | Worker'io metrikos | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |
 | Kopijų raktai | `sudo -n L/add-backup-key - --name … --from … [--allow-fresh]` (raktas per stdin), `--remove VARDAS`, `--list` |
 | Paruošti serverį | `sudo -n L/prepare-host [--setup-ref …]` (`--check` kodas 1 – „Needs attention“ – vykdyti leidžia) |
+| Atnaujinti setup | `sudo -n L/update-setup [vX.Y.Z]` (tik release tag'ai, be slaptažodžio) |
 | Atnaujinti | `sudo -n -H -u <klono savininkas> <klonas>/bin/update [--server-ref …] [--setup-ref …]` |
 | Deploy'us, „backup dabar“, runner'io testas | Bitbucket API (žr. žemiau) |
 
@@ -683,6 +692,21 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
   tekstas laikomas tik sąsajos atmintyje (persikrovus – įklijuok iš naujo).
 - **Atnaujinimas** vykdomas kaip klono, iš kurio paleistas `install-ui`, savininkas; jam sudo turi veikti be
   slaptažodžio (žr. „Atnaujinimas“), kitaip – terminale.
+- **Paslaugos.** `bin/server-unit` valdo tik setup-server unit'us ir tik leidžiamais veiksmais; ką ir su kuo daryti,
+  nustato jo paties sąrašas, ne kvietėjas. `--check` parodo unit'o būseną ir ar vyksta pipeline'o žingsnis (sustabdžius
+  ar perkrovus runner'į jis nutrūktų).
+
+  | UNIT | Veiksmai | systemd unit'as |
+  | --- | --- | --- |
+  | `runner` | start, stop, restart | `setup-server-runner.service` |
+  | `github-runner@SCOPE` | start, stop, restart | `setup-server-github-runner@SCOPE.service` (tik užregistruotas SCOPE) |
+  | `metrics` | start, stop, restart | `setup-server-metrics.service` |
+  | `backup`, `backup-full` | start (laukia, kol kopija baigsis) | `setup-server-backup.service`, `setup-server-backup-full.service` |
+  | `ui` | restart (perskaito `ui.env`, pvz. naujus token'us) | `setup-server-ui.service` |
+
+  Ranka: `sudo bin/server-unit --check restart runner`.
+- **Ko sąsaja nedaro:** `bin/install-ui` (port'as, vardas, slaptažodis) ir rankinis atstatymas po nepavykusio
+  `bin/update` (žr. „Rankinis atstatymas“) lieka terminale: jie keičia pačią sąsają arba reikalingi, kai ji neveikia.
 
 **Deploy'ai per Bitbucket.** Projekto puslapyje – „Deploy į stage“ ir „Deploy į prod“ (custom pipeline'ai `deploy-stage`,
 `deploy-production` su kintamaisiais `REF`, `IMAGES`, `BACKUP`, `ROLLBACK`), „Backup dabar“ (`backup-now`, pažymėjus
@@ -694,7 +718,7 @@ pipeline'ą. GitHub projektams pipeline'ų paleidimas dar nepalaikomas.
 
 ```bash
 sudo nano /etc/setup-server/ui.env        # įrašyk token'ą (žr. žemiau)
-sudo systemctl restart setup-server-ui    # paslauga token'us skaito pasileisdama
+sudo systemctl restart setup-server-ui    # paslauga token'us skaito pasileisdama (arba Apžvalgoje: Valdymo sąsaja → Perkrauti)
 ```
 
 ```ini
@@ -714,14 +738,17 @@ neperduodamas, puslapiuose nerodomas, į žurnalus nerašomas (žurnale – tik 
   savo žurnalą), bet **ne** `docker` grupėje (jei yra, `install-ui` atsisako).
 - Tai, kam reikia root, sąsaja daro tik per `sudo -n` pagal `/etc/sudoers.d/setup-server-ui` (tikrinama `visudo -cf`):
   root teisėmis – tik root'ui priklausančios kopijos `/usr/local/lib/setup-server/bin/` (`add-project`, `remove-project`,
-  `install-backups`, `install-metrics`, `install-runner`, `add-backup-key`, `prepare-host`, `server-status`), niekada
+  `install-backups`, `install-metrics`, `install-runner`, `install-ssh`, `add-backup-key`, `backup-projects`, `prepare-host`,
+  `server-status`, `server-unit`, `update-setup`), niekada
   administratoriaus klonas, kurį gali keisti jo savininkas. `bin/update` – tik klono savininko teisėmis (root'u jis nevyksta).
 - Argumentų sudo neriboja: ribą nustato sąsajos patikra ir pačios komandos. Todėl `setup-ui` per šias komandas
   (pvz. `install-runner`, `prepare-host`) turi administratoriaus galią; ją saugo `127.0.0.1`, slaptažodis ir CSRF token'as.
 - Būseną skaito viena tik skaitanti komanda `server-status` (JSON): `systemctl show`, `journalctl`, versijas ir diską –
   root teisėmis, o build katalogus, Docker konteinerius ir secret store – paskyros `setup` teisėmis. Pipeline'o pakištas
-  simlink'as todėl nieko daugiau neatskleidžia, o iš env failų išeina tik taikinio reikšmės. Ranka:
-  `sudo /usr/local/lib/setup-server/bin/server-status | less` (`--logs 100` – žurnalai).
+  simlink'as todėl nieko daugiau neatskleidžia, o iš env failų išeina tik taikinio reikšmės. Konteinerio log'ai –
+  tik to projekto aplinkos konteinerio (to paties sąrašo, kurį rodo apžvalga), jo Docker context'e. Ranka:
+  `sudo /usr/local/lib/setup-server/bin/server-status | less` (`--logs 100` – žurnalai,
+  `--container-logs PROJEKTAS ENV KONTEINERIS [EILUTĖS]`, `--metrics`).
 - **systemd.** `NoNewPrivileges` išjungtas: su juo neveiktų nė vienas `sudo`. `ProtectSystem`, `ProtectHome`, `PrivateTmp`
   taip pat išjungti: veiksmai vyksta paslaugos vardų erdvėje ir rašo `/usr`, `/etc` (diegimai), administratoriaus kloną
   (`bin/update`) ir `/tmp` (ankstesnės kopijos rankiniam grąžinimui). Palikta, kas netrukdo: `ProtectKernelModules`,
