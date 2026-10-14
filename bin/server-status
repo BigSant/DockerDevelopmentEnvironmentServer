@@ -468,13 +468,19 @@ def metrics():
     return {'text': output[:READ_LIMIT]}
 
 
+def deploy_key():
+    """The setup account's public key, the one a deploy target authorizes (bin/add-project); nothing else of .ssh."""
+    line = (read_text(ROOT / '.ssh/id_ed25519.pub') or '').strip()
+    return line if re.fullmatch(r'ssh-ed25519 [A-Za-z0-9+/]+={0,3}(?: \S{1,100})?', line) else None
+
+
 def overview():
     errors = []
     found, scopes = units(errors)
     part = projects_as_account()
     shown = versions()
     return {'generated': int(time.time()), 'root': str(ROOT), 'versions': shown, 'units': found, 'github_runners': scopes,
-            'disk': disk(), 'projects': part['projects'], 'errors': list(dict.fromkeys(errors + part['errors'] + ERRORS))}
+            'disk': disk(), 'deploy_key': deploy_key(), 'projects': part['projects'], 'errors': list(dict.fromkeys(errors + part['errors'] + ERRORS))}
 
 
 def logs(lines):

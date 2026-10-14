@@ -221,6 +221,18 @@ class ServerStatusTest(Worker):
             with self.subTest(arguments=arguments):
                 self.assertEqual(self.status(*arguments).returncode, 64)
 
+    def test_the_overview_names_only_the_setup_accounts_public_key(self):
+        self.assertIsNone(json.loads(self.status().stdout)["deploy_key"])
+        ssh = self.tree.root / ".ssh"
+        ssh.mkdir()
+        (ssh / "id_ed25519").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nnever-shown\n")
+        (ssh / "id_ed25519.pub").write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKey setup@worker1\n")
+        result = self.status()
+        self.assertEqual(json.loads(result.stdout)["deploy_key"], "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKey setup@worker1")
+        self.assertNotIn("never-shown", result.stdout)
+        (ssh / "id_ed25519.pub").write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
+        self.assertIsNone(json.loads(self.status().stdout)["deploy_key"], "only a public key line leaves")
+
     def test_metrics_are_the_installed_commands_exposition(self):
         sbin = self.root / "sbin"
         missing = json.loads(self.status("--metrics").stdout)
@@ -838,6 +850,59 @@ class WebUiTest(Worker):
         self.assertEqual(status, 200, metrics)
         self.assertIn("setup_worker_backup_size_bytes{project=&quot;asana&quot;} 4096", metrics)
         self.assertIn("trūksta", metrics, "the runner group is not up")
+
+    def instructions(self, **choice):
+        status, _, body = self.request("GET", "/instructions?" + urlencode(choice))
+        self.assertEqual(status, 200, body)
+        return body
+
+    def test_the_instructions_follow_the_chosen_os_panel_environment_and_certificate(self):
+        default = self.instructions()
+        for text in ("Ubuntu 22.04 / 24.04", "apt-get install -y rsync", "download.docker.com/linux/ubuntu", "Domenas DirectAdmin",
+                     "Custom HTTPD Configurations", "ProxyPass / http://127.0.0.1:8081/", "LOCALHOST_PORT_SSL=8082",
+                     "PMA_ALLOWED_IPS=&quot;BIURO_IP&quot;", "Deployments → <code>Production</code>", "žingsnių"):
+            with self.subTest(text=text):
+                self.assertIn(text, default)
+        self.assertNotRegex(default, r"\nALLOWED_IPS=", "prod: per-tool lists, not the site-wide one")
+        for text in ("certbot", "firewall-cmd", "SELinux", "Tik VPN"):
+            with self.subTest(absent=text):
+                self.assertNotIn(text, default)
+        self.assertIn("Worker'io rakto nepavyko perskaityti", default)
+        centos = self.instructions(os="centos", panel="none", env="stage", ssl="letsencrypt", host="shop.example.lt",
+                                   user="shop", path="/home/shop/site", domain="shop.example.lt", worker="10.8.0.14")
+        for text in ("Ši OS setup&#x27;e netestuota", "dnf install -y rsync", "firewall-cmd --permanent --add-rich-rule",
+                     'source address=&quot;10.8.0.14&quot;', "SELinux", "useradd -m -s /bin/bash shop",
+                     "dnf install -y epel-release &amp;&amp; dnf install -y certbot",
+                     "certbot certonly --standalone -d shop.example.lt",
+                     "/etc/letsencrypt/live/shop.example.lt/privkey.pem /home/shop/site/data/stage/ssl/domain.key",
+                     "LOCALHOST_PORT=80", "LOCALHOST_PORT_SSL=443", "\nALLOWED_IPS=&quot;BIURO_IP&quot;", "Deployments → <code>Staging</code>",
+                     "--target stage=ssh://shop@shop.example.lt/home/shop/site",
+                     "/actions?target=stage%3Dssh%3A%2F%2Fshop%40shop.example.lt%2Fhome%2Fshop%2Fsite#add-project"):
+            with self.subTest(text=text):
+                self.assertIn(text, centos)
+        self.assertNotIn("Custom HTTPD", centos)
+        vpn = self.instructions(panel="none", ssl="none", address="10.8.0.14")
+        for text in ("Tik VPN", "PUBLISH_ADDRESS=10.8.0.14", "HTTP_FORCE_HTTPS=off"):
+            self.assertIn(text, vpn)
+        self.assertNotIn("certbot", vpn)
+        self.assertNotIn("Atidaryti formą", vpn, "no form link without the server, user and path")
+
+    def test_the_instructions_refuse_bad_values_and_show_the_workers_key(self):
+        ssh = self.tree.root / ".ssh"
+        ssh.mkdir()
+        (ssh / "id_ed25519.pub").write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKey setup@worker1\n")
+        body = self.instructions(os="windows", panel="none", host="x;rm -rf /", user="Root User", path="/home/shop/app", port="80; id")
+        for text in ("Netinkamas pasirinkimas", "lauke „Serveris“", "lauke „SSH vartotojas“", "negali baigtis /app",
+                     "lauke „Projekto port&#x27;as“"):
+            with self.subTest(text=text):
+                self.assertIn(text, body)
+        self.assertNotIn("rm -rf", body.split("Netinkama reikšmė", 1)[0] + body.split("</ol>")[0].split('class="steps"')[-1])
+        self.assertIn("echo &#x27;ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKey setup@worker1&#x27; &gt;&gt; ~deploy/.ssh/authorized_keys", body)
+        self.assertNotIn("rakto nepavyko perskaityti", body)
+        prefilled = self.request("GET", "/actions?target=" + urlencode({"": "prod=ssh://shop@shop.example.lt/home/shop/site"})[1:])[2]
+        self.assertIn(">prod=ssh://shop@shop.example.lt/home/shop/site</textarea>", prefilled)
+        refused = self.request("GET", "/actions?target=" + urlencode({"": "prod=ssh://u@h/p -oProxyCommand=x"})[1:])[2]
+        self.assertNotIn("ProxyCommand", refused)
 
     # --- Bitbucket -------------------------------------------------------------------------------
     def test_a_deploy_starts_the_custom_pipeline_with_its_variables_and_the_projects_token(self):

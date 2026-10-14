@@ -663,6 +663,14 @@ laikomas tik jo PBKDF2 hash'as `/etc/setup-server/ui.env` (root, 0600). Pamiršu
   grupės surinktos.
 - *Žurnalai* – `ui-actions.log`, `backup-pulls.log`, setup-server paslaugų journal (po 50 eilučių) ir paskutiniai
   veiksmai su jų išvestimi.
+- *Instrukcijos* – kaip paruošti kitą serverį projekto taikiniu (`bin/add-project --target ENV=ssh://…`): pasirenki OS
+  (Ubuntu, Debian; CentOS/AlmaLinux/Rocky – netestuota), valdymo skydelį (DirectAdmin ar jokio), aplinką (prod, stage) ir
+  SSL (Let's Encrypt, savas, be SSL – tik VPN), įrašai serverį, vartotoją, katalogą, domeną, port'ą ir gauni
+  sunumeruotus žingsnius su komandomis: paketai, Docker, vartotojas ir `docker` grupė, katalogas, worker'io raktas
+  (tikras, iš `/srv/setup-server/.ssh/id_ed25519.pub`), ugniasienė, portai, DirectAdmin domenas, sertifikatas ir proxy,
+  `env/<env>.env.example`, slaptažodžiai, registracija, host key palyginimas ir pirmas deploy'us. Kiekvienas žingsnis
+  nurodo šaltinį; kur setup dar nieko neaprašo (DirectAdmin proxy, sertifikatas be skydelio, ne Debian OS), tai
+  pažymėta įspėjimu. Puslapis nieko nevykdo; mygtukas atidaro „Pridėti projektą“ su įrašytu taikiniu.
 
 **Veiksmai.** Kiekvienas pirmiausia paleidžiamas su `--check`: puslapis parodo komandą ir jos išvestį. Tik tada
 „Vykdyti“ paleidžia **tą pačią** komandą be `--check` (peržiūra galioja 15 min. ir vieną kartą; jei `--check` baigėsi

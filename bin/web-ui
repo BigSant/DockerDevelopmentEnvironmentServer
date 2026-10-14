@@ -707,6 +707,266 @@ def pipeline_runs(project, repository, fresh=False):
     return CACHE.get(('pipelines', project), PIPELINES_TTL, compute, fresh)
 
 
+# --- Instructions: preparing a server as a deploy target ------------------------------------------
+# What a server needs before bin/add-project --target ENV=ssh://USER@HOST/PATH and a first deploy, step by
+# step for the chosen OS, panel, environment and certificate. Facts come from setup's docs and code and
+# from bin/add-project; where setup documents nothing (CentOS, the DirectAdmin proxy, a certificate without a
+# panel) the step says so instead of pretending.
+GUIDE_OPTIONS = (
+    ('os', 'OS', (('ubuntu', 'Ubuntu 22.04 / 24.04'), ('debian', 'Debian 12'),
+                  ('centos', 'CentOS Stream / AlmaLinux / Rocky (netestuota)'))),
+    ('panel', 'Valdymo skydelis', (('directadmin', 'DirectAdmin'), ('none', 'Be skydelio'))),
+    ('env', 'Aplinka', (('prod', 'prod'), ('stage', 'stage'))),
+    ('ssl', 'SSL', (('letsencrypt', "Let's Encrypt"), ('own', 'Savas sertifikatas'), ('none', 'Be SSL (tik VPN, HTTP)'))),
+)
+GUIDE_FIELDS = (
+    ('host', 'Serveris', re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?'), 'SERVERIS'),
+    ('user', 'SSH vartotojas', re.compile(r'[a-z_][a-z0-9_.-]{0,31}'), None),
+    ('path', 'Projekto katalogas', re.compile(r'/[A-Za-z0-9._/-]{1,200}'), None),
+    ('domain', 'Domenas', re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?'), 'shop.example.lt'),
+    ('port', 'Projekto port\'as', re.compile(r'[0-9]{2,5}'), '8081'),
+    ('worker', 'Worker\'io IP', re.compile(r'[0-9a-fA-F:.]{2,45}'), 'WORKER_IP'),
+    ('address', 'Adresas portams', re.compile(r'[0-9a-fA-F:.]{2,45}'), None),
+)
+WHERE = {'target': 'taikinyje (root)', 'panel': 'DirectAdmin', 'repo': 'env repo ir Bitbucket', 'worker': 'worker\'yje (šiame serveryje)'}
+DOCKER_APT = ('install -m 0755 -d /etc/apt/keyrings',
+              'curl -fsSL https://download.docker.com/linux/{distribution}/gpg -o /etc/apt/keyrings/docker.asc',
+              'chmod a+r /etc/apt/keyrings/docker.asc',
+              'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] '
+              'https://download.docker.com/linux/{distribution} $(. /etc/os-release && echo $VERSION_CODENAME) stable" '
+              '> /etc/apt/sources.list.d/docker.list',
+              'apt-get update',
+              'apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin')
+
+
+class Step:
+    """One step of the guide, shown when every chosen option is among `when`'s values."""
+
+    def __init__(self, title, where, text, blocks=(), when=None, source='', warning='', link=False):
+        self.title, self.where, self.text, self.blocks = title, where, text, blocks
+        self.when, self.source, self.warning, self.link = when or {}, source, warning, link
+
+    def applies(self, choice):
+        return all(choice[key] in values for key, values in self.when.items())
+
+
+APT, DNF = ('ubuntu', 'debian'), ('centos',)
+GUIDE = (
+    Step('Ši OS setup\'e netestuota', 'target',
+         'setup dokumentacija reikalauja Debian/Ubuntu tipo serverio, o bin/prepare-host – Ubuntu 22.04+. Žemiau – bendri '
+         'Docker žingsniai šiai OS; SELinux ir firewalld setup netikrina. Pirmą deploy\'ų daryk į stage.',
+         when={'os': DNF}, source='setup doc/lt/02-pradzia.md:12; bin/prepare-host:46-51',
+         warning='CentOS 7 nebepalaikomas (EOL); rinkis Stream 9, AlmaLinux ar Rocky 9.'),
+    Step('Paketai, kurių reikia deploy\'ui', 'target',
+         'Worker\'is per SSH naudoja `rsync`, `mkdir`, `ls`, `xargs` ir `ss` (portų patikrai).',
+         blocks=((None, ('apt-get update', 'apt-get install -y rsync iproute2 openssh-server ca-certificates curl')),),
+         when={'os': APT}, source='setup docker/project_deploy.py, docker/project_release.py'),
+    Step('Paketai, kurių reikia deploy\'ui', 'target',
+         'Worker\'is per SSH naudoja `rsync`, `mkdir`, `ls`, `xargs` ir `ss` (portų patikrai).',
+         blocks=((None, ('dnf install -y rsync iproute openssh-server ca-certificates curl',
+                         'systemctl enable --now sshd')),),
+         when={'os': DNF}, source='setup docker/project_deploy.py, docker/project_release.py'),
+    Step('Docker Engine', 'target',
+         'Jei `docker version` jau atsako, nieko nekeisk: esamas Docker nekeičiamas. Kitaip – iš download.docker.com, '
+         'kaip tai daro bin/prepare-host.',
+         blocks=((None, ('docker version --format \'{{.Server.Version}}\' || {',
+                         *(f'  {line}' for line in DOCKER_APT), '}', 'systemctl enable --now docker')),),
+         when={'os': APT}, source='bin/prepare-host:91-99; README „Saugumas“'),
+    Step('Docker Engine', 'target',
+         'Jei `docker version` jau atsako, nieko nekeisk. Kitaip – Docker CE iš download.docker.com.',
+         blocks=((None, ('dnf install -y dnf-plugins-core',
+                         'dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo',
+                         'dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin',
+                         'systemctl enable --now docker')),),
+         when={'os': DNF}, source='docs.docker.com (setup šios OS neaprašo)'),
+    Step('Domenas DirectAdmin\'e', 'panel',
+         'Vartotojas `{user}` (Admin level → Create New User, jei jo dar nėra) → User level → Domain Setup → Add Another Domain: `{domain}` . Jo vardas – SSH vartotojas kitame žingsnyje.',
+         when={'panel': ('directadmin',)}),
+    Step('SSH vartotojas', 'target',
+         'Naudok domeno DirectAdmin vartotoją: konteineriai veikia jo UID/GID, todėl failų savininkas lieka vienas. '
+         'Jis turi galėti paleisti `docker`, t. y. būti `docker` grupėje.',
+         blocks=((None, ('usermod -aG docker {user}', 'id {user}')),),
+         when={'panel': ('directadmin',)}, source='setup doc/lt/09-aplinkos.md:29; bin/add-project:172,181',
+         warning='docker grupė prilygsta root teisėms. root vartotojo taikiniui nenaudok.'),
+    Step('SSH vartotojas', 'target',
+         'Atskiras vartotojas projektui: konteineriai veiks jo UID/GID. Jis turi galėti paleisti `docker`.',
+         blocks=((None, ('useradd -m -s /bin/bash {user}', 'usermod -aG docker {user}', 'id {user}')),),
+         when={'panel': ('none',)}, source='bin/add-project:164,172,181',
+         warning='docker grupė prilygsta root teisėms. root vartotojo taikiniui nenaudok.'),
+    Step('Projekto katalogas', 'target',
+         'Absoliutus kelias, jau sukurtas ir rašomas vartotojo; nesibaigia `/app` – jame atsiras `app/` (kodas) ir `data/` '
+         '(duomenys, sertifikatai). bin/add-project nutolusio katalogo nekuria.',
+         blocks=((None, ('install -d -o {user} -g {user} -m 0750 {path}',)),),
+         source='bin/add-project:159-162,182; setup docker/project_release.py:56-57'),
+    Step('Worker\'io raktas', 'target',
+         'Worker\'is jungiasi kaip `setup` paskyra savo raktu (tas pats, kuriuo skaito git). Įrašyk jį vartotojui:',
+         blocks=((None, ('install -d -m 0700 -o {user} -g {user} ~{user}/.ssh',
+                         "echo '{key}' >> ~{user}/.ssh/authorized_keys",
+                         'chown {user}: ~{user}/.ssh/authorized_keys', 'chmod 0600 ~{user}/.ssh/authorized_keys')),),
+         source='bin/add-project:171-177; README „Eiga“'),
+    Step('SSH iš worker\'io', 'target',
+         'Įleisk worker\'į į 22 portą (kitas SSH portas taikinio adrese nepalaikomas). Jei ufw išjungtas (`ufw status`), '
+         'šis žingsnis nereikalingas.',
+         blocks=((None, ('ufw allow proto tcp from {worker} to any port 22',)),),
+         when={'os': APT}, source='bin/add-project:159; spec setup-server „Ryšys“'),
+    Step('SSH iš worker\'io', 'target',
+         'Įleisk worker\'į į 22 portą (kitas SSH portas taikinio adrese nepalaikomas).',
+         blocks=((None, ('firewall-cmd --permanent --add-rich-rule=\'rule family="ipv4" source address="{worker}" '
+                         'port port="22" protocol="tcp" accept\'', 'firewall-cmd --reload')),),
+         when={'os': DNF}, source='bin/add-project:159'),
+    Step('SELinux', 'target',
+         'setup katalogams SELinux žymių nededa ir su SELinux netestuotas. Jei `getenforce` rodo Enforcing, po pirmo '
+         'deploy\'aus peržiūrėk atmetimus.',
+         blocks=((None, ('getenforce', 'ausearch -m avc -ts recent | tail -n 20')),),
+         when={'os': DNF}, source='setup to neaprašo'),
+    Step('Laisvas port\'as projektui', 'target',
+         'DirectAdmin laiko 80/443, todėl projektas klauso `127.0.0.1:{port}` (ir `{port_ssl}` – nginx-proxy SSL portas), '
+         'o DirectAdmin jį proxy\'ina. Stage ir prod tame pačiame serveryje – skirtingi portai. Tuščia išvestis – laisvas.',
+         blocks=((None, ("ss -ltn 'sport = :{port}'", "ss -ltn 'sport = :{port_ssl}'")),),
+         when={'panel': ('directadmin',)}, source='setup docker/docker/nginx-proxy/docker-compose.yml:64-68; docker/project_release.py:198-228'),
+    Step('Portai 80 ir 443', 'target',
+         'Be skydelio projekto nginx-proxy pats klauso 80 ir 443 adresu `{address}`. Host\'o web serveris jų laikyti '
+         'negali – jei laiko, deploy\'us atsisako.',
+         blocks=((None, ("ss -ltnp 'sport = :80'", "ss -ltnp 'sport = :443'")),
+                 ('jei laiko nginx, apache2 ar httpd', ('systemctl disable --now nginx',))),
+         when={'panel': ('none',), 'ssl': ('letsencrypt', 'own')}, source='README „Projektų konteineriai serveryje“; setup docker/project_release.py:224-228'),
+    Step('Web portai ugniasienėje', 'target',
+         'Svetainė vieša: atidaryk 80 ir 443.',
+         blocks=((None, ('ufw allow 80,443/tcp',)),),
+         when={'panel': ('none',), 'ssl': ('letsencrypt', 'own'), 'os': APT}),
+    Step('Web portai ugniasienėje', 'target',
+         'Svetainė vieša: atidaryk 80 ir 443.',
+         blocks=((None, ('firewall-cmd --permanent --add-service=http --add-service=https', 'firewall-cmd --reload')),),
+         when={'panel': ('none',), 'ssl': ('letsencrypt', 'own'), 'os': DNF}),
+    Step('Tik VPN', 'target',
+         'Be skydelio ir be SSL svetainė pasiekiama tik per VPN: portai publikuojami VPN adresu `{address}`, '
+         'adresas – `http://{domain}:{port}`. Viešų portų nėra. Patikrink, kad portas laisvas:',
+         blocks=((None, ("ss -ltn 'sport = :{port}'",)),),
+         when={'panel': ('none',), 'ssl': ('none',)}, source='setup doc/lt/09-aplinkos.md:46; spec setup-server „Prieiga“'),
+    Step('Let\'s Encrypt DirectAdmin\'e', 'panel',
+         'User level → SSL Certificates → „Free & automatic certificate from Let\'s Encrypt“ domenui `{domain}` (ir www, jei '
+         'naudojamas). TLS baigiasi DirectAdmin\'e; kiekvienas DOMAIN vardas gauna savo sertifikatą.',
+         when={'panel': ('directadmin',), 'ssl': ('letsencrypt',)}, source='setup doc/lt/09-aplinkos.md:45'),
+    Step('Savas sertifikatas DirectAdmin\'e', 'panel',
+         'User level → SSL Certificates → „Paste a pre-generated certificate and key“ domenui `{domain}`.',
+         when={'panel': ('directadmin',), 'ssl': ('own',)}, source='setup doc/lt/09-aplinkos.md:45'),
+    Step('Proxy į projektą', 'panel',
+         'Admin level → Custom HTTPD Configurations → `{domain}`: DirectAdmin perduoda užklausas projektui, '
+         '`/.well-known` palieka sau (Let\'s Encrypt atnaujinimui). nginx-proxy pasitiki `X-Forwarded-*` tik iš loopback.',
+         blocks=(('Apache (DirectAdmin numatytas)', ('ProxyPreserveHost On', 'ProxyPass /.well-known !',
+                                                      'ProxyPass / http://127.0.0.1:{port}/',
+                                                      'ProxyPassReverse / http://127.0.0.1:{port}/',
+                                                      'RequestHeader set X-Forwarded-Proto expr=%{REQUEST_SCHEME}')),
+                 ('tik nginx (be Apache)', ('location / {', '    proxy_pass http://127.0.0.1:{port};',
+                                            '    proxy_set_header Host $host;',
+                                            '    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;',
+                                            '    proxy_set_header X-Forwarded-Proto $scheme;', '}'))),
+         when={'panel': ('directadmin',)}, source='setup doc/lt/09-aplinkos.md:45; docker/docker/nginx-proxy',
+         warning='setup dokumentacija DirectAdmin proxy konfigūracijos dar neaprašo: šį fragmentą pirmiau išbandyk stage\'e.'),
+    Step('Let\'s Encrypt be skydelio', 'target',
+         'setup ACME neturi: nginx-proxy naudoja porą iš `{path}/data/{env}/ssl/` (be jos – savo pasirašytą). Pirmą '
+         'sertifikatą gauk, kol 80 portas laisvas (prieš pirmą deploy\'ų), ir įdėk porą:',
+         blocks=((None, ('{certbot_install}', 'certbot certonly --standalone -d {domain}',
+                         'install -d -o {user} -g {user} {path}/data/{env}/ssl',
+                         'install -o {user} -g {user} -m 0644 /etc/letsencrypt/live/{domain}/fullchain.pem {path}/data/{env}/ssl/domain.crt',
+                         'install -o {user} -g {user} -m 0600 /etc/letsencrypt/live/{domain}/privkey.pem {path}/data/{env}/ssl/domain.key')),),
+         when={'panel': ('none',), 'ssl': ('letsencrypt',)}, source='setup doc/lt/09-aplinkos.md:47',
+         warning='Atnaujinimas (kas ≤ 90 d.) neautomatizuotas: 80 portą laiko projektas. Jei gali – rinkis DirectAdmin ar VPN.'),
+    Step('Savas sertifikatas', 'target',
+         'nginx-proxy naudoja porą iš `{path}/data/{env}/ssl/` ir jos neperrašo:',
+         blocks=((None, ('install -d -o {user} -g {user} {path}/data/{env}/ssl',
+                         'install -o {user} -g {user} -m 0644 GRANDINĖ.crt {path}/data/{env}/ssl/domain.crt',
+                         'install -o {user} -g {user} -m 0600 RAKTAS.key {path}/data/{env}/ssl/domain.key')),),
+         when={'panel': ('none',), 'ssl': ('own',)}, source='setup doc/lt/09-aplinkos.md:47'),
+    Step('env/{env}.env.example aplinkos repo', 'repo',
+         'Adresas, portai, limitai ir IP sąrašai – aplinkos repo `env/{env}.env.example`. `DEPLOY_*`, `APP_UID` ir `APP_GID` '
+         'nerašyk: juos įrašo bin/add-project į `target.{env}.env`, o toks example atmetamas. Limitai privalomi; serveriui su '
+         'vienu projektu setup siūlo ~30 % RAM PHP ir ~45 % duomenų bazei (dalink, jei serveris bendras).',
+         blocks=((None, ('DOMAIN={domain}', 'PUBLISH_ADDRESS={address}', 'LOCALHOST_PORT={port}', 'LOCALHOST_PORT_SSL={port_ssl}',
+                         '{https_line}', 'PHP_MEMORY=…', 'PHP_CPUS=…', 'DATABASE_MEMORY=…', 'DATABASE_CPUS=…', 'WEBSERVER_MEMORY=…',
+                         'WEBSERVER_CPUS=…', 'PROXY_MEMORY=…', 'PROXY_CPUS=…', '{allow_lines}')),),
+         source='setup doc/lt/09-aplinkos.md:20,62-81; doc/lt/05-servisai.md:218-249; templates/grouped/env/prod.env.example'),
+    Step('Slaptažodžiai Bitbucket\'e', 'repo',
+         'Repository settings → Deployments → `{deployment}`: `DATABASE_PASSWORD`, `DATABASE_ROOT_PASSWORD` ir kiti projekto '
+         'slaptažodžiai kaip Secured kintamieji (GitHub – environment secrets). Patikra iš kompiuterio:',
+         blocks=((None, ('make deploy-variables ENV={env} token=…',)),), source='setup doc/lt/09-aplinkos.md:208-244'),
+    Step('Užregistruoti taikinį', 'worker',
+         'Worker\'is prisijungia kaip `{user}`, įrašo jo UID/GID į `target.{env}.env` ir sukuria Docker context '
+         '`setup-<vardas>-{env}`. Esamam projektui – ta pati komanda su jo vardu ir aplinkos repo; arba forma „Pridėti projektą“.',
+         blocks=((None, ('sudo bin/add-project --check --target {env}=ssh://{user}@{host}{path} [VARDAS] APLINKOS_REPO_URL',
+                         'sudo bin/add-project --target {env}=ssh://{user}@{host}{path} [VARDAS] APLINKOS_REPO_URL')),),
+         source='bin/add-project:159-210; README „Eiga“', link=True),
+    Step('Palygink host key', 'worker',
+         'Pirmą kartą worker\'is serverio raktą priima be patikros (accept-new), o bin/add-project parodo tik jo tipą. '
+         'Palygink fingerprint\'us – jie turi sutapti:',
+         blocks=(('taikinyje', ('ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub',)),
+                 ('worker\'yje', ('sudo -u setup ssh-keygen -lF {host} -f {root}/.ssh/known_hosts',))),
+         source='bin/add-project:170-171,188'),
+    Step('Pirmas deploy\'us', 'worker',
+         'Projekto puslapyje „Deploy į {env}“ su IMAGES (pirmą kartą ir pakeitus serverio env – privaloma). {release}',
+         source='setup doc/lt/09-aplinkos.md:44,127,186'),
+)
+
+
+def guide_values(query, status_data):
+    """(choice, values, errors): the chosen options, the values steps fill in, and what was not accepted."""
+    choice, errors = {}, []
+    for key, _, options in GUIDE_OPTIONS:
+        given = query.get(key, [''])[0]
+        allowed = [value for value, _ in options]
+        if given and given not in allowed:
+            errors.append(f'Netinkamas pasirinkimas „{key}“.')
+        choice[key] = given if given in allowed else allowed[0]
+    given = {}
+    for key, label, pattern, _ in GUIDE_FIELDS:
+        text = query.get(key, [''])[0].strip()
+        if text and (not pattern.fullmatch(text) or '..' in text):
+            errors.append(f'Netinkama reikšmė lauke „{label}“: {text[:60]}')
+            text = ''
+        given[key] = text
+    if given['address']:
+        try:
+            ipaddress.ip_address(given['address'])
+        except ValueError:
+            errors.append(f'„Adresas portams“: {given["address"]} nėra IP adresas.')
+            given['address'] = ''
+    directadmin, private = choice['panel'] == 'directadmin', choice['panel'] == 'none' and choice['ssl'] == 'none'
+    user = given['user'] or ('DA_VARTOTOJAS' if directadmin else 'deploy')
+    path = (given['path'] or f'/home/{user}/PROJEKTAS').rstrip('/')
+    if path.endswith('/app'):
+        errors.append('Projekto katalogas negali baigtis /app: jame bus app/ ir data/.')
+    port = given['port'] or ('80' if choice['panel'] == 'none' and not private else '8081')
+    port_ssl = '443' if choice['panel'] == 'none' and not private else str(int(port) + 1) if port.isdigit() and int(port) < 65535 else '8082'
+    address = given['address'] or ('127.0.0.1' if directadmin else 'VPN_IP' if private else 'VIEŠAS_IP')
+    key = (status_data or {}).get('deploy_key')
+    allow = ('ALLOWED_IPS="BIURO_IP"' if choice['env'] == 'stage' else
+             'PMA_ALLOWED_IPS="BIURO_IP"\nCRON_ALLOWED_IPS="BIURO_IP"\nBACKUP_ALLOWED_IPS="BIURO_IP"')
+    values = {'host': given['host'] or 'SERVERIS', 'user': user, 'path': path, 'domain': given['domain'] or 'shop.example.lt',
+              'port': port, 'port_ssl': port_ssl, 'worker': given['worker'] or 'WORKER_IP', 'address': address,
+              'env': choice['env'], 'key': key or 'SETUP_RAKTAS', 'root': str(ROOT), 'distribution': choice['os'],
+              'deployment': 'Production' if choice['env'] == 'prod' else 'Staging',
+              'certbot_install': 'dnf install -y epel-release && dnf install -y certbot' if choice['os'] == 'centos'
+              else 'apt-get install -y certbot',
+              'https_line': 'HTTP_FORCE_HTTPS=off' if choice['ssl'] == 'none' else '# HTTP_FORCE_HTTPS=on (numatyta stage/prod)',
+              'allow_lines': allow,
+              'release': 'prod – iš release tag\'o (REF = vX.Y.Z, setup ant vX.Y.Z tag\'o); vėlesni – su BACKUP.' if choice['env'] == 'prod'
+              else 'stage tinka bet kuris commit\'as.'}
+    return choice, values, errors, given, key is not None
+
+
+def steps_word(count):
+    """Lithuanian plural: 1 žingsnis, 2–9 žingsniai, 10–20 žingsnių, 21 žingsnis…"""
+    if count % 10 == 1 and count % 100 != 11:
+        return 'žingsnis'
+    return 'žingsniai' if 2 <= count % 10 <= 9 and not 12 <= count % 100 <= 19 else 'žingsnių'
+
+
+def guide_fill(text, values):
+    for key, value in values.items():
+        text = text.replace('{' + key + '}', value)
+    return text
+
+
 # --- HTML ----------------------------------------------------------------------------------------
 def e(text):
     return html.escape(str(text), quote=True)
@@ -862,9 +1122,26 @@ details>summary::before{content:"\\25B8  ";color:var(--amber)}
 details[open]>summary::before{content:"\\25BE  "}
 details>.inner{padding:0 14px 12px}
 details .term{margin:0}
+.guide{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:4px 20px}
+.guide label{grid-template-columns:1fr;gap:4px}
+.chosen{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:22px 0 14px}
+.steps{list-style:none;margin:0;padding:0;counter-reset:step}
+.step{counter-increment:step;display:grid;grid-template-columns:52px minmax(0,1fr);column-gap:14px;margin:0 0 10px;padding:14px 16px;
+background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--amber);border-radius:4px;
+animation:arrive .5s cubic-bezier(.2,.8,.2,1) both}
+.step::before{content:counter(step,decimal-leading-zero);grid-row:1/span 20;font-size:26px;font-weight:800;line-height:1.1;
+color:var(--amber);text-shadow:0 0 12px var(--amber-glow)}
+.step.is-warn{border-left-color:var(--hazard)}
+.step h3{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 6px}
+.step p{margin:0 0 8px}
+.step .tape{margin:4px 0 10px;padding:8px 12px}
+.step .source{margin:8px 0 0;color:var(--faint);font-size:11px}
+.block-label{margin:8px 0 4px;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint)}
+pre.cmd{margin:0;padding:10px 14px;background:#070806;border:1px solid var(--rule);border-radius:4px;color:#d8e8c8;font:inherit;
+overflow:auto;white-space:pre}
 .empty{padding:30px;text-align:center;color:var(--dim);border:1px dashed var(--rule);border-radius:4px}
 .foot{margin-top:28px;color:var(--faint);font-size:11px}
-""" + ''.join(f'.unit:nth-child({index}),.board tbody tr:nth-child({index}){{animation-delay:{(index - 1) * 45}ms}}'
+""" + ''.join(f'.unit:nth-child({index}),.board tbody tr:nth-child({index}),.step:nth-child({index}){{animation-delay:{(index - 1) * 45}ms}}'
               for index in range(2, 21)) + """
 @media (max-width:900px){.top{padding:12px 16px}main{padding:18px 16px}.deck{grid-template-columns:1fr}
 label{grid-template-columns:1fr;gap:4px}.board thead{display:none}.board,.board tbody,.board tr,.board td{display:block;width:100%}
@@ -872,8 +1149,8 @@ label{grid-template-columns:1fr;gap:4px}.board thead{display:none}.board,.board 
 .board td:first-child{padding-top:12px}.runs li{grid-template-columns:18px 1fr 100px}.runs li .hide{display:none}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important}}
 """
-NAVIGATION = (('overview', '/', 'Apžvalga'), ('actions', '/actions', 'Veiksmai'), ('logs', '/logs', 'Žurnalai'),
-              ('metrics', '/worker-metrics', 'Metrikos'))
+NAVIGATION = (('overview', '/', 'Apžvalga'), ('actions', '/actions', 'Veiksmai'), ('instructions', '/instructions', 'Instrukcijos'),
+              ('logs', '/logs', 'Žurnalai'), ('metrics', '/worker-metrics', 'Metrikos'))
 
 
 def ago(moment, now=None):
@@ -1303,8 +1580,48 @@ class Page:
                 '<p class="note">setup-server-metrics --once kaip setup paskyra: tai, ką mato Prometheus (be token\'o).</p>' + term(text))
         return self.layout('Metrikos', body, section='metrics')
 
+    # --- Instructions ---
+    def instructions(self, choice, values, errors, given, key_known):
+        def text(markup):
+            return re.sub(r'`([^`]+)`', r'<code>\1</code>', e(guide_fill(markup, values)))
+        selects = ''.join(
+            f'<label><span>{e(label)}</span><select name="{key}">' +
+            ''.join(f'<option value="{value}"{" selected" if choice[key] == value else ""}>{e(title)}</option>'
+                    for value, title in options) + '</select></label>' for key, label, options in GUIDE_OPTIONS)
+        fields = ''.join(f'<label><span>{e(label)}</span><input type="text" name="{key}" value="{e(given[key])}" '
+                         f'placeholder="{e(placeholder or values[key])}" autocomplete="off"></label>'
+                         for key, label, _, placeholder in GUIDE_FIELDS)
+        body = ('<p class="note">Ką padaryti serveryje, kad jis taptų projekto taikiniu (bin/add-project --target '
+                'ENV=ssh://VARTOTOJAS@SERVERIS/KELIAS). Užpildyti laukai įrašomi į komandas; tušti lieka DIDŽIOSIOMIS.</p>'
+                f'<form class="action" method="get" action="/instructions"><div class="guide">{selects}{fields}</div>'
+                '<div class="form-foot"><p class="note">Nieko nevykdo: tik parodo žingsnius.</p><button>Rodyti žingsnius</button></div></form>')
+        if errors:
+            body += '<div class="callout bad">' + ''.join(f'<p>{e(item)}</p>' for item in errors) + '</div>'
+        if not key_known:
+            body += ('<div class="callout warn"><p>Worker\'io rakto nepavyko perskaityti: SETUP_RAKTAS – '
+                     f'<code>sudo cat {e(ROOT)}/.ssh/id_ed25519.pub</code>.</p></div>')
+        steps = [step for step in GUIDE if step.applies(choice)]
+        labels = {key: dict(options)[choice[key]] for key, _, options in GUIDE_OPTIONS}
+        body += ('<div class="chosen">' + ''.join(badge(label, 'warn' if key == 'os' and choice['os'] == 'centos' else 'muted')
+                                                  for key, label in labels.items()) +
+                 f'<span class="note">{len(steps)} {steps_word(len(steps))}</span></div><ol class="steps">')
+        for step in steps:
+            blocks = ''.join((f'<p class="block-label">{e(label)}</p>' if label else '') +
+                             f'<pre class="cmd">{e(guide_fill(chr(10).join(lines), values))}</pre>' for label, lines in step.blocks)
+            link = ''
+            if step.link and all(given[key] for key in ('host', 'user', 'path')):
+                target = f'{choice["env"]}=ssh://{values["user"]}@{values["host"]}{values["path"]}'
+                if TARGET.fullmatch(target):
+                    link = (f'<p><a class="btn" href="/actions?target={e(quote(target, safe=""))}#add-project">'
+                            'Atidaryti formą su šiuo taikiniu</a></p>')
+            warning = f'<div class="tape"><span>{e(step.warning)}</span></div>' if step.warning else ''
+            source = f'<p class="source">Šaltinis: {e(step.source)}</p>' if step.source else ''
+            body += (f'<li class="step{" is-warn" if step.warning else ""}"><h3>{e(guide_fill(step.title, values))}'
+                     f'{badge(WHERE[step.where], "muted")}</h3>{warning}<p>{text(step.text)}</p>{blocks}{link}{source}</li>')
+        return self.layout('Instrukcijos: serverio paruošimas', body + '</ol>', section='instructions')
+
     # --- Actions ---
-    def actions(self, where, scopes=()):
+    def actions(self, where, scopes=(), target=''):
         def text(name, label, placeholder='', value=''):
             # autocomplete off: a browser must not fill in a value typed for another project (a build root name).
             return (f'<label><span>{e(label)}</span><input type="text" name="{name}" value="{e(value)}" '
@@ -1319,7 +1636,8 @@ class Page:
             text('env_repo', 'Aplinkos repo URL', 'git@bitbucket.org:darbo-erdve/projektas.git') +
             text('code_repo', 'Kodo repo URL (nebūtina)', 'git@bitbucket.org:darbo-erdve/kodas.git') +
             text('name', 'Vardas (nebūtina)', 'numatyta – repo vardas') +
-            '<label><span>Taikinys (po vieną eilutėje)</span><textarea name="targets" placeholder="local&#10;local:/home/vartotojas/projektas&#10;prod=ssh://deploy@shop.example/home/deploy/shop"></textarea></label>'
+            '<label><span>Taikinys (po vieną eilutėje)</span><textarea name="targets" placeholder="local&#10;local:/home/vartotojas/projektas&#10;prod=ssh://deploy@shop.example/home/deploy/shop">'
+            f'{e(target)}</textarea></label>'
             '<label class="check"><input type="checkbox" name="shared_key" value="yes"> GitHub: paskyros raktas (--shared-key)</label>',
             note='Naujam projektui taikinys privalomas (local – šis serveris). Esamam tuščias laukas taikinio nekeičia. '
                  'Pašalinimas – projekto puslapyje.', command='bin/add-project') + '</div>'
@@ -1625,7 +1943,12 @@ def handler(user, stored):
                     self.reply(404, page.layout('Nėra projekto', '<p><a href="/">← Į apžvalgą</a></p>'))
             if path == '/actions':
                 data, _ = status()
-                return self.reply(200, page.actions(installation(), (data or {}).get('github_runners', [])))
+                target = query.get('target', [''])[0]
+                target = target if len(target) <= 200 and TARGET.fullmatch(target) else ''
+                return self.reply(200, page.actions(installation(), (data or {}).get('github_runners', []), target))
+            if path == '/instructions':
+                data, _ = status()
+                return self.reply(200, page.instructions(*guide_values(query, data)))
             if path == '/logs':
                 recent = []
                 for directory in jobs(20):
