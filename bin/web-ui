@@ -10,7 +10,8 @@ compared in constant time) and a Host of 127.0.0.1/localhost (a DNS-rebound name
 needs the CSRF token of its form: an HMAC of the user with a key made at start (a restart invalidates the open
 forms) and, when the browser sends one, an Origin of 127.0.0.1/localhost.
 
-What it runs. Status: `sudo -n $LIBRARY/bin/server-status` (read-only, JSON). Actions: the root-owned copies
+What it runs. Status: `sudo -n $LIBRARY/bin/server-status` (read-only, JSON: the overview, the logs, a project
+container's docker logs and the worker's /metrics). Actions: the root-owned copies
 in $LIBRARY/bin (never a writable checkout) through sudo, and bin/update of the admin clone as its owner;
 the sudo rule of bin/install-ui allows nothing else. Arguments are checked here against strict patterns and
 always passed as an argv list. Every action first runs with --check; only that previewed command (kept
@@ -80,6 +81,19 @@ KEY_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
 PUBLIC_KEY = re.compile(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|'
                         r'sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}(?: [^\s]{1,100})?')
 JOB_ID = re.compile(r'\d{8}T\d{6}Z-[0-9a-f]{6}')
+SCOPE = re.compile(r'[a-z0-9][a-z0-9._-]{0,99}')
+CONTAINER = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
+TARBALL = re.compile(r'https://[A-Za-z0-9.-]+/[A-Za-z0-9._~%/+-]{1,400}|/[A-Za-z0-9._/-]{1,300}')
+SHA256 = re.compile(r'[0-9a-f]{64}')
+# bin/server-unit's units and what may be done to each (a registered GitHub runner: github-runner@SCOPE).
+UNIT_OPERATIONS = {'runner': ('start', 'stop', 'restart'), 'metrics': ('start', 'stop', 'restart'),
+                   'backup': ('start',), 'backup-full': ('start',), 'ui': ('restart',)}
+UNIT_TITLES = {'runner': "Bitbucket runner'is", 'metrics': 'Metrikos (/metrics)', 'backup': 'Naktinė DB kopija',
+               'backup-full': 'Savaitinė pilna DB kopija', 'ui': 'Valdymo sąsaja'}
+OPERATION_TITLES = {'start': 'Paleisti', 'stop': 'Sustabdyti', 'restart': 'Perkrauti'}
+CONTAINER_LINES = ('200', '500', '2000')
+BACKUP_KINDS = {'worker': 'naktinė', 'full': 'pilna', 'fresh': 'šviežia', 'fresh-full': 'šviežia pilna',
+                'predeploy': "prieš deploy'ų"}
 BITBUCKET_URL = re.compile(r'(?:git@bitbucket\.org:|ssh://git@bitbucket\.org/|https://(?:[^@/\s]+@)?bitbucket\.org/)'
                            r'([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*?)(?:\.git)?/?')
 PIPELINES = {'deploy-stage': 'Deploy į stage', 'deploy-production': 'Deploy į prod', 'backup-now': 'Backup dabar',
@@ -220,9 +234,10 @@ def flag(form, key):
 class Plan:
     """One action: the --check command, the command "Vykdyti" runs, and its stdin (kept in memory only)."""
 
-    def __init__(self, action, title, check, run, stdin=None, timeout=600, run_codes=(0,)):
+    def __init__(self, action, title, check, run, stdin=None, timeout=600, run_codes=(0,), danger=None):
         self.action, self.title, self.check, self.run = action, title, check, run
         self.stdin, self.timeout, self.run_codes = stdin, timeout, run_codes
+        self.danger = danger  # what can go wrong, shown above "Vykdyti"
         self.kind = 'command'
 
 
@@ -264,8 +279,10 @@ def plan_add_project(form, status):
 
 def plan_remove_project(form, status):
     name = value(form, 'name', NAME, 'Projektas', required=True)
-    arguments = (['--with-backups'] if flag(form, 'with_backups') else []) + [name]
-    return Plan('remove-project', f'Pašalinti projektą {name}', *command('remove-project', arguments))
+    with_backups = flag(form, 'with_backups')
+    arguments = (['--with-backups'] if with_backups else []) + [name]
+    return Plan('remove-project', f'Pašalinti projektą {name}', *command('remove-project', arguments),
+                danger='Build katalogas ištrinamas' + (' kartu su DB kopijomis ir deploy\'ų istorija.' if with_backups else '.'))
 
 
 def plan_install_runner(form, status):
@@ -273,12 +290,21 @@ def plan_install_runner(form, status):
     if provider not in ('bitbucket', 'github'):
         raise Invalid('Runner\'is: bitbucket arba github.')
     name = value(form, 'runner_name', RUNNER_NAME, 'Vardas GitHub\'e') if provider == 'github' else ''
+    tarball = value(form, 'tarball', TARBALL, 'Archyvas', limit=420)
+    if tarball and ('..' in tarball.split('/') or tarball.startswith('//')):
+        raise Invalid(f'Netinkama reikšmė lauke „Archyvas“: {tarball[:80]}')
+    sha256 = value(form, 'sha256', SHA256, 'SHA-256')
+    if sha256 and provider != 'github':
+        raise Invalid('SHA-256 nurodomas tik GitHub runner\'iui (Bitbucket archyvą tikrina pati Atlassian nuoroda).')
+    if sha256 and not tarball:
+        raise Invalid('SHA-256 – tik kartu su archyvu (be jo imamas pin\'intas release\'as, jo hash\'as žinomas).')
     text = form.get('dialog', '')
     if not text.strip():
         raise Invalid('Įklijuok Bitbucket dialogo (GitHub puslapio) tekstą.')
     if len(text) > 64 * 1024:
         raise Invalid('Tekstas per ilgas.')
-    arguments = ['--provider', provider] + (['--name', name] if name else [])
+    arguments = ['--provider', provider] + (['--name', name] if name else []) + \
+        (['--tarball', tarball] if tarball else []) + (['--sha256', sha256] if sha256 else [])
     title = 'Įdiegti GitHub runner\'į' if provider == 'github' else 'Įdiegti Bitbucket runner\'į'
     return Plan('install-runner', title, *command('install-runner', arguments), stdin=text, timeout=1800)
 
@@ -313,6 +339,46 @@ def plan_install_metrics(form, status):
     return Plan('install-metrics', 'Worker\'io metrikos', *command('install-metrics', arguments))
 
 
+def plan_backup_local(form, status):
+    name = value(form, 'project', NAME, 'Projektas')
+    environment = form.get('environment', '')
+    if environment not in ('', 'stage', 'prod'):
+        raise Invalid('Aplinka: stage arba prod.')
+    if environment and not name:
+        raise Invalid('Aplinka nurodoma tik kartu su projektu.')
+    full = flag(form, 'full')
+    arguments = (['--full'] if full else []) + ([name] if name else []) + ([environment] if environment else [])
+    what = ' '.join(part for part in (name or 'visi projektai', environment) if part)
+    title = f'{"Pilna DB kopija" if full else "DB kopija"} dabar: {what}'
+    return Plan('backup-local', title, *command('backup-projects', arguments), timeout=12 * 3600)
+
+
+def plan_unit(form, status):
+    unit, operation = form.get('unit', ''), form.get('operation', '')
+    scope = unit[len('github-runner@'):] if unit.startswith('github-runner@') else None
+    allowed = ('start', 'stop', 'restart') if scope and SCOPE.fullmatch(scope) else UNIT_OPERATIONS.get(unit)
+    if not allowed:
+        raise Invalid('Nežinoma paslauga.')
+    if operation not in allowed:
+        raise Invalid(f'Paslaugai „{unit}“ galima tik: {", ".join(allowed)}.')
+    title = f'{OPERATION_TITLES[operation]}: ' + (f"GitHub runner'is {scope}" if scope else UNIT_TITLES[unit])
+    danger = None
+    if operation in ('stop', 'restart') and unit != 'ui' and unit != 'metrics':
+        danger = 'Vykdomas pipeline\'o žingsnis nutrūktų (peržiūra parodo, ar toks yra).'
+    if operation == 'stop' and unit == 'metrics':
+        danger = 'Prometheus nebegaus worker\'io metrikų, kol paslauga nebus paleista.'
+    return Plan('unit', title, *command('server-unit', [operation, unit]),
+                timeout=12 * 3600 if unit.startswith('backup') else 600, danger=danger)
+
+
+def plan_install_ssh(form, status):
+    sources = networks(form.get('sources', ''), 'Tinklai')
+    arguments = ['--from', ','.join(sources)] if sources else []
+    return Plan('install-ssh', 'SSH iš VPN (bin/install-ssh)', *command('install-ssh', arguments), timeout=1800,
+                danger='Iš kitų tinklų sshd priims tik raktus. Šią sąsają pasieki per SSH tunelį: patikrink, kad tavo '
+                       'tinklas yra sąraše arba kad jungiesi raktu.')
+
+
 def plan_add_backup_key(form, status):
     lines = [line.strip() for line in form.get('public_key', '').splitlines() if line.strip()]
     if len(lines) != 1 or not PUBLIC_KEY.fullmatch(lines[0]):
@@ -327,7 +393,8 @@ def plan_add_backup_key(form, status):
 
 def plan_remove_backup_key(form, status):
     name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
-    return Plan('remove-backup-key', f'Atimti kopijų raktą {name}', *command('add-backup-key', ['--remove', name]))
+    return Plan('remove-backup-key', f'Atimti kopijų raktą {name}', *command('add-backup-key', ['--remove', name]),
+                danger=f'Raktas {name} nebegalės parsisiųsti kopijų.')
 
 
 def plan_list_backup_keys(form, status):
@@ -391,7 +458,7 @@ ACTIONS = {'add-project': plan_add_project, 'remove-project': plan_remove_projec
            'install-metrics': plan_install_metrics, 'add-backup-key': plan_add_backup_key,
            'remove-backup-key': plan_remove_backup_key, 'list-backup-keys': plan_list_backup_keys,
            'prepare-host': plan_prepare_host, 'update': plan_update, 'update-setup': plan_update_setup,
-           'pipeline': plan_pipeline}
+           'pipeline': plan_pipeline, 'backup-local': plan_backup_local, 'unit': plan_unit, 'install-ssh': plan_install_ssh}
 
 
 # --- Running commands ----------------------------------------------------------------------------
@@ -645,25 +712,168 @@ def e(text):
     return html.escape(str(text), quote=True)
 
 
+# The look of setup's own boards (cron, backups): a dark control board, amber for what can be pressed, lamps
+# for states, hazard tape where something is lost. Served as /ui.css: the Content-Security-Policy allows no
+# inline style and no script, so the pages are static HTML (a running job's page reloads itself).
 STYLE = """
-body{font:14px/1.45 system-ui,sans-serif;margin:0;color:#1d2433;background:#f6f7f9}
-header{background:#1d2433;color:#fff;padding:.6em 1.2em;display:flex;gap:1.5em;align-items:baseline}
-header a{color:#cfe0ff;text-decoration:none}header strong{margin-right:auto}
-main{padding:1em 1.2em;max-width:1200px}
-h1{font-size:1.3em}h2{font-size:1.1em;margin-top:1.6em}
-table{border-collapse:collapse;background:#fff;margin:.4em 0;width:100%}
-th,td{border:1px solid #d9dde5;padding:.3em .5em;text-align:left;vertical-align:top}
-th{background:#eef1f6;font-weight:600}
-pre{background:#10141c;color:#e6e6e6;padding:.8em;overflow:auto;max-height:70vh;white-space:pre-wrap}
-.ok{color:#17733a}.warn{color:#9a6200}.bad{color:#b3261e;font-weight:600}.muted{color:#6b7280}
-form.action{background:#fff;border:1px solid #d9dde5;padding:.8em 1em;margin:.6em 0}
-form.action h3{margin:.1em 0 .5em;font-size:1em}
-label{display:block;margin:.35em 0}label span{display:inline-block;min-width:13em}
-input[type=text],textarea,select{font:inherit;padding:.25em;width:28em;max-width:100%}
-textarea{height:7em}button{font:inherit;padding:.35em 1em;cursor:pointer}
-button.run{background:#b3261e;color:#fff;border:0}.note{color:#4b5563;font-size:.92em}
-.box{background:#fff;border:1px solid #d9dde5;padding:.6em 1em;margin:.6em 0}
+:root{--board:#0c0e0b;--panel:#13170f;--panel-2:#191e14;--rule:#283022;--ink:#ece6d3;--dim:#8d917f;--faint:#5c6152;
+--amber:#ffb22e;--amber-glow:rgba(255,178,46,.35);--go:#4fe08c;--stop:#ff5b4f;--hazard:#f4c20d;--steel:#6f93c9;
+--mono:ui-monospace,"JetBrains Mono","Iosevka","IBM Plex Mono","SF Mono","Cascadia Code","DejaVu Sans Mono",Menlo,Consolas,monospace}
+*{box-sizing:border-box}
+html{background:var(--board);scrollbar-color:#3a4430 var(--board)}
+body{margin:0;min-height:100vh;color:var(--ink);font:13px/1.5 var(--mono);font-variant-numeric:tabular-nums;
+background:radial-gradient(1200px 500px at 15% -10%,rgba(255,178,46,.07),transparent 60%),
+repeating-linear-gradient(0deg,rgba(255,255,255,.012) 0 1px,transparent 1px 3px),var(--board)}
+a{color:var(--amber);text-decoration:none}a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+code{font:inherit;color:var(--ink);background:#0f120c;border:1px solid var(--rule);border-radius:3px;padding:1px 6px;word-break:break-word}
+p{margin:0 0 12px}
+.top{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:14px 28px;border-bottom:1px solid var(--rule);
+background:linear-gradient(180deg,#171c12,#10130d)}
+.mark{font-weight:800;letter-spacing:.32em;font-size:15px;color:var(--amber);text-shadow:0 0 14px var(--amber-glow)}
+.mark:hover{text-decoration:none}
+.mark small{display:block;letter-spacing:.18em;font-size:10px;color:var(--dim);font-weight:400;text-shadow:none}
+.spacer{flex:1}
+.nav{display:flex;gap:6px;flex-wrap:wrap}
+.btn,button{font:inherit;cursor:pointer;color:var(--ink);background:var(--panel-2);border:1px solid var(--rule);
+padding:6px 12px;border-radius:3px;letter-spacing:.06em;text-transform:uppercase;font-size:11px;font-weight:700;display:inline-block}
+.btn:hover,button:hover{border-color:var(--amber);color:var(--amber);text-decoration:none}
+.nav .on{border-color:var(--amber);color:var(--amber);box-shadow:inset 0 -2px 0 var(--amber)}
+button.run{background:var(--amber);border-color:var(--amber);color:#1a1205}
+button.run:hover{background:#ffc75e;color:#1a1205;box-shadow:0 0 18px var(--amber-glow)}
+button.stop{color:var(--stop);border-color:rgba(255,91,79,.45)}
+button.stop:hover{color:var(--stop);border-color:var(--stop)}
+.busy{display:flex;align-items:center;gap:8px;padding:5px 12px;border:1px solid var(--amber);border-radius:3px;
+color:var(--amber);font-size:11px;letter-spacing:.06em;text-transform:uppercase;font-weight:700}
+.who{text-align:right;color:var(--dim);font-size:11px;letter-spacing:.08em}
+.who b{display:block;color:var(--ink);font-size:20px;letter-spacing:.06em;font-weight:600}
+main{padding:22px 28px 60px;max-width:1400px;margin:0 auto}
+h1{font-size:12px;letter-spacing:.3em;text-transform:uppercase;color:var(--dim);margin:0 0 16px;font-weight:600}
+h2{display:flex;align-items:center;gap:12px;font-size:11px;letter-spacing:.28em;text-transform:uppercase;color:var(--amber);
+margin:34px 0 12px;font-weight:700}
+h2::after{content:"";flex:1;border-top:1px solid var(--rule)}
+h3{font-size:12px;letter-spacing:.12em;text-transform:uppercase;margin:0 0 12px;color:var(--ink)}
+h3 small{display:block;margin-top:2px;color:var(--faint);font-weight:400;letter-spacing:0;text-transform:none}
+.note{color:var(--dim);font-size:12px}
+.muted{color:var(--faint)}
+.chip{display:inline-block;padding:1px 7px;border-radius:2px;font-size:10px;letter-spacing:.12em;text-transform:uppercase;
+font-weight:700;border:1px solid var(--rule);color:var(--dim);white-space:nowrap;vertical-align:1px}
+.chip.ok{color:var(--go);border-color:rgba(79,224,140,.4)}.chip.bad{color:var(--stop);border-color:rgba(255,91,79,.45)}
+.chip.warn{color:var(--amber);border-color:#6b4e12}.chip.muted{color:var(--faint)}
+.chip.run{color:#1a1205;background:var(--amber);border-color:var(--amber)}
+.lamp{display:inline-block;flex:none;width:11px;height:11px;border-radius:50%;background:#20261a;box-shadow:inset 0 0 0 1px #2c3324;
+vertical-align:-1px}
+.lamp.ok{background:var(--go);box-shadow:0 0 8px rgba(79,224,140,.55)}
+.lamp.bad{background:var(--stop);box-shadow:0 0 8px rgba(255,91,79,.6)}
+.lamp.warn{background:var(--amber);box-shadow:0 0 8px var(--amber-glow)}
+.lamp.run{background:var(--amber);box-shadow:0 0 10px var(--amber-glow);animation:pulse 1.2s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.3}}
+.sign{display:inline-block;padding:3px 10px 2px;font-weight:800;letter-spacing:.24em;text-transform:uppercase;font-size:11px;
+color:#fff;border-radius:3px;background:var(--steel);box-shadow:inset 0 0 0 2px rgba(255,255,255,.25)}
+.sign.stage{background:#b8740f}
+.sign.prod{background:#b3261e;border:4px solid;border-image:repeating-linear-gradient(-45deg,var(--hazard) 0 5px,#111 5px 10px) 4}
+.callout{border:1px solid var(--rule);border-left:4px solid var(--go);background:var(--panel);padding:10px 14px;margin:0 0 16px;border-radius:3px}
+.callout.bad{border-left-color:var(--stop)}.callout.warn{border-left-color:var(--amber)}
+.callout p:last-child{margin:0}
+.tape{margin:0 0 16px;padding:12px 16px;color:#111;font-weight:800;letter-spacing:.04em;border-radius:3px;
+background:repeating-linear-gradient(-45deg,var(--hazard) 0 18px,#171717 18px 36px)}
+.tape span{background:var(--hazard);padding:3px 10px;line-height:2;box-decoration-break:clone;-webkit-box-decoration-break:clone}
+.stats{display:flex;gap:34px;flex-wrap:wrap;padding:14px 18px;background:var(--panel);border:1px solid var(--rule);border-radius:4px}
+.stat b{display:block;font-size:22px;color:var(--ink);font-weight:700}
+.stat span{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--faint)}
+.units{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:10px}
+.unit{display:flex;flex-direction:column;gap:6px;background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--faint);
+border-radius:4px;padding:12px 14px;animation:arrive .5s cubic-bezier(.2,.8,.2,1) both}
+.unit.is-ok{border-left-color:var(--go)}.unit.is-bad{border-left-color:var(--stop)}.unit.is-warn,.unit.is-run{border-left-color:var(--amber)}
+.unit .name{display:flex;align-items:center;gap:9px;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);font-weight:700}
+.unit .state{font-size:13px}
+.unit .detail{color:var(--dim);font-size:11px}
+.controls{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto;padding-top:6px}
+.controls form{margin:0}
+.controls .btn,.controls button{padding:3px 9px;font-size:10px}
+.board{width:100%;border-collapse:separate;border-spacing:0 6px}
+.board th{white-space:nowrap;text-align:left;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--faint);
+font-weight:600;padding:0 12px 2px}
+.board td{background:var(--panel);padding:10px;vertical-align:top;border-top:1px solid var(--rule);border-bottom:1px solid #0a0c08}
+.board td:first-child{border-radius:4px 0 0 4px;border-left:3px solid var(--amber)}
+.board td:last-child{border-radius:0 4px 4px 0}
+.board tr.is-ok td:first-child{border-left-color:var(--go)}.board tr.is-bad td:first-child{border-left-color:var(--stop)}
+.board tr.is-idle td:first-child{border-left-color:var(--faint)}
+.board td.project{min-width:12em;max-width:20em}
+.board td.project a{font-weight:700;font-size:14px}
+.board td.project small{display:block;margin-top:3px;color:var(--faint);font-size:11px;word-break:break-all}
+.when{display:block;font-size:11px}
+.board td.target{max-width:18em;word-break:break-all}
+.scroll{overflow-x:auto;scrollbar-color:#3a4430 transparent}
+.board .line{display:block;white-space:nowrap}
+.board .line+.line{margin-top:4px}
+.board .line b{display:inline-block;min-width:4.6em;color:var(--faint);font-weight:400;font-size:10px;letter-spacing:.12em;text-transform:uppercase}
+.board tbody tr{animation:arrive .5s cubic-bezier(.2,.8,.2,1) both}
+@keyframes arrive{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+.facts{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--rule);margin:0 0 12px}
+.facts th{width:16em;text-align:left;vertical-align:top;font-size:10px;letter-spacing:.18em;text-transform:uppercase;
+color:var(--faint);font-weight:600;padding:10px 14px;border-bottom:1px solid var(--rule)}
+.facts td{padding:9px 14px;border-bottom:1px solid var(--rule);word-break:break-word}
+.facts tr:last-child th,.facts tr:last-child td{border-bottom:none}
+.term{background:#070806;border:1px solid var(--rule);border-radius:4px;overflow:auto;max-height:70vh;margin:0 0 16px;
+box-shadow:inset 0 0 40px rgba(0,0,0,.6)}
+.term ol{margin:0;padding:12px 0;counter-reset:l;list-style:none}
+.term li{counter-increment:l;display:grid;grid-template-columns:56px 1fr;min-height:1.5em;white-space:pre-wrap;word-break:break-all;color:#d8e8c8}
+.term li::before{content:counter(l);text-align:right;padding-right:14px;color:var(--faint);user-select:none}
+.term li:hover{background:#10140c}
+pre.json{margin:0 0 16px;padding:12px 16px;background:#070806;border:1px solid var(--rule);border-radius:4px;color:#d8e8c8;
+font:inherit;overflow:auto;max-height:60vh}
+.subnav{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
+.subnav select{width:auto}
+.list{width:100%;border-collapse:collapse}
+.list th{text-align:left;font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);font-weight:600;
+padding:6px 10px;border-bottom:1px solid var(--rule)}
+.list td{padding:7px 10px;border-bottom:1px solid var(--rule);word-break:break-all}
+.deck{display:grid;grid-template-columns:repeat(auto-fill,minmax(430px,1fr));gap:12px;align-items:start}
+form.action{margin:0;background:var(--panel);border:1px solid var(--rule);border-top:2px solid var(--amber);border-radius:4px;padding:14px 16px}
+form.action.danger{border-top:7px solid transparent;
+background:linear-gradient(var(--panel),var(--panel)) padding-box,repeating-linear-gradient(-45deg,var(--hazard) 0 10px,#171717 10px 20px) border-box}
+label{display:grid;grid-template-columns:minmax(9em,14em) minmax(0,1fr);gap:10px;align-items:center;margin:0 0 8px;color:var(--dim);font-size:12px}
+label.check{display:flex;gap:9px;align-items:flex-start;color:var(--ink)}
+input[type=text],textarea,select{font:inherit;color:var(--ink);background:#0f120c;border:1px solid var(--rule);border-radius:3px;
+padding:6px 9px;width:100%;caret-color:var(--amber)}
+input[type=text]:focus,textarea:focus,select:focus{outline:none;border-color:var(--amber)}
+input::placeholder,textarea::placeholder{color:var(--faint)}
+textarea{min-height:7em;resize:vertical}
+input[type=checkbox]{accent-color:var(--amber);width:15px;height:15px;margin:1px 0 0}
+.form-foot{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;margin-top:12px}
+.form-foot .note{margin:0}
+.form-foot button{flex:none}
+.runs{list-style:none;margin:0;padding:0;border-top:1px solid var(--rule)}
+.runs li{display:grid;grid-template-columns:18px 150px minmax(0,1fr) 110px 150px;gap:14px;align-items:center;padding:9px 6px;
+border-bottom:1px solid var(--rule)}
+.runs li:hover{background:var(--panel)}
+.bar{height:6px;background:#1c2217;border-radius:3px;overflow:hidden;margin:0 0 16px}
+.bar i{display:block;height:100%;background:var(--go)}
+.bar.bad i{background:var(--stop)}
+.bar.run i{background:repeating-linear-gradient(-45deg,var(--amber) 0 8px,#8a5c10 8px 16px);background-size:22px 22px;
+animation:march 1s linear infinite}
+@keyframes march{to{background-position:22px 0}}
+details{background:var(--panel);border:1px solid var(--rule);border-radius:4px;margin:0 0 10px}
+details>summary{cursor:pointer;padding:10px 14px;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);
+font-weight:700;list-style:none}
+details>summary::-webkit-details-marker{display:none}
+details>summary::before{content:"\\25B8  ";color:var(--amber)}
+details[open]>summary::before{content:"\\25BE  "}
+details>.inner{padding:0 14px 12px}
+details .term{margin:0}
+.empty{padding:30px;text-align:center;color:var(--dim);border:1px dashed var(--rule);border-radius:4px}
+.foot{margin-top:28px;color:var(--faint);font-size:11px}
+""" + ''.join(f'.unit:nth-child({index}),.board tbody tr:nth-child({index}){{animation-delay:{(index - 1) * 45}ms}}'
+              for index in range(2, 21)) + """
+@media (max-width:900px){.top{padding:12px 16px}main{padding:18px 16px}.deck{grid-template-columns:1fr}
+label{grid-template-columns:1fr;gap:4px}.board thead{display:none}.board,.board tbody,.board tr,.board td{display:block;width:100%}
+.board tr{margin-bottom:10px}.board td{border-radius:0!important;border-top:none;border-bottom:none;padding:6px 14px}
+.board td:first-child{padding-top:12px}.runs li{grid-template-columns:18px 1fr 100px}.runs li .hide{display:none}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important}}
 """
+NAVIGATION = (('overview', '/', 'Apžvalga'), ('actions', '/actions', 'Veiksmai'), ('logs', '/logs', 'Žurnalai'),
+              ('metrics', '/worker-metrics', 'Metrikos'))
 
 
 def ago(moment, now=None):
@@ -687,7 +897,33 @@ def local_time(moment):
 
 
 def badge(text, kind):
-    return f'<span class="{kind}">{e(text)}</span>'
+    return f'<span class="chip {kind}">{e(text)}</span>'
+
+
+def lamp(kind):
+    return f'<span class="lamp {kind}"></span>'
+
+
+def term(text, empty='(tuščia)'):
+    """Output as numbered lines on the dark terminal."""
+    lines = str(text).splitlines() or [empty]
+    return '<div class="term"><ol>' + ''.join(f'<li>{e(line)}</li>' for line in lines) + '</ol></div>'
+
+
+def facts(rows):
+    return '<table class="facts">' + ''.join(f'<tr><th>{e(name)}</th><td>{cell}</td></tr>' for name, cell in rows) + '</table>'
+
+
+def unit_kind(units, name):
+    unit = units.get(name)
+    if not unit or unit.get('LoadState') == 'not-found':
+        return 'muted'
+    active = unit.get('ActiveState', '?')
+    return 'ok' if active == 'active' else 'bad' if active == 'failed' else 'warn'
+
+
+def installed(units, name):
+    return unit_kind(units, name) != 'muted'
 
 
 def unit_state(units, name):
@@ -695,10 +931,20 @@ def unit_state(units, name):
     if not unit or unit.get('LoadState') == 'not-found':
         return badge('neįdiegta', 'muted')
     active = unit.get('ActiveState', '?')
-    kind = 'ok' if active == 'active' else 'bad' if active == 'failed' else 'warn'
     text = {'active': 'veikia', 'inactive': 'neveikia', 'failed': 'klaida', 'activating': 'paleidžiama'}.get(active, active)
-    return badge(text, kind) + (f' <span class="muted">nuo {e(unit["ActiveEnterTimestamp"])}</span>'
-                                if active == 'active' and unit.get('ActiveEnterTimestamp') else '')
+    return badge(text, unit_kind(units, name)) + (f' <span class="muted">nuo {e(unit["ActiveEnterTimestamp"])}</span>'
+                                                  if active == 'active' and unit.get('ActiveEnterTimestamp') else '')
+
+
+def environment_kind(state):
+    """The stripe of a project environment's row: bad when something needs a look, idle when not deployed from here."""
+    deploys = state.get('deploys') or {}
+    newest = (state.get('backups') or {}).get('newest')
+    unhealthy = any(item.get('health') == 'unhealthy' for item in state.get('containers', []))
+    if (deploys.get('last') or {}).get('failed') or state.get('secrets') == 'stopped' or unhealthy or \
+            (state.get('declared') and (not newest or time.time() - newest['time'] >= 26 * 3600)):
+        return 'bad'
+    return 'ok' if state.get('declared') else 'idle'
 
 
 class Page:
@@ -707,66 +953,120 @@ class Page:
     def __init__(self, user, token):
         self.user, self.token = user, token
 
-    def layout(self, title, body, refresh=None):
+    def layout(self, title, body, refresh=None, section=None):
         head = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ''
-        return (f'<!doctype html><html lang="lt"><head><meta charset="utf-8">{head}<title>{e(title)} · setup-server</title>'
-                f'<link rel="stylesheet" href="/ui.css"></head><body><header><strong>setup-server · {e(socket.gethostname())}</strong>'
-                '<a href="/">Apžvalga</a><a href="/actions">Veiksmai</a><a href="/logs">Žurnalai</a>'
-                f'<span class="muted">{e(self.user)}</span></header><main><h1>{e(title)}</h1>{body}</main></body></html>')
+        navigation = ''.join(f'<a class="btn{" on" if key == section else ""}" href="{href}">{e(label)}</a>'
+                             for key, href, label in NAVIGATION)
+        busy = running_job()
+        busy = (f'<a class="busy" href="/job/{e(busy)}">{lamp("run")}veiksmas eina</a>') if busy else ''
+        return (f'<!doctype html><html lang="lt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+                f'{head}<title>{e(title)} · setup-server</title><link rel="stylesheet" href="/ui.css"></head><body>'
+                f'<header class="top"><a class="mark" href="/">SETUP-SERVER<small>{e(socket.gethostname())}</small></a>'
+                f'<nav class="nav">{navigation}</nav><span class="spacer"></span>{busy}'
+                f'<div class="who"><b>{e(time.strftime("%H:%M"))}</b>{e(self.user)}</div></header>'
+                f'<main><h1>{e(title)}</h1>{body}</main></body></html>')
 
-    def form(self, action, title, fields, button='Peržiūrėti', note=''):
-        return (f'<form id="form-{e(action)}" class="action" method="post" action="/preview"><h3>{e(title)}</h3>'
-                f'<input type="hidden" name="csrf" value="{e(self.token)}"><input type="hidden" name="action" value="{e(action)}">'
-                f'{fields}{f"<p class=note>{note}</p>" if note else ""}<button>{e(button)}</button></form>')
+    def hidden(self, action, fields=()):
+        return (f'<input type="hidden" name="csrf" value="{e(self.token)}"><input type="hidden" name="action" value="{e(action)}">' +
+                ''.join(f'<input type="hidden" name="{e(key)}" value="{e(text)}">' for key, text in fields))
+
+    def form(self, action, title, fields, button='Peržiūrėti', note='', command='', danger=False):
+        return (f'<form id="form-{e(action)}" class="action{" danger" if danger else ""}" method="post" action="/preview">'
+                f'<h3>{e(title)}{f"<small>{e(command)}</small>" if command else ""}</h3>{self.hidden(action)}{fields}'
+                f'<div class="form-foot"><p class="note">{note}</p><button>{e(button)}</button></div></form>')
+
+    def button(self, action, fields, label, kind=''):
+        """A one-button form (a unit's start/stop/restart): it leads to the same preview as any action."""
+        return (f'<form method="post" action="/preview">{self.hidden(action, fields.items())}'
+                f'<button class="{kind}">{e(label)}</button></form>')
+
+    def unit_controls(self, unit, operations):
+        return ''.join(self.button('unit', {'unit': unit, 'operation': operation}, OPERATION_TITLES[operation],
+                                   'stop' if operation == 'stop' else '') for operation in operations)
+
+    @staticmethod
+    def tile(name, kind, state, detail='', controls=''):
+        detail = f'<div class="detail">{detail}</div>' if detail else ''
+        controls = f'<div class="controls">{controls}</div>' if controls else ''
+        return f'<div class="unit is-{kind}"><div class="name">{lamp(kind)}{e(name)}</div><div class="state">{state}</div>{detail}{controls}</div>'
 
     # --- Overview ---
     def overview(self, data, error):
         if data is None:
-            return self.layout('Apžvalga', f'<p class="bad">Būsenos nepavyko gauti: {e(error)}</p>')
+            return self.layout('Apžvalga', f'<div class="callout bad"><p>Būsenos nepavyko gauti: {e(error)}</p></div>',
+                               section='overview')
         units = data.get('units', {})
         versions = data.get('versions') or {}
-        rows = []
-        installed, checkout = versions.get('installed'), versions.get('checkout')
-        server = e(installed or '?') + (f' <span class="warn">(klonas: {e(checkout)}; '
-                                        'įdiegtos kopijos atnaujinamos per bin/update)</span>'
-                                        if checkout and installed and checkout != installed else '')
-        rows.append(('setup-server', server))
-        rows.append(('setup (bendras checkout\'as)', e(versions.get('setup') or '?') +
-                     ' <a href="/actions#form-update-setup">atnaujinti</a>'))
-        rows.append(("Bitbucket runner'is", unit_state(units, 'setup-server-runner.service')))
+        projects = data.get('projects', [])
+        disk = data.get('disk') or {}
+        share = disk['available'] / disk['size'] if disk.get('size') else None
+        stats = [(len(projects), 'projektai'), (sum(len(item.get('environments', {})) for item in projects), 'aplinkos'),
+                 (f'{share:.0%}' if share is not None else '?', 'laisva diske'),
+                 (versions.get('installed') or '?', 'setup-server'), (versions.get('setup') or '?', 'setup')]
+        body = '<div class="stats">' + ''.join(f'<div class="stat"><b>{e(number)}</b><span>{e(label)}</span></div>'
+                                               for number, label in stats) + '</div>'
+        tiles = []
+        installed_version, checkout = versions.get('installed'), versions.get('checkout')
+        differs = checkout and installed_version and checkout != installed_version
+        tiles.append(self.tile('setup-server', 'warn' if differs else 'ok', e(installed_version or '?'),
+                               f'klonas: {e(checkout)}; įdiegtos kopijos atnaujinamos per bin/update' if differs else '',
+                               '<a class="btn" href="/actions#form-update">Atnaujinti</a>'))
+        tiles.append(self.tile("setup (bendras checkout'as)", 'ok' if versions.get('setup') else 'warn', e(versions.get('setup') or '?'),
+                               controls='<a class="btn" href="/actions#form-update-setup">atnaujinti</a>'))
+        runner = 'setup-server-runner.service'
+        tiles.append(self.tile("Bitbucket runner'is", unit_kind(units, runner), unit_state(units, runner),
+                               controls=self.unit_controls('runner', UNIT_OPERATIONS['runner']) if installed(units, runner)
+                               else '<a class="btn" href="/actions#form-install-runner">Įdiegti</a>'))
         for scope in data.get('github_runners', []):
-            rows.append((f"GitHub runner'is {scope}", unit_state(units, f'setup-server-github-runner@{scope}.service')))
-        for unit, label in (('setup-server-backup', 'Naktinės DB kopijos'),
-                            ('setup-server-backup-full', 'Savaitinės pilnos DB kopijos')):
+            name = f'setup-server-github-runner@{scope}.service'
+            tiles.append(self.tile(f"GitHub runner'is {scope}", unit_kind(units, name), unit_state(units, name),
+                                   controls=self.unit_controls(f'github-runner@{scope}', ('start', 'stop', 'restart'))))
+        for unit, label, operation in (('setup-server-backup', 'Naktinės DB kopijos', 'backup'),
+                                       ('setup-server-backup-full', 'Savaitinės pilnos DB kopijos', 'backup-full')):
             timer, service = units.get(f'{unit}.timer', {}), units.get(f'{unit}.service', {})
             if timer and timer.get('LoadState') != 'not-found':
                 result = service.get('Result')
                 last = timer.get('LastTriggerUSec') or service.get('ExecMainExitTimestamp')
-                text = unit_state(units, f'{unit}.timer') + (f'; paskutinė {e(last)}' if last else '; dar nevyko')
+                kind = 'bad' if result and result != 'success' else unit_kind(units, f'{unit}.timer')
+                if service.get('ActiveState') == 'activating':
+                    kind = 'run'
+                text = unit_state(units, f'{unit}.timer')
                 if result:
-                    text += ' – ' + (badge('pavyko', 'ok') if result == 'success' else badge(f'nepavyko ({result})', 'bad'))
-                if timer.get('NextElapseUSecRealtime'):
-                    text += f'; kita {e(timer["NextElapseUSecRealtime"])}'
+                    text += ' ' + (badge('pavyko', 'ok') if result == 'success' else badge(f'nepavyko ({result})', 'bad'))
+                detail = (f'paskutinė {e(last)}' if last else 'dar nevyko') + \
+                    (f'<br>kita {e(timer["NextElapseUSecRealtime"])}' if timer.get('NextElapseUSecRealtime') else '')
+                controls = self.button('unit', {'unit': operation, 'operation': 'start'}, 'Paleisti dabar') \
+                    if installed(units, f'{unit}.service') else ''
+                tiles.append(self.tile(label, kind, text, detail, controls))
             else:
-                text = badge('neįdiegtos', 'muted') + ' <a href="/actions#form-install-backups">įdiegti</a>'
-            rows.append((label, text))
-        rows.append(('Metrikos (/metrics)', unit_state(units, 'setup-server-metrics.service')))
-        disk = data.get('disk')
-        if disk and disk.get('size'):
-            share = disk['available'] / disk['size']
-            rows.append((f'Diskas ({e(disk["path"])})', badge(f'laisva {size(disk["available"])} iš {size(disk["size"])} '
-                                                            f'({share:.0%})', 'ok' if share > 0.15 else 'bad')))
-        body = '<h2>Serveris</h2><table>' + ''.join(f'<tr><th>{e(name)}</th><td>{cell}</td></tr>' for name, cell in rows) + '</table>'
+                tiles.append(self.tile(label, 'muted', badge('neįdiegtos', 'muted'),
+                                       controls='<a class="btn" href="/actions#form-install-backups">įdiegti</a>'))
+        metrics = 'setup-server-metrics.service'
+        tiles.append(self.tile('Metrikos (/metrics)', unit_kind(units, metrics), unit_state(units, metrics),
+                               controls=(self.unit_controls('metrics', UNIT_OPERATIONS['metrics']) +
+                                         '<a class="btn" href="/worker-metrics">Rodyti</a>') if installed(units, metrics)
+                               else '<a class="btn" href="/actions#form-install-metrics">Įdiegti</a>'))
+        ui = 'setup-server-ui.service'
+        tiles.append(self.tile('Valdymo sąsaja', unit_kind(units, ui), unit_state(units, ui),
+                               "perkrovus perskaitomi ui.env token'ai; peržiūros formos dingsta",
+                               self.unit_controls('ui', UNIT_OPERATIONS['ui']) if installed(units, ui) else ''))
+        if disk.get('size'):
+            tiles.append(self.tile(f'Diskas ({disk["path"]})', 'ok' if share > 0.15 else 'bad',
+                                   badge(f'laisva {size(disk["available"])} iš {size(disk["size"])} ({share:.0%})',
+                                         'ok' if share > 0.15 else 'bad')))
+        body += '<h2>Serveris</h2><div class="units">' + ''.join(tiles) + '</div>'
         body += '<h2>Projektai</h2>' + self.projects_table(data)
         if data.get('errors'):
-            body += '<h2>Ko nepavyko perskaityti</h2><ul>' + ''.join(f'<li class="warn">{e(item)}</li>' for item in data['errors']) + '</ul>'
-        body += f'<p class="muted">Būsena: {e(local_time(data.get("generated", time.time())))}. <a href="/?fresh=1">Atnaujinti</a></p>'
-        return self.layout('Apžvalga', body)
+            body += '<h2>Ko nepavyko perskaityti</h2><div class="callout warn">' + \
+                ''.join(f'<p>{e(item)}</p>' for item in data['errors']) + '</div>'
+        body += (f'<p class="foot">Būsena: {e(local_time(data.get("generated", time.time())))} · '
+                 '<a href="/?fresh=1">Atnaujinti</a></p>')
+        return self.layout('Apžvalga', body, section='overview')
 
     def projects_table(self, data):
         projects = data.get('projects', [])
         if not projects:
-            return '<p>Projektų dar nėra. <a href="/actions#add-project">Pridėti projektą</a></p>'
+            return '<div class="empty">Projektų dar nėra. <a href="/actions#add-project">Pridėti projektą</a></div>'
         rows = []
         for entry in projects:
             environments = entry.get('environments', {}) or {'': None}
@@ -777,27 +1077,28 @@ class Page:
                 runs = self.run_cell(found[0], repository) if found else e(error) if error else 'dar nebuvo'
             elif entry.get('repository'):
                 runs = '<span class="muted">GitHub: dar nepalaikoma</span>'
-            first = True
-            for environment, state in environments.items():
-                cells = ''
-                if first:
-                    span = len(environments)
-                    cells += (f'<td rowspan="{span}"><a href="/project/{e(entry["name"])}">{e(entry["name"])}</a></td>'
-                              f'<td rowspan="{span}">{e(entry.get("repository") or "?")}'
-                              f'{"<br>" + e(entry["code_repository"]) if entry.get("code_repository") else ""}</td>')
+            for index, (environment, state) in enumerate(environments.items()):
+                first = index == 0
+                cells = (f'<td class="project"><a href="/project/{e(entry["name"])}">{e(entry["name"])}</a>'
+                         f'<small>{e(entry.get("repository") or "?")}</small>'
+                         f'{"<small>" + e(entry["code_repository"]) + "</small>" if entry.get("code_repository") else ""}</td>') if first \
+                    else '<td></td>'
                 if state is None:
-                    cells += '<td colspan="7" class="muted">nedeploy\'inta iš čia (nėra env/stage.env ar env/prod.env)</td>'
+                    kind = 'idle'
+                    cells += '<td colspan="5" class="muted">nedeploy\'inta iš čia (nėra env/stage.env ar env/prod.env)</td>'
                 else:
-                    cells += (f'<td>{e(environment)}</td><td>{self.target(entry, environment)}</td><td>{self.deploy_cell(state)}</td>'
-                              f'<td>{self.backup_cell(state)}</td><td>{self.full_backup_cell(state)}</td>'
-                              f'<td>{self.secrets_cell(state)}</td><td>{self.containers_cell(state)}</td>')
-                if first:
-                    cells += f'<td rowspan="{len(environments)}">{runs}</td>'
-                    first = False
-                rows.append(f'<tr>{cells}</tr>')
-        return ('<table><tr><th>Projektas</th><th>Repo</th><th>Aplinka</th><th>Taikinys</th><th>Paskutinis deploy\'us</th>'
-                '<th>Naujausia kopija</th><th>Pilna kopija</th><th>Secrets</th><th>Konteineriai</th><th>Pipeline</th></tr>'
-                + ''.join(rows) + '</table>')
+                    kind = environment_kind(state)
+                    cells += (f'<td><span class="sign {e(environment)}">{e(environment)}</span></td>'
+                              f'<td class="target">{self.target(entry, environment)}</td><td>{self.deploy_cell(state)}</td>'
+                              f'<td><span class="line"><b>naktinė</b> {self.backup_cell(state)}</span>'
+                              f'<span class="line"><b>pilna</b> {self.full_backup_cell(state)}</span></td>'
+                              f'<td><span class="line"><b>secrets</b> {self.secrets_cell(state)}</span>'
+                              f'<span class="line"><b>visi</b> {self.containers_cell(state)}</span></td>')
+                cells += f'<td>{runs if first else ""}</td>'
+                rows.append(f'<tr class="is-{kind}">{cells}</tr>')
+        return ('<div class="scroll"><table class="board"><thead><tr><th>Projektas · repo</th><th>Aplinka</th><th>Taikinys</th>'
+                '<th>Paskutinis deploy\'us</th><th>Naujausia kopija</th><th>Konteineriai</th>'
+                '<th>Pipeline</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div>')
 
     @staticmethod
     def target(entry, environment):
@@ -832,7 +1133,7 @@ class Page:
             return badge('nėra', 'bad' if state.get('declared') else 'muted')
         age = time.time() - newest['time']
         return badge(ago(newest['time']), 'ok' if age < 26 * 3600 else 'bad') + \
-            f', {e(size(newest["size"]))}, laikoma {backups.get("count", 0)}'
+            f' {e(size(newest["size"]))}, laikoma {backups.get("count", 0)}'
 
     @staticmethod
     def full_backup_cell(state):
@@ -843,7 +1144,7 @@ class Page:
             return badge('nėra', 'muted')
         age = time.time() - newest['time']
         return badge(ago(newest['time']), 'ok' if age < 8 * 24 * 3600 else 'bad') + \
-            f', {e(size(newest["size"]))}, laikoma {backups.get("count", 0)}'
+            f' {e(size(newest["size"]))}, laikoma {backups.get("count", 0)}'
 
     @staticmethod
     def fresh_backup_cell(state):
@@ -877,204 +1178,313 @@ class Page:
         pattern = (target.get('selector') or {}).get('pattern') or target.get('ref_name') or ''
         link = f'{BITBUCKET_WEB}/{quote(repository[0])}/{quote(repository[1])}/pipelines/results/{int(run.get("build_number", 0))}'
         return (f'<a href="{e(link)}">#{e(run.get("build_number", "?"))}</a> {e(pattern)} {badge(result, kind)} '
-                f'<span class="muted">{e((run.get("created_on") or "")[:16].replace("T", " "))}</span>')
+                f'<span class="muted when">{e((run.get("created_on") or "")[:16].replace("T", " "))}</span>')
 
     # --- One project ---
     def project(self, data, name):
         entry = next((item for item in (data or {}).get('projects', []) if item.get('name') == name), None)
         if entry is None:
             return None
-        body = (f'<table><tr><th>Aplinkos repo</th><td>{e(entry.get("repository") or "?")}</td></tr>'
-                f'<tr><th>Kodo repo</th><td>{e(entry.get("code_repository") or "—")}</td></tr>'
-                f'<tr><th>Build katalogas</th><td>{e(data.get("root", ""))}/projects/{e(name)}/{e(entry.get("layout") or "")}</td></tr>'
-                f'<tr><th>PROJECT_NAME</th><td>{e(entry.get("project_name"))}</td></tr></table>')
+        body = facts([('Aplinkos repo', e(entry.get('repository') or '?')),
+                      ('Kodo repo', e(entry.get('code_repository') or '—')),
+                      ('Build katalogas', f'{e(data.get("root", ""))}/projects/{e(name)}/{e(entry.get("layout") or "")}'),
+                      ('PROJECT_NAME', e(entry.get('project_name')))])
         for environment, state in entry.get('environments', {}).items():
-            body += (f'<h2>{e(environment)}</h2><table><tr><th>Taikinys</th><td>{self.target(entry, environment)}'
-                     f' <span class="muted">(Docker context {e(state["context"])})</span></td></tr>'
-                     f'<tr><th>Paskutinis deploy\'us</th><td>{self.deploy_cell(state)}</td></tr>')
+            body += f'<h2><span class="sign {e(environment)}">{e(environment)}</span> aplinka</h2>'
+            rows = [('Taikinys', f'{self.target(entry, environment)} <span class="muted">(Docker context {e(state["context"])})</span>'),
+                    ("Paskutinis deploy'us", self.deploy_cell(state))]
             success = (state.get('deploys') or {}).get('last_success')
             if success and success != state['deploys']['last']:
-                body += f'<tr><th>Paskutinis pavykęs</th><td>{e(success["ref"])} {e(success["commit"])} {e(ago(success["at"]))}</td></tr>'
-            body += (f'<tr><th>Naujausia kopija</th><td>{self.backup_cell(state)}'
-                     f'{" <span class=muted>" + e(state["backups"]["newest"]["name"]) + "</span>" if (state.get("backups") or {}).get("newest") else ""}</td></tr>'
-                     f'<tr><th>Pilna kopija (savaitinė)</th><td>{self.full_backup_cell(state)}'
-                     f'{" <span class=muted>" + e(state["full_backups"]["newest"]["name"]) + "</span>" if (state.get("full_backups") or {}).get("newest") else ""}</td></tr>'
-                     f'<tr><th>Šviežia kopija (db-pull fresh=1)</th><td>{self.fresh_backup_cell(state)}</td></tr>'
-                     f'<tr><th>Secret store</th><td>{self.secrets_cell(state)} <span class="muted">{e(state["compose_project"])}-secrets</span></td></tr></table>')
+                rows.append(('Paskutinis pavykęs', f'{e(success["ref"])} {e(success["commit"])} {e(ago(success["at"]))}'))
+            newest = lambda key: (f' <span class="muted">{e(state[key]["newest"]["name"])}</span>'
+                                  if (state.get(key) or {}).get('newest') else '')
+            rows += [('Naujausia kopija', self.backup_cell(state) + newest('backups')),
+                     ('Pilna kopija (savaitinė)', self.full_backup_cell(state) + newest('full_backups')),
+                     ('Šviežia kopija (db-pull fresh=1)', self.fresh_backup_cell(state)),
+                     ('Secret store', f'{self.secrets_cell(state)} <span class="muted">{e(state["compose_project"])}-secrets</span>')]
+            body += facts(rows)
             if state.get('containers'):
-                body += '<table><tr><th>Konteineris</th><th>Būsena</th><th>Sveikata</th><th>Status</th></tr>' + ''.join(
-                    f'<tr><td>{e(item["name"])}</td><td>{badge(item["state"], "ok" if item["state"] == "running" else "warn")}</td>'
-                    f'<td>{badge(item.get("health") or "—", {"healthy": "ok", "unhealthy": "bad"}.get(item.get("health"), "muted"))}</td>'
-                    f'<td class="muted">{e(item["status"])}</td></tr>' for item in state['containers']) + '</table>'
+                body += ('<table class="board"><thead><tr><th>Konteineris</th><th>Būsena</th><th>Sveikata</th><th>Status</th>'
+                         '<th>Log\'ai</th></tr></thead><tbody>' + ''.join(
+                             f'<tr class="is-{"ok" if item["state"] == "running" and item.get("health") != "unhealthy" else "bad"}">'
+                             f'<td>{e(item["name"])}</td><td>{badge(item["state"], "ok" if item["state"] == "running" else "warn")}</td>'
+                             f'<td>{badge(item.get("health") or "—", {"healthy": "ok", "unhealthy": "bad"}.get(item.get("health"), "muted"))}</td>'
+                             f'<td class="muted">{e(item["status"])}</td>'
+                             f'<td><a class="btn" href="/project/{e(name)}/logs?env={e(quote(environment))}&amp;container={e(quote(item["name"]))}">'
+                             'Rodyti</a></td></tr>' for item in state['containers']) + '</tbody></table>')
+            body += self.backup_list(state)
+            body += '<div class="deck">' + self.form(
+                'backup-local', 'Kopija dabar serveryje',
+                f'<input type="hidden" name="project" value="{e(name)}"><input type="hidden" name="environment" value="{e(environment)}">'
+                '<label class="check"><input type="checkbox" name="full" value="yes"> pilna – visų lentelių duomenys (--full)</label>',
+                note='Be Bitbucket: veikia ir GitHub projektams. Peržiūra parodo secret store ir ką rotacija ištrintų.',
+                command=f'setup-server-backup [--full] {name} {environment}') + '</div>'
         body += '<h2>Pipeline\'ai</h2>' + self.pipelines(entry)
-        body += '<h2>Pašalinti</h2>' + self.form('remove-project', f'Pašalinti build katalogą {name}',
-                                                  f'<input type="hidden" name="name" value="{e(name)}">'
-                                                  '<label><input type="checkbox" name="with_backups" value="yes"> kartu su DB kopijomis ir '
-                                                  'deploy\'ų istorija (dingsta rollback\'as)</label>',
-                                                  note='Peržiūra (--check) parodo dydį, kopijas ir ar katalogą naudoja konteineris.')
-        return self.layout(f'Projektas {name}', body)
+        body += '<h2>Pašalinti</h2><div class="deck">' + self.form(
+            'remove-project', f'Pašalinti build katalogą {name}',
+            f'<input type="hidden" name="name" value="{e(name)}">'
+            '<label class="check"><input type="checkbox" name="with_backups" value="yes"> kartu su DB kopijomis ir '
+            'deploy\'ų istorija (dingsta rollback\'as)</label>',
+            note='Peržiūra (--check) parodo dydį, kopijas ir ar katalogą naudoja konteineris.',
+            command=f'bin/remove-project {name}', danger=True) + '</div>'
+        return self.layout(f'Projektas {name}', body, section='overview')
+
+    @staticmethod
+    def backup_list(state):
+        files = state.get('backup_files') or []
+        if not files:
+            return ''
+        return (f'<details><summary>Visos kopijos ({len(files)})</summary><div class="inner"><table class="list">'
+                '<tr><th>Rūšis</th><th>Failas</th><th>Laikas</th><th>Dydis</th></tr>' +
+                ''.join(f'<tr><td>{badge(BACKUP_KINDS.get(item["kind"], item["kind"]), "muted")}</td><td>{e(item["name"])}</td>'
+                        f'<td>{e(local_time(item["time"]))} <span class="muted">{e(ago(item["time"]))}</span></td>'
+                        f'<td>{e(size(item["size"]))}</td></tr>' for item in files) +
+                '</table><p class="note">Parsisiųsti: make db-pull (raktas – bin/add-backup-key).</p></div></details>')
 
     def pipelines(self, entry):
         repository = bitbucket_repository(entry.get('repository') or '')
         if repository is None:
-            return ('<p class="muted">Pipeline\'ų paleidimas – tik Bitbucket projektams; GitHub dar nepalaikomas. '
-                    'Deploy\'us paleisk GitHub Actions.</p>')
+            return ('<div class="callout warn"><p>Pipeline\'ų paleidimas – tik Bitbucket projektams; GitHub dar nepalaikomas. '
+                    'Deploy\'us paleisk GitHub Actions; kopiją dabar – formoje „Kopija dabar serveryje“.</p></div>')
         found, error = pipeline_runs(entry['name'], repository)
         body = ''
         if error:
-            body += f'<p class="warn">Bitbucket: {e(error)}</p>'
+            body += f'<div class="callout warn"><p>Bitbucket: {e(error)}</p></div>'
         elif found:
-            body += '<table><tr><th>Nr.</th><th>Pipeline\'as</th><th>Rezultatas</th><th>Kas</th></tr>' + ''.join(
-                f'<tr><td colspan="3">{self.run_cell(run, repository)}</td><td>{e(((run.get("creator") or {}).get("display_name")) or "")}</td></tr>'
-                for run in found) + '</table>'
+            body += '<table class="board"><thead><tr><th>Nr. · pipeline\'as · rezultatas</th><th>Kas</th></tr></thead><tbody>' + ''.join(
+                f'<tr class="is-idle"><td>{self.run_cell(run, repository)}</td>'
+                f'<td>{e(((run.get("creator") or {}).get("display_name")) or "")}</td></tr>' for run in found) + '</tbody></table>'
         name, branch = e(entry['name']), e(entry.get('branch') or 'master')
         hidden = f'<input type="hidden" name="project" value="{name}">'
         branch_field = f'<label><span>Šaka (pipeline\'o apibrėžimas)</span><input type="text" name="branch" value="{branch}"></label>'
+        forms = []
         for pipeline in DEPLOY_PIPELINES:
-            body += self.form('pipeline', PIPELINES[pipeline],
-                              hidden + f'<input type="hidden" name="pipeline" value="{pipeline}">' + branch_field +
-                              '<label><span>REF (tag\'as ar commit\'as)</span><input type="text" name="ref"></label>'
-                              '<label><input type="checkbox" name="images" value="yes"> IMAGES – perkurti image\'us</label>'
-                              '<label><input type="checkbox" name="backup" value="yes" checked> BACKUP – kopija prieš deploy\'ų</label>'
-                              '<label><input type="checkbox" name="rollback" value="yes"> ROLLBACK – grįžti į ankstesnį</label>',
-                              note=f'Custom pipeline\'as {pipeline} per Bitbucket API: istorija lieka Bitbucket Deployments.')
-        body += self.form('pipeline', PIPELINES['backup-now'],
-                          hidden + '<input type="hidden" name="pipeline" value="backup-now">' + branch_field +
-                          '<label><input type="checkbox" name="full" value="yes"> FULL – pilna kopija (visų lentelių duomenys)</label>',
-                          note='Custom pipeline\'as backup-now. Be FULL – kopija pagal lentelių registrą (kaip naktinė).')
-        body += self.form('pipeline', PIPELINES['runner-test'],
-                          hidden + '<input type="hidden" name="pipeline" value="runner-test">' + branch_field,
-                          note='Custom pipeline\'as runner-test.')
-        return body
+            forms.append(self.form('pipeline', PIPELINES[pipeline],
+                                   hidden + f'<input type="hidden" name="pipeline" value="{pipeline}">' + branch_field +
+                                   '<label><span>REF (tag\'as ar commit\'as)</span><input type="text" name="ref" autocomplete="off"></label>'
+                                   '<label class="check"><input type="checkbox" name="images" value="yes"> IMAGES – perkurti image\'us</label>'
+                                   '<label class="check"><input type="checkbox" name="backup" value="yes" checked> BACKUP – kopija prieš deploy\'ų</label>'
+                                   '<label class="check"><input type="checkbox" name="rollback" value="yes"> ROLLBACK – grįžti į ankstesnį</label>',
+                                   note='Istorija lieka Bitbucket Deployments.', command=f'custom pipeline {pipeline}'))
+        forms.append(self.form('pipeline', PIPELINES['backup-now'],
+                               hidden + '<input type="hidden" name="pipeline" value="backup-now">' + branch_field +
+                               '<label class="check"><input type="checkbox" name="full" value="yes"> FULL – pilna kopija (visų lentelių duomenys)</label>',
+                               note='Be FULL – kopija pagal lentelių registrą (kaip naktinė).', command='custom pipeline backup-now'))
+        forms.append(self.form('pipeline', PIPELINES['runner-test'],
+                               hidden + '<input type="hidden" name="pipeline" value="runner-test">' + branch_field,
+                               command='custom pipeline runner-test'))
+        return body + '<div class="deck">' + ''.join(forms) + '</div>'
+
+    def container_logs(self, name, environment, container, lines, data, error):
+        choices = ''.join(f'<option value="{count}"{" selected" if count == lines else ""}>{count} eil.</option>'
+                          for count in CONTAINER_LINES)
+        body = (f'<p><a href="/project/{e(name)}">← {e(name)}</a> · <span class="sign {e(environment)}">{e(environment)}</span> · '
+                f'<code>docker logs --timestamps --tail {e(lines)} {e(container)}</code></p>'
+                f'<form class="subnav" method="get" action="/project/{e(name)}/logs">'
+                f'<input type="hidden" name="env" value="{e(environment)}"><input type="hidden" name="container" value="{e(container)}">'
+                f'<select name="lines">{choices}</select><button>Rodyti</button></form>')
+        problem = error or (data or {}).get('error')
+        if problem:
+            body += f'<div class="callout bad"><p>{e(problem)}</p></div>'
+        else:
+            body += term('\n'.join(data.get('lines', [])))
+        return self.layout(f'Log\'ai: {container}', body, section='overview')
+
+    def worker_metrics(self, data, error):
+        problem = error or (data or {}).get('error')
+        if problem:
+            return self.layout('Metrikos', f'<div class="callout bad"><p>{e(problem)}</p></div>', section='metrics')
+        text = data.get('text', '')
+        groups = re.findall(r'(?m)^setup_metrics_group_up\{group="([^"]+)"\} (\S+)$', text)
+        samples = sum(1 for line in text.splitlines() if line and not line.startswith('#'))
+        body = ('<div class="stats">' + ''.join(f'<div class="stat"><b>{lamp("ok" if up == "1" else "bad")} {e(group)}</b>'
+                                                f'<span>{"surinkta" if up == "1" else "trūksta"}</span></div>' for group, up in groups) +
+                f'<div class="stat"><b>{samples}</b><span>reikšmės</span></div></div>'
+                '<p class="note">setup-server-metrics --once kaip setup paskyra: tai, ką mato Prometheus (be token\'o).</p>' + term(text))
+        return self.layout('Metrikos', body, section='metrics')
 
     # --- Actions ---
-    def actions(self, where):
+    def actions(self, where, scopes=()):
         def text(name, label, placeholder='', value=''):
             # autocomplete off: a browser must not fill in a value typed for another project (a build root name).
             return (f'<label><span>{e(label)}</span><input type="text" name="{name}" value="{e(value)}" '
                     f'placeholder="{e(placeholder)}" autocomplete="off"></label>')
-        body = '<p class="note">Kiekvienas veiksmas pirmiausia paleidžiamas su --check: matai, ką jis darytų, ir tik tada spaudi „Vykdyti“.</p>'
-        body += '<h2 id="add-project">Projektai</h2>' + self.form(
-            'add-project', 'Pridėti projektą (bin/add-project)',
+        sections = (('add-project', 'Projektai'), ('runners', 'Runner\'iai'), ('backups', 'Kopijos'),
+                    ('access', 'Prieiga ir metrikos'), ('units', 'Paslaugos'), ('server', 'Serveris'))
+        body = ('<div class="callout"><p>Kiekvienas veiksmas pirmiausia paleidžiamas su --check: matai, ką jis darytų, '
+                'ir tik tada spaudi „Vykdyti“.</p></div><nav class="subnav">' +
+                ''.join(f'<a class="btn" href="#{key}">{e(label)}</a>' for key, label in sections) + '</nav>')
+        body += '<h2 id="add-project">Projektai</h2><div class="deck">' + self.form(
+            'add-project', 'Pridėti projektą',
             text('env_repo', 'Aplinkos repo URL', 'git@bitbucket.org:darbo-erdve/projektas.git') +
             text('code_repo', 'Kodo repo URL (nebūtina)', 'git@bitbucket.org:darbo-erdve/kodas.git') +
-            text('name', 'Vardas (palik tuščią: repo vardas, kurį randa pipeline\'as)', 'numatyta – repo vardas') +
+            text('name', 'Vardas (nebūtina)', 'numatyta – repo vardas') +
             '<label><span>Taikinys (po vieną eilutėje)</span><textarea name="targets" placeholder="local&#10;local:/home/vartotojas/projektas&#10;prod=ssh://deploy@shop.example/home/deploy/shop"></textarea></label>'
-            '<label><input type="checkbox" name="shared_key" value="yes"> GitHub: paskyros raktas (--shared-key)</label>',
-            note='Naujam projektui taikinys privalomas (local – šis serveris). Esamam tuščias laukas taikinio nekeičia. Projekto pašalinimas – projekto puslapyje.')
-        body += '<h2>Runner\'iai</h2>' + self.form(
-            'install-runner', 'Įdiegti runner\'į (bin/install-runner)',
+            '<label class="check"><input type="checkbox" name="shared_key" value="yes"> GitHub: paskyros raktas (--shared-key)</label>',
+            note='Naujam projektui taikinys privalomas (local – šis serveris). Esamam tuščias laukas taikinio nekeičia. '
+                 'Pašalinimas – projekto puslapyje.', command='bin/add-project') + '</div>'
+        body += '<h2 id="runners">Runner\'iai</h2><div class="deck">' + self.form(
+            'install-runner', 'Įdiegti runner\'į',
             '<label><span>Runner\'is</span><select name="provider"><option value="bitbucket">Bitbucket</option>'
             '<option value="github">GitHub Actions</option></select></label>' +
             text('runner_name', 'Vardas GitHub\'e (nebūtina)', 'numatyta – serverio vardas') +
+            text('tarball', 'Archyvas (nebūtina)', 'https://… arba /kelias/runner.tar.gz') +
+            text('sha256', 'Archyvo SHA-256 (GitHub)', 'būtina GitHub archyvui, kuris ne pin\'intas') +
             '<label><span>Dialogo / puslapio tekstas</span><textarea name="dialog" autocomplete="off" spellcheck="false"></textarea></label>',
             note='Įklijuok visą Bitbucket „Runner installation“ dialogo arba GitHub „New self-hosted runner“ puslapio tekstą. '
-                 'Jis perduodamas komandai per stdin, niekur neįrašomas ir nerodomas; paslaptis lieka tik serverio atmintyje iki „Vykdyti“.')
-        body += '<h2>Kopijos ir metrikos</h2>' + self.form(
-            'install-backups', 'DB kopijos (bin/install-backups)',
-            text('at', 'Naktinės kopijos laikas (nebūtina)', '03:30') +
-            text('full_at', 'Savaitinės pilnos kopijos diena ir laikas (nebūtina)', 'Sun 04:30'),
-            note='Naktinė – pagal lentelių registrą (7 dienos + 4 savaitės), savaitinė – visų lentelių duomenys (laikomos 2). '
-                 'Be reikšmių paliekamos įdiegtos (numatyta 03:30 ir Sun 04:30).')
+                 'Jis perduodamas per stdin, niekur neįrašomas ir nerodomas. Archyvas: Bitbucket – numatyta nuoroda iš dialogo, '
+                 'GitHub – pin\'intas release\'as.', command='bin/install-runner') + '</div>'
+        body += '<h2 id="backups">Kopijos</h2><div class="deck">' + self.form(
+            'backup-local', 'Kopija dabar serveryje',
+            text('project', 'Projektas (nebūtina)', 'tuščia – visi projektai') +
+            '<label><span>Aplinka</span><select name="environment"><option value="">visos projekto</option>'
+            '<option value="stage">stage</option><option value="prod">prod</option></select></label>'
+            '<label class="check"><input type="checkbox" name="full" value="yes"> pilna – visų lentelių duomenys (--full)</label>',
+            note='Tas pats, ką daro naktinis (be --full) ar savaitinis (su --full) laikmatis; be Bitbucket, veikia ir GitHub projektams.',
+            command='setup-server-backup [--full] [PROJEKTAS [ENV]]')
         body += self.form(
-            'install-metrics', 'Worker\'io metrikos (bin/install-metrics)',
+            'install-backups', 'DB kopijų laikmačiai',
+            text('at', 'Naktinės kopijos laikas', '03:30') +
+            text('full_at', 'Savaitinės pilnos diena ir laikas', 'Sun 04:30'),
+            note='Naktinė – pagal lentelių registrą (7 dienos + 4 savaitės), savaitinė – visų lentelių duomenys (laikomos 2). '
+                 'Be reikšmių paliekamos įdiegtos (numatyta 03:30 ir Sun 04:30).', command='bin/install-backups')
+        body += self.form(
+            'add-backup-key', 'Kopijų atsisiuntimo raktas',
+            '<label><span>Viešasis raktas (.pub)</span><textarea name="public_key" spellcheck="false"></textarea></label>' +
+            text('key_name', 'Vardas', 'tomas') + text('sources', 'Iš kur (VPN tinklas)', '10.8.0.0/24') +
+            '<label class="check"><input type="checkbox" name="allow_fresh" value="yes"> gali prašyti šviežios kopijos '
+            '(make db-pull fresh=1; apkrauna projekto DB)</label>',
+            note='Raktas gali tik parsisiųsti kopijas (naktinę, pilną); su varnele – ir paprašyti naujos kopijos dabar.',
+            command='bin/add-backup-key')
+        body += self.form('remove-backup-key', 'Atimti kopijų raktą', text('key_name', 'Vardas', 'tomas'),
+                          command='bin/add-backup-key --remove', danger=True)
+        body += self.form('list-backup-keys', 'Kopijų raktai', '', button='Rodyti', command='bin/add-backup-key --list') + '</div>'
+        body += '<h2 id="access">Prieiga ir metrikos</h2><div class="deck">' + self.form(
+            'install-ssh', 'SSH iš VPN',
+            text('sources', 'Tinklai (per kablelį)', '10.8.0.0/24'),
+            note='Įdiegia openssh-server, iš kitų tinklų – tik raktai, ufw taisyklė (jei ufw įjungtas). Tuščia – įdiegti tinklai.',
+            command='bin/install-ssh', danger=True)
+        body += self.form(
+            'install-metrics', 'Worker\'io metrikos',
             text('address', 'Adresas (nebūtina)', '10.8.0.14') + text('allow', 'Leidžiami adresai', '10.8.0.20') +
             text('port', 'Port\'as (nebūtina)', '9101') +
             '<label><span>Token\'as</span><select name="token"><option value="keep">palikti, kaip yra</option>'
             '<option value="new">naujas (--new-token)</option><option value="none">be token\'o (--no-token)</option></select></label>',
-            note='Nenurodyti nustatymai paliekami iš /etc/setup-server/metrics.env.')
+            note='Nenurodyti nustatymai paliekami iš /etc/setup-server/metrics.env. <a href="/worker-metrics">Ką mato Prometheus</a>.',
+            command='bin/install-metrics') + '</div>'
+        units = [*UNIT_OPERATIONS, *(f'github-runner@{scope}' for scope in scopes)]
+        titles = {**UNIT_TITLES, **{f'github-runner@{scope}': f"GitHub runner'is {scope}" for scope in scopes}}
+        body += '<h2 id="units">Paslaugos</h2><div class="deck">' + self.form(
+            'unit', 'Paleisti, sustabdyti, perkrauti',
+            '<label><span>Paslauga</span><select name="unit">' +
+            ''.join(f'<option value="{e(unit)}">{e(titles[unit])} – {e(", ".join(UNIT_OPERATIONS.get(unit, ("start", "stop", "restart"))))}</option>'
+                    for unit in units) + '</select></label>'
+            '<label><span>Veiksmas</span><select name="operation">' +
+            ''.join(f'<option value="{key}">{e(label)} ({key})</option>' for key, label in OPERATION_TITLES.items()) + '</select></label>',
+            note='Tie patys mygtukai – Apžvalgoje prie kiekvienos paslaugos. Kopijos „start“ laukia, kol kopija baigsis.',
+            command='bin/server-unit ACTION UNIT') + '</div>'
+        body += '<h2 id="server">Serveris</h2><div class="deck">' + self.form(
+            'prepare-host', 'Paruošti serverį', text('setup_ref', 'setup tag\'as (nebūtina)', 'v2.6.0'),
+            note='Paketai, Docker, paskyra setup, git raktas, setup checkout\'as. Esamas Docker nekeičiamas.',
+            command='bin/prepare-host')
         body += self.form(
-            'add-backup-key', 'Kopijų atsisiuntimo raktas (bin/add-backup-key)',
-            '<label><span>Viešasis raktas (.pub)</span><textarea name="public_key" spellcheck="false"></textarea></label>' +
-            text('key_name', 'Vardas', 'tomas') + text('sources', 'Iš kur (VPN tinklas)', '10.8.0.0/24') +
-            '<label><input type="checkbox" name="allow_fresh" value="yes"> gali prašyti šviežios kopijos '
-            '(make db-pull fresh=1; apkrauna projekto DB)</label>',
-            note='Raktas gali tik parsisiųsti kopijas (naktinę, pilną); su varnele – ir paprašyti naujos kopijos dabar.')
-        body += self.form('remove-backup-key', 'Atimti kopijų raktą', text('key_name', 'Vardas', 'tomas'))
-        body += self.form('list-backup-keys', 'Kopijų raktai (--list)', '', button='Rodyti')
-        body += '<h2>Serveris</h2>' + self.form(
-            'prepare-host', 'Paruošti serverį (bin/prepare-host)', text('setup_ref', 'setup tag\'as (nebūtina)', 'v2.6.0'),
-            note='Paketai, Docker, paskyra setup, git raktas, setup checkout\'as. Esamas Docker nekeičiamas.')
-        body += self.form(
-            'update-setup', 'Atnaujinti setup (bin/update-setup)', text('setup_tag', 'setup tag\'as (tuščia – naujausias)', 'v2.7.0'),
-            note='Tik bendras setup checkout\'as, tik release tag\'ai; be slaptažodžio. Peržiūra parodo dabartinę ir naują versiją. '
-                 'Deploy\'us tai daro ir pats, kai projektui reikia naujesnio setup (tas pats MAJOR).')
+            'update-setup', 'Atnaujinti setup', text('setup_tag', 'setup tag\'as (tuščia – naujausias)', 'v2.7.0'),
+            note='Tik bendras setup checkout\'as, tik release tag\'ai; be slaptažodžio. Deploy\'us tai daro ir pats, '
+                 'kai projektui reikia naujesnio setup (tas pats MAJOR).', command='bin/update-setup')
         if where['checkout']:
             body += self.form(
-                'update', 'Atnaujinti (bin/update)',
+                'update', 'Atnaujinti setup-server ir setup',
                 text('server_ref', 'setup-server ref\'as', 'v0.3.0') + text('setup_ref', 'setup ref\'as', 'v2.6.0'),
-                note=f'Vykdoma kaip {e(where["admin"])} iš {e(where["checkout"])}. Jo sudo turi veikti be slaptažodžio '
-                     '(be terminalo jo paklausti negalima); kitaip – terminale. Sąsaja atnaujinimo metu persikrauna, darbas tęsiasi.')
-        else:
-            body += '<p class="warn">bin/update: nežinomas administratoriaus klonas (paleisk sudo bin/install-ui iš jo).</p>'
-        return self.layout('Veiksmai', body)
+                note=f'Vykdoma kaip {e(where["admin"])} iš {e(where["checkout"])}; jo sudo turi veikti be slaptažodžio. '
+                     'Sąsaja atnaujinimo metu persikrauna, darbas tęsiasi.', command='bin/update')
+        body += '</div>'
+        if not where['checkout']:
+            body += '<div class="callout warn"><p>bin/update: nežinomas administratoriaus klonas (paleisk sudo bin/install-ui iš jo).</p></div>'
+        return self.layout('Veiksmai', body, section='actions')
 
     def invalid(self, message):
-        return self.layout('Netinkami duomenys', f'<p class="bad">{e(message)}</p><p><a href="/actions">Atgal į veiksmus</a></p>')
+        return self.layout('Netinkami duomenys', f'<div class="callout bad"><p>{e(message)}</p></div>'
+                                                 '<p><a href="/actions">← Atgal į veiksmus</a></p>', section='actions')
 
     def preview(self, plan, code, output, pending):
-        body = f'<p>Komanda: <code>{e(shlex.join(plan.check))}</code></p>'
+        body = facts([('Komanda', f'<code>{e(shlex.join(plan.check))}</code>'),
+                      ('Kodas', badge('—' if code is None else code, 'ok' if code == 0 else 'bad'))])
         if plan.stdin and plan.action == 'install-runner':
             body += '<p class="note">Įklijuotas tekstas perduotas per stdin (nerodomas).</p>'
-        body += f'<p>Kodas: {badge("—" if code is None else code, "ok" if code == 0 else "bad")}</p><pre>{e(output)}</pre>'
+        body += term(output)
         if plan.run is None:
-            return self.layout(plan.title, body)
+            return self.layout(plan.title, body, section='actions')
         if pending:
-            body += (f'<form method="post" action="/run"><input type="hidden" name="csrf" value="{e(self.token)}">'
+            if plan.danger:
+                body += f'<div class="tape"><span>{e(plan.danger)}</span></div>'
+            body += (f'<form class="action" method="post" action="/run"><input type="hidden" name="csrf" value="{e(self.token)}">'
                      f'<input type="hidden" name="pending" value="{e(pending)}">'
-                     f'<p>Vykdys: <code>{e(shlex.join(plan.run))}</code></p><button class="run">Vykdyti</button> '
-                     '<a href="/actions">Atšaukti</a></form>')
+                     f'<p>Vykdys: <code>{e(shlex.join(plan.run))}</code></p>'
+                     '<div class="form-foot"><a class="btn" href="/actions">Atšaukti</a><button class="run">Vykdyti</button></div></form>')
         else:
-            body += '<p class="bad">Peržiūra baigėsi klaida: vykdyti negalima. Pataisyk, ką ji rodo, ir bandyk dar kartą.</p>'
-        return self.layout(f'Peržiūra: {plan.title}', body)
+            body += '<div class="callout bad"><p>Peržiūra baigėsi klaida: vykdyti negalima. Pataisyk, ką ji rodo, ir bandyk dar kartą.</p></div>'
+        return self.layout(f'Peržiūra: {plan.title}', body, section='actions')
 
     def pipeline_preview(self, plan, pending, token_variable):
-        body = (f'<p>Bitbucket repo: <code>{e(plan.workspace)}/{e(plan.slug)}</code>; token\'as: '
-                f'{e(token_variable) if token_variable else badge("nėra (" + TOKEN_VARIABLE + ")", "bad")}</p>'
-                f'<p>Užklausa: <code>POST {e(bitbucket_api() + plan.path)}</code></p><pre>{e(json.dumps(plan.body, indent=2))}</pre>')
+        body = ''
+        if plan.pipeline == 'deploy-production':
+            body += '<div class="tape"><span>Deploy\'us į PROD</span></div>'
+        body += (f'<p>Bitbucket repo: <code>{e(plan.workspace)}/{e(plan.slug)}</code>; token\'as: '
+                 f'{e(token_variable) if token_variable else badge("nėra (" + TOKEN_VARIABLE + ")", "bad")}</p>'
+                 f'<p>Užklausa: <code>POST {e(bitbucket_api() + plan.path)}</code></p><pre class="json">{e(json.dumps(plan.body, indent=2))}</pre>')
         if token_variable:
-            body += (f'<form method="post" action="/run"><input type="hidden" name="csrf" value="{e(self.token)}">'
-                     f'<input type="hidden" name="pending" value="{e(pending)}"><button class="run">Vykdyti</button> '
-                     f'<a href="/project/{e(plan.project)}">Atšaukti</a></form>')
-        return self.layout(f'Peržiūra: {plan.title}', body)
+            body += (f'<form class="action" method="post" action="/run"><input type="hidden" name="csrf" value="{e(self.token)}">'
+                     f'<input type="hidden" name="pending" value="{e(pending)}"><div class="form-foot">'
+                     f'<a class="btn" href="/project/{e(plan.project)}">Atšaukti</a><button class="run">Vykdyti</button></div></form>')
+        return self.layout(f'Peržiūra: {plan.title}', body, section='overview')
 
     def pipeline_result(self, plan, code, data, error):
         if error or code != 201 or not isinstance(data, dict):
-            body = f'<p class="bad">Bitbucket atsakė: {e(error or f"HTTP {code}")}</p>'
+            body = f'<div class="callout bad"><p>Bitbucket atsakė: {e(error or f"HTTP {code}")}</p></div>'
         else:
             number = data.get('build_number')
             link = f'{BITBUCKET_WEB}/{quote(plan.workspace)}/{quote(plan.slug)}/pipelines/results/{int(number or 0)}'
-            body = f'<p class="ok">Paleista: <a href="{e(link)}">#{e(number)}</a> ({e(plan.pipeline)}, šaka {e(plan.branch)}).</p>'
-        body += f'<p><a href="/project/{e(plan.project)}">Atgal į projektą</a></p>'
-        return self.layout(plan.title, body)
+            body = (f'<div class="callout"><p>Paleista: <a href="{e(link)}">#{e(number)}</a> ({e(plan.pipeline)}, '
+                    f'šaka {e(plan.branch)}).</p></div>')
+        body += f'<p><a href="/project/{e(plan.project)}">← Atgal į projektą</a></p>'
+        return self.layout(plan.title, body, section='overview')
 
     def job(self, identifier, meta, result, running, output):
         if running:
-            state = badge('vykdoma', 'warn')
+            state, bar = badge('vykdoma', 'run'), 'run'
         elif result is None:
-            state = badge('nutrūko (be rezultato)', 'bad')
+            state, bar = badge('nutrūko (be rezultato)', 'bad'), 'bad'
         else:
-            state = badge(f'baigta, kodas {result["exit"]}', 'ok' if result['exit'] == 0 else 'bad')
-        body = (f'<p>{state} · pradėta {e(local_time(meta["started"]))} · {e(meta["user"])}</p>'
-                f'<p><code>{e(shlex.join(meta["argv"]))}</code></p><pre>{e(output)}</pre>')
+            state, bar = badge(f'baigta, kodas {result["exit"]}', 'ok' if result['exit'] == 0 else 'bad'), \
+                'ok' if result['exit'] == 0 else 'bad'
+        rows = [('Būsena', state), ('Pradėta', f'{e(local_time(meta["started"]))} · {e(meta["user"])}'),
+                ('Komanda', f'<code>{e(shlex.join(meta["argv"]))}</code>')]
+        if result is not None:
+            rows.insert(2, ('Truko', f'{result.get("seconds", 0)} s'))
+        body = f'<div class="bar {bar}"><i></i></div>' + facts(rows) + term(output, '(išvesties dar nėra)')
         if running:
-            body += '<p class="muted">Puslapis atsinaujina kas 3 s.</p>'
-        return self.layout(meta.get('title', 'Veiksmas'), body, refresh=3 if running else None)
+            body += '<p class="note">Puslapis atsinaujina kas 3 s.</p>'
+        return self.layout(meta.get('title', 'Veiksmas'), body, refresh=3 if running else None, section='logs')
 
     def logs(self, actions, recent, data, error):
         body = '<h2>Paskutiniai veiksmai</h2>'
         if recent:
-            body += '<table><tr><th>Pradėta</th><th>Veiksmas</th><th>Kas</th><th>Būsena</th></tr>' + ''.join(
-                f'<tr><td><a href="/job/{e(name)}">{e(local_time(meta["started"]))}</a></td><td>{e(meta.get("title", ""))}</td>'
-                f'<td>{e(meta["user"])}</td><td>{state}</td></tr>' for name, meta, state in recent) + '</table>'
-        body += f'<h2>ui-actions.log</h2><pre>{e(actions)}</pre>'
-        if data is None:
-            body += f'<p class="bad">{e(error)}</p>'
+            body += '<ul class="runs">' + ''.join(
+                f'<li>{lamp(kind)}<a href="/job/{e(name)}">{e(local_time(meta["started"]))}</a><span>{e(meta.get("title", ""))}</span>'
+                f'<span class="hide muted">{e(meta["user"])}</span><span>{state}</span></li>'
+                for name, meta, state, kind in recent) + '</ul>'
         else:
-            body += f'<h2>backup-pulls.log</h2><pre>{e(chr(10).join(data.get("backup_pulls", [])) or "(tuščia)")}</pre>'
+            body += '<div class="empty">Veiksmų dar nebuvo.</div>'
+        body += f'<h2>Žurnalai</h2><details open><summary>ui-actions.log</summary><div class="inner">{term(actions)}</div></details>'
+        if data is None:
+            body += f'<div class="callout bad"><p>{e(error)}</p></div>'
+        else:
+            body += (f'<details><summary>backup-pulls.log</summary><div class="inner">'
+                     f'{term(chr(10).join(data.get("backup_pulls", [])))}</div></details>')
             for unit, lines in data.get('journal', {}).items():
-                body += f'<h2>journalctl -u {e(unit)}</h2><pre>{e(chr(10).join(lines) or "(tuščia)")}</pre>'
-        return self.layout('Žurnalai', body)
+                body += (f'<details><summary>journalctl -u {e(unit)}</summary><div class="inner">'
+                         f'{term(chr(10).join(lines))}</div></details>')
+        return self.layout('Žurnalai', body, section='logs')
 
 
 # --- HTTP ----------------------------------------------------------------------------------------
@@ -1195,13 +1605,27 @@ def handler(user, stored):
             if path == '/':
                 data, error = status(fresh='fresh' in query)
                 return self.reply(200, page.overview(data, error))
+            match = re.fullmatch(r'/project/([a-z0-9][a-z0-9_-]{0,63})/logs', path)
+            if match:
+                environment, container = query.get('env', [''])[0], query.get('container', [''])[0]
+                lines = query.get('lines', [CONTAINER_LINES[0]])[0]
+                if environment not in ('stage', 'prod') or not CONTAINER.fullmatch(container) or lines not in CONTAINER_LINES:
+                    return self.reply(400, page.invalid('Netinkama aplinka, konteineris ar eilučių skaičius.'))
+                data, error = helper('--container-logs', match[1], environment, container, lines)
+                return self.reply(200, page.container_logs(match[1], environment, container, lines, data, error))
+            if path == '/worker-metrics':
+                data, error = helper('--metrics')
+                return self.reply(200, page.worker_metrics(data, error))
             match = re.fullmatch(r'/project/([a-z0-9][a-z0-9_-]{0,63})', path)
             if match:
                 data, error = status(fresh='fresh' in query)
-                rendered = page.project(data, match[1]) if data else page.layout('Projektas', f'<p class="bad">{e(error)}</p>')
-                return self.reply(200, rendered) if rendered else self.reply(404, page.layout('Nėra projekto', ''))
+                rendered = page.project(data, match[1]) if data else \
+                    page.layout('Projektas', f'<div class="callout bad"><p>{e(error)}</p></div>')
+                return self.reply(200, rendered) if rendered else \
+                    self.reply(404, page.layout('Nėra projekto', '<p><a href="/">← Į apžvalgą</a></p>'))
             if path == '/actions':
-                return self.reply(200, page.actions(installation()))
+                data, _ = status()
+                return self.reply(200, page.actions(installation(), (data or {}).get('github_runners', [])))
             if path == '/logs':
                 recent = []
                 for directory in jobs(20):
@@ -1209,16 +1633,18 @@ def handler(user, stored):
                         meta, result, running = job_state(directory)
                     except (OSError, ValueError, KeyError):
                         continue
-                    state = badge('vykdoma', 'warn') if running else badge('nutrūko', 'bad') if result is None else \
-                        badge(f'kodas {result["exit"]}', 'ok' if result['exit'] == 0 else 'bad')
-                    recent.append((directory.name, meta, state))
+                    kind = 'run' if running else 'bad' if result is None or result['exit'] else 'ok'
+                    state = badge('vykdoma', 'run') if running else badge('nutrūko', 'bad') if result is None else \
+                        badge(f'kodas {result["exit"]}', kind)
+                    recent.append((directory.name, meta, state, kind))
                 data, error = helper('--logs', '50')
                 return self.reply(200, page.logs(tail(ACTIONS_LOG), recent, data, error))
             match = re.fullmatch(r'/job/(' + JOB_ID.pattern + ')', path)
             if match and (JOBS / match[1] / 'job.json').is_file():
                 meta, result, running = job_state(JOBS / match[1])
-                return self.reply(200, page.job(match[1], meta, result, running, tail(JOBS / match[1] / 'output.log', 3000)))
-            self.reply(404, page.layout('Nerasta', '<p><a href="/">Į apžvalgą</a></p>'))
+                output = JOBS / match[1] / 'output.log'
+                return self.reply(200, page.job(match[1], meta, result, running, tail(output, 3000) if output.exists() else ''))
+            self.reply(404, page.layout('Nerasta', '<p><a href="/">← Į apžvalgą</a></p>'))
 
         do_HEAD = do_GET
 
@@ -1276,8 +1702,8 @@ def handler(user, stored):
                 return self.pipeline(page, name, plan)
             busy = running_job()
             if busy:
-                return self.reply(409, page.layout('Užimta', f'<p class="warn">Dar vykdomas kitas veiksmas: '
-                                                            f'<a href="/job/{e(busy)}">{e(busy)}</a>. Palauk, kol baigsis.</p>'))
+                return self.reply(409, page.layout('Užimta', f'<div class="callout warn"><p>Dar vykdomas kitas veiksmas: '
+                                                            f'<a href="/job/{e(busy)}">{e(busy)}</a>. Palauk, kol baigsis.</p></div>'))
             identifier = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + secrets.token_hex(3)
             try:
                 record(name, self.client(), 'run', f'job={identifier} {plan.action}: {shlex.join(plan.run)}')

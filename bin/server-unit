@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Start, stop or restart one of setup-server's own systemd units: the runners, the metrics endpoint, a backup
+# run now, or the web UI (it reads its Bitbucket tokens only when it starts). Nothing else: the unit and
+# what may be done to it come from the list below, never from the caller. The web UI runs the root-owned
+# copy in $LIBRARY/bin through its sudo rule (bin/install-ui); by hand: sudo bin/server-unit restart runner.
+set -euo pipefail
+
+ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+ACCOUNT=${SETUP_SERVER_USER:-setup}
+PATH=$PATH:/usr/sbin:/sbin
+
+check=0
+usage() {
+    cat <<EOF
+Usage: sudo $0 [--check] ACTION UNIT
+  ACTION and UNIT, one of:
+    start|stop|restart  runner                 the Bitbucket runner (setup-server-runner.service)
+    start|stop|restart  github-runner@SCOPE    a registered GitHub runner ($ROOT/github-runner/SCOPE)
+    start|stop|restart  metrics                the worker /metrics (setup-server-metrics.service)
+    start               backup                 the nightly backup now (setup-server-backup.service; waits for it)
+    start               backup-full            the weekly full backup now (setup-server-backup-full.service; waits)
+    restart             ui                     the web UI (setup-server-ui.service): reads ui.env again
+  --check  show the unit's state and what would be done; change nothing (no root needed)
+Exit: 0 done, 1 the unit failed, 64 usage, 65 refused, 77 not root.
+EOF
+}
+positional=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) check=1 ;;
+        -h|--help) usage; exit 0 ;;
+        -*) usage >&2; exit 64 ;;
+        *) positional+=("$1") ;;
+    esac
+    shift
+done
+[ "${#positional[@]}" = 2 ] || { usage >&2; exit 64; }
+action=${positional[0]}
+name=${positional[1]}
+refuse() { echo "$1" >&2; exit 65; }
+
+case "$name" in
+    runner) unit=setup-server-runner.service; allowed="start stop restart" ;;
+    metrics) unit=setup-server-metrics.service; allowed="start stop restart" ;;
+    backup) unit=setup-server-backup.service; allowed="start" ;;
+    backup-full) unit=setup-server-backup-full.service; allowed="start" ;;
+    ui) unit=setup-server-ui.service; allowed="restart" ;;
+    github-runner@*)
+        scope=${name#github-runner@}
+        [[ "$scope" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || refuse "Not a GitHub runner scope: $scope"
+        [ -f "$ROOT/github-runner/$scope/.runner" ] && [ ! -L "$ROOT/github-runner/$scope" ] \
+            || refuse "No GitHub runner registered as $scope in $ROOT/github-runner (bin/install-runner --provider github)"
+        unit="setup-server-github-runner@$scope.service"; allowed="start stop restart" ;;
+    *) refuse "Unknown unit $name (runner, github-runner@SCOPE, metrics, backup, backup-full, ui)" ;;
+esac
+case " $allowed " in
+    *" $action "*) ;;
+    *) refuse "$name: only $(sed 's/ /, /g' <<<"$allowed") (not $action)" ;;
+esac
+if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
+    echo "Run with sudo (or use --check)" >&2
+    exit 77
+fi
+
+state() { systemctl show --property=LoadState,ActiveState,SubState,Result,ActiveEnterTimestamp --value "$unit" 2>/dev/null | paste -sd ' ' || true; }
+load=$(systemctl show --property=LoadState --value "$unit" 2>/dev/null || true)
+[ "$load" = loaded ] || refuse "$unit is not installed (LoadState ${load:-unknown})"
+echo "==> $unit: $(state)"
+case "$name:$action" in
+    runner:stop|runner:restart|github-runner@*:stop|github-runner@*:restart)
+        busy=$(pgrep -u "$ACCOUNT" -x make 2>/dev/null | paste -sd ' ' || true)
+        [ -z "$busy" ] || echo "    note: a pipeline step of $ACCOUNT is running (make, PID $busy): $action stops it" ;;
+    ui:restart)
+        echo "    note: the page loses its preview forms; an action that is running goes on" ;;
+esac
+if [ "$check" = 1 ]; then
+    echo "==> would: systemctl $action $unit"
+    echo "==> Check finished; nothing was changed."
+    exit 0
+fi
+
+since=$(date +%s)
+echo "==> systemctl $action $unit"
+code=0
+systemctl "$action" "$unit" || code=$?
+echo "==> $unit: $(state)"
+journalctl --no-pager --quiet --output=short-iso --since "@$since" --unit "$unit" 2>/dev/null | tail -n 200 || true
+[ "$code" = 0 ] || { echo "systemctl $action $unit: exit $code" >&2; exit 1; }
