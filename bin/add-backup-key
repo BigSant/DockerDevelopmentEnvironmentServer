@@ -178,6 +178,9 @@ def main(argv=None):
     host = os.environ.get('SETUP_SERVER_ADDRESS', '<server VPN address>')
     print(f'==> {args.name} downloads with: make db-pull (asks for {ACCOUNT}@{host} the first time)'
           + ('; make db-pull fresh=1 asks for a new backup' if args.allow_fresh else ''))
+    if not shutil.which('sshd', path=os.environ.get('PATH', '') + ':/usr/sbin:/sbin'):
+        print('==> note: this server has no sshd, so the key cannot connect yet; set it up with: sudo bin/install-ssh --from '
+              + ','.join(networks(args.sources)))
     if args.allow_fresh and not (SBIN / 'setup-server-backup').exists():
         print('==> note: fresh backups need the backup command; install it with: sudo bin/install-backups')
     return 0

@@ -1090,6 +1090,124 @@ class UpdateTest(ScriptTest):
                 self.assertEqual(branch.returncode, 0, branch.stdout + branch.stderr)
 
 
+class InstallSshTest(ScriptTest):
+    """install-ssh with stubbed system commands: sshd's settings, the package, the service and ufw."""
+
+    def setUp(self):
+        super().setUp()
+        self.calls = self.root / "calls"
+        self.config = self.root / "sshd_config.d"
+        self.dropin = self.config / "10-setup-server.conf"
+        self.stub("dpkg-query", '[ -n "${FAKE_SSH_INSTALLED:-}" ] && printf "install ok installed" || exit 1\n')
+        self.stub("apt-get", f'echo "apt-get $*" >> {self.calls}\n'
+                             f'[ "$1" != install ] || [ ! -f {self.dropin} ] || echo "settings were there first" >> {self.calls}\n')
+        self.stub("sshd", f'echo "sshd $*" >> {self.calls}\n'
+                          'case "$1" in -t) [ -z "${FAKE_SSHD_BAD:-}" ] || { echo "Bad configuration option" >&2; exit 255; };;\n'
+                          '  -T) echo "port 22";; esac\n')
+        self.stub("systemctl", f'echo "systemctl $*" >> {self.calls}\n'
+                               'case "$1" in cat) exit 0;; is-enabled|is-active) [ -n "${FAKE_SSH_RUNNING:-}" ] || exit 3;; esac\n')
+        self.stub("ss", 'printf "LISTEN 0 128 %s *\\n" ${FAKE_LISTEN:-0.0.0.0:22}\n')
+        self.stub("ip", 'printf "2: enp3s0    inet 192.168.1.221/24 brd 192.168.1.255 scope global enp3s0\\n'
+                        '5: tun0    inet 10.8.0.14 peer 10.8.0.13/32 scope global tun0\\n"\n')
+        self.stub("ufw", f'case "$1" in status) printf "Status: %s\\n${{FAKE_UFW_RULES:-}}" "${{FAKE_UFW:-inactive}}";;\n'
+                         f'  *) echo "ufw $*" >> {self.calls};; esac\n')
+        self.stub("ssh-keygen", 'echo "256 SHA256:hostkeyfingerprint root@server (ED25519)"\n')
+        (self.root / "host_key.pub").write_text("ssh-ed25519 AAAAhost root@server\n")
+
+    def run_ssh(self, *arguments, root=True, **env):
+        path = f"{self.bin}:{os.environ['PATH']}"
+        if root:
+            path = f"{self.fake_root()}:{path}"
+        return self.run_script("install-ssh", *arguments, PATH=path, SETUP_SERVER_USER="setup",
+                               SETUP_SERVER_SSHD_CONFIG=str(self.config), SETUP_SERVER_SSHD_RUN=str(self.root / "run-sshd"),
+                               SETUP_SERVER_SSH_HOST_KEY=str(self.root / "host_key.pub"), **env)
+
+    def logged(self):
+        return self.calls.read_text() if self.calls.exists() else ""
+
+    def test_check_on_a_host_without_sshd_plans_everything_and_changes_nothing(self):
+        result = self.run_ssh("--check", "--from", "10.8.0.0/24", root=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("openssh-server: missing", result.stdout)
+        self.assertIn("would apt-get install openssh-server", result.stdout)
+        self.assertIn("Match Address *,!10.8.0.0/24,!127.0.0.0/8,!::1\n            PasswordAuthentication no", result.stdout)
+        self.assertIn("would systemctl enable --now ssh.socket", result.stdout)
+        self.assertIn("Developers connect to setup@10.8.0.14;", result.stdout)
+        self.assertFalse(self.dropin.exists(), "--check changes nothing")
+        self.assertNotIn("apt-get", self.logged())
+        self.assertNotIn("enable --now", self.logged())
+
+    def test_networks_are_required_and_never_every_address(self):
+        for arguments, message in ((("--check",), "--from needs the VPN network"),
+                                   (("--check", "--from", "0.0.0.0/0"), "not every address"),
+                                   (("--check", "--from", "vpn"), "is not an IP address or network")):
+            with self.subTest(arguments=arguments):
+                result = self.run_ssh(*arguments, root=False)
+                self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
+                self.assertIn(message, result.stderr)
+        if os.getuid() != 0:
+            self.assertEqual(self.run_ssh("--from", "10.8.0.0/24", root=False).returncode, 77)
+
+    def test_it_writes_the_settings_before_installing_then_starts_sshd_and_a_rerun_keeps_the_networks(self):
+        result = self.run_ssh("--from", "10.8.0.0/24,fd00::1/64")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.dropin.read_text(),
+                         "# Written by setup-server bin/install-ssh; a rerun rewrites it.\n"
+                         "# from: 10.8.0.0/24,fd00::/64\n"
+                         "# From outside these networks and this host sshd takes keys only, never a password.\n"
+                         "Match Address *,!10.8.0.0/24,!fd00::/64,!127.0.0.0/8,!::1\n"
+                         "    PasswordAuthentication no\n    KbdInteractiveAuthentication no\nMatch all\n")
+        calls = self.logged()
+        self.assertIn("settings were there first", calls)
+        self.assertIn("sshd -t", calls)
+        self.assertIn("systemctl enable --now ssh.socket", calls)
+        self.assertIn("SSH ready. Developers connect to setup@10.8.0.14;", result.stdout)
+        self.assertIn("Port 22: listens on every address", result.stdout)
+        self.assertIn("SHA256:hostkeyfingerprint", result.stdout)
+        self.calls.unlink()
+        again = self.run_ssh(FAKE_SSH_INSTALLED="1", FAKE_SSH_RUNNING="1")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("unchanged (keys only from outside 10.8.0.0/24,fd00::/64)", again.stdout)
+        self.assertIn("sshd: running and starts after a reboot", again.stdout)
+        self.assertNotIn("apt-get", self.logged())
+        self.assertNotIn("reload", self.logged(), "unchanged settings need no reload")
+
+    def test_changed_settings_reload_a_running_sshd_and_refused_ones_are_put_back(self):
+        self.config.mkdir()
+        self.dropin.write_text("# from: 10.9.0.0/24\n")
+        running = {"FAKE_SSH_INSTALLED": "1", "FAKE_SSH_RUNNING": "1"}
+        refused = self.run_ssh("--from", "10.8.0.0/24", FAKE_SSHD_BAD="1", **running)
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        self.assertIn("sshd refuses the settings", refused.stderr)
+        self.assertEqual(self.dropin.read_text(), "# from: 10.9.0.0/24\n")
+        self.assertNotIn("reload", self.logged())
+        result = self.run_ssh("--from", "10.8.0.0/24", **running)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("systemctl reload ssh.service", self.logged())
+
+    def test_an_active_ufw_gets_the_rule_once_and_an_inactive_one_is_left_off(self):
+        running = {"FAKE_SSH_INSTALLED": "1", "FAKE_SSH_RUNNING": "1"}
+        inactive = self.run_ssh("--from", "10.8.0.0/24", **running)
+        self.assertIn("ufw: inactive; nothing to allow", inactive.stdout)
+        self.assertNotIn("ufw allow", self.logged())
+        self.run_ssh("--from", "10.8.0.0/24", FAKE_UFW="active", **running)
+        self.assertIn("ufw allow proto tcp from 10.8.0.0/24 to any port 22 comment setup-server ssh", self.logged())
+        self.calls.unlink()
+        allowed = self.run_ssh(FAKE_UFW="active", FAKE_UFW_RULES="22/tcp                     ALLOW IN    10.8.0.0/24\\n",
+                               **running)
+        self.assertIn("ufw: 22/tcp from 10.8.0.0/24 already allowed", allowed.stdout)
+        self.assertNotIn("ufw allow", self.logged())
+
+    def test_sshd_listening_only_outside_the_networks_needs_attention(self):
+        running = {"FAKE_SSH_INSTALLED": "1", "FAKE_SSH_RUNNING": "1"}
+        vpn = self.run_ssh("--from", "10.8.0.0/24", FAKE_LISTEN="10.8.0.14:22", **running)
+        self.assertEqual(vpn.returncode, 0, vpn.stdout + vpn.stderr)
+        self.assertIn("Port 22: listens on 10.8.0.14:22", vpn.stdout)
+        lan = self.run_ssh("--from", "10.8.0.0/24", FAKE_LISTEN="192.168.1.221:22", **running)
+        self.assertEqual(lan.returncode, 1, lan.stdout + lan.stderr)
+        self.assertIn("port 22 listens only on 192.168.1.221:22, none of them in 10.8.0.0/24", lan.stdout)
+
+
 UBUNTU = os.environ.get("SETUP_SERVER_UBUNTU_IMAGE")
 # The test containers share the host with running stacks: capped, removed when done.
 DOCKER_RUN = ["docker", "run", "--rm", "--memory", "1g"]
@@ -1105,6 +1223,26 @@ class RealUbuntuTest(unittest.TestCase):
         self.assertIn("JAVA_AVAILABLE", result.stdout, result.stderr)
         self.assertIn("would apt-get install", result.stdout)
         self.assertIn("Docker: missing", result.stdout)
+
+    def test_install_ssh_installs_sshd_and_its_settings_take_passwords_only_inside_the_networks(self):
+        # A stub systemctl (no systemd in the container); sshd -T shows what each source address gets, with a later
+        # drop-in that allows passwords everywhere (as cloud-init writes) to prove the first value wins.
+        script = """set -eu
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq >/dev/null && apt-get install -y -qq python3 iproute2 >/dev/null
+mkdir -p /stubs && printf '#!/bin/sh\\ncase "$1" in is-*) exit 3;; esac\\nexit 0\\n' > /stubs/systemctl && chmod +x /stubs/systemctl
+PATH=/stubs:$PATH /setup-server/bin/install-ssh --from 10.8.0.0/24 || true
+echo 'PasswordAuthentication yes' > /etc/ssh/sshd_config.d/50-cloud-init.conf
+for address in 10.8.0.230 192.168.1.5 127.0.0.1; do
+    echo "$address $(sshd -T -C user=someone,host=h,addr=$address | awk '$1 == "passwordauthentication" {print $2}')"
+done
+"""
+        result = subprocess.run([*DOCKER_RUN, "-v", f"{ROOT}:/setup-server:ro", UBUNTU, "bash", "-c", script],
+                                capture_output=True, text=True, timeout=600)
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("doing: apt-get install openssh-server", output)
+        self.assertIn("10.8.0.230 yes\n192.168.1.5 no\n127.0.0.1 yes\n", output)
 
     def test_the_installed_runner_unit_verifies(self):
         # A stand-in archive (bin/start.sh) and a stub systemctl: the unit is checked by systemd-analyze.

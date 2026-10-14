@@ -18,6 +18,7 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
 | `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
 | `bin/install-backups` | DB kopijos: naktinė (`setup-server-backup.timer`, pagal lentelių registrą) ir savaitinė pilna (`setup-server-backup-full.timer`, visų lentelių duomenys), komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
+| `bin/install-ssh` | SSH iš VPN: `openssh-server` (Ubuntu Desktop jo neturi), paleistas ir startuojantis po perkrovimo, nustatymai `/etc/ssh/sshd_config.d/10-setup-server.conf` – iš už nurodytų tinklų ir šio serverio tik raktu, be slaptažodžio; įjungtam ufw – leidimas tiems tinklams. Reikia `make db-pull` ir valdymo sąsajos tuneliui. |
 | `bin/add-backup-key` | Programuotojo SSH raktas DB kopijoms atsisiųsti (`make db-pull`), su `--allow-fresh` – ir naujai kopijai užsakyti (`make db-pull fresh=1`): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. |
 | `bin/install-metrics` | Worker'io Prometheus `/metrics`: systemd paslauga `setup-server-metrics` (paskyra `setup`, tik skaito), komanda `/usr/local/sbin/setup-server-metrics` (kopija iš `bin/worker-metrics`), nustatymai `/etc/setup-server/metrics.env`. |
 | `bin/install-ui` | Valdymo sąsaja naršyklėje (tik `127.0.0.1`, per SSH tunelį): paslauga `setup-server-ui` (atskira paskyra `setup-ui`), komanda `/usr/local/sbin/setup-server-ui` (kopija iš `bin/web-ui`), komandų kopijos `/usr/local/lib/setup-server/bin/`, sudo taisyklė, nustatymai `/etc/setup-server/ui.env`. |
@@ -325,6 +326,30 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    prieš deploy'ų – kuri naujausia; su `full=1` – savaitinę pilną) ir iš jos pasiruošia veikiančią aplinką.
    Su `fresh=1` serveris kopiją padaro tuo metu. LIVE nepasiekiamas.
 
+   Pirmiausia serveris turi priimti SSH iš VPN. Ubuntu Desktop `openssh-server` neturi, tada į 22 port'ą
+   niekas neklauso (`ssh: connect to host … port 22: Connection refused`):
+
+   ```bash
+   bin/install-ssh --check --from 10.8.0.0/24   # paketas, sshd nustatymai, paslauga, ufw; nieko nekeičia
+   sudo bin/install-ssh --from 10.8.0.0/24      # įdiegia; vėliau užtenka sudo bin/install-ssh (tinklai lieka)
+   ```
+
+   - **Nustatymai** – `/etc/ssh/sshd_config.d/10-setup-server.conf` (įrašomas prieš diegiant paketą, todėl naujas
+     sshd be jo nepasileidžia): iš už `--from` tinklų ir ne iš šio serverio – tik raktas
+     (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`). VPN viduje galioja serverio paties nustatymai.
+     sshd ima pirmą perskaitytą reikšmę, todėl failo vardas eina prieš kitus (`50-cloud-init.conf` ir pan.).
+     `sshd -t` jo nepriėmus, ankstesnis failas grąžinamas. Port'ų, `ListenAddress` ir kitų failų scriptas nekeičia.
+   - **Paslauga** – Ubuntu 22.10+ `ssh.socket` (sshd startuoja pirmu prisijungimu), senesniuose `ssh.service`;
+     įjungiama, kad veiktų ir po perkrovimo. Pasikeitus nustatymams veikianti paslauga perkraunama `reload`
+     (atidaryti seansai lieka).
+   - **Tikrinama**, ar sshd klauso visais adresais ar VPN adresu; jei tik kitais (`ListenAddress`) – parodoma.
+   - **ufw** – jei įjungtas, pridedama `ufw allow proto tcp from 10.8.0.0/24 to any port 22`; išjungtas paliekamas
+     išjungtas (pakartotinai paleistas scriptas taisyklę pridės, kai ufw bus įjungtas).
+   - Pabaigoje parodomas serverio ED25519 host rakto fingerprint'as: pirmą kartą jungiantis programuotojas jį
+     palygina prieš atsakydamas `yes`.
+
+   Tada – programuotojo raktas:
+
    ```bash
    sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --check   # parodo, ką keistų
    sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24           # įrašo raktą (tik atsisiuntimas)
@@ -617,6 +642,8 @@ sudo bin/install-ui                # įdiegia, paleidžia ir vieną kartą parod
 ssh -L 9102:127.0.0.1:9102 <serveris>    # kol tunelis atidarytas, sąsaja pasiekiama
 ```
 
+Tunelis eina per serverio SSH; jei jis neatsako, žr. `bin/install-ssh` („Eiga“, 7 žingsnis).
+
 Naršyklė paklaus vardo ir slaptažodžio (Basic auth; srautą šifruoja SSH). Slaptažodis rodomas tik įdiegus, serveryje
 laikomas tik jo PBKDF2 hash'as `/etc/setup-server/ui.env` (root, 0600). Pamiršus – `sudo bin/install-ui --new-password`.
 
@@ -753,6 +780,8 @@ sudo tail -n 20 /srv/setup-server/ui-actions.log
 - Slaptažodžiai į šį repo, į projekto katalogus ir į serverio failus nerašomi: jie tik Bitbucket'e ir veikiančių
   konteinerių aplinkoje (Docker konfigūracija, kaip ir DB slaptažodžiai DB konteineryje); naktinės kopijos juos ima
   iš projekto `secrets` konteinerio. Sudo taisyklė `setup` paskyrai naujų teisių neprideda: ji ir taip Docker grupėje.
+- SSH (`bin/install-ssh`) iš už VPN tinklo ir ne iš šio serverio priima tik raktus; slaptažodžiu jungtis galima tik
+  iš VPN (jei serverio nustatymai tai leidžia). Port'as iš interneto neatidaromas: tai lemia maršrutizatorius ar ufw.
 - Kopijų atsisiuntimo raktai (`bin/add-backup-key`) prisijungia prie paskyros `setup`, bet tik iš nurodyto tinklo
   ir tik su priverstine komanda, kuri atiduoda vien kopijas (`restrict`: be terminalo ir persiuntimų). Kopijose
   yra tikri klientų duomenys; kiekvienas atsisiuntimas registruojamas `backup-pulls.log`.

@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# Let developers reach this server over SSH from the VPN: make db-pull (bin/add-backup-key) and the web UI's
+# tunnel (bin/install-ui). Installs openssh-server when it is missing (Ubuntu Desktop ships none), keeps it
+# running after a reboot, and writes /etc/ssh/sshd_config.d/10-setup-server.conf: from outside the given
+# networks and this host, sshd takes keys only, never a password. An active ufw gets a rule for the networks;
+# an inactive one is left off. Idempotent (a rerun keeps the installed networks); --check only reports.
+set -euo pipefail
+
+CONFIG_DIR=${SETUP_SERVER_SSHD_CONFIG:-/etc/ssh/sshd_config.d}
+RUN_DIR=${SETUP_SERVER_SSHD_RUN:-/run/sshd}
+HOST_KEY=${SETUP_SERVER_SSH_HOST_KEY:-/etc/ssh/ssh_host_ed25519_key.pub}
+DROPIN=$CONFIG_DIR/10-setup-server.conf
+ACCOUNT=${SETUP_SERVER_USER:-setup}
+PATH=$PATH:/usr/sbin:/sbin
+
+check=0
+sources=
+usage() {
+    cat <<EOF
+Usage: sudo $0 [--check] [--from NETWORKS]
+  --from   networks developers connect from, comma-separated, e.g. the VPN 10.8.0.0/24 (default: the
+           installed ones); from anywhere else sshd takes keys only
+  --check  report what would change, change nothing (no root needed)
+EOF
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) check=1 ;;
+        --from) sources=${2:-}; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 64 ;;
+    esac
+    shift
+done
+if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
+    echo "Run with sudo (or use --check)" >&2
+    exit 77
+fi
+
+problems=()
+say() { printf '==> %s\n' "$*"; }
+would() { printf '    %s %s\n' "$([ "$check" = 1 ] && echo 'would' || echo 'doing:')" "$*"; }
+
+# --- Networks ---------------------------------------------------------------------------------
+sources=${sources:-$(sed -n 's/^# from: //p' "$DROPIN" 2>/dev/null || true)}
+[ -n "$sources" ] || { echo "--from needs the VPN network, e.g. 10.8.0.0/24" >&2; exit 64; }
+# Normalised, one per line; never every address (then the file would protect nothing).
+networks=$(python3 - "$sources" <<'EOF'
+import ipaddress, sys
+result = []
+for part in [part.strip() for part in sys.argv[1].split(',') if part.strip()]:
+    try:
+        network = ipaddress.ip_network(part, strict=False)
+    except ValueError:
+        raise SystemExit(f'--from: {part!r} is not an IP address or network')
+    if network.prefixlen == 0:
+        raise SystemExit('--from must name your VPN network, not every address')
+    result.append(str(network))
+if not result:
+    raise SystemExit('--from needs the VPN network, e.g. 10.8.0.0/24')
+print('\n'.join(result))
+EOF
+) || exit 64
+listed=$(paste -sd, <<<"$networks")
+# Which of the given addresses lie in the networks (the host's own VPN address, a listening socket).
+inside() {
+    python3 - "$listed" "$@" <<'EOF'
+import ipaddress, sys
+networks = [ipaddress.ip_network(part) for part in sys.argv[1].split(',')]
+for address in sys.argv[2:]:
+    try:
+        if any(ipaddress.ip_address(address) in network for network in networks):
+            print(address)
+    except ValueError:
+        pass
+EOF
+}
+
+# --- sshd settings ----------------------------------------------------------------------------
+# Written before openssh-server is installed, so a new sshd never starts without it. sshd keeps the first
+# value it reads, so the file is named to come before the host's own drop-ins (50-cloud-init.conf and the
+# like). Match takes a pattern list: * and then the networks left out.
+wanted="# Written by setup-server bin/install-ssh; a rerun rewrites it.
+# from: $listed
+# From outside these networks and this host sshd takes keys only, never a password.
+Match Address *,$(sed 's/^/!/' <<<"$networks" | paste -sd,),!127.0.0.0/8,!::1
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+Match all"
+changed=0
+if [ -f "$DROPIN" ] && [ "$(cat "$DROPIN")" = "$wanted" ]; then
+    say "$DROPIN: unchanged (keys only from outside $listed)"
+else
+    changed=1
+    say "$DROPIN: $([ -f "$DROPIN" ] && echo 'differs' || echo 'missing')"
+    would "write it (keys only from outside $listed):"
+    sed 's/^/        /' <<<"$wanted"
+    if [ "$check" = 0 ]; then
+        previous=$(cat "$DROPIN" 2>/dev/null || true)
+        had_previous=$([ -f "$DROPIN" ] && echo 1 || echo 0)
+        install -d -m 0755 "$CONFIG_DIR"
+        printf '%s\n' "$wanted" > "$DROPIN.tmp"
+        chmod 0644 "$DROPIN.tmp"
+        mv "$DROPIN.tmp" "$DROPIN"
+    fi
+fi
+
+# --- openssh-server ---------------------------------------------------------------------------
+if dpkg-query -W -f='${Status}' openssh-server 2>/dev/null | grep -q 'install ok installed'; then
+    say "openssh-server: installed"
+else
+    say "openssh-server: missing (nothing listens on port 22)"
+    would "apt-get install openssh-server"
+    if [ "$check" = 0 ]; then
+        apt-get update -q
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q openssh-server
+    fi
+fi
+
+if [ "$check" = 0 ] && [ "$changed" = 1 ]; then
+    # sshd -t wants its privilege separation directory, which only the running service creates.
+    [ -d "$RUN_DIR" ] || install -d -m 0755 "$RUN_DIR"
+    if ! test_output=$(sshd -t 2>&1); then
+        if [ "$had_previous" = 1 ]; then printf '%s\n' "$previous" > "$DROPIN"; else rm -f "$DROPIN"; fi
+        echo "sshd refuses the settings, $DROPIN put back: $test_output" >&2
+        exit 1
+    fi
+fi
+
+
+# --- Service ----------------------------------------------------------------------------------
+# Ubuntu 22.10+ starts sshd from ssh.socket on the first connection; older releases run ssh.service.
+unit=ssh.service
+systemctl cat ssh.socket >/dev/null 2>&1 && unit=ssh.socket
+if systemctl is-enabled -q ssh.socket 2>/dev/null || systemctl is-enabled -q ssh.service 2>/dev/null; then
+    enabled=1
+else
+    enabled=0
+fi
+if systemctl is-active -q ssh.socket 2>/dev/null || systemctl is-active -q ssh.service 2>/dev/null; then
+    active=1
+else
+    active=0
+fi
+if [ "$enabled" = 1 ] && [ "$active" = 1 ]; then
+    say "sshd: running and starts after a reboot"
+    if [ "$changed" = 1 ] && systemctl is-active -q ssh.service 2>/dev/null; then
+        would "systemctl reload ssh.service (open sessions stay)"
+        [ "$check" = 1 ] || systemctl reload ssh.service
+    fi
+else
+    say "sshd: $([ "$active" = 1 ] && echo 'running' || echo 'stopped'), $([ "$enabled" = 1 ] && echo 'starts' || echo 'does not start') after a reboot"
+    would "systemctl enable --now $unit"
+    if [ "$check" = 0 ]; then
+        systemctl enable --now "$unit"
+        # A running ssh.service read the settings before they were written.
+        [ "$changed" = 0 ] || ! systemctl is-active -q ssh.service || systemctl reload ssh.service
+    fi
+fi
+
+# The port(s) sshd uses: sshd -T (root) is exact; without root, the Port lines the caller can read.
+ports=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' | sort -un || true)
+[ -n "$ports" ] || ports=$(cat /etc/ssh/sshd_config "$CONFIG_DIR"/*.conf 2>/dev/null | awk 'tolower($1) == "port" {print $2}' | sort -un || true)
+ports=${ports:-22}
+
+# --- Listening --------------------------------------------------------------------------------
+mapfile -t addresses < <(ip -o addr show 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}' || true)
+own=$(inside "${addresses[@]}" || true)
+if [ "$check" = 0 ] || [ "$active" = 1 ]; then
+    for port in $ports; do
+        sockets=$(ss -tlnH "sport = :$port" 2>/dev/null | awk '{print $4}' || true)
+        mapfile -t hosts < <(sed -E 's/:[0-9]+$//; s/^\[(.*)\]$/\1/; s/%.*//' <<<"$sockets")
+        if grep -qE '^(0\.0\.0\.0|\*|\[::\]):' <<<"$sockets"; then
+            say "Port $port: listens on every address"
+        elif [ -n "$(inside "${hosts[@]}")" ]; then
+            say "Port $port: listens on $(paste -sd' ' <<<"$sockets")"
+        elif [ -z "$sockets" ]; then
+            problems+=("nothing listens on port $port (journalctl -u ssh.service -u ssh.socket says why)")
+        else
+            problems+=("port $port listens only on $(paste -sd' ' <<<"$sockets"), none of them in $listed: a ListenAddress in /etc/ssh/sshd_config or $CONFIG_DIR leaves the VPN out")
+        fi
+    done
+fi
+
+# --- Firewall ---------------------------------------------------------------------------------
+if ! command -v ufw >/dev/null 2>&1; then
+    say "ufw: not installed; nothing to allow"
+elif ! firewall=$(ufw status 2>/dev/null); then
+    say "ufw: its state needs root (run without --check, or with sudo)"
+elif ! grep -q '^Status: active' <<<"$firewall"; then
+    say "ufw: inactive; nothing to allow (a rerun adds the rule once it is on)"
+else
+    for network in $networks; do
+        for port in $ports; do
+            if grep -qE "^$port/tcp +ALLOW IN +$network( |$)" <<<"$firewall"; then
+                say "ufw: $port/tcp from $network already allowed"
+            else
+                would "ufw allow proto tcp from $network to any port $port"
+                [ "$check" = 1 ] || ufw allow proto tcp from "$network" to any port "$port" comment 'setup-server ssh' >/dev/null
+            fi
+        done
+    done
+fi
+
+# --- Summary ----------------------------------------------------------------------------------
+if [ -f "$HOST_KEY" ]; then
+    say "Host key $(ssh-keygen -lf "$HOST_KEY" | awk '{print $2}') (ED25519): a developer's first connection shows it; compare before answering yes"
+fi
+if [ ${#problems[@]} -gt 0 ]; then
+    say "Needs attention:"
+    printf '    - %s\n' "${problems[@]}"
+    exit 1
+fi
+address=$(head -n1 <<<"$own")
+say "$([ "$check" = 1 ] && echo 'Check finished; nothing was changed.' || echo 'SSH ready.')" \
+    "Developers connect to ${ACCOUNT}@${address:-<this server in $listed>}$([ "$ports" = 22 ] || echo " port $(paste -sd, <<<"$ports")");" \
+    "give each one a key: sudo bin/add-backup-key KEY.pub --name NAME --from $listed"
