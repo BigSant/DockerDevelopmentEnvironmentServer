@@ -881,17 +881,37 @@ class WebUiTest(Worker):
             with self.subTest(text=text):
                 self.assertIn(text, centos)
         self.assertNotIn("Custom HTTPD", centos)
-        vpn = self.instructions(panel="none", ssl="none", address="10.8.0.14")
+        vpn = self.instructions(panel="none", ssl="none", vpn_address="10.8.0.14", public_address="192.0.2.1")
         for text in ("Tik VPN", "PUBLISH_ADDRESS=10.8.0.14", "HTTP_FORCE_HTTPS=off"):
             self.assertIn(text, vpn)
         self.assertNotIn("certbot", vpn)
+        self.assertNotIn("192.0.2.1", vpn.split('class="steps"')[1], "a field this choice does not ask for is ignored")
         self.assertNotIn("Atidaryti formą", vpn, "no form link without the server, user and path")
+
+    def test_the_form_asks_only_for_what_the_choice_needs(self):
+        body = self.instructions(host="shop.example.lt", domain="shop.example.lt", da_user="shopda", address="ignored", worker="10.8.0.14")
+        steps = body.split('class="steps"')[1]
+        self.assertIn("install -d -o shopda -g shopda -m 0750 /home/shopda/shop.example.lt", steps,
+                      "with DirectAdmin the directory comes from its user and the domain")
+        self.assertIn("--target prod=ssh://shopda@shop.example.lt/home/shopda/shop.example.lt", steps)
+        self.assertIn("Atidaryti formą su šiuo taikiniu", steps)
+        self.assertIn("PUBLISH_ADDRESS=127.0.0.1", steps)
+        css = self.request("GET", "/ui.css")[2]
+        self.assertIn('.guide-form:has(select[name="panel"] option[value="none"]:checked) .field-da_user', css)
+        self.assertIn('.guide-form:has(select[name="panel"] option[value="directadmin"]:checked) .field-user', css)
+        self.assertIn(':has(select[name="ssl"] option[value="letsencrypt"]:checked) .field-port', css)
+        self.assertIn('<details class="more">', body, "the optional overrides stay folded while empty")
+        self.assertIn('<details class="more" open>', self.instructions(path="/srv/shop"))
+        public = self.instructions(panel="none", ssl="letsencrypt", port="8081").split('class="steps"')[1]
+        self.assertIn("LOCALHOST_PORT=80", public, "a public site without a panel takes 80/443, whatever the port field says")
+        self.assertIn("Netinkama reikšmė lauke „Projekto port&#x27;as“", self.instructions(port="70000"))
 
     def test_the_instructions_refuse_bad_values_and_show_the_workers_key(self):
         ssh = self.tree.root / ".ssh"
         ssh.mkdir()
         (ssh / "id_ed25519.pub").write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKey setup@worker1\n")
-        body = self.instructions(os="windows", panel="none", host="x;rm -rf /", user="Root User", path="/home/shop/app", port="80; id")
+        body = self.instructions(os="windows", panel="none", ssl="none", host="x;rm -rf /", user="Root User",
+                                 path="/home/shop/app", port="80; id")
         for text in ("Netinkamas pasirinkimas", "lauke „Serveris“", "lauke „SSH vartotojas“", "negali baigtis /app",
                      "lauke „Projekto port&#x27;as“"):
             with self.subTest(text=text):

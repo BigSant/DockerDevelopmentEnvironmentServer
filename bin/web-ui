@@ -719,15 +719,59 @@ GUIDE_OPTIONS = (
     ('env', 'Aplinka', (('prod', 'prod'), ('stage', 'stage'))),
     ('ssl', 'SSL', (('letsencrypt', "Let's Encrypt"), ('own', 'Savas sertifikatas'), ('none', 'Be SSL (tik VPN, HTTP)'))),
 )
+class Field:
+    """A value the guide asks for. `when`: alternatives of {option: values} under which it is asked (none: always);
+    `more`: an optional override, kept under "Nebūtina"; `address`: an IP address."""
+
+    def __init__(self, key, label, pattern, hint, when=(), more=False, address=False):
+        self.key, self.label, self.pattern, self.hint = key, label, pattern, hint
+        self.when, self.more, self.address = when, more, address
+
+    def applies(self, choice):
+        return not self.when or any(all(choice[key] in values for key, values in case.items()) for case in self.when)
+
+
+NAME_PATTERN = re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?')
+ACCOUNT_PATTERN = re.compile(r'[a-z_][a-z0-9_.-]{0,31}')
+ADDRESS_PATTERN = re.compile(r'[0-9a-fA-F:.]{2,45}')
+PUBLIC = {'panel': ('none',), 'ssl': ('letsencrypt', 'own')}
+VPN = {'panel': ('none',), 'ssl': ('none',)}
+DIRECTADMIN = {'panel': ('directadmin',)}
 GUIDE_FIELDS = (
-    ('host', 'Serveris', re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?'), 'SERVERIS'),
-    ('user', 'SSH vartotojas', re.compile(r'[a-z_][a-z0-9_.-]{0,31}'), None),
-    ('path', 'Projekto katalogas', re.compile(r'/[A-Za-z0-9._/-]{1,200}'), None),
-    ('domain', 'Domenas', re.compile(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?'), 'shop.example.lt'),
-    ('port', 'Projekto port\'as', re.compile(r'[0-9]{2,5}'), '8081'),
-    ('worker', 'Worker\'io IP', re.compile(r'[0-9a-fA-F:.]{2,45}'), 'WORKER_IP'),
-    ('address', 'Adresas portams', re.compile(r'[0-9a-fA-F:.]{2,45}'), None),
+    Field('host', 'Serveris', NAME_PATTERN, 'adresas, kuriuo worker\'is jungsis per SSH'),
+    Field('domain', 'Domenas', NAME_PATTERN, 'svetainės domenas (DOMAIN)'),
+    Field('da_user', 'DirectAdmin vartotojas', ACCOUNT_PATTERN, 'domeno savininkas DirectAdmin\'e', when=(DIRECTADMIN,)),
+    Field('vpn_address', 'Taikinio VPN IP', ADDRESS_PATTERN, 'taikinyje: ip -4 addr show tun0', when=(VPN,), address=True),
+    Field('public_address', 'Taikinio viešas IP', ADDRESS_PATTERN, 'taikinyje: hostname -I', when=(PUBLIC,), address=True),
+    Field('worker', 'Worker\'io IP', ADDRESS_PATTERN, 'ugniasienei: per VPN – worker\'io VPN adresas; internetu – '
+          'curl -4 -s https://ifconfig.me worker\'yje', address=True),
+    Field('user', 'SSH vartotojas', ACCOUNT_PATTERN, 'numatyta deploy', when=({'panel': ('none',)},), more=True),
+    Field('path', 'Projekto katalogas', re.compile(r'/[A-Za-z0-9._/-]{1,200}'),
+          'numatyta /home/VARTOTOJAS/DOMENAS', more=True),
+    Field('port', 'Projekto port\'as', re.compile(r'[0-9]{2,5}'), 'numatyta 8081; stage ir prod viename serveryje – skirtingi',
+          when=(DIRECTADMIN, VPN), more=True),
 )
+
+
+def guide_css():
+    """Hide a field while the chosen options do not ask for it: CSS :has() on the selected options, so the form
+    follows a choice at once without any script. A browser without :has() shows every field; the server ignores
+    the ones that do not apply either way."""
+    rules = []
+    for field in GUIDE_FIELDS:
+        keys = sorted({key for case in field.when for key in case})
+        options = {key: [value for value, _ in next(item for item in GUIDE_OPTIONS if item[0] == key)[2]] for key in keys}
+        combinations = [{}]
+        for key in keys:
+            combinations = [{**combination, key: value} for combination in combinations for value in options[key]]
+        for combination in combinations:
+            if not field.applies({**{key: None for key, _, _ in GUIDE_OPTIONS}, **combination}):
+                selector = ''.join(f':has(select[name="{key}"] option[value="{value}"]:checked)'
+                                   for key, value in combination.items())
+                rules.append(f'.guide-form{selector} .field-{field.key}')
+    return (','.join(rules) + '{display:none}') if rules else ''
+
+
 WHERE = {'target': 'taikinyje (root)', 'panel': 'DirectAdmin', 'repo': 'env repo ir Bitbucket', 'worker': 'worker\'yje (šiame serveryje)'}
 DOCKER_APT = ('install -m 0755 -d /etc/apt/keyrings',
               'curl -fsSL https://download.docker.com/linux/{distribution}/gpg -o /etc/apt/keyrings/docker.asc',
@@ -795,9 +839,11 @@ GUIDE = (
          warning='docker grupė prilygsta root teisėms. root vartotojo taikiniui nenaudok.'),
     Step('Projekto katalogas', 'target',
          'Absoliutus kelias, jau sukurtas ir rašomas vartotojo; nesibaigia `/app` – jame atsiras `app/` (kodas) ir `data/` '
-         '(duomenys, sertifikatai). bin/add-project nutolusio katalogo nekuria.',
+         '(duomenys, sertifikatai). bin/add-project nutolusio katalogo nekuria. Su DirectAdmin tai ne jo '
+         '`domains/{domain}/public_html` (tą aptarnauja pats DirectAdmin), o atskiras katalogas vartotojo namuose, kaip '
+         'setup pavyzdyje `/home/VARTOTOJAS/demo`.',
          blocks=((None, ('install -d -o {user} -g {user} -m 0750 {path}',)),),
-         source='bin/add-project:159-162,182; setup docker/project_release.py:56-57'),
+         source='bin/add-project:159-162,182; setup docker/project_release.py:56-57; doc/lt/09-aplinkos.md:55,88'),
     Step('Worker\'io raktas', 'target',
          'Worker\'is jungiasi kaip `setup` paskyra savo raktu (tas pats, kuriuo skaito git). Įrašyk jį vartotojui:',
          blocks=((None, ('install -d -m 0700 -o {user} -g {user} ~{user}/.ssh',
@@ -909,40 +955,49 @@ GUIDE = (
 
 
 def guide_values(query, status_data):
-    """(choice, values, errors): the chosen options, the values steps fill in, and what was not accepted."""
+    """(choice, values, errors, given, key known): the chosen options, the values steps fill in, what was not accepted
+    and what was typed. A field the choice does not ask for is ignored."""
     choice, errors = {}, []
     for key, _, options in GUIDE_OPTIONS:
-        given = query.get(key, [''])[0]
+        text = query.get(key, [''])[0]
         allowed = [value for value, _ in options]
-        if given and given not in allowed:
+        if text and text not in allowed:
             errors.append(f'Netinkamas pasirinkimas „{key}“.')
-        choice[key] = given if given in allowed else allowed[0]
+        choice[key] = text if text in allowed else allowed[0]
     given = {}
-    for key, label, pattern, _ in GUIDE_FIELDS:
-        text = query.get(key, [''])[0].strip()
-        if text and (not pattern.fullmatch(text) or '..' in text):
-            errors.append(f'Netinkama reikšmė lauke „{label}“: {text[:60]}')
-            text = ''
-        given[key] = text
-    if given['address']:
-        try:
-            ipaddress.ip_address(given['address'])
-        except ValueError:
-            errors.append(f'„Adresas portams“: {given["address"]} nėra IP adresas.')
-            given['address'] = ''
+    for field in GUIDE_FIELDS:
+        text = query.get(field.key, [''])[0].strip()
+        if text and field.applies(choice):
+            valid = field.pattern.fullmatch(text) and '..' not in text and (field.key != 'port' or 1 <= int(text) <= 65535)
+            if valid and field.address:
+                try:
+                    ipaddress.ip_address(text)
+                except ValueError:
+                    valid = False
+            if not valid:
+                errors.append(f'Netinkama reikšmė lauke „{field.label}“: {text[:60]}')
+                text = ''
+        given[field.key] = text
     directadmin, private = choice['panel'] == 'directadmin', choice['panel'] == 'none' and choice['ssl'] == 'none'
-    user = given['user'] or ('DA_VARTOTOJAS' if directadmin else 'deploy')
-    path = (given['path'] or f'/home/{user}/PROJEKTAS').rstrip('/')
+    public = choice['panel'] == 'none' and not private
+    applies = lambda key: next(field for field in GUIDE_FIELDS if field.key == key).applies(choice)
+    pick = lambda key: given[key] if applies(key) else ''
+    user = (pick('da_user') or 'DA_VARTOTOJAS') if directadmin else (pick('user') or 'deploy')
+    domain = pick('domain') or 'DOMENAS'
+    path = (pick('path') or f'/home/{user}/{domain}').rstrip('/')
     if path.endswith('/app'):
         errors.append('Projekto katalogas negali baigtis /app: jame bus app/ ir data/.')
-    port = given['port'] or ('80' if choice['panel'] == 'none' and not private else '8081')
-    port_ssl = '443' if choice['panel'] == 'none' and not private else str(int(port) + 1) if port.isdigit() and int(port) < 65535 else '8082'
-    address = given['address'] or ('127.0.0.1' if directadmin else 'VPN_IP' if private else 'VIEŠAS_IP')
+    port = '80' if public else pick('port') or '8081'
+    port_ssl = '443' if public else str(int(port) + 1) if int(port) < 65535 else '8082'
+    address = '127.0.0.1' if directadmin else (pick('vpn_address') or 'TAIKINIO_VPN_IP') if private else \
+        (pick('public_address') or 'TAIKINIO_IP')
     key = (status_data or {}).get('deploy_key')
     allow = ('ALLOWED_IPS="BIURO_IP"' if choice['env'] == 'stage' else
              'PMA_ALLOWED_IPS="BIURO_IP"\nCRON_ALLOWED_IPS="BIURO_IP"\nBACKUP_ALLOWED_IPS="BIURO_IP"')
-    values = {'host': given['host'] or 'SERVERIS', 'user': user, 'path': path, 'domain': given['domain'] or 'shop.example.lt',
-              'port': port, 'port_ssl': port_ssl, 'worker': given['worker'] or 'WORKER_IP', 'address': address,
+    # The form link needs real values: what the step's target is made of must be typed or derived from typed ones.
+    complete = bool(pick('host') and pick('domain') and (pick('da_user') if directadmin else True))
+    values = {'host': pick('host') or 'SERVERIS', 'user': user, 'path': path, 'domain': domain,
+              'port': port, 'port_ssl': port_ssl, 'worker': pick('worker') or 'WORKER_IP', 'address': address,
               'env': choice['env'], 'key': key or 'SETUP_RAKTAS', 'root': str(ROOT), 'distribution': choice['os'],
               'deployment': 'Production' if choice['env'] == 'prod' else 'Staging',
               'certbot_install': 'dnf install -y epel-release && dnf install -y certbot' if choice['os'] == 'centos'
@@ -951,7 +1006,7 @@ def guide_values(query, status_data):
               'allow_lines': allow,
               'release': 'prod – iš release tag\'o (REF = vX.Y.Z, setup ant vX.Y.Z tag\'o); vėlesni – su BACKUP.' if choice['env'] == 'prod'
               else 'stage tinka bet kuris commit\'as.'}
-    return choice, values, errors, given, key is not None
+    return choice, values, errors, given, key is not None, complete
 
 
 def steps_word(count):
@@ -1123,7 +1178,10 @@ details[open]>summary::before{content:"\\25BE  "}
 details>.inner{padding:0 14px 12px}
 details .term{margin:0}
 .guide{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:4px 20px}
-.guide label{grid-template-columns:1fr;gap:4px}
+.guide label{grid-template-columns:1fr;gap:4px;align-content:start}
+.guide label small{color:var(--faint);font-size:11px;line-height:1.35}
+details.more{margin:12px 0 0;background:transparent}
+details.more .inner{padding-top:4px}
 .chosen{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:22px 0 14px}
 .steps{list-style:none;margin:0;padding:0;counter-reset:step}
 .step{counter-increment:step;display:grid;grid-template-columns:52px minmax(0,1fr);column-gap:14px;margin:0 0 10px;padding:14px 16px;
@@ -1143,6 +1201,7 @@ overflow:auto;white-space:pre}
 .foot{margin-top:28px;color:var(--faint);font-size:11px}
 """ + ''.join(f'.unit:nth-child({index}),.board tbody tr:nth-child({index}),.step:nth-child({index}){{animation-delay:{(index - 1) * 45}ms}}'
               for index in range(2, 21)) + """
+""" + guide_css() + """
 @media (max-width:900px){.top{padding:12px 16px}main{padding:18px 16px}.deck{grid-template-columns:1fr}
 label{grid-template-columns:1fr;gap:4px}.board thead{display:none}.board,.board tbody,.board tr,.board td{display:block;width:100%}
 .board tr{margin-bottom:10px}.board td{border-radius:0!important;border-top:none;border-bottom:none;padding:6px 14px}
@@ -1581,19 +1640,25 @@ class Page:
         return self.layout('Metrikos', body, section='metrics')
 
     # --- Instructions ---
-    def instructions(self, choice, values, errors, given, key_known):
+    def instructions(self, choice, values, errors, given, key_known, complete):
         def text(markup):
             return re.sub(r'`([^`]+)`', r'<code>\1</code>', e(guide_fill(markup, values)))
         selects = ''.join(
             f'<label><span>{e(label)}</span><select name="{key}">' +
             ''.join(f'<option value="{value}"{" selected" if choice[key] == value else ""}>{e(title)}</option>'
                     for value, title in options) + '</select></label>' for key, label, options in GUIDE_OPTIONS)
-        fields = ''.join(f'<label><span>{e(label)}</span><input type="text" name="{key}" value="{e(given[key])}" '
-                         f'placeholder="{e(placeholder or values[key])}" autocomplete="off"></label>'
-                         for key, label, _, placeholder in GUIDE_FIELDS)
+        def field(item):
+            return (f'<label class="field-{item.key}"><span>{e(item.label)}</span><input type="text" name="{item.key}" '
+                    f'value="{e(given[item.key])}" autocomplete="off"><small>{e(item.hint)}</small></label>')
+        required = ''.join(field(item) for item in GUIDE_FIELDS if not item.more)
+        optional = ''.join(field(item) for item in GUIDE_FIELDS if item.more)
+        opened = ' open' if any(given[item.key] for item in GUIDE_FIELDS if item.more) else ''
         body = ('<p class="note">Ką padaryti serveryje, kad jis taptų projekto taikiniu (bin/add-project --target '
-                'ENV=ssh://VARTOTOJAS@SERVERIS/KELIAS). Užpildyti laukai įrašomi į komandas; tušti lieka DIDŽIOSIOMIS.</p>'
-                f'<form class="action" method="get" action="/instructions"><div class="guide">{selects}{fields}</div>'
+                'ENV=ssh://VARTOTOJAS@SERVERIS/KELIAS). Rodomi tik tam pasirinkimui reikalingi laukai; užpildyti įrašomi '
+                'į komandas, tušti lieka DIDŽIOSIOMIS.</p>'
+                f'<form class="action guide-form" method="get" action="/instructions"><div class="guide">{selects}{required}</div>'
+                f'<details class="more"{opened}><summary>Nebūtina: pakeisti numatytas reikšmes</summary>'
+                f'<div class="inner guide">{optional}</div></details>'
                 '<div class="form-foot"><p class="note">Nieko nevykdo: tik parodo žingsnius.</p><button>Rodyti žingsnius</button></div></form>')
         if errors:
             body += '<div class="callout bad">' + ''.join(f'<p>{e(item)}</p>' for item in errors) + '</div>'
@@ -1609,7 +1674,7 @@ class Page:
             blocks = ''.join((f'<p class="block-label">{e(label)}</p>' if label else '') +
                              f'<pre class="cmd">{e(guide_fill(chr(10).join(lines), values))}</pre>' for label, lines in step.blocks)
             link = ''
-            if step.link and all(given[key] for key in ('host', 'user', 'path')):
+            if step.link and complete:
                 target = f'{choice["env"]}=ssh://{values["user"]}@{values["host"]}{values["path"]}'
                 if TARGET.fullmatch(target):
                     link = (f'<p><a class="btn" href="/actions?target={e(quote(target, safe=""))}#add-project">'
