@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "web-ui",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["tests/preview_ui.py"],
+      "port": 9178
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+# The test suite on what the servers run: Ubuntu 22.04 and its python3 (3.10). No root, no network: the tests
+# stub sudo, systemctl, docker and the rest (tests/test_scripts.py); the real-Ubuntu container tests stay opt-in.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  unittest:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: python3 -m unittest discover -s tests
+        run: |
+          python3 --version
+          python3 -m unittest discover -s tests

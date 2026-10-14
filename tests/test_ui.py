@@ -547,7 +547,7 @@ class WebUiTest(Worker):
             return status, reply
         for _ in range(200):
             status, _, page = self.request("GET", headers["Location"])
-            if "vykdoma" not in page:
+            if 'class="chip run"' not in page:  # the running job's state chip, not a word other text may contain
                 return status, page
             time.sleep(0.05)
         self.fail("the job did not finish")
