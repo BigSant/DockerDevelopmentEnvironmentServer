@@ -22,6 +22,7 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/add-backup-key` | Programuotojo SSH raktas DB kopijoms atsisiųsti (`make db-pull`), su `--allow-fresh` – ir naujai kopijai užsakyti (`make db-pull fresh=1`): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. |
 | `bin/install-metrics` | Worker'io Prometheus `/metrics`: systemd paslauga `setup-server-metrics` (paskyra `setup`, tik skaito), komanda `/usr/local/sbin/setup-server-metrics` (kopija iš `bin/worker-metrics`), nustatymai `/etc/setup-server/metrics.env`. |
 | `bin/install-ui` | Valdymo sąsaja naršyklėje (tik `127.0.0.1`, per SSH tunelį): paslauga `setup-server-ui` (atskira paskyra `setup-ui`), komanda `/usr/local/sbin/setup-server-ui` (kopija iš `bin/web-ui`), komandų kopijos `/usr/local/lib/setup-server/bin/`, sudo taisyklė, nustatymai `/etc/setup-server/ui.env`. |
+| `bin/move-bitbucket-ssh` | Perkelia build katalogų Bitbucket remote'us iš `bitbucket.org` į `ssh.bitbucket.org` (Bitbucket SSH adresas nuo 2026-11-12); perkelia tik tada, kai naujas adresas atsako. Žr. „Bitbucket SSH adresas“. |
 | `bin/server-status` | Serverio būsena JSON formatu (tik skaito): paslaugos, laikmačiai, versijos, diskas, projektai, konteineriai. Ją naudoja valdymo sąsaja; galima leisti ir ranka. |
 
 Visi scriptai yra idempotentiški, juos galima kartoti. Su `--check` jie tik parodo, ką keistų,
@@ -68,7 +69,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    Pabaigoje parodomas viešasis git raktas. Pridėk jį **tik skaitymui** prie setup repo (GitHub,
    deploy key) ir prie kiekvieno Bitbucket projekto repo (Access keys); GitHub projekto repo gauna savo
    raktą (žr. 4 žingsnį). Tada paleisk scriptą dar
-   kartą: jis nusiklonuos setup. `bitbucket.org` ir `github.com` SSH host raktai įrašomi tik tada, kai
+   kartą: jis nusiklonuos setup. `bitbucket.org`, `ssh.bitbucket.org` ir `github.com` SSH host raktai įrašomi tik tada, kai
    nuskenuoto rakto fingerprint'as sutampa su paslaugos paskelbtu (jie įrašyti scripte su nuorodomis į
    GitHub ir Atlassian puslapius); kitaip raktas neįrašomas ir parodoma „Needs attention“.
 
@@ -161,8 +162,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 4. **Projektas:**
 
    ```bash
-   sudo bin/add-project --target local git@bitbucket.org:rsmaizys/asana_tracker.git
-   sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@bitbucket.org:rsmaizys/forsena_docker.git git@bitbucket.org:rsmaizys/forsena.git
+   sudo bin/add-project --target local git@ssh.bitbucket.org:rsmaizys/asana_tracker.git
+   sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@ssh.bitbucket.org:rsmaizys/forsena_docker.git git@ssh.bitbucket.org:rsmaizys/forsena.git
    ```
 
    Build katalogas pavadinamas pagal repo vardą (`/srv/setup-server/projects/asana_tracker`), todėl
@@ -181,8 +182,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    tokį pavyzdį atmeta):
 
    ```bash
-   sudo bin/add-project --target local git@bitbucket.org:rsmaizys/asana_tracker.git   # šis serveris
-   sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@bitbucket.org:rsmaizys/forsena_docker.git
+   sudo bin/add-project --target local git@ssh.bitbucket.org:rsmaizys/asana_tracker.git   # šis serveris
+   sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@ssh.bitbucket.org:rsmaizys/forsena_docker.git
    ```
 
    - **Taikinys nurodomas visada:** naujas projektas be `--target` nesukuriamas (nieko neklonuoja).
@@ -382,6 +383,31 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 
    Kopijose yra tikri klientų duomenys (stage/prod pagal lentelių registrą): leisk tik tiems, kam jų reikia,
    ir atimk leidimą (`--remove`), kai nebereikia. Įdiegtą komandos kopiją atnaujina `bin/update`.
+
+## Bitbucket SSH adresas (nuo 2026-11-12)
+
+Nuo 2026-11-12 Bitbucket git per SSH atsako tik `ssh.bitbucket.org` (`git@ssh.bitbucket.org:darbo-erdve/repo.git`);
+`bitbucket.org` SSH ryšių nebepriims. HTTPS (API, asana.local git mirror) nesikeičia. Naujas vardas turi tuos pačius
+host raktus (ED25519 `SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM`), bet `known_hosts` įrašas rišamas prie
+vardo, o build katalogų `origin` lieka toks, su kokiu jie nuklonuoti. Todėl serveryje, iki tos datos:
+
+```bash
+cd ~/setup-server
+sudo bin/prepare-host --check          # turi rodyti: would record the SSH host key of ssh.bitbucket.org
+sudo bin/prepare-host                  # įrašo jį (tik su paskelbtu fingerprint'u)
+sudo bin/move-bitbucket-ssh --check    # kurie remote'ai persikels ir ar naujas adresas atsako
+sudo bin/move-bitbucket-ssh            # perkelia app/ ir app/public/ remote'us; GitHub nelieča
+sudo bin/install-ui                    # sudo taisyklė web sąsajai (veiksmas „Bitbucket SSH“)
+```
+
+- `move-bitbucket-ssh` kiekvieną naują URL pirmiau perskaito `git ls-remote` kaip `setup` paskyra (jos raktu ir
+  `known_hosts`); neatsakiusio remote'o nekeičia ir baigia kodu 1. Kartoti galima.
+- `bin/add-project` seną `git@bitbucket.org:…` URL nuo šiol klonuoja per `ssh.bitbucket.org`, o pakartotinai
+  paleistas esamo build katalogo remote'ą perkelia pats.
+- Web sąsaja atpažįsta abu vardus (pipeline'ai, deploy'ai).
+- **Programuotojo kompiuteryje** ta pati komanda be sudo perkelia savo klonų remote'us (visus, ne tik `origin`):
+  `bin/move-bitbucket-ssh --check --under ~/Projects`, tada be `--check`. Pirmiau į `~/.ssh/known_hosts` įrašyk
+  `ssh.bitbucket.org` raktą, palyginęs jo fingerprint'ą su paskelbtu (`ssh-keyscan -t ed25519 ssh.bitbucket.org | ssh-keygen -lf -`).
 
 ## Atnaujinimas
 

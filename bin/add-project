@@ -58,7 +58,13 @@ else
     name=
 fi
 [ ${#args[@]} -ge 1 ] && [ ${#args[@]} -le 2 ] || { usage >&2; exit 64; }
-env_repo=${args[0]}; code_repo=${args[1]:-}
+# Bitbucket serves git over SSH at ssh.bitbucket.org from 2026-11-12 (bitbucket.org then refuses SSH): an
+# old-host URL is cloned through the new name - the same repository, the same host keys (bin/prepare-host).
+bitbucket_ssh() { sed -E 's#^git@bitbucket\.org:#git@ssh.bitbucket.org:#; s#^ssh://git@bitbucket\.org/#ssh://git@ssh.bitbucket.org/#' <<<"$1"; }
+env_repo=$(bitbucket_ssh "${args[0]}"); code_repo=$(bitbucket_ssh "${args[1]:-}")
+for given in "${args[@]}"; do
+    [ "$(bitbucket_ssh "$given")" = "$given" ] || echo "==> note: $given is cloned as $(bitbucket_ssh "$given") (Bitbucket's SSH host from 2026-11-12)"
+done
 slug=$(basename "${env_repo%/}" .git | tr '[:upper:]' '[:lower:]')
 name=${name:-$slug}
 [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || { echo "NAME must be lowercase letters, digits, _ or -" >&2; exit 65; }
@@ -117,6 +123,11 @@ clone() {  # clone URL DIRECTORY — an existing checkout of the same remote is 
     clone_url=$(clone_url "$1")
     if [ -d "$2/.git" ]; then
         remote=$(as_account git -C "$2" remote get-url origin)
+        if [ "$remote" != "$1" ] && [ "$(bitbucket_ssh "$remote")" = "$1" ]; then
+            echo "==> $([ "$check" = 1 ] && echo would move || echo moving) $2 to $1 (Bitbucket's SSH host from 2026-11-12)"
+            [ "$check" = 1 ] || as_account git -C "$2" remote set-url origin "$1"
+            remote=$1
+        fi
         [ "$remote" = "$1" ] || [ "$remote" = "$clone_url" ] || { echo "$2 already holds $remote, not $1" >&2; exit 65; }
         echo "==> $2: present"
         return

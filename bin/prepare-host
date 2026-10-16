@@ -141,11 +141,14 @@ known="$ROOT/.ssh/known_hosts"
 #   github.com:    https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints
 #   bitbucket.org: https://support.atlassian.com/bitbucket-cloud/docs/configure-ssh-and-two-step-verification/
 #                  (the known_hosts lines: https://bitbucket.org/site/ssh)
+# Bitbucket moves git over SSH to ssh.bitbucket.org on 2026-11-12 (bitbucket.org then stops answering SSH); the
+# new name serves the same host keys. Both are recorded until every remote uses the new one (bin/move-bitbucket-ssh).
 declare -A PUBLISHED_HOST_KEYS=(
     [bitbucket.org]=SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM
+    [ssh.bitbucket.org]=SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM
     [github.com]=SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU
 )
-for host in bitbucket.org github.com; do
+for host in bitbucket.org ssh.bitbucket.org github.com; do
     if [ ! -f "$known" ] || ! as_account ssh-keygen -F "$host" -f "$known" >/dev/null 2>&1; then
         published=${PUBLISHED_HOST_KEYS[$host]}
         would "record the SSH host key of $host (only with the published fingerprint $published)"

@@ -94,7 +94,8 @@ OPERATION_TITLES = {'start': 'Paleisti', 'stop': 'Sustabdyti', 'restart': 'Perkr
 CONTAINER_LINES = ('200', '500', '2000')
 BACKUP_KINDS = {'worker': 'naktinė', 'full': 'pilna', 'fresh': 'šviežia', 'fresh-full': 'šviežia pilna',
                 'predeploy': "prieš deploy'ų"}
-BITBUCKET_URL = re.compile(r'(?:git@bitbucket\.org:|ssh://git@bitbucket\.org/|https://(?:[^@/\s]+@)?bitbucket\.org/)'
+# git over SSH: ssh.bitbucket.org from 2026-11-12, bitbucket.org before (bin/move-bitbucket-ssh moves the remotes).
+BITBUCKET_URL = re.compile(r'(?:git@(?:ssh\.)?bitbucket\.org:|ssh://git@(?:ssh\.)?bitbucket\.org/|https://(?:[^@/\s]+@)?bitbucket\.org/)'
                            r'([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*?)(?:\.git)?/?')
 PIPELINES = {'deploy-stage': 'Deploy į stage', 'deploy-production': 'Deploy į prod', 'backup-now': 'Backup dabar',
              'runner-test': "Runner'io testas"}
@@ -409,6 +410,10 @@ def plan_prepare_host(form, status):
                 timeout=3600, run_codes=(0, 1))
 
 
+def plan_move_bitbucket_ssh(form, status):
+    return Plan('move-bitbucket-ssh', 'Bitbucket remote\'ai į ssh.bitbucket.org', *command('move-bitbucket-ssh', []), timeout=1800)
+
+
 def plan_update(form, status):
     where = installation()
     if not where['checkout']:
@@ -458,7 +463,8 @@ ACTIONS = {'add-project': plan_add_project, 'remove-project': plan_remove_projec
            'install-metrics': plan_install_metrics, 'add-backup-key': plan_add_backup_key,
            'remove-backup-key': plan_remove_backup_key, 'list-backup-keys': plan_list_backup_keys,
            'prepare-host': plan_prepare_host, 'update': plan_update, 'update-setup': plan_update_setup,
-           'pipeline': plan_pipeline, 'backup-local': plan_backup_local, 'unit': plan_unit, 'install-ssh': plan_install_ssh}
+           'pipeline': plan_pipeline, 'backup-local': plan_backup_local, 'unit': plan_unit, 'install-ssh': plan_install_ssh,
+           'move-bitbucket-ssh': plan_move_bitbucket_ssh}
 
 
 # --- Running commands ----------------------------------------------------------------------------
@@ -1698,8 +1704,8 @@ class Page:
                 ''.join(f'<a class="btn" href="#{key}">{e(label)}</a>' for key, label in sections) + '</nav>')
         body += '<h2 id="add-project">Projektai</h2><div class="deck">' + self.form(
             'add-project', 'Pridėti projektą',
-            text('env_repo', 'Aplinkos repo URL', 'git@bitbucket.org:darbo-erdve/projektas.git') +
-            text('code_repo', 'Kodo repo URL (nebūtina)', 'git@bitbucket.org:darbo-erdve/kodas.git') +
+            text('env_repo', 'Aplinkos repo URL', 'git@ssh.bitbucket.org:darbo-erdve/projektas.git') +
+            text('code_repo', 'Kodo repo URL (nebūtina)', 'git@ssh.bitbucket.org:darbo-erdve/kodas.git') +
             text('name', 'Vardas (nebūtina)', 'numatyta – repo vardas') +
             '<label><span>Taikinys (po vieną eilutėje)</span><textarea name="targets" placeholder="local&#10;local:/home/vartotojas/projektas&#10;prod=ssh://deploy@shop.example/home/deploy/shop">'
             f'{e(target)}</textarea></label>'
@@ -1770,6 +1776,11 @@ class Page:
             'prepare-host', 'Paruošti serverį', text('setup_ref', 'setup tag\'as (nebūtina)', 'v2.6.0'),
             note='Paketai, Docker, paskyra setup, git raktas, setup checkout\'as. Esamas Docker nekeičiamas.',
             command='bin/prepare-host')
+        body += self.form(
+            'move-bitbucket-ssh', 'Bitbucket SSH: ssh.bitbucket.org', '',
+            note='Nuo 2026-11-12 Bitbucket git per SSH – tik ssh.bitbucket.org. Perkelia build katalogų (app/, app/public/) '
+                 'remote\'us, kai naujas adresas atsako; GitHub nelieča. Prieš tai – „Paruošti serverį“ (host key).',
+            command='bin/move-bitbucket-ssh')
         body += self.form(
             'update-setup', 'Atnaujinti setup', text('setup_tag', 'setup tag\'as (tuščia – naujausias)', 'v2.7.0'),
             note='Tik bendras setup checkout\'as, tik release tag\'ai; be slaptažodžio. Deploy\'us tai daro ir pats, '
