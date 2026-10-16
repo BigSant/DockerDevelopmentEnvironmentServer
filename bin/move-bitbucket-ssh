@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Move the build roots' Bitbucket remotes to ssh.bitbucket.org. Bitbucket serves git over SSH under that name
+# from 2026-11-12 and bitbucket.org then refuses SSH, so a deploy's fetch in a build root would fail. For every
+# checkout under $ROOT/projects (app/ and app/public/) whose origin is git@bitbucket.org:… or
+# ssh://git@bitbucket.org/…, the new URL is first read with git ls-remote as the setup account (its key, its
+# known_hosts: bin/prepare-host records ssh.bitbucket.org) and only then set; a remote it cannot read is left as
+# it is. GitHub and other remotes are not touched. Idempotent; --check only reports (and reads the remotes).
+# --under DIR does the same for the git checkouts under DIR (a developer's clones), every remote of each, as the
+# user who runs it (no sudo), with that user's key and ~/.ssh/known_hosts.
+set -euo pipefail
+
+ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+FINGERPRINT=SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM  # bin/prepare-host PUBLISHED_HOST_KEYS
+ACCOUNT=${SETUP_SERVER_USER:-setup}
+PATH=$PATH:/usr/sbin:/sbin
+
+check=0
+under=
+usage() {
+    cat <<EOF
+Usage: sudo $0 [--check]                      the build roots under $ROOT/projects (as $ACCOUNT)
+       $0 [--check] --under DIR               the git checkouts under DIR (as you, e.g. --under ~/Projects)
+  --check  show which remotes would move and whether the new URL answers; change nothing
+Exit: 0 every Bitbucket remote is on ssh.bitbucket.org, 1 one or more could not be moved, 64 usage, 65 refused, 77 not root.
+EOF
+}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --check) check=1 ;;
+        --under) under=${2:?--under needs a directory}; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 64 ;;
+    esac
+    shift
+done
+if [ -n "$under" ]; then
+    [ -d "$under" ] || { echo "--under: no directory $under" >&2; exit 64; }
+    as_account() { "$@"; }  # your own clones, your own key
+    known="$HOME/.ssh/known_hosts"
+    hint="add it after comparing its fingerprint with $FINGERPRINT: ssh-keyscan -t ed25519 ssh.bitbucket.org | ssh-keygen -lf -"
+else
+    if [ "$check" = 0 ] && [ "$(id -u)" != 0 ] && [ "$(id -un)" != "$ACCOUNT" ]; then
+        echo "Run with sudo (or use --check)" >&2
+        exit 77
+    fi
+    # Run from a directory the account can read: a caller's home (0750 on Ubuntu) makes git fail early.
+    as_account() {
+        if [ "$(id -u)" = 0 ]; then (cd "$ROOT" 2>/dev/null || cd /; sudo -u "$ACCOUNT" -H "$@"); else "$@"; fi
+    }
+    known="$ROOT/.ssh/known_hosts"
+    hint="run sudo bin/prepare-host first (it records the published one)"
+fi
+new_url() { sed -E 's#^git@bitbucket\.org:#git@ssh.bitbucket.org:#; s#^ssh://git@bitbucket\.org/#ssh://git@ssh.bitbucket.org/#' <<<"$1"; }
+
+if ! as_account ssh-keygen -F ssh.bitbucket.org -f "$known" >/dev/null 2>&1; then
+    echo "==> $known has no host key of ssh.bitbucket.org: $hint" >&2
+    [ "$check" = 1 ] || exit 65
+fi
+
+checkouts() {  # the build roots' checkouts, or every checkout (.git directory or worktree file) under --under
+    if [ -n "$under" ]; then
+        find "$under" -maxdepth 5 -name .git \( -type d -o -type f \) -printf '%h\n' 2>/dev/null | sort -u
+    else
+        for checkout in "$ROOT"/projects/*/app "$ROOT"/projects/*/app/public; do
+            [ -d "$checkout/.git" ] && [ ! -L "$checkout" ] && echo "$checkout"
+        done
+    fi
+}
+
+moved=0 kept=0 failed=()
+while IFS= read -r checkout; do
+    for remote in $(as_account git -C "$checkout" remote 2>/dev/null || true); do
+        url=$(as_account git -C "$checkout" remote get-url "$remote" 2>/dev/null || true)
+        target=$(new_url "$url")
+        if [ -z "$url" ] || [ "$target" = "$url" ]; then
+            [[ "$url" != *ssh.bitbucket.org[:/]* ]] || kept=$((kept + 1))
+            continue
+        fi
+        # BatchMode: a missing host key or key access fails here instead of waiting for a prompt.
+        if answer=$(as_account env GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=15' git ls-remote -q "$target" HEAD 2>&1 </dev/null); then
+            reachable=1
+        else
+            reachable=0
+        fi
+        if [ "$reachable" = 0 ]; then
+            echo "==> $checkout ($remote): $target does not answer; it stays $url"
+            printf '%s\n' "$answer" | tail -n 2 | sed 's/^/    /'
+            failed+=("$checkout")
+        elif [ "$check" = 1 ]; then
+            echo "==> would move $checkout ($remote): $url -> $target (it answers)"
+            moved=$((moved + 1))
+        else
+            as_account git -C "$checkout" remote set-url "$remote" "$target"
+            echo "==> moved $checkout ($remote): $url -> $target"
+            moved=$((moved + 1))
+        fi
+    done
+done < <(checkouts)
+
+echo "==> $([ "$check" = 1 ] && echo 'would move' || echo moved) $moved, already on ssh.bitbucket.org $kept, could not move ${#failed[@]}"
+[ "$check" = 0 ] || echo "==> Check finished; nothing was changed."
+[ ${#failed[@]} = 0 ] || exit 1

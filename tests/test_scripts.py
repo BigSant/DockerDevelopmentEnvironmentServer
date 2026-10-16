@@ -121,6 +121,8 @@ class PrepareHostKeysTest(ScriptTest):
     PUBLISHED = {  # the providers' known_hosts lines (see the fingerprints in bin/prepare-host)
         "github.com": "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
         "bitbucket.org": "bitbucket.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIazEu89wgQZ4bqs3d63QSMzYVa0MuJ2e2gKTKqu+UUO",
+        # git over SSH from 2026-11-12: the same key under the new name
+        "ssh.bitbucket.org": "ssh.bitbucket.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIazEu89wgQZ4bqs3d63QSMzYVa0MuJ2e2gKTKqu+UUO",
     }
 
     def setUp(self):
@@ -147,7 +149,9 @@ class PrepareHostKeysTest(ScriptTest):
         self.assertEqual(sorted(self.known.read_text().splitlines()), sorted(self.PUBLISHED.values()),
                          result.stdout + result.stderr)
         self.assertIn("github.com fingerprint: SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU (published)", result.stdout)
-        self.assertIn("bitbucket.org fingerprint: SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM (published)",
+        self.assertIn("\n    bitbucket.org fingerprint: SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM (published)",
+                      result.stdout)
+        self.assertIn("ssh.bitbucket.org fingerprint: SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM (published)",
                       result.stdout)
         self.assertNotIn("host key", result.stdout.split("Needs attention")[-1])
 
@@ -447,7 +451,9 @@ class AddProjectTest(ScriptTest):
     def test_check_plans_the_build_root(self):
         result = self.run_script("add-project", "--target", "local", "--check", "asana", "git@bitbucket.org:ws/asana_tracker.git")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"would clone git@bitbucket.org:ws/asana_tracker.git into {self.root}/srv/projects/asana/app",
+        self.assertIn("note: git@bitbucket.org:ws/asana_tracker.git is cloned as git@ssh.bitbucket.org:ws/asana_tracker.git",
+                      result.stdout)
+        self.assertIn(f"would clone git@ssh.bitbucket.org:ws/asana_tracker.git into {self.root}/srv/projects/asana/app",
                       result.stdout)
         self.assertIn(f"BUILD_ROOT={self.root}/srv/projects/asana", result.stdout)
         self.assertEqual(self.run_script("add-project", "--target", "local", "--check", "Bad Name", "x").returncode, 65)
@@ -469,7 +475,7 @@ class AddProjectTargetTest(ScriptTest):
         root_bin = self.fake_root()
         self.stub("git", 'case "$1" in\n'
                          '  clone) for last; do :; done; mkdir -p "$last/.git"; echo "$3" > "$last/.git/origin";;\n'
-                         '  -C) cat "$2/.git/origin";;\n'
+                         '  -C) if [ "$4" = set-url ]; then echo "$6" > "$2/.git/origin"; else cat "$2/.git/origin"; fi;;\n'
                          'esac\n')
         self.stub("ssh", 'echo "$*" >> "$SSH_LOG"\n'
                          '[ -z "${FAKE_SSH_FAIL:-}" ] || { echo "Permission denied (publickey)." >&2; exit 255; }\n'
@@ -517,6 +523,18 @@ class AddProjectTargetTest(ScriptTest):
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn("deploy target kept", again.stdout)
         self.assertTrue(target.read_text().endswith("# edited\n"))
+
+    def test_a_rerun_moves_an_old_bitbucket_remote_to_the_new_ssh_host(self):
+        self.assertEqual(self.run_add("--target", "local", "git@bitbucket.org:rsmaizys/asana_tracker.git").returncode, 0)
+        origin = self.root / "srv/projects/asana_tracker/app/.git/origin"
+        self.assertEqual(origin.read_text(), "git@ssh.bitbucket.org:rsmaizys/asana_tracker.git\n", "cloned through the new name")
+        origin.write_text("git@bitbucket.org:rsmaizys/asana_tracker.git\n")  # a clone made before the move
+        check = self.run_add("--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertIn("would move", check.stdout)
+        self.assertEqual(origin.read_text(), "git@bitbucket.org:rsmaizys/asana_tracker.git\n", "--check changes nothing")
+        again = self.run_add("git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertEqual(origin.read_text(), "git@ssh.bitbucket.org:rsmaizys/asana_tracker.git\n")
 
     def test_a_local_directory_target_is_created_for_the_account_or_must_be_writable(self):
         place = self.root / "home/someone/projects/asana"
@@ -1322,3 +1340,81 @@ echo TOKEN_NOWHERE
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MoveBitbucketSshTest(ScriptTest):
+    """bin/move-bitbucket-ssh over build roots with old, new, GitHub and unreachable remotes (git stubbed)."""
+    KEY = "ssh.bitbucket.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIazEu89wgQZ4bqs3d63QSMzYVa0MuJ2e2gKTKqu+UUO\n"
+
+    def setUp(self):
+        super().setUp()
+        self.calls = self.root / "git.calls"
+        self.stub("git", f'echo "$*" >> {self.calls}\n'
+                         'case "$1" in\n'
+                         '  -C) case "$4" in "") echo origin;; set-url) echo "$6" > "$2/.git/origin";; *) cat "$2/.git/origin";; esac;;\n'
+                         '  ls-remote) case " ${FAKE_UNREACHABLE:-} " in *" $3 "*) echo "Permission denied (publickey)." >&2; exit 128;; esac;;\n'
+                         'esac\n')
+        self.origins = {"a/app": "git@bitbucket.org:ws/a.git", "b/app": "ssh://git@bitbucket.org/ws/b.git",
+                        "c/app": "git@ssh.bitbucket.org:ws/c.git", "d/app": "git@github.com-own.d:own/d.git",
+                        "d/app/public": "git@bitbucket.org:ws/code.git"}
+        for path, url in self.origins.items():
+            (self.root / f"srv/projects/{path}/.git").mkdir(parents=True)
+            (self.root / f"srv/projects/{path}/.git/origin").write_text(url + "\n")
+        (self.root / "srv/.ssh").mkdir(parents=True)
+        (self.root / "srv/.ssh/known_hosts").write_text(self.KEY)
+
+    def move(self, *arguments, root=False, **env):
+        path = f"{self.fake_root()}:{self.bin}" if root else str(self.bin)
+        env = {"SETUP_SERVER_USER": getpass.getuser(), "FAKE_UNREACHABLE": "git@ssh.bitbucket.org:ws/code.git", **env}
+        return self.run_script("move-bitbucket-ssh", *arguments, PATH=f"{path}:{os.environ['PATH']}", **env)
+
+    def origin(self, path):
+        return (self.root / f"srv/projects/{path}/.git/origin").read_text().strip()
+
+    def test_check_reads_the_new_urls_and_changes_nothing(self):
+        result = self.move("--check")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("would move " + str(self.root) + "/srv/projects/a/app (origin): git@bitbucket.org:ws/a.git -> git@ssh.bitbucket.org:ws/a.git", result.stdout)
+        self.assertIn("ssh://git@bitbucket.org/ws/b.git -> ssh://git@ssh.bitbucket.org/ws/b.git", result.stdout)
+        self.assertIn("git@ssh.bitbucket.org:ws/code.git does not answer; it stays git@bitbucket.org:ws/code.git", result.stdout)
+        self.assertIn("would move 2, already on ssh.bitbucket.org 1, could not move 1", result.stdout)
+        self.assertEqual({path: self.origin(path) for path in self.origins}, self.origins)
+        self.assertNotIn("set-url", self.calls.read_text())
+
+    def test_a_run_moves_what_answers_and_leaves_the_rest(self):
+        result = self.move(root=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(self.origin("a/app"), "git@ssh.bitbucket.org:ws/a.git")
+        self.assertEqual(self.origin("b/app"), "ssh://git@ssh.bitbucket.org/ws/b.git")
+        self.assertEqual(self.origin("c/app"), "git@ssh.bitbucket.org:ws/c.git")
+        self.assertEqual(self.origin("d/app"), "git@github.com-own.d:own/d.git", "GitHub is not touched")
+        self.assertEqual(self.origin("d/app/public"), "git@bitbucket.org:ws/code.git", "an unreachable one stays")
+        again = self.move(root=True, FAKE_UNREACHABLE="")
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("moved 1, already on ssh.bitbucket.org 3, could not move 0", again.stdout)
+
+    def test_without_the_new_host_key_or_root_nothing_moves(self):
+        (self.root / "srv/.ssh/known_hosts").write_text("")
+        refused = self.move(root=True)
+        self.assertEqual(refused.returncode, 65, refused.stdout + refused.stderr)
+        self.assertIn("run sudo bin/prepare-host first", refused.stderr)
+        (self.root / "srv/.ssh/known_hosts").write_text(self.KEY)
+        self.assertEqual(self.move(SETUP_SERVER_USER="someone-else").returncode, 77)
+        self.assertEqual(self.origin("a/app"), "git@bitbucket.org:ws/a.git")
+
+    def test_under_a_directory_it_moves_your_own_clones(self):
+        clones = self.root / "Projects"
+        for name, url in (("shop", "git@bitbucket.org:ws/shop.git"), ("tool", "git@github.com:me/tool.git")):
+            (clones / name / ".git").mkdir(parents=True)
+            (clones / name / ".git/origin").write_text(url + "\n")
+        home = self.root / "home"
+        (home / ".ssh").mkdir(parents=True)
+        missing = self.move("--under", str(clones), HOME=str(home))
+        self.assertEqual(missing.returncode, 65, missing.stdout + missing.stderr)
+        self.assertIn("ssh-keyscan -t ed25519 ssh.bitbucket.org", missing.stderr)
+        (home / ".ssh/known_hosts").write_text(self.KEY)
+        result = self.move("--under", str(clones), HOME=str(home), SETUP_SERVER_USER="nobody-needed")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((clones / "shop/.git/origin").read_text().strip(), "git@ssh.bitbucket.org:ws/shop.git")
+        self.assertEqual((clones / "tool/.git/origin").read_text().strip(), "git@github.com:me/tool.git")
+        self.assertEqual(self.origin("a/app"), "git@bitbucket.org:ws/a.git", "the build roots are another run")

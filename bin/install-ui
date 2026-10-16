@@ -27,7 +27,7 @@ NAME=setup-server-ui
 ADDRESS=127.0.0.1
 # What the UI runs as root, from $LIBRARY/bin; bin/update runs as the owner of this checkout instead.
 ROOT_COMMANDS=(add-project remove-project install-backups install-metrics install-runner install-ssh add-backup-key
-               backup-projects prepare-host server-status server-unit update-setup)
+               backup-projects move-bitbucket-ssh prepare-host server-status server-unit update-setup)
 
 check=0
 refresh=0

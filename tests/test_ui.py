@@ -28,7 +28,8 @@ PROJECT_TOKEN = "project-token-ABCdef0123456789"
 GENERAL_TOKEN = "general-token-XYZxyz9876543210"
 SECRET = "ATOAfake_secret-VALUE_9"  # the OAuthClientSecret of test_scripts.DIALOG
 ROOT_COMMANDS = ("add-project", "remove-project", "install-backups", "install-metrics", "install-runner", "install-ssh",
-                 "add-backup-key", "backup-projects", "prepare-host", "server-status", "server-unit", "update-setup")
+                 "add-backup-key", "backup-projects", "move-bitbucket-ssh", "prepare-host", "server-status", "server-unit",
+                 "update-setup")
 
 
 def load_web_ui():
@@ -820,6 +821,8 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("install-runner"),
                          [f"{library}/install-runner --check --provider github --name worker1 "
                           f"--tarball https://dl.example/actions-runner.tar.gz --sha256 {sha}"])
+        self.preview("move-bitbucket-ssh")
+        self.assertEqual(self.sudo_calls("move-bitbucket-ssh"), [f"{library}/move-bitbucket-ssh --check"])
         status, page = self.confirm(self.preview("unit", unit="ui", operation="restart")[2])
         self.assertIn("baigta, kodas 0", page)
         self.assertIn(f"stub ran: {self.library}/bin/server-unit restart ui", page)
@@ -850,6 +853,15 @@ class WebUiTest(Worker):
         self.assertEqual(status, 200, metrics)
         self.assertIn("setup_worker_backup_size_bytes{project=&quot;asana&quot;} 4096", metrics)
         self.assertIn("trūksta", metrics, "the runner group is not up")
+
+    def test_a_remote_on_the_new_bitbucket_ssh_host_keeps_its_pipelines(self):
+        self.origin(self.tree.projects / "asana_tracker/app", "git@ssh.bitbucket.org:rsmaizys/asana_tracker.git")
+        page = self.request("GET", "/project/asana_tracker?fresh=1")[2]
+        self.assertIn("Deploy į prod", page)
+        self.assertIn("pipelines/results/41", page)
+        web_ui = load_web_ui()
+        for url in ("git@ssh.bitbucket.org:ws/shop.git", "ssh://git@ssh.bitbucket.org/ws/shop.git", "git@bitbucket.org:ws/shop.git"):
+            self.assertEqual(web_ui.bitbucket_repository(url), ("ws", "shop"), url)
 
     def instructions(self, **choice):
         status, _, body = self.request("GET", "/instructions?" + urlencode(choice))
