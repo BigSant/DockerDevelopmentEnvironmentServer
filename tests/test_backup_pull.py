@@ -172,6 +172,34 @@ class AddBackupKeyTest(unittest.TestCase):
         self.run_as_root("--remove", "tomas")
         self.assertEqual(keys.read_text(), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOther other@admin\n")
 
+    def test_grants_make_the_access_command_with_a_terminal_and_keep_the_backups(self):
+        keys = self.root / "home/.ssh/authorized_keys"
+        (self.root / "home/projects/shop").mkdir(parents=True)
+        output = self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24", "--allow-fresh",
+                                  "--grant", "shop=phpfpm-readonly", "--grant", "shop:prod=docker,other:stage=full")
+        access = self.root / "sbin/setup-server-access"
+        self.assertEqual(keys.read_text().splitlines()[0],
+                         f'from="10.8.0.0/24",command="{access} --key tomas --allow-fresh --grant other:stage=full '
+                         f'--grant shop:prod=docker --grant shop:stage=phpfpm-readonly",restrict,pty {KEY.rsplit(" ", 1)[0]} tomas')
+        self.assertIn("no project other on this server", output)
+        self.assertIn("full on a target of this server", output)
+        installed = access.read_text()
+        self.assertIn(f"'SETUP_SERVER_ROOT', '{self.root / 'home'}'", installed)
+        self.assertIn(repr(str(self.root / "sbin/setup-server-backup-pull")), installed, "backups still go to the pull command")
+        self.assertTrue((self.root / "sbin/setup-server-backup-pull").is_file())
+        self.assertIn("tomas  from 10.8.0.0/24  fresh backups allowed  access other:stage=full shop:prod=docker "
+                      "shop:stage=phpfpm-readonly", self.run_as_root("--list"))
+        # Without grants again: back to the pull command alone, the same single entry.
+        self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24")
+        self.assertEqual(len(keys.read_text().splitlines()), 1)
+        self.assertIn("setup-server-backup-pull --key tomas\",restrict ssh-ed25519", keys.read_text())
+        self.assertIn("==> " + str(access) + ": unchanged", self.run_as_root("--refresh"))
+        self.run_as_root("--remove", "tomas")
+        self.assertEqual(keys.read_text(), "")
+        for grant in ("shop:live=phpfpm", "shop=root", "../x=full", "shop:prod"):
+            with self.subTest(grant=grant), self.assertRaisesRegex(SystemExit, "--grant"):
+                self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24", "--grant", grant)
+
     def test_unsafe_requests_are_refused(self):
         private = self.root / "id_ed25519"
         private.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n")

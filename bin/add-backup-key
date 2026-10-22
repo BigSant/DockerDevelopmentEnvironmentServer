@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
-"""Let a developer download the newest database backups over SSH, from the VPN only, with their key.
+"""Let a developer download the newest database backups over SSH, from the VPN only, with their key; with
+--grant also reach the deploy targets of those projects through this worker.
 
 Writes the key into the setup account's authorized_keys as
   from="<networks>",command="/usr/local/sbin/setup-server-backup-pull --key <name> [--allow-fresh]",restrict <key> <name>
 so the key logs in only from the given networks and runs nothing but that command (no shell, no
 forwarding, no Docker). --allow-fresh also lets it ask for a new backup now (make db-pull fresh=1), which
-loads the project's database. Installs the command (a root-owned copy of bin/backup-pull) first.
-Idempotent: a key of the same name is replaced. --refresh only rewrites an installed copy (bin/update).
+loads the project's database. --grant PROJECT[:ENV]=LEVEL (repeatable) makes the command
+setup-server-access (a copy of bin/server-access) with those grants and `restrict,pty`: the same backups, and a
+shell or command on the granted targets at that level (phpfpm-readonly, phpfpm, docker, full; make ssh). Installs
+the commands (root-owned copies of bin/backup-pull and bin/server-access) first.
+Idempotent: a key of the same name is replaced. --refresh only rewrites the installed copies (bin/update).
 """
 
 import argparse
@@ -25,35 +29,53 @@ ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
 ACCOUNT = os.environ.get('SETUP_SERVER_USER', 'setup')
 SBIN = Path(os.environ.get('SETUP_SERVER_SBIN', '/usr/local/sbin'))
 COMMAND = SBIN / 'setup-server-backup-pull'
+ACCESS = SBIN / 'setup-server-access'
+# Installed copy : its source in bin/.
+COPIES = {COMMAND: 'backup-pull', ACCESS: 'server-access'}
+LEVELS = ('phpfpm-readonly', 'phpfpm', 'docker', 'full')
+GRANT = re.compile(r'([a-z0-9][a-z0-9_-]{0,63})(?::(stage|prod))?=(' + '|'.join(LEVELS) + ')')
 KEYS = ROOT / '.ssh/authorized_keys'
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
 KEY = re.compile(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)'
                  r' ([A-Za-z0-9+/]+={0,3})(?: .*)?')
 
 
-def command_copy():
-    """bin/backup-pull with this host's root as its default: sshd starts it without our environment."""
-    text = (HERE / 'backup-pull').read_text()
+def command_copy(source):
+    """bin/<source> with this host's root (and sbin) as its defaults: sshd starts it without our environment."""
+    text = (HERE / source).read_text()
     default = "os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server')"
     if default not in text:
-        raise SystemExit('bin/backup-pull no longer has the default of SETUP_SERVER_ROOT')
-    return text.replace(default, f"os.environ.get('SETUP_SERVER_ROOT', '{ROOT}')")
+        raise SystemExit(f'bin/{source} no longer has the default of SETUP_SERVER_ROOT')
+    text = text.replace(default, f"os.environ.get('SETUP_SERVER_ROOT', '{ROOT}')")
+    return text.replace("'/usr/local/sbin/setup-server-backup-pull'", repr(str(COMMAND)))
 
 
-def place_command(check):
-    text = command_copy()
-    if COMMAND.is_file() and COMMAND.read_text() == text:
-        print(f'==> {COMMAND}: unchanged')
+def place_command(check, command=COMMAND):
+    text = command_copy(COPIES[command])
+    if command.is_file() and command.read_text() == text:
+        print(f'==> {command}: unchanged')
     elif check:
-        print(f'==> would write {COMMAND}')
+        print(f'==> would write {command}')
     else:
-        COMMAND.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile('w', dir=COMMAND.parent, delete=False) as handle:
+        command.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile('w', dir=command.parent, delete=False) as handle:
             handle.write(text)
         os.chmod(handle.name, 0o755)
         os.chown(handle.name, 0, 0)
-        os.replace(handle.name, COMMAND)
-        print(f'==> wrote {COMMAND}')
+        os.replace(handle.name, command)
+        print(f'==> wrote {command}')
+
+
+def parse_grants(values):
+    """PROJECT[:ENV]=LEVEL words as sorted PROJECT:ENV=LEVEL; a project without ENV gets both."""
+    found = {}
+    for word in [part.strip() for value in values for part in value.split(',') if part.strip()]:
+        match = GRANT.fullmatch(word)
+        if not match:
+            raise SystemExit(f'--grant {word}: expected PROJECT[:stage|prod]=' + '|'.join(LEVELS))
+        for environment in [match[2]] if match[2] else ['stage', 'prod']:
+            found[(match[1], environment)] = match[3]
+    return [f'{project}:{environment}={level}' for (project, environment), level in sorted(found.items())]
 
 
 def networks(value):
@@ -89,17 +111,29 @@ def public_key(path):
     return f'{match[1]} {match[2]}'
 
 
-def marker(name, fresh=False):
-    return f'command="{COMMAND} --key {name}{" --allow-fresh" if fresh else ""}"'
+ENTRY = re.compile(r'from="([^"]*)",command="(\S+) --key (\S+)((?: --allow-fresh)?)((?: --grant \S+)*)"')
+
+
+def parsed(line):
+    """(networks, name, fresh, grants) of one of our authorized_keys entries, else None."""
+    match = ENTRY.search(line)
+    if not match or match[2] not in (str(COMMAND), str(ACCESS)):
+        return None
+    return match[1], match[3], bool(match[4]), match[5].split()[1::2]
 
 
 def owned(line, name):
-    """True when the authorized_keys line is this command's entry for `name` (with or without --allow-fresh)."""
-    return marker(name) in line or marker(name, True) in line
+    """True when the authorized_keys line is our entry for `name` (either command, any options)."""
+    found = parsed(line)
+    return found is not None and found[1] == name
 
 
-def entry(name, sources, key, fresh=False):
-    return f'from="{",".join(sources)}",{marker(name, fresh)},restrict {key} {name}'
+def entry(name, sources, key, fresh=False, granted=()):
+    fresh_option = ' --allow-fresh' if fresh else ''
+    if granted:
+        grant_options = ''.join(f' --grant {grant}' for grant in granted)
+        return f'from="{",".join(sources)}",command="{ACCESS} --key {name}{fresh_option}{grant_options}",restrict,pty {key} {name}'
+    return f'from="{",".join(sources)}",command="{COMMAND} --key {name}{fresh_option}",restrict {key} {name}'
 
 
 def current_lines():
@@ -136,25 +170,29 @@ def main(argv=None):
     parser.add_argument('--from', dest='sources', help='networks it may connect from, e.g. the VPN 10.8.0.0/24')
     parser.add_argument('--allow-fresh', action='store_true',
                         help='the key may also ask for a new backup now (make db-pull fresh=1); it loads the database')
+    parser.add_argument('--grant', action='append', default=[], metavar='PROJECT[:ENV]=LEVEL',
+                        help='the key may also reach this project environment through this worker (make ssh); LEVEL: '
+                             + ', '.join(LEVELS) + '; without :ENV both stage and prod; repeatable or comma-separated')
     parser.add_argument('--remove', metavar='NAME', help='remove the key of this name')
     parser.add_argument('--list', action='store_true', help='show the backup keys')
     parser.add_argument('--check', action='store_true', help='show what would change; change nothing')
-    parser.add_argument('--refresh', action='store_true', help='only rewrite the installed command copy (bin/update)')
+    parser.add_argument('--refresh', action='store_true', help='only rewrite the installed command copies (bin/update)')
     args = parser.parse_args(argv)
     if not args.check and not args.list and os.geteuid() != 0:
         raise SystemExit('Run with sudo (or use --check / --list)')
     if args.refresh:
-        if COMMAND.exists():
-            place_command(args.check)
-        else:
-            print(f'==> {COMMAND} is not installed; nothing to refresh')
+        for command in COPIES:
+            if command.exists():
+                place_command(args.check, command)
+            else:
+                print(f'==> {command} is not installed; nothing to refresh')
         return 0
     lines = current_lines()
-    ours = [line for line in lines if f'command="{COMMAND} --key ' in line]
+    ours = [parsed(line) for line in lines if parsed(line)]
     if args.list:
-        for line in ours:
-            match = re.search(r'from="([^"]*)".*--key ([^" ]+)( --allow-fresh)?"', line)
-            print(f'{match[2]}  from {match[1]}{"  fresh backups allowed" if match[3] else ""}' if match else line)
+        for sources, name, fresh, granted in ours:
+            print(f'{name}  from {sources}{"  fresh backups allowed" if fresh else ""}'
+                  + (f'  access {" ".join(granted)}' if granted else ''))
         if not ours:
             print('No backup keys.')
         return 0
@@ -168,11 +206,14 @@ def main(argv=None):
         parser.error('give the public key file, --name and --from (or --remove NAME / --list)')
     if not NAME.fullmatch(args.name):
         raise SystemExit('--name: letters, digits, . _ @ - (up to 64)')
-    line = entry(args.name, networks(args.sources), public_key(args.key), args.allow_fresh)
-    key_part = line.split(',restrict ', 1)[1].rsplit(' ', 1)[0]
+    granted = parse_grants(args.grant)
+    key_part = public_key(args.key)
+    line = entry(args.name, networks(args.sources), key_part, args.allow_fresh, granted)
     if any(key_part in other for other in lines if not owned(other, args.name)):
         raise SystemExit('This public key is already in authorized_keys under another entry; remove that one first')
     place_command(args.check)
+    if granted:
+        place_command(args.check, ACCESS)
     kept = [other for other in lines if not owned(other, args.name)]
     write_keys(kept + [line], args.check)
     host = os.environ.get('SETUP_SERVER_ADDRESS', '<server VPN address>')
@@ -181,6 +222,15 @@ def main(argv=None):
     if not shutil.which('sshd', path=os.environ.get('PATH', '') + ':/usr/sbin:/sbin'):
         print('==> note: this server has no sshd, so the key cannot connect yet; set it up with: sudo bin/install-ssh --from '
               + ','.join(networks(args.sources)))
+    for grant in granted:
+        project = grant.split(':', 1)[0]
+        if not (ROOT / 'projects' / project).is_dir():
+            print(f'==> note: no project {project} on this server yet (projects/{project}); the grant waits for it')
+    if any(grant.endswith('=full') for grant in granted):
+        print('==> note: full on a target of this server (--target local) is a shell of the setup account here: every '
+              'project, its secrets and Docker, i.e. root; on another server the deploy user\'s shell there')
+    if granted:
+        print(f'==> {args.name} connects with: make ssh from=prod (make ssh access=1 lists what the key reaches)')
     if args.allow_fresh and not (SBIN / 'setup-server-backup').exists():
         print('==> note: fresh backups need the backup command; install it with: sudo bin/install-backups')
     return 0

@@ -78,6 +78,8 @@ TARGET = re.compile(r'(?:(?:stage|prod)=)?(?:local(?::/[A-Za-z0-9._/-]+)?|ssh://
 REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,99}')
 RUNNER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
 KEY_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
+# What a developer key may reach through this worker (bin/add-backup-key --grant, bin/server-access).
+GRANT = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}(?::(?:stage|prod))?=(?:phpfpm-readonly|phpfpm|docker|full)')
 PUBLIC_KEY = re.compile(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|'
                         r'sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}(?: [^\s]{1,100})?')
 JOB_ID = re.compile(r'\d{8}T\d{6}Z-[0-9a-f]{6}')
@@ -388,14 +390,21 @@ def plan_add_backup_key(form, status):
     sources = networks(form.get('sources', ''), 'Iš kur')
     if not sources:
         raise Invalid('„Iš kur“: nurodyk VPN tinklą, pvz. 10.8.0.0/24.')
+    grants = form.get('grants', '').replace(',', ' ').split()
+    for grant in grants:
+        if not GRANT.fullmatch(grant):
+            raise Invalid(f'„Prieiga“: {grant} – rašyk PROJEKTAS[:stage|prod]=LYGIS, lygis phpfpm-readonly, phpfpm, docker '
+                          'arba full.')
     arguments = ['-', '--name', name, '--from', ','.join(sources)] + (['--allow-fresh'] if flag(form, 'allow_fresh') else [])
-    return Plan('add-backup-key', f'Kopijų raktas {name}', *command('add-backup-key', arguments), stdin=lines[0] + '\n')
+    arguments += [word for grant in grants for word in ('--grant', grant)]
+    return Plan('add-backup-key', f'Kopijų ir prieigos raktas {name}', *command('add-backup-key', arguments),
+                stdin=lines[0] + '\n')
 
 
 def plan_remove_backup_key(form, status):
     name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
-    return Plan('remove-backup-key', f'Atimti kopijų raktą {name}', *command('add-backup-key', ['--remove', name]),
-                danger=f'Raktas {name} nebegalės parsisiųsti kopijų.')
+    return Plan('remove-backup-key', f'Atimti kopijų ir prieigos raktą {name}', *command('add-backup-key', ['--remove', name]),
+                danger=f'Raktas {name} nebegalės parsisiųsti kopijų nei prisijungti prie taikinių.')
 
 
 def plan_list_backup_keys(form, status):
@@ -1738,14 +1747,19 @@ class Page:
             note='Naktinė – pagal lentelių registrą (7 dienos + 4 savaitės), savaitinė – visų lentelių duomenys (laikomos 2). '
                  'Be reikšmių paliekamos įdiegtos (numatyta 03:30 ir Sun 04:30).', command='bin/install-backups')
         body += self.form(
-            'add-backup-key', 'Kopijų atsisiuntimo raktas',
+            'add-backup-key', 'Kopijų ir prieigos raktas',
             '<label><span>Viešasis raktas (.pub)</span><textarea name="public_key" spellcheck="false"></textarea></label>' +
             text('key_name', 'Vardas', 'tomas') + text('sources', 'Iš kur (VPN tinklas)', '10.8.0.0/24') +
             '<label class="check"><input type="checkbox" name="allow_fresh" value="yes"> gali prašyti šviežios kopijos '
-            '(make db-pull fresh=1; apkrauna projekto DB)</label>',
-            note='Raktas gali tik parsisiųsti kopijas (naktinę, pilną); su varnele – ir paprašyti naujos kopijos dabar.',
-            command='bin/add-backup-key')
-        body += self.form('remove-backup-key', 'Atimti kopijų raktą', text('key_name', 'Vardas', 'tomas'),
+            '(make db-pull fresh=1; apkrauna projekto DB)</label>' +
+            text('grants', 'Prieiga prie taikinių (neprivaloma)', 'shop:prod=phpfpm-readonly shop:stage=docker'),
+            note='Raktas gali parsisiųsti kopijas (naktinę, pilną); su varnele – ir paprašyti naujos kopijos dabar. „Prieiga“ – '
+                 'per šį serverį į projekto taikinį (make ssh): phpfpm-readonly – php-fpm kaip nobody (DB slaptažodis '
+                 'konteinerio aplinkoje lieka), phpfpm – php-fpm projekto vartotoju ar root, docker – projekto '
+                 'konteineriai, full – taikinio shell (local taikiniui – paskyra setup šiame serveryje, t. y. root). Be '
+                 ':stage/:prod – abi aplinkos.',
+            command='bin/add-backup-key [--grant PROJEKTAS:ENV=LYGIS]')
+        body += self.form('remove-backup-key', 'Atimti kopijų ir prieigos raktą', text('key_name', 'Vardas', 'tomas'),
                           command='bin/add-backup-key --remove', danger=True)
         body += self.form('list-backup-keys', 'Kopijų raktai', '', button='Rodyti', command='bin/add-backup-key --list') + '</div>'
         body += '<h2 id="access">Prieiga ir metrikos</h2><div class="deck">' + self.form(
@@ -1875,6 +1889,8 @@ class Page:
         else:
             body += (f'<details><summary>backup-pulls.log</summary><div class="inner">'
                      f'{term(chr(10).join(data.get("backup_pulls", [])))}</div></details>')
+            body += (f'<details><summary>access.log</summary><div class="inner">'
+                     f'{term(chr(10).join(data.get("access", [])))}</div></details>')
             for unit, lines in data.get('journal', {}).items():
                 body += (f'<details><summary>journalctl -u {e(unit)}</summary><div class="inner">'
                          f'{term(chr(10).join(lines))}</div></details>')

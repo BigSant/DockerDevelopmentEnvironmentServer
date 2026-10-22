@@ -248,10 +248,12 @@ class ServerStatusTest(Worker):
 
     def test_logs_are_bounded_and_only_of_the_setup_server_units(self):
         (self.tree.root / "backup-pulls.log").write_text("".join(f"line {n}\n" for n in range(100)))
+        (self.tree.root / "access.log").write_text("".join(f"access {n}\n" for n in range(10)))
         result = self.status("--logs", "5")
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
         self.assertEqual(data["backup_pulls"], [f"line {n}" for n in range(95, 100)])
+        self.assertEqual(data["access"], [f"access {n}" for n in range(5, 10)])
         self.assertEqual(sorted(data["journal"]), sorted(["setup-server-runner.service", "setup-server-github-runner@*.service",
                                                           "setup-server-backup.service", "setup-server-backup-full.service",
                                                           "setup-server-metrics.service", "setup-server-ui.service"]))
@@ -707,6 +709,10 @@ class WebUiTest(Worker):
                  ("install-metrics", {"allow": "0.0.0.0/0"}, "ne visus adresus"),
                  ("add-backup-key", {"public_key": "-----BEGIN OPENSSH PRIVATE KEY-----", "key_name": "tomas",
                                      "sources": "10.8.0.0/24"}, "viešąjį raktą"),
+                 ("add-backup-key", {"public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1",
+                                     "key_name": "tomas", "sources": "10.8.0.0/24", "grants": "shop:prod=root"}, "Prieiga"),
+                 ("add-backup-key", {"public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1",
+                                     "key_name": "tomas", "sources": "10.8.0.0/24", "grants": "shop=full --remove=x"}, "Prieiga"),
                  ("update", {"server_ref": "--upload-pack=x"}, "setup-server ref"),
                  ("update", {"setup_ref": "v1..v2"}, "setup ref"),
                  ("update", {}, "bent vieną"),
@@ -784,6 +790,11 @@ class WebUiTest(Worker):
         self.preview("add-backup-key", public_key=key, key_name="tomas", sources="10.8.0.0/24", allow_fresh="yes")
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
                          f"-n {self.library}/bin/add-backup-key --check - --name tomas --from 10.8.0.0/24 --allow-fresh")
+        self.preview("add-backup-key", public_key=key, key_name="tomas", sources="10.8.0.0/24",
+                     grants="shop:prod=phpfpm-readonly, shop:stage=docker")
+        self.assertEqual(self.sudo_calls("add-backup-key")[-1],
+                         f"-n {self.library}/bin/add-backup-key --check - --name tomas --from 10.8.0.0/24 "
+                         "--grant shop:prod=phpfpm-readonly --grant shop:stage=docker")
         status, _, body = self.preview("pipeline", project="shop-two", pipeline="backup-now", branch="master", full="yes")
         self.assertEqual(status, 200, body)
         self.assertIn("&quot;key&quot;: &quot;FULL&quot;,\n      &quot;value&quot;: &quot;yes&quot;", body)

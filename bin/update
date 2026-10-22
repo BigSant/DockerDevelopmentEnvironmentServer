@@ -5,7 +5,7 @@
 # read the setup checkout when they run.
 # Run it as the owner of this checkout (the admin who cloned it), without sudo; the setup account's part
 # runs through sudo -u. The installed command copies ($SBIN/setup-server-backup, setup-server-metrics,
-# setup-server-backup-pull and the web UI's setup-server-ui with $LIBRARY/bin, when installed) are rewritten
+# setup-server-backup-pull, setup-server-access and the web UI's setup-server-ui with $LIBRARY/bin, when installed) are rewritten
 # from the new checkout through sudo and returned with the checkouts. Without a terminal (the web UI runs it
 # so) sudo cannot ask for a password: its calls are then sudo -n and fail at once instead of waiting.
 # --check fetches and shows what would change; it changes no checkout.
@@ -23,7 +23,7 @@ SBIN=${SETUP_SERVER_SBIN:-/usr/local/sbin}
 LIBRARY=${SETUP_SERVER_LIBRARY:-/usr/local/lib/setup-server}
 # Installed copy of a command : the installer whose --refresh rewrites it.
 COPIES=(setup-server-backup:install-backups setup-server-metrics:install-metrics setup-server-backup-pull:add-backup-key
-        setup-server-ui:install-ui)
+        setup-server-access:add-backup-key setup-server-ui:install-ui)
 RELEASE_TAG='^v[0-9]+\.[0-9]+\.[0-9]+$'
 
 usage() {
