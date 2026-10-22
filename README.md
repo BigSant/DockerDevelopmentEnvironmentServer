@@ -19,7 +19,7 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
 | `bin/install-backups` | DB kopijos: naktinė (`setup-server-backup.timer`, pagal lentelių registrą) ir savaitinė pilna (`setup-server-backup-full.timer`, visų lentelių duomenys), komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
 | `bin/install-ssh` | SSH iš VPN: `openssh-server` (Ubuntu Desktop jo neturi), paleistas ir startuojantis po perkrovimo, nustatymai `/etc/ssh/sshd_config.d/10-setup-server.conf` – iš už nurodytų tinklų ir šio serverio tik raktu, be slaptažodžio; įjungtam ufw – leidimas tiems tinklams. Reikia `make db-pull` ir valdymo sąsajos tuneliui. |
-| `bin/add-backup-key` | Programuotojo SSH raktas DB kopijoms atsisiųsti (`make db-pull`), su `--allow-fresh` – ir naujai kopijai užsakyti (`make db-pull fresh=1`): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. |
+| `bin/add-backup-key` | Programuotojo SSH raktas DB kopijoms atsisiųsti (`make db-pull`), su `--allow-fresh` – ir naujai kopijai užsakyti (`make db-pull fresh=1`): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. Su `--grant PROJEKTAS:ENV=LYGIS` – ir prieiga prie to projekto taikinio per šį serverį (`make ssh`), per `/usr/local/sbin/setup-server-access` (kopija iš `bin/server-access`). |
 | `bin/install-metrics` | Worker'io Prometheus `/metrics`: systemd paslauga `setup-server-metrics` (paskyra `setup`, tik skaito), komanda `/usr/local/sbin/setup-server-metrics` (kopija iš `bin/worker-metrics`), nustatymai `/etc/setup-server/metrics.env`. |
 | `bin/install-ui` | Valdymo sąsaja naršyklėje (tik `127.0.0.1`, per SSH tunelį): paslauga `setup-server-ui` (atskira paskyra `setup-ui`), komanda `/usr/local/sbin/setup-server-ui` (kopija iš `bin/web-ui`), komandų kopijos `/usr/local/lib/setup-server/bin/`, sudo taisyklė, nustatymai `/etc/setup-server/ui.env`. |
 | `bin/move-bitbucket-ssh` | Perkelia build katalogų Bitbucket remote'us iš `bitbucket.org` į `ssh.bitbucket.org` (Bitbucket SSH adresas nuo 2026-11-12); perkelia tik tada, kai naujas adresas atsako. Žr. „Bitbucket SSH adresas“. |
@@ -38,6 +38,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 ├── runner/current/             Bitbucket runner'io versija; runner/temp – jo darbo katalogas
 ├── github-runner/<scope>/      GitHub runner'is (organizacijai `bigsant`, repo `bigsant.<repo>`); _work – darbo katalogas
 ├── ui-actions.log              valdymo sąsajos veiksmų žurnalas (setup-ui, 0640)
+├── backup-pulls.log, access.log   programuotojų raktų prašymai: kopijos ir prieiga prie taikinių
 ├── .ssh/id_ed25519             git raktas (tik skaitymui): setup repo ir Bitbucket projektai
 └── .ssh/github-<savininkas>.<repo>   GitHub projekto deploy key (tik skaitymui); host alias'ai – .ssh/config
 /etc/setup-server/runner.env    Bitbucket runner'io OAuth duomenys (root, 0600)
@@ -384,6 +385,57 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    Kopijose yra tikri klientų duomenys (stage/prod pagal lentelių registrą): leisk tik tiems, kam jų reikia,
    ir atimk leidimą (`--remove`), kai nebereikia. Įdiegtą komandos kopiją atnaujina `bin/update`.
 
+8. **Prieiga prie taikinių per šį serverį (neprivaloma).** Šis serveris jau pasiekia kiekvieną projekto taikinį:
+   deploy'us jungiasi `DEPLOY_SSH` savo raktu, o konteinerius valdo per Docker context'ą. Tuo pačiu keliu gali eiti
+   ir programuotojas: jo raktas LIVE serveryje nereikalingas, o tiesioginės prieigos prie LIVE jam nereikia. Tas pats
+   raktas, kaip kopijoms, gauna leidimus kiekvienam projektui ir aplinkai:
+
+   ```bash
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 \
+       --grant forsena:prod=phpfpm-readonly --grant forsena:stage=docker --check     # parodo, ką keistų
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 \
+       --grant forsena:prod=phpfpm-readonly --grant forsena:stage=docker             # įrašo
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --grant asana_tracker=full   # abi aplinkos
+   sudo bin/add-backup-key --list          # tomas  from 10.8.0.0/24  access forsena:prod=phpfpm-readonly …
+   ```
+
+   `--grant` galima kartoti arba rašyti per kablelį; be `:stage`/`:prod` – abi aplinkos. Pakartotinai paleidus su tuo
+   pačiu vardu įrašas pakeičiamas visas: išvardyk visus leidimus (be `--grant` – lieka tik kopijos). Projektas – build
+   katalogo vardas (`projects/<vardas>`); dar nesančiam projektui leidimas įrašomas su pastaba.
+
+   | Lygis | Ką leidžia | Ko neleidžia |
+   | --- | --- | --- |
+   | `phpfpm-readonly` | shell ir komandos aplinkos php-fpm konteineryje vartotoju `nobody` (65534) | rašyti į projekto vartotojo failus. **Tik failai:** konteinerio aplinkoje ir parduotuvės konfigūracijoje (`parameters.php`) lieka DB slaptažodis, todėl duomenų bazę keisti galima |
+   | `phpfpm` | tas pats projekto vartotoju (`APP_UID`, failų savininkas) arba `root` konteineryje | kitų konteinerių, taikinio |
+   | `docker` | projekto konteineriai: `ps`, `logs`, `exec` (ir `root`), `start`, `stop`, `restart`, `top`, `stats`, `inspect` | `docker run`, `exec --privileged`, image'ų, volume'ų, kitų projektų konteinerių ir `exec` į konteinerį su Docker socket'u (`metrics-docker`, `metrics-logs`: tai būtų root serveryje) |
+   | `full` | taikinio shell: `DEPLOY_SSH` vartotojas taikinyje, kataloge `DEPLOY_PATH` | – (tiek, kiek gali tas vartotojas). **`--target local` projektui tai paskyra `setup` šiame serveryje:** visi projektai, jų paslaptys ir Docker, t. y. root |
+
+   Kiekvienas lygis apima žemesnius. Raktas su leidimais įrašomas kaip
+   `from="10.8.0.0/24",command="/usr/local/sbin/setup-server-access --key tomas --grant forsena:prod=phpfpm-readonly …",restrict,pty`:
+   tik iš VPN, tik ši komanda, su terminalu (`pty`), bet be port'ų, agento ir X11 persiuntimo, todėl nei `ProxyJump`,
+   nei tunelis į LIVE neveikia. Kopijų prašymus (`latest`, `info`, `get`, `fresh`) komanda perduoda
+   `setup-server-backup-pull`, todėl `make db-pull` veikia kaip anksčiau.
+
+   Programuotojo kompiuteryje – setup `make ssh` (tas pats serveris ir raktas, kaip `make db-pull`) arba tiesiogiai:
+
+   | Prašymas (`ssh -t setup@10.8.0.14 …`) | Ką daro |
+   | --- | --- |
+   | `access` | kur raktas gali jungtis: `PROJEKTAS ENV LYGIS` eilutės |
+   | `shell PROJEKTAS ENV [root\|readonly]` | shell php-fpm konteineryje (raktui tik su `phpfpm-readonly` – visada `readonly`) |
+   | `exec PROJEKTAS ENV [root\|readonly] -- KOMANDA …` | viena komanda ten |
+   | `host PROJEKTAS ENV [-- KOMANDA …]` | `full`: shell (ar komanda) taikinyje, `DEPLOY_PATH` kataloge |
+   | `docker PROJEKTAS ENV ps [-a]` | projekto konteineriai |
+   | `docker PROJEKTAS ENV logs [--tail N] [-f] [--since LAIKAS] [-t] KONTEINERIS` | žurnalas |
+   | `docker PROJEKTAS ENV exec [--root\|-u VARTOTOJAS] [-w KATALOGAS] KONTEINERIS [KOMANDA …]` | shell ar komanda konteineryje |
+   | `docker PROJEKTAS ENV start\|stop\|restart KONTEINERIS …`, `top`, `stats`, `inspect` | valdymas |
+
+   Konteineris – vardas (`forsena-prod-php-fpm-1`) arba servisas (`php-fpm`, `database`). Taikinys, Docker context'as ir
+   `APP_UID` imami iš build katalogo (`target*.env`, `env/<env>.env`), kaip deploy'aus. Terminalą komanda duoda, kai jį
+   turi SSH seansas (`ssh -t`); be jo – stdin perduodamas, todėl veikia ir `… exec … -- mysqldump … > failas`.
+   Kiekvienas prašymas (ir atmestas) ir jo pabaiga (išėjimo kodas) įrašomi į `/srv/setup-server/access.log`: laikas,
+   rakto vardas, adresas, prašymas, lygis ir vykdoma komanda. Seanso turinys neįrašomas. Įdiegtą komandos kopiją
+   atnaujina `bin/update`.
+
 ## Bitbucket SSH adresas (nuo 2026-11-12)
 
 Nuo 2026-11-12 Bitbucket git per SSH atsako tik `ssh.bitbucket.org` (`git@ssh.bitbucket.org:darbo-erdve/repo.git`);
@@ -426,7 +478,7 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
 - Galima nurodyti tik vieną pusę (`--setup-ref` arba `--server-ref`); kita lieka, kur buvo.
 - **Įdiegtos komandų kopijos.** Kai keičiasi setup-server, po perjungimo (prieš sveikatos patikrą) per
   `sudo` perrašomos įdiegtos kopijos `/usr/local/sbin/setup-server-backup`, `/usr/local/sbin/setup-server-metrics`,
-  `/usr/local/sbin/setup-server-backup-pull` ir valdymo sąsajos `/usr/local/sbin/setup-server-ui` kartu su
+  `/usr/local/sbin/setup-server-backup-pull`, `/usr/local/sbin/setup-server-access` ir valdymo sąsajos `/usr/local/sbin/setup-server-ui` kartu su
   `/usr/local/lib/setup-server/bin/` (tik tos, kurios įdiegtos) iš naujos versijos: `bin/install-backups --refresh`,
   `bin/install-metrics --refresh`, `bin/add-backup-key --refresh` ir `bin/install-ui --refresh`.
   Pasikeitus metrikų ar sąsajos kopijai, perkraunama paslauga `setup-server-metrics` ar `setup-server-ui` (runner'io – ne).
@@ -687,7 +739,7 @@ laikomas tik jo PBKDF2 hash'as `/etc/setup-server/ui.env` (root, 0600). Pamiršu
   kiekvieno konteinerio `docker logs` (200, 500 ar 2000 paskutinių eilučių) ir „Kopija dabar serveryje“.
 - *Metrikos* – worker'io `/metrics`, kaip jį mato Prometheus (`setup-server-metrics --once`, be token'o), ir kurios
   grupės surinktos.
-- *Žurnalai* – `ui-actions.log`, `backup-pulls.log`, setup-server paslaugų journal (po 50 eilučių) ir paskutiniai
+- *Žurnalai* – `ui-actions.log`, `backup-pulls.log`, `access.log`, setup-server paslaugų journal (po 50 eilučių) ir paskutiniai
   veiksmai su jų išvestimi.
 - *Instrukcijos* – kaip paruošti kitą serverį projekto taikiniu (`bin/add-project --target ENV=ssh://…`): pasirenki OS
   (Ubuntu, Debian; CentOS/AlmaLinux/Rocky – netestuota), valdymo skydelį (DirectAdmin ar jokio), aplinką (prod, stage) ir
@@ -712,7 +764,7 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 | SSH iš VPN | `sudo -n L/install-ssh [--from TINKLAI]` |
 | Paslaugos (ir Apžvalgoje) | `sudo -n L/server-unit start\|stop\|restart UNIT` (žr. žemiau) |
 | Worker'io metrikos | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |
-| Kopijų raktai | `sudo -n L/add-backup-key - --name … --from … [--allow-fresh]` (raktas per stdin), `--remove VARDAS`, `--list` |
+| Kopijų ir prieigos raktai | `sudo -n L/add-backup-key - --name … --from … [--allow-fresh] [--grant PROJEKTAS[:ENV]=LYGIS …]` (raktas per stdin), `--remove VARDAS`, `--list` |
 | Paruošti serverį | `sudo -n L/prepare-host [--setup-ref …]` (`--check` kodas 1 – „Needs attention“ – vykdyti leidžia) |
 | Atnaujinti setup | `sudo -n L/update-setup [vX.Y.Z]` (tik release tag'ai, be slaptažodžio) |
 | Atnaujinti | `sudo -n -H -u <klono savininkas> <klonas>/bin/update [--server-ref …] [--setup-ref …]` |
@@ -846,6 +898,11 @@ sudo tail -n 20 /srv/setup-server/ui-actions.log
 - Kopijų atsisiuntimo raktai (`bin/add-backup-key`) prisijungia prie paskyros `setup`, bet tik iš nurodyto tinklo
   ir tik su priverstine komanda, kuri atiduoda vien kopijas (`restrict`: be terminalo ir persiuntimų). Kopijose
   yra tikri klientų duomenys; kiekvienas atsisiuntimas registruojamas `backup-pulls.log`.
+- Raktai su `--grant` per šį serverį pasiekia projektų taikinius tuo pačiu keliu, kaip deploy'us (žr. „Eiga“, 8
+  žingsnį): leidimai įrašyti rakto eilutėje, juos tikrina priverstinė komanda, persiuntimų nėra (`restrict,pty`),
+  kiekvienas prašymas – `access.log`. `full` local taikiniui ir `docker` (`exec` kaip root į projekto konteinerius su
+  jų prijungtais katalogais) – didelės teisės; `phpfpm-readonly` saugo tik failus, ne duomenų bazę. `authorized_keys`
+  priklauso paskyrai `setup`, todėl pipeline žingsnis galėtų jį keisti – bet jis ir taip yra `setup` su Docker.
 - Worker'io `/metrics` token'as (jei naudojamas) yra tik `/etc/setup-server/metrics.env` (root, 0600); paslauga
   jį gauna per aplinką. Endpoint'as klauso tik nurodytu adresu (VPN), atsako tik leidžiamiems adresams (ir, kai
   token'as nustatytas, tik su juo) ir nieko nekeičia.

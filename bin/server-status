@@ -11,7 +11,7 @@ so a file a pipeline step planted there is read with that account's rights, neve
 values leave (never a whole env file). Run by another account it reports what that account can read.
 
 Usage: server-status                 versions, units, backup timer, disk and every project
-       server-status --logs [LINES]  the journal of the setup-server units and the tail of backup-pulls.log
+       server-status --logs [LINES]  the journal of the setup-server units and the tails of backup-pulls.log and access.log
                                      (default 50 lines each, at most 500)
        server-status --container-logs PROJECT ENV CONTAINER [LINES]
                                      the last LINES (default 200, at most 2000) of docker logs of one container
@@ -484,20 +484,22 @@ def overview():
 
 
 def logs(lines):
-    """The journal of the setup-server units and the tail of backup-pulls.log, at most `lines` each."""
+    """The journal of the setup-server units and the tails of backup-pulls.log and access.log, at most `lines` each."""
     journal = {}
     for unit in JOURNAL_UNITS:
         code, output, error = run(['journalctl', '--no-pager', '--quiet', '--output=short-iso', f'--lines={lines}',
                                    f'--unit={unit}'], timeout=30)
         journal[unit] = output.splitlines()[-lines:] if code == 0 else [f'(journalctl: {error.strip()[:200]})']
-    pulls = []
-    try:
-        options = as_user(ACCOUNT)  # the account's file: read with its rights
-        code, output, _ = run(['tail', '-n', str(lines), str(ROOT / 'backup-pulls.log')], **options)
-        pulls = output.splitlines() if code == 0 else []
-    except KeyError:
-        pass
-    return {'journal': journal, 'backup_pulls': pulls}
+    tails = {}
+    for key, name in (('backup_pulls', 'backup-pulls.log'), ('access', 'access.log')):
+        tails[key] = []
+        try:
+            options = as_user(ACCOUNT)  # the account's file: read with its rights
+            code, output, _ = run(['tail', '-n', str(lines), str(ROOT / name)], **options)
+            tails[key] = output.splitlines() if code == 0 else []
+        except KeyError:
+            pass
+    return {'journal': journal, **tails}
 
 
 def main(arguments):

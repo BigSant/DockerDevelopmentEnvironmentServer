@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Let a developer key reach the deploy targets of the projects it was granted, through this worker.
+
+The forced command of a developer key in the setup account's authorized_keys (bin/add-backup-key --grant writes
+`from="<VPN>",command="setup-server-access --key <name> [--allow-fresh] --grant PROJECT:ENV=LEVEL …",restrict,pty
+<key>`): the key runs nothing else and reaches no target itself. This worker already reaches every target (the
+deploy does: DEPLOY_SSH with its key, DEPLOY_CONTEXT through Docker), so the developer goes the same way and needs
+no key on LIVE. SSH_ORIGINAL_COMMAND is one of
+  access                                   the PROJECT ENV LEVEL lines this key may use
+  shell PROJECT ENV [root|readonly]        a shell in the environment's php-fpm container
+  exec PROJECT ENV [root|readonly] -- CMD  one command there
+  host PROJECT ENV [-- CMD]                a shell (or one command) on the target itself, in DEPLOY_PATH
+  docker PROJECT ENV VERB …                ps [-a] | logs [--tail N] [-f] [--since T] [-t] C | exec [--root|-u USER]
+                                           [-w DIR] C [CMD] | start|stop|restart C… | top C | stats | inspect C
+                                           (C: a container of the project's compose project, or its service)
+  latest|info|get|fresh …                  the backup requests, answered by setup-server-backup-pull
+Levels, each with everything below it:
+  phpfpm-readonly  shell/exec in php-fpm as nobody (65534): no write to the code the project account owns. Files
+                   only: the container's environment and the shop's config still hold the database password.
+  phpfpm           shell/exec in php-fpm as the project account (APP_UID), or root in the container
+  docker           the verbs above on the project's containers; never one that holds the Docker socket
+  full             host: the deploy user's shell on the target; on a local target the setup account here
+A child gets a terminal when the session has one (ssh -t). Every request is logged with the key's name.
+"""
+
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+
+ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
+PROJECTS = ROOT / 'projects'
+LOG = ROOT / 'access.log'
+BACKUP_PULL = os.environ.get('SETUP_SERVER_BACKUP_PULL', '/usr/local/sbin/setup-server-backup-pull')
+BACKUP_REQUESTS = ('latest', 'info', 'get', 'fresh')
+ENVIRONMENTS = ('stage', 'prod')
+LEVELS = ('phpfpm-readonly', 'phpfpm', 'docker', 'full')
+# NAME and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
+NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
+KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
+GRANT = re.compile(r'([a-z0-9][a-z0-9_-]*):(stage|prod)=(' + '|'.join(LEVELS) + ')')
+CONTEXT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+SSH_TARGET = re.compile(r'(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+')
+DIRECTORY = re.compile(r'/[A-Za-z0-9._/-]*')
+USER = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.-]*(?::[A-Za-z0-9_][A-Za-z0-9_.-]*)?')
+SINCE = re.compile(r'[0-9A-Za-z:.+-]{1,40}')
+READONLY_USER = '65534:65534'
+SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=15']
+# A shell where the image has one: bash when it is there, else sh.
+SHELL = ['sh', '-c', 'if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi']
+CONTAINERS = '{{.Names}}\t{{.Label "com.docker.compose.service"}}\t{{.State}}'
+READ_LIMIT = 1024 * 1024
+REFUSED = 65
+USAGE = ('expected: access | shell PROJECT ENV [root|readonly] | exec PROJECT ENV [root|readonly] -- CMD | '
+         'host PROJECT ENV [-- CMD] | docker PROJECT ENV VERB … | latest|info|get|fresh … (backups)')
+
+
+class Refused(Exception):
+    """A request this key may not make, or one this command does not answer."""
+
+
+def environment_directory(build_root):
+    """The environment repository of a build root: app/, or app/docker/ in older layouts."""
+    for directory in (build_root / 'app', build_root / 'app/docker'):
+        if (directory / 'Makefile').is_file() and (directory / 'env').is_dir():
+            return directory
+    return None
+
+
+def read_text(path):
+    try:
+        with open(path, 'rb') as handle:
+            return handle.read(READ_LIMIT).decode('utf-8', 'replace')
+    except OSError:
+        return None
+
+
+ENV_ENTRY = re.compile(r'(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*')
+ENV_ESCAPES = {'n': '\n', 't': '\t', 'r': '\r'}
+
+
+def env_closing(text, quote):
+    """Index of the quote that closes a value (after the opening one) in text, or -1."""
+    if quote == "'":
+        return text.find("'")
+    index = 0
+    while index < len(text):
+        if text[index] == '\\':
+            index += 2
+            continue
+        if text[index] == quote:
+            return index
+        index += 1
+    return -1
+
+
+def env_entries(text):
+    """(line number, NAME, value) of an env file, read as setup reads it (project_env_files.parse_dotenv):
+    a quoted value may run over several lines (asana.local's APP_ENVIRONMENT), double quotes take \n \t \r
+    escapes, an unquoted value ends at ' #'. NAME is None for a line that is no entry or a quote never closed."""
+    lines = (text or '').splitlines()
+    index = 0
+    while index < len(lines):
+        number, line = index + 1, lines[index].strip()
+        index += 1
+        if not line or line.startswith('#'):
+            continue
+        match = ENV_ENTRY.match(line)
+        if not match:
+            yield number, None, None
+            continue
+        raw = line[match.end():]
+        quote = raw[:1] if raw[:1] in ('"', "'") else ''
+        if not quote:
+            yield number, match[1], '' if raw.startswith('#') else re.split(r'\s#', raw, maxsplit=1)[0].strip()
+            continue
+        body = raw[1:]
+        end = env_closing(body, quote)
+        while end < 0 and index < len(lines):
+            body += '\n' + lines[index]
+            index += 1
+            end = env_closing(body, quote)
+        if end < 0:
+            yield number, None, None
+            continue
+        value = body[:end]
+        if quote == '"':
+            value = re.sub(r'\\(.)', lambda escape: ENV_ESCAPES.get(escape[1], escape[1]), value, flags=re.S)
+        yield number, match[1], value
+
+
+def parse_env(text):
+    return {key: value for _, key, value in env_entries(text) if key is not None}
+
+
+class Target:
+    """Where one project environment runs, as its deploys see it: the env files and the target bin/add-project
+    registered (target.env, target.<env>.env)."""
+
+    def __init__(self, project, environment):
+        build_root = PROJECTS / project
+        directory = environment_directory(build_root)
+        if directory is None:
+            raise Refused(f'no project {project} on this server')
+        common = parse_env(read_text(directory / 'env/common.env'))
+        values = {**common, **parse_env(read_text(directory / f'env/{environment}.env')),
+                  **parse_env(read_text(build_root / 'target.env')),
+                  **parse_env(read_text(build_root / f'target.{environment}.env'))}
+        name = common.get('PROJECT_NAME', '')
+        self.compose_project = f'{name if NAME.fullmatch(name) else project}-{environment}'
+        self.context = values.get('DEPLOY_CONTEXT') or 'default'
+        self.ssh = values.get('DEPLOY_SSH', '')
+        self.path = values.get('DEPLOY_PATH') or str(build_root)
+        ids = values.get('APP_UID', ''), values.get('APP_GID', '')
+        self.user = f'{ids[0]}:{ids[1]}' if all(value.isdigit() for value in ids) else None
+        if not CONTEXT.fullmatch(self.context) or (self.ssh and not SSH_TARGET.fullmatch(self.ssh)) \
+                or not DIRECTORY.fullmatch(self.path):
+            raise Refused(f'the deploy target of {project} {environment} is not one this command reaches')
+
+    def docker(self, *arguments):
+        return ['docker', *([] if self.context == 'default' else ['--context', self.context]), *arguments]
+
+    def containers(self):
+        """[(name, service, state)] of the compose project's containers."""
+        result = subprocess.run(self.docker('ps', '--all', '--filter', f'label=com.docker.compose.project={self.compose_project}',
+                                            '--format', CONTAINERS), capture_output=True, text=True, timeout=60)
+        if result.returncode:
+            raise Refused(f'docker does not answer for {self.compose_project}: '
+                          + ((result.stderr.strip().splitlines() or ['no answer'])[-1])[:300])
+        return [tuple((line.split('\t') + ['', ''])[:3]) for line in result.stdout.splitlines() if line.strip()]
+
+    def container(self, wanted, running=True):
+        """The container name of a container or service of the project; running ones only unless told."""
+        found = self.containers()
+        for name, service, state in [item for item in found if item[0] == wanted] or \
+                [item for item in found if item[1] == wanted]:
+            if running and state != 'running':
+                raise Refused(f'{name} is {state or "not running"}')
+            return name
+        raise Refused(f'{wanted} is no container or service of {self.compose_project}')
+
+    def holds_docker_socket(self, name):
+        result = subprocess.run(self.docker('inspect', '--format', '{{range .Mounts}}{{.Source}}\n{{end}}', name),
+                                capture_output=True, text=True, timeout=60)
+        return result.returncode != 0 or any(line.endswith('docker.sock') for line in result.stdout.splitlines())
+
+
+def interactive():
+    return sys.stdin.isatty()
+
+
+def exec_options():
+    return ['-it'] if interactive() else ['-i']
+
+
+def grants(arguments):
+    """{(project, env): level} of the forced command's --grant words."""
+    found = {}
+    for index, word in enumerate(arguments):
+        if word == '--grant' and index + 1 < len(arguments):
+            match = GRANT.fullmatch(arguments[index + 1])
+            if match:
+                found[(match[1], match[2])] = match[3]
+    return found
+
+
+def level_of(granted, project, environment):
+    if not NAME.fullmatch(project) or environment not in ENVIRONMENTS:
+        raise Refused('expected a project name and stage or prod')
+    level = granted.get((project, environment))
+    if level is None:
+        raise Refused(f'this key may not reach {project} {environment}')
+    return level
+
+
+def need(level, wanted, project, environment):
+    if LEVELS.index(level) < LEVELS.index(wanted):
+        raise Refused(f'{project} {environment} needs {wanted} for that; this key has {level} '
+                      f'(bin/add-backup-key --grant {project}:{environment}={wanted})')
+
+
+def command_words(words):
+    """CMD after `--`, or [] when there is none."""
+    if not words:
+        return []
+    if words[0] != '--' or len(words) == 1:
+        raise Refused('the command comes after --')
+    return words[1:]
+
+
+def php_fpm(granted, words):
+    """shell/exec PROJECT ENV [root|readonly] [-- CMD]: docker exec into php-fpm as the level allows."""
+    verb, project, environment, rest = words[0], words[1], words[2], words[3:]
+    level = level_of(granted, project, environment)
+    mode = rest.pop(0) if rest[:1] in (['root'], ['readonly']) else None
+    command = command_words(rest)
+    if verb == 'exec' and not command:
+        raise Refused('exec needs a command: exec PROJECT ENV [root|readonly] -- CMD')
+    if verb == 'shell' and command:
+        raise Refused('shell takes no command (use exec)')
+    if mode == 'root':
+        need(level, 'phpfpm', project, environment)
+    elif mode is None and LEVELS.index(level) < LEVELS.index('phpfpm'):
+        mode = 'readonly'
+    target = Target(project, environment)
+    user = {'root': '0', 'readonly': READONLY_USER}.get(mode, target.user)
+    container = target.container('php-fpm')
+    return target.docker('exec', *exec_options(), *(['-u', user] if user else []), container, *(command or SHELL)), level
+
+
+def host(granted, words):
+    """host PROJECT ENV [-- CMD]: the deploy user's shell on the target (the setup account's on a local one)."""
+    project, environment = words[1], words[2]
+    level = level_of(granted, project, environment)
+    need(level, 'full', project, environment)
+    command = command_words(words[3:])
+    target = Target(project, environment)
+    if command:
+        script = f'cd {shlex.quote(target.path)} && {shlex.join(command)}'
+    else:
+        script = f'cd {shlex.quote(target.path)} && exec "${{SHELL:-/bin/sh}}" -l'
+    if target.ssh:
+        return ['ssh', *SSH_OPTIONS, *(['-t'] if interactive() else []), target.ssh, script], level
+    return ['sh', '-c', script], level
+
+
+def docker(granted, words):
+    """docker PROJECT ENV VERB …: the allowed verbs on the project's containers, options parsed here."""
+    project, environment, rest = words[1], words[2], words[3:]
+    level = level_of(granted, project, environment)
+    need(level, 'docker', project, environment)
+    if not rest:
+        raise Refused('expected a verb: ps, logs, exec, start, stop, restart, top, stats, inspect')
+    target = Target(project, environment)
+    verb, rest = rest[0], rest[1:]
+    if verb == 'ps':
+        if rest not in ([], ['-a'], ['--all']):
+            raise Refused('ps takes only -a')
+        return target.docker('ps', *rest[:1], '--filter', f'label=com.docker.compose.project={target.compose_project}'), level
+    if verb == 'logs':
+        options = []
+        while rest[:1] and rest[0].startswith('-'):
+            option = rest.pop(0)
+            if option in ('-f', '--follow', '-t', '--timestamps'):
+                options.append(option)
+            elif option in ('--tail', '-n') and rest and (rest[0].isdigit() or rest[0] == 'all'):
+                options += ['--tail', rest.pop(0)]
+            elif option == '--since' and rest and SINCE.fullmatch(rest[0]):
+                options += ['--since', rest.pop(0)]
+            else:
+                raise Refused(f'logs: {option} is not allowed (-f, -t, --tail N, --since TIME)')
+        if len(rest) != 1:
+            raise Refused('logs takes one container')
+        return target.docker('logs', *options, target.container(rest[0], running=False)), level
+    if verb in ('start', 'stop', 'restart'):
+        if not rest or any(word.startswith('-') for word in rest):
+            raise Refused(f'{verb} takes containers only')
+        return target.docker(verb, *[target.container(word, running=False) for word in rest]), level
+    if verb in ('top', 'inspect'):
+        if len(rest) != 1:
+            raise Refused(f'{verb} takes one container')
+        return target.docker(verb, target.container(rest[0], running=verb == 'top')), level
+    if verb == 'stats':
+        if rest:
+            raise Refused('stats takes nothing')
+        running = [name for name, _, state in target.containers() if state == 'running']
+        if not running:
+            raise Refused(f'no container of {target.compose_project} runs')
+        return target.docker('stats', '--no-stream', *running), level
+    if verb == 'exec':
+        options = []
+        while rest[:1] and rest[0].startswith('-'):
+            option = rest.pop(0)
+            if option == '--root':
+                options += ['-u', '0']
+            elif option in ('-u', '--user') and rest and USER.fullmatch(rest[0]):
+                options += ['-u', rest.pop(0)]
+            elif option in ('-w', '--workdir') and rest and DIRECTORY.fullmatch(rest[0]):
+                options += ['-w', rest.pop(0)]
+            else:
+                raise Refused(f'exec: {option} is not allowed (--root, -u USER, -w DIR)')
+        if not rest:
+            raise Refused('exec takes a container')
+        container = target.container(rest[0])
+        if target.holds_docker_socket(container):
+            raise Refused(f'{container} holds the Docker socket: no exec into it')
+        return target.docker('exec', *exec_options(), *options, container, *(rest[1:] or SHELL)), level
+    raise Refused(f'docker {verb} is not allowed (ps, logs, exec, start, stop, restart, top, stats, inspect)')
+
+
+def access_lines(granted):
+    return [f'{project} {environment} {level}' for (project, environment), level in sorted(granted.items())]
+
+
+def plan(granted, request):
+    """(argv, level) of a request; Refused when the key may not."""
+    try:
+        words = shlex.split(request)
+    except ValueError:
+        raise Refused('the request does not parse (an unclosed quote?)')
+    if words[:1] in (['shell'], ['exec']) and len(words) >= 3:
+        return php_fpm(granted, words)
+    if words[:1] == ['host'] and len(words) >= 3:
+        return host(granted, words)
+    if words[:1] == ['docker'] and len(words) >= 3:
+        return docker(granted, words)
+    raise Refused(USAGE)
+
+
+def log(key, request, answer):
+    stamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    peer = (os.environ.get('SSH_CONNECTION') or '-').split(' ')[0]
+    try:
+        with LOG.open('a') as handle:
+            handle.write(f'{stamp} key={key} from={peer} {request[:300]!r} -> {answer}\n')
+    except OSError:
+        pass  # the log is a record, not a gate; sshd's own log has the login too
+
+
+def main(arguments):
+    named = arguments[:1] == ['--key'] and len(arguments) > 1 and KEY.fullmatch(arguments[1])
+    key = arguments[1] if named else '-'
+    allow_fresh = '--allow-fresh' in arguments[2:]
+    granted = grants(arguments[2:]) if named else {}
+    request = os.environ.get('SSH_ORIGINAL_COMMAND', '')
+    first = request.split()[:1]
+    if first and first[0] in BACKUP_REQUESTS:
+        # The backup requests are setup-server-backup-pull's, as for a key without access; it logs them itself.
+        os.execv(BACKUP_PULL, [BACKUP_PULL, '--key', key, *(['--allow-fresh'] if allow_fresh and named else [])])
+    if first in ([], ['access']):
+        lines = access_lines(granted)
+        print('\n'.join(lines) if lines else 'This key reaches no project.')
+        if not first:
+            print(f'setup-server-access: {USAGE}', file=sys.stderr)
+        log(key, request, 'listed')
+        return 0
+    try:
+        command, level = plan(granted, request)
+    except Refused as refusal:
+        log(key, request, f'refused: {refusal}')
+        print(f'setup-server-access: {refusal}', file=sys.stderr)
+        return REFUSED
+    except (OSError, subprocess.SubprocessError) as error:
+        log(key, request, f'failed: {error}')
+        print(f'setup-server-access: {error}', file=sys.stderr)
+        return 74
+    log(key, request, f'started ({level}): {shlex.join(command)[:300]}')
+    try:
+        code = subprocess.run(command).returncode
+    except OSError as error:
+        log(key, request, f'failed: {error.strerror}')
+        print(f'setup-server-access: {error.strerror}', file=sys.stderr)
+        return 74
+    log(key, request, f'exit {code}')
+    return code
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

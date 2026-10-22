@@ -118,6 +118,17 @@ class SharedHelpersTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(status.get(name), backups[name])
 
+    def test_the_access_command_reads_build_roots_and_env_files_as_the_others(self):
+        saved = self.SHARED
+        self.SHARED = self.ENV_HELPERS + ("environment_directory", "NAME")
+        try:
+            backups, access = self.definitions("backup-projects"), self.definitions("server-access")
+        finally:
+            self.SHARED = saved
+        for name in self.ENV_HELPERS + ("environment_directory", "NAME"):
+            with self.subTest(name=name):
+                self.assertEqual(access.get(name), backups[name])
+
     def test_the_duplicated_helpers_are_identical(self):
         backups = self.definitions("backup-projects")
         self.assertEqual(sorted(backups), sorted(self.SHARED))
