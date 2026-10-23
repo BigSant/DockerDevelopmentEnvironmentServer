@@ -772,6 +772,15 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("update")[-1],
                          f"-n -H -u {getpass.getuser()} {ROOT}/bin/update --check --server-ref origin/master")
 
+    def test_a_status_read_before_an_action_ended_is_read_again_after_it(self):
+        module = load_web_ui()
+        cache, calls = module.Cache(), []
+        compute = lambda: calls.append(1) or len(calls)
+        self.assertEqual(cache.get("status", 60, compute), 1)
+        self.assertEqual(cache.get("status", 60, compute, since=time.time() - 3600), 1, "an action that ended before")
+        self.assertEqual(cache.get("status", 60, compute, since=time.time() + 1), 2, "an action that ended after it")
+        self.assertEqual(cache.peek("status"), 2)
+
     def write_keys(self):
         ssh = self.tree.root / ".ssh"
         ssh.mkdir(exist_ok=True)

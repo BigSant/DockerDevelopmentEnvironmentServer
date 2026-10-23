@@ -6,6 +6,8 @@ Stopping it (Ctrl-C, SIGTERM) stops the UI and removes the temporary tree.
 """
 
 import base64
+import getpass
+import hashlib
 import http.client
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,17 +38,18 @@ def fixture():
     for shop in ('biofitus', 'joldija', 'nespresso', 'papildai', 'forsena', 'vaistai', 'zoo-shop', 'baldai', 'knygos', 'geles'):
         case.tree.project(shop, 'prod', 'stage')
     # Developer keys with grants (bin/add-backup-key), their requests, and a setup checkout past its release tag.
-    blob = 'AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1'
-    access = '/usr/local/sbin/setup-server-access'
+    def blob(seed):  # a well-formed ssh-ed25519 public key of its own for each developer
+        return base64.b64encode(b'\0\0\0\x0bssh-ed25519\0\0\0\x20' + hashlib.sha256(seed.encode()).digest()).decode()
+    access = case.sbin / 'setup-server-access'  # the UI's SETUP_SERVER_SBIN: bin/add-backup-key knows its entries by it
     (ssh / 'authorized_keys').write_text(
         f'from="10.8.0.0/24",command="{access} --key tomas --allow-fresh --grant asana_tracker:prod=full '
         f'--grant forsena_docker:stage=docker --grant shop-two:prod=phpfpm --grant biofitus:prod=phpfpm-readonly '
         f'--grant biofitus:stage=docker --grant joldija:prod=phpfpm-readonly --grant joldija:stage=docker '
-        f'--grant nespresso:prod=phpfpm --grant nespresso:stage=docker",restrict,pty ssh-ed25519 {blob} tomas\n'
+        f'--grant nespresso:prod=phpfpm --grant nespresso:stage=docker",restrict,pty ssh-ed25519 {blob("tomas")} tomas\n'
         f'from="10.8.0.0/24",command="{access} --key ona --grant asana_tracker:prod=phpfpm-readonly '
-        f'--grant forsena_docker:stage=phpfpm",restrict,pty ssh-ed25519 {blob} ona\n'
-        f'from="10.8.0.0/24,10.9.0.5/32",command="/usr/local/sbin/setup-server-backup-pull --key qa-ci",restrict '
-        f'ssh-ed25519 {blob} qa-ci\n')
+        f'--grant forsena_docker:stage=phpfpm",restrict,pty ssh-ed25519 {blob("ona")} ona\n'
+        f'from="10.8.0.0/24,10.9.0.5/32",command="{case.sbin / "setup-server-backup-pull"} --key qa-ci",restrict '
+        f'ssh-ed25519 {blob("qa-ci")} qa-ci\n')
     now = lambda age: time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - age))
     (case.tree.root / 'access.log').write_text(
         f"{now(7200)} key=tomas from=10.8.0.20 'shell asana_tracker prod' -> started (full): docker exec …\n"
@@ -79,6 +82,24 @@ def fixture():
             git('tag', f'v{version}')
     git('update-ref', 'refs/remotes/origin/master', 'HEAD')
     git('checkout', '-q', '--detach', 'HEAD')
+    # "Vykdyti" of a key change writes the tree's authorized_keys for real (the test stub only records): the real
+    # bin/add-backup-key, as this user, with its root checks answered.
+    helper = case.root / 'preview-add-backup-key'
+    helper.write_text(f"""#!{sys.executable}
+import os, sys
+from unittest.mock import patch
+sys.path.insert(0, {str(Path(__file__).resolve().parent)!r})
+os.environ['SETUP_SERVER_USER'] = {getpass.getuser()!r}
+import test_backup_pull
+module = test_backup_pull.load('add_backup_key', {str(test_ui.ROOT / 'bin/add-backup-key')!r})
+with patch.object(module.os, 'geteuid', return_value=0), patch.object(module.os, 'chown'):
+    sys.exit(module.main(sys.argv[1:]))
+""")
+    helper.chmod(0o755)
+    stub = case.bin / 'sudo'
+    stub.write_text(stub.read_text().replace('  */server-status) shift; exec "$SERVER_STATUS" "$@";;',
+                                             '  */server-status) shift; exec "$SERVER_STATUS" "$@";;\n'
+                                             f'  */add-backup-key) shift; exec {helper} "$@";;'))
     return case
 
 

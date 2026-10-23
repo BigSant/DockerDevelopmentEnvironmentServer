@@ -726,7 +726,7 @@ def start_job(plan, identifier, user, client):
     directory.mkdir(mode=0o700)
     (directory / 'job.json').write_text(json.dumps({'argv': plan.run, 'action': plan.action, 'title': plan.title,
                                                     'user': user, 'client': client, 'timeout': plan.timeout,
-                                                    'started': int(time.time())}))
+                                                    'started': int(time.time()), 'back': plan.back}))
     process = subprocess.Popen([sys.executable, PROGRAM, '--job', str(directory)], stdin=subprocess.PIPE,
                                stdout=subprocess.DEVNULL, start_new_session=True, env=child_environment())
     try:
@@ -743,14 +743,16 @@ class Cache:
         self.lock = threading.Lock()
         self.values = {}
 
-    def get(self, key, ttl, compute, fresh=False):
+    def get(self, key, ttl, compute, fresh=False, since=None):
+        """The stored value while younger than ttl, and (since given) computed after that wall-clock time."""
         with self.lock:
             stored = self.values.get(key)
-            if stored and not fresh and time.monotonic() - stored[0] < ttl:
+            if stored and not fresh and time.monotonic() - stored[0] < ttl and (since is None or stored[2] > since):
                 return stored[1]
+        computed = time.time()
         result = compute()
         with self.lock:
-            self.values[key] = (time.monotonic(), result)
+            self.values[key] = (time.monotonic(), result, computed)
         return result
 
     def forget(self, key):
@@ -783,7 +785,18 @@ def helper(*arguments, timeout=150):
 
 
 def status(fresh=False):
-    return CACHE.get('status', STATUS_TTL, helper, fresh)
+    # A status read while an action ran may miss what it changed: read again once one has finished since.
+    return CACHE.get('status', STATUS_TTL, helper, fresh, since=last_job_end())
+
+
+def last_job_end():
+    """When the newest finished action finished (its result.json), or None."""
+    for directory in jobs(3):
+        try:
+            return (directory / 'result.json').stat().st_mtime
+        except OSError:
+            continue
+    return None
 
 
 # --- Bitbucket -----------------------------------------------------------------------------------
@@ -2511,9 +2524,12 @@ class Page:
         if result is not None:
             rows.insert(2, ('Truko', f'{result.get("seconds", 0)} s'))
         body = f'<div class="bar {bar}"><i></i></div>' + facts(rows) + term(output, '(išvesties dar nėra)')
+        back, section = meta.get('back') or ('/logs', 'logs')
         if running:
             body += '<p class="note">Puslapis atsinaujina kas 3 s.</p>'
-        return self.layout(meta.get('title', 'Veiksmas'), body, refresh=3 if running else None, section='logs')
+        elif back != '/actions':
+            body += f'<p><a class="btn go" href="{e(back)}">← Atgal</a></p>'
+        return self.layout(meta.get('title', 'Veiksmas'), body, refresh=3 if running else None, section=section)
 
     def logs(self, actions, recent, data, error):
         body = '<h2>Paskutiniai veiksmai</h2>'
@@ -2791,8 +2807,7 @@ def handler(user, stored):
                 record(name, self.client(), 'run', f'job={identifier} {plan.action}: {shlex.join(plan.run)}')
             except OSError as error:
                 return self.reply(500, page.invalid(f'Veiksmų žurnalas {ACTIONS_LOG} neįrašomas ({error.strerror}): nieko nevykdyta.'))
-            start_job(plan, identifier, name, self.client())
-            CACHE.forget('status')
+            start_job(plan, identifier, name, self.client())  # status() reads again once it has finished
             self.send_response(303)
             self.send_header('Location', f'/job/{identifier}')
             self.send_header('Content-Length', '0')
