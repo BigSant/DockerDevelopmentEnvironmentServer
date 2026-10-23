@@ -321,7 +321,7 @@ class InstallBackupsTest(ScriptTest):
         # optionally stage/prod.
         self.stub("sudo", 'echo "Sudo version 1.9.15p5"\n')
         exact = self.run_script("install-backups", "--check")
-        self.assertIn(rule + f"^(--full )?{projects}[a-z0-9][a-z0-9_-]*( [a-z][a-z0-9]{{1,15}})?$\n", exact.stdout)
+        self.assertIn(rule + f"^(--full )?{projects}[a-z0-9][a-z0-9_-]*( [a-z][a-z0-9]*)?$\n", exact.stdout)
         # Older sudo (Ubuntu 22.04: 1.9.9) has only wildcards: the first argument must be a build root (or
         # --full and then a build root), the command refuses anything else after it.
         self.stub("sudo", 'echo "Sudo version 1.9.9"\n')

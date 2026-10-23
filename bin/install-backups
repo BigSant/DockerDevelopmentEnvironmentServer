@@ -136,7 +136,8 @@ EOF
 projects="$ROOT/projects"
 sudo_version=$(sudo -V 2>/dev/null | sed -n '1s/^Sudo version \([0-9.]*\).*/\1/p' || true)
 if [ "$(printf '%s\n%s\n' 1.9.10 "${sudo_version:-0}" | sort -V | head -n1)" = 1.9.10 ]; then
-    allowed="$command ^(--full )?${projects//./\\.}/[a-z0-9][a-z0-9_-]*( [a-z][a-z0-9]{1,15})?\$"
+    # No {m,n}: a comma separates commands in sudoers. The command itself checks the name (2-16 characters, listed).
+    allowed="$command ^(--full )?${projects//./\\.}/[a-z0-9][a-z0-9_-]*( [a-z][a-z0-9]*)?\$"
 else
     allowed="$command $projects/[a-z0-9]*, $command --full $projects/[a-z0-9]*"
 fi
