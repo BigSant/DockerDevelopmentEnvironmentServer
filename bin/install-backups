@@ -129,13 +129,15 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
-# Only the "backup now" form: sudo -n $command [--full] "$BUILD_ROOT" [stage|prod]. sudo 1.9.10+ matches the
+# Only the "backup now" form: sudo -n $command [--full] "$BUILD_ROOT" [ENV] (stage, prod or a STAGE_ENVIRONMENTS
+# name; the command checks the project has it). sudo 1.9.10+ matches the
 # arguments with a regular expression; older ones (Ubuntu 22.04: 1.9.9) only with wildcards, where `*` also
 # matches spaces: the first argument is still a build root (or --full), and the command refuses anything else.
 projects="$ROOT/projects"
 sudo_version=$(sudo -V 2>/dev/null | sed -n '1s/^Sudo version \([0-9.]*\).*/\1/p' || true)
 if [ "$(printf '%s\n%s\n' 1.9.10 "${sudo_version:-0}" | sort -V | head -n1)" = 1.9.10 ]; then
-    allowed="$command ^(--full )?${projects//./\\.}/[a-z0-9][a-z0-9_-]*( (stage|prod))?\$"
+    # No {m,n}: a comma separates commands in sudoers. The command itself checks the name (2-16 characters, listed).
+    allowed="$command ^(--full )?${projects//./\\.}/[a-z0-9][a-z0-9_-]*( [a-z][a-z0-9]*)?\$"
 else
     allowed="$command $projects/[a-z0-9]*, $command --full $projects/[a-z0-9]*"
 fi

@@ -505,6 +505,14 @@ class AddProjectTargetTest(ScriptTest):
         self.assertIn(f"would write {build_root}/target.prod.env:", remote.stdout)
         self.assertIn("DEPLOY_CONTEXT=setup-asana_tracker-prod\n    DEPLOY_SSH=deploy@shop.example\n"
                       "    DEPLOY_PATH=/home/deploy/shop", remote.stdout)
+        mdv = self.run_script("add-project", "--target", "local", "--check", "--target", "mdv=ssh://deploy@mdv.example/home/deploy/mdv",
+                              "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(mdv.returncode, 0, mdv.stdout + mdv.stderr)
+        self.assertIn(f"would write {build_root}/target.mdv.env:", mdv.stdout)
+        self.assertIn("DEPLOY_CONTEXT=setup-asana_tracker-mdv\n", mdv.stdout)
+        reserved = self.run_script("add-project", "--check", "--target", "test=local", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(reserved.returncode, 64)
+        self.assertIn("test is not a deploy environment", reserved.stderr)
         bad = self.run_script("add-project", "--target", "local", "--check", "--target", "ftp://x/y", "git@bitbucket.org:rsmaizys/asana_tracker.git")
         self.assertEqual(bad.returncode, 64)
         self.assertIn("expected local, local:/PATH or ssh://USER@HOST/ABSOLUTE/PATH", bad.stderr)
@@ -636,8 +644,27 @@ class UpdateSetupTest(ScriptTest):
         self.assertIn("new MAJOR version", major.stdout)
         self.assertEqual(self.version(), "3.0.0")
 
+    def test_master_takes_the_newest_commit_and_warns_that_prod_needs_a_tag(self):
+        work = self.root / "setup-work"
+        git = lambda *arguments: subprocess.run(["git", *arguments], env=GIT_ENV, check=True, capture_output=True, text=True)
+        (work / "VERSION").write_text("3.1.0\n")
+        git("-C", str(work), "commit", "-q", "-am", "Unreleased work")
+        git("-C", str(work), "push", "-q", "origin", "master")
+        check = self.update("--check", "master")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertRegex(check.stdout, r"==> setup 2\.4\.0 \(v2\.4\.0\) -> master \([0-9a-f]{7,}\)")
+        self.assertIn("prod deploys stop", check.stdout)
+        self.assertEqual(self.version(), "2.4.0")
+        moved = self.update("master")
+        self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+        self.assertEqual(self.version(), "3.1.0")
+        self.assertIn("Nothing to do", self.update("master").stdout)
+        back = self.update()
+        self.assertEqual(back.returncode, 0, back.stdout + back.stderr)
+        self.assertEqual(self.version(), "3.0.0", "without master: the newest release of the MAJOR version")
+
     def test_only_release_tags_a_clean_checkout_and_no_running_pipeline(self):
-        self.assertEqual(self.update("master").returncode, 64)
+        self.assertEqual(self.update("main").returncode, 64)
         self.assertEqual(self.update("v2.7").returncode, 64)
         unknown = self.update("v2.9.9")
         self.assertEqual(unknown.returncode, 65)

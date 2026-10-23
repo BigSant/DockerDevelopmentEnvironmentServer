@@ -39,6 +39,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 ├── github-runner/<scope>/      GitHub runner'is (organizacijai `bigsant`, repo `bigsant.<repo>`); _work – darbo katalogas
 ├── ui-actions.log              valdymo sąsajos veiksmų žurnalas (setup-ui, 0640)
 ├── backup-pulls.log, access.log   programuotojų raktų prašymai: kopijos ir prieiga prie taikinių
+├── access-sessions/<raktas>/   kas surinkta interaktyviuose seansuose (įvestis, 0600; laikoma 180 d.)
 ├── .ssh/id_ed25519             git raktas (tik skaitymui): setup repo ir Bitbucket projektai
 └── .ssh/github-<savininkas>.<repo>   GitHub projekto deploy key (tik skaitymui); host alias'ai – .ssh/config
 /etc/setup-server/runner.env    Bitbucket runner'io OAuth duomenys (root, 0600)
@@ -200,8 +201,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
      `VARTOTOJAS` `authorized_keys`, ir sustoja), patikrina Docker ir ar `KELIAS` rašomas, perima vartotojo
      `id -u`/`id -g` ir sukuria Docker context'ą `setup-<vardas>[-<env>]`. Naujas host raktas įrašomas
      pirmo prisijungimo metu (parodomas).
-   - **`stage=…` / `prod=…`** – tik viena aplinka (`target.<env>.env`, laimi prieš bendrą `target.env`),
-     kai stage ir prod skirtinguose serveriuose. `--target` galima kartoti.
+   - **`stage=…` / `prod=…` / `mdv=…`** – tik viena aplinka (`target.<env>.env`, laimi prieš bendrą `target.env`),
+     kai stage ir prod skirtinguose serveriuose, ar papildomai aplinkai (žr. „Papildomos aplinkos“). `--target` galima kartoti.
    - Pakartotinai paleistas be `--target` taikinio nekeičia; su `--target` – perrašo. `remove-project`
      pašalina ir build katalogą (su `target*.env`), ir projekto Docker context'us.
 
@@ -256,7 +257,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    asana_tracker prod`) rodoma juosta: parašyti baitai, palyginti su ankstesnės tokios pat kopijos dydžiu.
 
    **Kurie projektai ir aplinkos.** Kopijuojama kiekviena `/srv/setup-server/projects/<vardas>` aplinka,
-   kuriai aplinkos repo (`app/`, senesniame išdėstyme `app/docker/`) turi `env/stage.env` arba `env/prod.env`.
+   kuriai aplinkos repo (`app/`, senesniame išdėstyme `app/docker/`) turi `env/stage.env`, `env/prod.env` ar
+   papildomos aplinkos (`STAGE_ENVIRONMENTS`, žr. „Papildomos aplinkos“) `env/<env>.env`.
    Šį failą sukuria projekto deploy pipeline'as (`cp env/prod.env.example env/prod.env`), todėl kopijuojama
    tai, kas iš šio serverio deploy'inama. `local` ir `test` nekopijuojamos. Kopija – setup `make db-backup
    ENV=<env>`: stage/prod pagal lentelių registrą, su `DATABASE_EXTRA_SCHEMAS` – visos schemos vienu dump'u
@@ -400,8 +402,10 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    ```
 
    `--grant` galima kartoti arba rašyti per kablelį; be `:stage`/`:prod` – abi aplinkos. Pakartotinai paleidus su tuo
-   pačiu vardu įrašas pakeičiamas visas: išvardyk visus leidimus (be `--grant` – lieka tik kopijos). Projektas – build
-   katalogo vardas (`projects/<vardas>`); dar nesančiam projektui leidimas įrašomas su pastaba.
+   pačiu vardu įrašas pakeičiamas visas: išvardyk visus leidimus (be `--grant` – lieka tik kopijos). Esamam raktui
+   rakto failo ir `--from` nereikia – lieka įrašytas raktas ir tinklai: `sudo bin/add-backup-key --name tomas --grant
+   forsena=docker` pakeičia tik leidimus (ir `--allow-fresh`). Projektas – build katalogo vardas (`projects/<vardas>`);
+   dar nesančiam projektui leidimas įrašomas su pastaba. Patogiausia – sąsajos puslapyje *Prieiga* (žr. „Valdymo sąsaja“).
 
    | Lygis | Ką leidžia | Ko neleidžia |
    | --- | --- | --- |
@@ -433,8 +437,35 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    `APP_UID` imami iš build katalogo (`target*.env`, `env/<env>.env`), kaip deploy'aus. Terminalą komanda duoda, kai jį
    turi SSH seansas (`ssh -t`); be jo – stdin perduodamas, todėl veikia ir `… exec … -- mysqldump … > failas`.
    Kiekvienas prašymas (ir atmestas) ir jo pabaiga (išėjimo kodas) įrašomi į `/srv/setup-server/access.log`: laikas,
-   rakto vardas, adresas, prašymas, lygis ir vykdoma komanda. Seanso turinys neįrašomas. Įdiegtą komandos kopiją
-   atnaujina `bin/update`.
+   rakto vardas, adresas, prašymas, lygis ir vykdoma komanda. **Interaktyvaus seanso** (su terminalu) įvestis – tai, ką
+   žmogus surinko, ne tai, ką rodė ekranas – įrašoma `script --log-in` į
+   `/srv/setup-server/access-sessions/<raktas>/<UTC laikas>-<pid>.log` (paskyra `setup`, 0600, laikoma 180 dienų), o
+   `access.log` eilutė nurodo failą (`session=…`). Taip žinomos ir shell'e surinktos komandos; jose surinktas
+   slaptažodis (pvz. `mysql -p`) įrašomas taip pat. Be terminalo įrašo nėra: komanda jau yra prašyme. Sąsaja rodo
+   kiekvieno rakto veiklą (prisijungimai, kopijos, shell'ai su trukme, komandos, atmesti bandymai) ir seansų įrašus –
+   `server-status --activity [RAKTAS]`, `--session RAKTAS FAILAS`. Įdiegtą komandos kopiją atnaujina `bin/update`.
+
+## Papildomos aplinkos (pvz. laikina `mdv`)
+
+Didesniam darbui projektas gali turėti daugiau aplinkų nei stage ir prod. Jas išvardija projekto `env/common.env`:
+`STAGE_ENVIRONMENTS="mdv"` (setup; vardas – mažosios raidės ir skaitmenys, 2–16 simbolių, ne `local`/`test`/`stage`/`prod`).
+Kiekviena tokia aplinka setup'e elgiasi kaip stage (žr. setup `doc/lt/09-aplinkos.md`), o šiame serveryje – kaip bet kuri
+kita aplinka:
+
+- **Taikinys** – bendras `target.env` arba savas: `sudo bin/add-project --target mdv=ssh://deploy@mdv.example/home/deploy/shop VARDAS URL`
+  (`target.mdv.env`). Tame pačiame taikinyje kaip stage ar prod aplinkai reikia savo port'ų ar adreso (setup tai tikrina).
+- **Deploy'us** – projekto `bitbucket-pipelines.yml` custom pipeline'as `deploy-mdv` su `deployment: mdv` (Bitbucket
+  deployment environment `mdv`, tipas Staging) arba GitHub environment `mdv`; sąsajos projekto puslapyje – „Deploy į mdv“
+  (rodomas, kai aplinka išvardyta, dar prieš pirmą deploy'ų).
+- **Kopijos** – naktinės, savaitinės pilnos ir „backup dabar“ (`… setup-server-backup "$BUILD_ROOT" mdv`), kai yra
+  `env/mdv.env`; `make db-pull from=mdv`. Sudo taisyklė „backup dabar“ priima ir papildomos aplinkos vardą: atnaujinus
+  setup-server pakartok `sudo bin/install-backups` (`bin/update` parodo, kad taisyklė skiriasi).
+- **Metrikos** – tos pačios eilutės su `environment="mdv"`.
+- **Prieiga** – `--grant projektas:mdv=LYGIS` ir sąsajos *Prieiga* (rakto puslapyje mdv stovi greta prod ir stage;
+  „Visoms iš karto“ – eilutė „kitos“). `--grant projektas=LYGIS` be aplinkos – tik stage ir prod.
+- **Kai aplinkos nebereikia** – setup pusėje `make down ENV=mdv`, `data/mdv` pašalinimas ir vardas iš `STAGE_ENVIRONMENTS`;
+  čia – `target.mdv.env` ir `app/.generated/backups/*-mdv-*` (jei kopijų nebereikia) ištrinami ranka, raktų `…:mdv` leidimai
+  atimami *Prieigoje* (neišvardytai aplinkai vartai ir taip neleidžia jungtis).
 
 ## Bitbucket SSH adresas (nuo 2026-11-12)
 
@@ -524,16 +555,20 @@ išvedamos komandos rankiniam atstatymui.
 ### Tik setup (be slaptažodžio)
 
 Bendrą setup checkout'ą (`/srv/setup-server/setup`) atnaujina viena komanda, be administratoriaus slaptažodžio ir be
-setup-server atnaujinimo – arba sąsajoje *Veiksmai → Atnaujinti setup*:
+setup-server atnaujinimo – arba sąsajoje *Atnaujinimas* („Į naujausią (master)“, „Release tag'as“):
 
 ```bash
 sudo bin/update-setup --check          # dabartinė versija, naujausias to paties MAJOR release'as, commit'ai
 sudo bin/update-setup                  # perjungia į jį
 sudo bin/update-setup v2.6.0           # arba į nurodytą release tag'ą
+sudo bin/update-setup master           # naujausias origin/master commit'as
 ```
 
-- Tik release tag'ai (`vX.Y.Z`), tik švarus checkout'as, ne pipeline žingsnio metu (`make` paskyros `setup`).
+- Release tag'ai (`vX.Y.Z`) arba `master`, tik švarus checkout'as, ne pipeline žingsnio metu (`make` paskyros `setup`).
   Nepavykus perjungti checkout'as grįžta. Git darbą atlieka paskyra `setup`.
+- **`master` – ne release'as:** setup `make release ENV=prod` stato tik iš release tag'o, todėl kol setup ant `master`
+  (už naujausio tag'o), **prod deploy'ai neveikia**; stage – veikia. Peržiūra ir sąsaja (*Atnaujinimas*, *Apžvalga* –
+  „Reikia dėmesio“) tai rodo; grįžti – `sudo bin/update-setup` (be argumentų) arba „Release tag'as“.
 - Naujas MAJOR – tik nurodžius tag'ą; peržiūra perspėja, kad projektams gali reikėti pakeitimų.
 - **Deploy'us tai daro ir pats:** kai deploy'inamo commit'o `SETUP_MIN_VERSION` naujesnis už serverio setup, setup 2.7.0+
   `pipeline-deploy` perjungia setup į naujausią to paties MAJOR release'ą ir žingsnį paleidžia iš naujo.
@@ -725,9 +760,13 @@ Tunelis eina per serverio SSH; jei jis neatsako, žr. `bin/install-ssh` („Eiga
 Naršyklė paklaus vardo ir slaptažodžio (Basic auth; srautą šifruoja SSH). Slaptažodis rodomas tik įdiegus, serveryje
 laikomas tik jo PBKDF2 hash'as `/etc/setup-server/ui.env` (root, 0600). Pamiršus – `sudo bin/install-ui --new-password`.
 
-**Ką rodo.**
+**Ką rodo.** Navigacijoje prie *Prieigos* – raktų skaičius, prie *Atnaujinimo* – taškas: geltonas, kai yra naujesnis
+commit'as, raudonas, kai setup ne ant release tag'o.
 
-- *Apžvalga* – setup-server versija (įdiegta ir administratoriaus klono), bendro setup checkout'o versija, Bitbucket ir
+- *Apžvalga* – viršuje „Reikia dėmesio“: viskas, kas sugedę ar laukia (nepavykę unit'ai, setup ne ant tag'o, naujesnė
+  versija, mažai vietos, nepavykęs deploy'us, sustojęs secret store, nesveiki konteineriai, senesnė nei 26 val. kopija),
+  kiekvienas su nuoroda. Toliau – setup-server versija (įdiegta ir administratoriaus klono), bendro setup checkout'o versija
+  (commit'as, ar release tag'as, kiek naujesnis origin/master pagal paskutinį fetch), Bitbucket ir
   GitHub runner'ių paslaugos, naktinių ir savaitinių pilnų kopijų laikmačiai (paskutinis paleidimas, rezultatas, kitas), metrikų paslauga,
   pati sąsaja, laisva vieta diske, kuriame `/srv/setup-server`. Prie kiekvienos įdiegtos paslaugos – jos mygtukai
   (paleisti, sustabdyti, perkrauti; kopijoms – „Paleisti dabar“), kurie veda į tą pačią peržiūrą kaip kiti veiksmai.
@@ -737,9 +776,27 @@ laikomas tik jo PBKDF2 hash'as `/etc/setup-server/ui.env` (root, 0600). Pamiršu
   ar veikia `<PROJECT_NAME>-<env>-secrets`, konteineriai (būsena, sveikata) ir paskutiniai Bitbucket pipeline'ai.
   Projekto puslapyje – ir visos aplinkos kopijos (naktinės, pilnos, šviežios, prieš deploy'ų: failas, laikas, dydis),
   kiekvieno konteinerio `docker logs` (200, 500 ar 2000 paskutinių eilučių) ir „Kopija dabar serveryje“.
+- *Prieiga* – programuotojų raktai: kiekvienam – kiek prod, stage ir kitų aplinkų jis pasiekia kokiu lygiu, kopijų
+  teisės, tinklai ir paskutinis naudojimas; paieška pagal raktą ar projektą; visų raktų paskutinė veikla.
+  „Pridėti raktą“ – viešasis raktas, vardas, tinklai, „fresh“ ir pradinė prieiga visoms prod ir stage aplinkoms.
+  Rakto puslapyje:
+  - *Visoms iš karto* – vienas lygis (arba „—“, atimti) visoms prod, visoms stage ar visoms aplinkoms, visiems projektams
+    arba tik ten, kur raktas jau turi prieigą;
+  - *Projektai* – po eilutę projektui, jo aplinkos (prod, stage, kitos) šalia, lygis – mygtukų juosta; filtras pagal
+    vardą ir „tik su prieiga“ (keičiamos tik rodomos aplinkos, paslėptos lieka);
+  - *Rakto nustatymai* – tinklai, „fresh“, naujas viešasis raktas (galioja visoms aplinkoms), dar nesančio projekto
+    leidimas; rakto atėmimas;
+  - *Veikla* – kas, kada, iš kur: prisijungimai, kopijos, shell'ai (lygis, trukmė, rezultatas, seanso įrašas), komandos,
+    atmesti bandymai; seanso puslapyje – surinktos eilutės.
+
+  Visi pakeitimai – ta pati `add-backup-key` komanda su visu rakto leidimų sąrašu; peržiūra virš komandos parodo, kas
+  pasikeis (`+` nauja, `~` kitas lygis, `−` atimama). Projekto puslapyje – kas pasiekia to projekto aplinkas.
+- *Atnaujinimas* – setup-server ir setup: versija, commit'as, ar release tag'as, kiek naujesnis origin/master.
+  „Atnaujinti į naujausią“ – setup-server į `origin/master` (`bin/update`, žr. „Atnaujinimas“), setup – „Į naujausią
+  (master)“ arba „Release tag'as“ (`bin/update-setup`); konkreti versija – „Konkreti versija ar ref'as“.
 - *Metrikos* – worker'io `/metrics`, kaip jį mato Prometheus (`setup-server-metrics --once`, be token'o), ir kurios
   grupės surinktos.
-- *Žurnalai* – `ui-actions.log`, `backup-pulls.log`, `access.log`, setup-server paslaugų journal (po 50 eilučių) ir paskutiniai
+- *Žurnalai* – programuotojų veikla (visų raktų), `ui-actions.log`, `backup-pulls.log`, `access.log`, setup-server paslaugų journal (po 50 eilučių) ir paskutiniai
   veiksmai su jų išvestimi.
 - *Instrukcijos* – kaip paruošti kitą serverį projekto taikiniu (`bin/add-project --target ENV=ssh://…`): pasirenki OS
   (Ubuntu, Debian; CentOS/AlmaLinux/Rocky – netestuota), valdymo skydelį (DirectAdmin ar jokio), aplinką (prod, stage) ir
@@ -764,10 +821,10 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 | SSH iš VPN | `sudo -n L/install-ssh [--from TINKLAI]` |
 | Paslaugos (ir Apžvalgoje) | `sudo -n L/server-unit start\|stop\|restart UNIT` (žr. žemiau) |
 | Worker'io metrikos | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |
-| Kopijų ir prieigos raktai | `sudo -n L/add-backup-key - --name … --from … [--allow-fresh] [--grant PROJEKTAS[:ENV]=LYGIS …]` (raktas per stdin), `--remove VARDAS`, `--list` |
+| Raktai (*Prieiga*) | `sudo -n L/add-backup-key [-] --name … [--from …] [--allow-fresh] [--grant PROJEKTAS:ENV=LYGIS …]` (naujas raktas per stdin; esamam – be jo), `--remove VARDAS` |
 | Paruošti serverį | `sudo -n L/prepare-host [--setup-ref …]` (`--check` kodas 1 – „Needs attention“ – vykdyti leidžia) |
-| Atnaujinti setup | `sudo -n L/update-setup [vX.Y.Z]` (tik release tag'ai, be slaptažodžio) |
-| Atnaujinti | `sudo -n -H -u <klono savininkas> <klonas>/bin/update [--server-ref …] [--setup-ref …]` |
+| Atnaujinti setup (*Atnaujinimas*) | `sudo -n L/update-setup [master\|vX.Y.Z]` (be slaptažodžio) |
+| Atnaujinti setup-server (*Atnaujinimas*) | `sudo -n -H -u <klono savininkas> <klonas>/bin/update --server-ref origin/master` (ar kiti `--server-ref`/`--setup-ref`) |
 | Deploy'us, „backup dabar“, runner'io testas | Bitbucket API (žr. žemiau) |
 
 - Vardai, URL, taikiniai, ref'ai, laikas ir adresai tikrinami griežtais šablonais, komanda paduodama argumentų sąrašu
@@ -794,7 +851,8 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 - **Ko sąsaja nedaro:** `bin/install-ui` (port'as, vardas, slaptažodis) ir rankinis atstatymas po nepavykusio
   `bin/update` (žr. „Rankinis atstatymas“) lieka terminale: jie keičia pačią sąsają arba reikalingi, kai ji neveikia.
 
-**Deploy'ai per Bitbucket.** Projekto puslapyje – „Deploy į stage“ ir „Deploy į prod“ (custom pipeline'ai `deploy-stage`,
+**Deploy'ai per Bitbucket.** Projekto puslapyje – „Deploy į stage“, „Deploy į prod“ ir kiekvienai papildomai aplinkai
+„Deploy į mdv“ (custom pipeline'ai `deploy-stage`, `deploy-<env>`,
 `deploy-production` su kintamaisiais `REF`, `IMAGES`, `BACKUP`, `ROLLBACK`), „Backup dabar“ (`backup-now`, pažymėjus
 FULL – su kintamuoju `FULL=yes`; nepažymėjus kintamasis nesiunčiamas) ir „Runner'io
 testas“ (`runner-test`). Sąsaja juos paleidžia per Bitbucket API, todėl istorija lieka Bitbucket'e (Pipelines,
@@ -900,7 +958,7 @@ sudo tail -n 20 /srv/setup-server/ui-actions.log
   yra tikri klientų duomenys; kiekvienas atsisiuntimas registruojamas `backup-pulls.log`.
 - Raktai su `--grant` per šį serverį pasiekia projektų taikinius tuo pačiu keliu, kaip deploy'us (žr. „Eiga“, 8
   žingsnį): leidimai įrašyti rakto eilutėje, juos tikrina priverstinė komanda, persiuntimų nėra (`restrict,pty`),
-  kiekvienas prašymas – `access.log`. `full` local taikiniui ir `docker` (`exec` kaip root į projekto konteinerius su
+  kiekvienas prašymas – `access.log`, interaktyvaus seanso įvestis – `access-sessions/` (ir joje surinkti slaptažodžiai). `full` local taikiniui ir `docker` (`exec` kaip root į projekto konteinerius su
   jų prijungtais katalogais) – didelės teisės; `phpfpm-readonly` saugo tik failus, ne duomenų bazę. `authorized_keys`
   priklauso paskyrai `setup`, todėl pipeline žingsnis galėtų jį keisti – bet jis ir taip yra `setup` su Docker.
 - Worker'io `/metrics` token'as (jei naudojamas) yra tik `/etc/setup-server/metrics.env` (root, 0600); paslauga

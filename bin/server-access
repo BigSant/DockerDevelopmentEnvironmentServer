@@ -20,7 +20,10 @@ Levels, each with everything below it:
   phpfpm           shell/exec in php-fpm as the project account (APP_UID), or root in the container
   docker           the verbs above on the project's containers; never one that holds the Docker socket
   full             host: the deploy user's shell on the target; on a local target the setup account here
-A child gets a terminal when the session has one (ssh -t). Every request is logged with the key's name.
+A child gets a terminal when the session has one (ssh -t). Every request is logged with the key's name, and what
+is typed in an interactive session (a terminal) is recorded by script(1) --log-in into
+access-sessions/<key>/<UTC time>-<pid>.log (the input only, not what the session shows; kept SESSION_DAYS days), so
+the commands run in a shell are known too. A password typed there is recorded as well.
 """
 
 from datetime import datetime, timezone
@@ -30,18 +33,21 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 
 ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
 PROJECTS = ROOT / 'projects'
 LOG = ROOT / 'access.log'
+SESSIONS = ROOT / 'access-sessions'
+SESSION_DAYS = 180
+SCRIPT = os.environ.get('SETUP_SERVER_SCRIPT', 'script')
 BACKUP_PULL = os.environ.get('SETUP_SERVER_BACKUP_PULL', '/usr/local/sbin/setup-server-backup-pull')
 BACKUP_REQUESTS = ('latest', 'info', 'get', 'fresh')
-ENVIRONMENTS = ('stage', 'prod')
 LEVELS = ('phpfpm-readonly', 'phpfpm', 'docker', 'full')
 # NAME and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
 KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
-GRANT = re.compile(r'([a-z0-9][a-z0-9_-]*):(stage|prod)=(' + '|'.join(LEVELS) + ')')
+GRANT = re.compile(r'([a-z0-9][a-z0-9_-]*):([a-z][a-z0-9]{1,15})=(' + '|'.join(LEVELS) + ')')
 CONTEXT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 SSH_TARGET = re.compile(r'(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+')
 DIRECTORY = re.compile(r'/[A-Za-z0-9._/-]*')
@@ -60,6 +66,28 @@ USAGE = ('expected: access | shell PROJECT ENV [root|readonly] | exec PROJECT EN
 
 class Refused(Exception):
     """A request this key may not make, or one this command does not answer."""
+
+
+# ENVIRONMENTS, ENVIRONMENT and server_environments are identical in bin/backup-projects, bin/backup-pull,
+# bin/server-access, bin/server-status and bin/worker-metrics (tests/test_metrics.py).
+ENVIRONMENTS = ('stage', 'prod')
+ENVIRONMENT = re.compile(r'[a-z][a-z0-9]{1,15}')
+
+
+def server_environments(directory):
+    """stage, prod and the stage-class environments env/common.env lists (setup's STAGE_ENVIRONMENTS, e.g. a
+    temporary mdv): every environment a deploy from here may have. None (no environment repository): stage, prod."""
+    extra = []
+    try:
+        text = (directory / 'env/common.env').read_text(errors='replace') if directory else ''
+    except OSError:
+        text = ''
+    for line in text.splitlines():
+        match = re.fullmatch(r'\s*(?:export\s+)?STAGE_ENVIRONMENTS\s*=\s*(["\']?)([^"\'#]*)\1\s*(?:#.*)?', line)
+        if match:
+            extra = [name for name in re.split(r'[\s,]+', match[2])
+                     if ENVIRONMENT.fullmatch(name) and name not in ('local', 'test', *ENVIRONMENTS)]
+    return ENVIRONMENTS + tuple(dict.fromkeys(extra))
 
 
 def environment_directory(build_root):
@@ -145,6 +173,8 @@ class Target:
         directory = environment_directory(build_root)
         if directory is None:
             raise Refused(f'no project {project} on this server')
+        if environment not in server_environments(directory):
+            raise Refused(f'{project} has no environment {environment} (stage, prod and its STAGE_ENVIRONMENTS)')
         common = parse_env(read_text(directory / 'env/common.env'))
         values = {**common, **parse_env(read_text(directory / f'env/{environment}.env')),
                   **parse_env(read_text(build_root / 'target.env')),
@@ -208,8 +238,8 @@ def grants(arguments):
 
 
 def level_of(granted, project, environment):
-    if not NAME.fullmatch(project) or environment not in ENVIRONMENTS:
-        raise Refused('expected a project name and stage or prod')
+    if not NAME.fullmatch(project) or not ENVIRONMENT.fullmatch(environment):
+        raise Refused('expected a project name and an environment (stage, prod or one of STAGE_ENVIRONMENTS)')
     level = granted.get((project, environment))
     if level is None:
         raise Refused(f'this key may not reach {project} {environment}')
@@ -350,6 +380,29 @@ def plan(granted, request):
     raise Refused(USAGE)
 
 
+def recorded(key, command):
+    """The command inside script(1) recording what is typed, and the record's file; (command, None) when it cannot
+    be recorded (no script with --log-in): the session still runs, its access.log line says so."""
+    try:
+        folder = SESSIONS / key
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        cutoff = time.time() - SESSION_DAYS * 86400
+        for old in folder.glob('*.log'):
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
+        name = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + f'-{os.getpid()}.log'
+        record = folder / name
+        os.close(os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    except OSError:
+        return command, None
+    probe = subprocess.run([SCRIPT, '--help'], capture_output=True, text=True)
+    if probe.returncode or '--log-in' not in probe.stdout:
+        record.unlink(missing_ok=True)
+        return command, None
+    # -e: the child's exit status; -q: no start and end lines; script runs the command with $SHELL -c.
+    return [SCRIPT, '-q', '-e', '--log-in', str(record), '--command', shlex.join(command)], name
+
+
 def log(key, request, answer):
     stamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
     peer = (os.environ.get('SSH_CONNECTION') or '-').split(' ')[0]
@@ -387,7 +440,11 @@ def main(arguments):
         log(key, request, f'failed: {error}')
         print(f'setup-server-access: {error}', file=sys.stderr)
         return 74
-    log(key, request, f'started ({level}): {shlex.join(command)[:300]}')
+    shown, record = shlex.join(command)[:300], None
+    if interactive() and key != '-':
+        command, record = recorded(key, command)
+    log(key, request, f'started ({level}): {shown}' +
+        (f' session={record}' if record else ' session=not-recorded' if interactive() else ''))
     try:
         code = subprocess.run(command).returncode
     except OSError as error:

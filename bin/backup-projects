@@ -3,8 +3,9 @@
 
 Every night setup-server-backup.timer runs this as root (installed by bin/install-backups as
 /usr/local/sbin/setup-server-backup). A project's environment is backed up when its environment
-repository in the build root ($ROOT/projects/<name>/app, or app/docker) has env/stage.env or
-env/prod.env: the file its deploy pipeline writes, so "deployed from here" is the declaration. Each
+repository in the build root ($ROOT/projects/<name>/app, or app/docker) has env/stage.env, env/prod.env or
+the env file of an environment its env/common.env lists in STAGE_ENVIRONMENTS (setup's stage-class ones, e.g. a
+temporary mdv): the file its deploy pipeline writes, so "deployed from here" is the declaration. Each
 backup is `make db-backup ENV=<env>` (setup: every schema of DATABASE_EXTRA_SCHEMAS in one dump), run as
 the setup account and written to .generated/backups/worker-<env>-<UTC time>Z.sql.gz. No secret is kept
 here: setup takes the Deployment variables from the stack's secret store (<PROJECT_NAME>-<env>-secrets,
@@ -13,7 +14,7 @@ series is rotated; a failed one deletes nothing. A failing project does not stop
 run, and the command then exits 1 naming them (the unit shows failed, the journal has the details).
 
 "Backup now" for one project (Bitbucket custom pipeline on the runner):
-    sudo -n /usr/local/sbin/setup-server-backup [--full] "$BUILD_ROOT" [stage|prod]
+    sudo -n /usr/local/sbin/setup-server-backup [--full] "$BUILD_ROOT" [ENV]
 Variables in the caller's environment (e.g. a deployment step's) win over the store.
 
 Kinds (one series each, rotated on its own; anything else in .generated/backups is never touched):
@@ -42,7 +43,6 @@ ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
 ACCOUNT = os.environ.get('SETUP_SERVER_USER', 'setup')
 CONFIG = Path(os.environ.get('SETUP_SERVER_CONFIG', '/etc/setup-server'))
 PROJECTS = ROOT / 'projects'
-ENVIRONMENTS = ('stage', 'prod')
 KEEP_DAILY, KEEP_WEEKLY = 7, 4
 KEEP_FULL, KEEP_FRESH = 2, 2
 FRESH_REUSE = 30 * 60
@@ -52,12 +52,13 @@ KINDS = {'daily': ('worker', [], None), 'full': ('full', ['full=1'], KEEP_FULL),
          'fresh': ('fresh', [], KEEP_FRESH), 'fresh-full': ('fresh-full', ['full=1'], KEEP_FRESH)}
 # NAME, SERIES and environment_directory are identical in bin/worker-metrics (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
-SERIES = re.compile(r'(worker|full|fresh|fresh-full)-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
+SERIES = re.compile(r'(worker|full|fresh|fresh-full)-([a-z][a-z0-9]{1,15})-(\d{8}T\d{6})Z\.sql\.gz')
 STAMP = '%Y%m%dT%H%M%S'
 USAGE = f"""Usage: {Path(sys.argv[0]).name} [--check] [--full] [--fresh] [--progress] [PROJECT [ENV]]
-  (none)      every project under {PROJECTS} with env/stage.env or env/prod.env (the nightly timer)
+  (none)      every project under {PROJECTS} with env/stage.env, env/prod.env or the env file of an environment its
+              env/common.env lists in STAGE_ENVIRONMENTS (the nightly timer)
   PROJECT     one project: its name or build root, e.g. "$BUILD_ROOT" in a pipeline ("backup now")
-  ENV         stage or prod; by default every one the project has
+  ENV         stage, prod or a STAGE_ENVIRONMENTS one (e.g. mdv); by default every one the project has
   --full      every table's data, the full-<env> series (the weekly timer); keeps {KEEP_FULL}
   --fresh     the fresh-<env> series a developer asked for (bin/backup-pull); with --full fresh-full-<env>.
               Not made again while a backup with the same content is younger than {FRESH_REUSE // 60} minutes
@@ -94,6 +95,28 @@ def rotation(names, daily=KEEP_DAILY, weekly=KEEP_WEEKLY):
     return keep, [name for _, name in stamped if name not in keep]
 
 
+# ENVIRONMENTS, ENVIRONMENT and server_environments are identical in bin/backup-projects, bin/backup-pull,
+# bin/server-access, bin/server-status and bin/worker-metrics (tests/test_metrics.py).
+ENVIRONMENTS = ('stage', 'prod')
+ENVIRONMENT = re.compile(r'[a-z][a-z0-9]{1,15}')
+
+
+def server_environments(directory):
+    """stage, prod and the stage-class environments env/common.env lists (setup's STAGE_ENVIRONMENTS, e.g. a
+    temporary mdv): every environment a deploy from here may have. None (no environment repository): stage, prod."""
+    extra = []
+    try:
+        text = (directory / 'env/common.env').read_text(errors='replace') if directory else ''
+    except OSError:
+        text = ''
+    for line in text.splitlines():
+        match = re.fullmatch(r'\s*(?:export\s+)?STAGE_ENVIRONMENTS\s*=\s*(["\']?)([^"\'#]*)\1\s*(?:#.*)?', line)
+        if match:
+            extra = [name for name in re.split(r'[\s,]+', match[2])
+                     if ENVIRONMENT.fullmatch(name) and name not in ('local', 'test', *ENVIRONMENTS)]
+    return ENVIRONMENTS + tuple(dict.fromkeys(extra))
+
+
 def environment_directory(build_root):
     """The environment repository of a build root: app/, or app/docker/ in older layouts."""
     for directory in (build_root / 'app', build_root / 'app/docker'):
@@ -104,7 +127,7 @@ def environment_directory(build_root):
 
 def declared(build_root):
     directory = environment_directory(build_root)
-    environments = [env for env in ENVIRONMENTS if directory and (directory / f'env/{env}.env').is_file()]
+    environments = [env for env in server_environments(directory) if directory and (directory / f'env/{env}.env').is_file()]
     return directory, environments
 
 
@@ -398,15 +421,15 @@ def plan(arguments):
         if build_root.is_symlink() or not build_root.is_dir():
             names = ' '.join(sorted(path.name for path in PROJECTS.iterdir())) if PROJECTS.is_dir() else ''
             raise Refused(f'No build root {build_root} (projects: {names})')
-        _, environments = declared(build_root)
+        directory, environments = declared(build_root)
         if rest:
-            if rest[0] not in ENVIRONMENTS:
-                raise Refused('ENV must be stage or prod')
+            if rest[0] not in server_environments(directory):
+                raise Refused('ENV must be stage, prod or one of the project\'s STAGE_ENVIRONMENTS')
             if rest[0] not in environments:
                 raise Refused(f'{project} has no env/{rest[0]}.env: it is not deployed to {rest[0]} from here')
             environments = rest[:1]
         if not environments:
-            raise Refused(f'{project} has no env/stage.env or env/prod.env: nothing deployed from here yet')
+            raise Refused(f'{project} has no env/<stage|prod|…>.env: nothing deployed from here yet')
         return [(project, env) for env in environments]
     jobs = []
     for build_root in sorted(PROJECTS.iterdir()) if PROJECTS.is_dir() else []:
@@ -414,7 +437,7 @@ def plan(arguments):
             continue
         _, environments = declared(build_root)
         if not environments:
-            say(f'==> {build_root.name}: no env/stage.env or env/prod.env (not deployed from here); skipped')
+            say(f'==> {build_root.name}: no env/<env>.env (not deployed from here); skipped')
         jobs += [(build_root.name, env) for env in environments]
     return jobs
 
@@ -530,7 +553,7 @@ def main(arguments):
         sys.stdout = sys.stderr  # bin/backup-pull keeps stdout for its answer
     jobs = plan(positional)
     if not jobs:
-        say(f'==> No project under {PROJECTS} has env/stage.env or env/prod.env; nothing to back up')
+        say(f'==> No project under {PROJECTS} has an env/<env>.env of stage, prod or STAGE_ENVIRONMENTS; nothing to back up')
         return 0
     return check(jobs, kind) if checking else run(jobs, kind, progress)
 
