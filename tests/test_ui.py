@@ -177,6 +177,81 @@ class ServerStatusTest(Worker):
         self.assertEqual(data["disk"]["path"], str(self.tree.root))
         self.assertTrue(all(call.startswith("show ") for call in self.calls("systemctl")), "systemd is only read")
 
+    def test_developer_keys_are_listed_with_their_grants_fingerprint_and_last_use(self):
+        ssh = self.tree.root / ".ssh"
+        ssh.mkdir()
+        blob = "AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1"
+        (ssh / "authorized_keys").write_text(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOther admin@laptop\n"
+            f'from="10.8.0.0/24",command="/usr/local/sbin/setup-server-backup-pull --key ona",restrict ssh-ed25519 {blob} ona\n'
+            f'from="10.8.0.0/24,10.9.0.5/32",command="/usr/local/sbin/setup-server-access --key tomas --allow-fresh '
+            f'--grant asana_tracker:prod=phpfpm --grant shop-two:stage=full",restrict,pty ssh-ed25519 {blob} tomas\n')
+        (self.tree.root / "backup-pulls.log").write_text("2026-10-20T08:00:00Z key=tomas from=10.8.0.20 info x prod -> ok\n")
+        (self.tree.root / "access.log").write_text("2026-10-21T09:30:00Z key=tomas from=10.8.0.21 'shell asana_tracker prod' -> exit 0\n"
+                                                   "garbage line\n")
+        result = self.status("--projects")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        keys = {item["name"]: item for item in json.loads(result.stdout)["keys"]}
+        self.assertEqual(sorted(keys), ["ona", "tomas"], "an administrator's own key is not listed")
+        self.assertEqual(keys["ona"], {"name": "ona", "sources": ["10.8.0.0/24"], "fresh": False, "type": "ssh-ed25519",
+                                       "fingerprint": keys["tomas"]["fingerprint"], "command": "backup-pull", "grants": [],
+                                       "last": None})
+        self.assertTrue(keys["tomas"]["fingerprint"].startswith("SHA256:"))
+        self.assertEqual(keys["tomas"]["grants"], [{"project": "asana_tracker", "environment": "prod", "level": "phpfpm"},
+                                                   {"project": "shop-two", "environment": "stage", "level": "full"}])
+        self.assertEqual(keys["tomas"]["last"], {"at": 1792575000, "from": "10.8.0.21", "log": "access"})
+        self.assertTrue(keys["tomas"]["fresh"])
+
+    def test_the_versions_tell_a_release_tag_from_a_branch_and_count_what_master_has_beyond(self):
+        git = lambda *arguments: subprocess.run(["git", *arguments], env={**os.environ, "GIT_AUTHOR_NAME": "t",
+                                                "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+                                                check=True, capture_output=True, text=True)
+        setup = self.tree.root / "setup"
+        git("init", "-q", "-b", "master", str(setup))
+        for version in ("2.14.0", "2.14.1"):
+            (setup / "VERSION").write_text(version)
+            git("-C", str(setup), "add", "-A")
+            git("-C", str(setup), "commit", "-q", "-m", version)
+        git("-C", str(setup), "tag", "v2.14.1")
+        (setup / "VERSION").write_text("2.15.0")
+        git("-C", str(setup), "commit", "-q", "-am", "next")
+        git("-C", str(setup), "update-ref", "refs/remotes/origin/master", "HEAD")
+        git("-C", str(setup), "checkout", "-q", "--detach", "v2.14.1")
+        os.environ["SETUP_SERVER_USER"] = getpass.getuser()
+        self.addCleanup(os.environ.pop, "SETUP_SERVER_USER")
+        data = json.loads(self.status().stdout)["versions"]["setup_git"]
+        self.assertEqual((data["tag"], data["behind"], len(data["commit"])), ("v2.14.1", 1, 12))
+        git("-C", str(setup), "checkout", "-q", "--detach", "refs/remotes/origin/master")
+        data = json.loads(self.status().stdout)["versions"]["setup_git"]
+        self.assertEqual((data["tag"], data["behind"]), (None, 0))
+
+    def test_activity_joins_a_shells_start_and_exit_and_a_session_reads_as_typed_lines(self):
+        (self.tree.root / "backup-pulls.log").write_text(
+            "2026-10-20T08:00:00Z key=ona from=10.8.0.33 get asana_tracker prod worker-prod-1.sql.gz -> sent 5 bytes\n")
+        (self.tree.root / "access.log").write_text(
+            "2026-10-21T09:30:00Z key=tomas from=10.8.0.21 'shell asana_tracker prod' -> started (phpfpm): docker exec -it x sh "
+            "session=20261021T093000Z-77.log\n"
+            "2026-10-21T09:31:00Z key=ona from=10.8.0.33 'docker asana_tracker prod ps' -> refused: needs docker\n"
+            "2026-10-21T09:32:00Z key=tomas from=10.8.0.21 \"exec asana_tracker prod -- echo 'a -> b'\" -> started (phpfpm): docker exec\n"
+            "2026-10-21T09:32:01Z key=tomas from=10.8.0.21 \"exec asana_tracker prod -- echo 'a -> b'\" -> exit 3\n"
+            "2026-10-21T09:40:00Z key=tomas from=10.8.0.21 'shell asana_tracker prod' -> exit 0\n")
+        result = self.status("--activity", "tomas")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = json.loads(result.stdout)["events"]
+        self.assertEqual([(item["request"], item["state"], item.get("exit")) for item in events],
+                         [("exec asana_tracker prod -- echo 'a -> b'", "failed", 3), ("shell asana_tracker prod", "ok", 0)])
+        self.assertEqual((events[1]["session"], events[1]["level"], events[1]["ended"] - events[1]["at"]),
+                         ("20261021T093000Z-77.log", "phpfpm", 600))
+        everyone = json.loads(self.status("--activity").stdout)["events"]
+        self.assertEqual([item["verb"] for item in everyone], ["exec", "docker", "shell", "get"])
+        self.assertEqual(everyone[1]["state"], "refused")
+        sessions = self.tree.root / "access-sessions/tomas"
+        sessions.mkdir(parents=True)
+        (sessions / "20261021T093000Z-77.log").write_bytes(b"lss\x7f\r\x1b[Acat var/log\tx\rpasswd\x15exit\r\x04")
+        lines = json.loads(self.status("--session", "tomas", "20261021T093000Z-77.log").stdout)["lines"]
+        self.assertEqual(lines, ["ls", "cat var/log\tx", "exit", "^D"])
+        self.assertEqual(self.status("--session", "tomas", "../../etc/passwd").returncode, 64)
+
     def test_only_listed_values_leave_and_a_planted_symlink_is_not_followed(self):
         asana = self.tree.projects / "asana_tracker"
         (self.root / "root-only.env").write_text("DEPLOY_SSH=from-a-root-file\nBITBUCKET_ACCESS_TOKEN=leaked\n")
@@ -679,9 +754,84 @@ class WebUiTest(Worker):
         newest = self.preview("update-setup", setup_tag="")
         self.assertEqual(newest[0], 200, newest[2])
         self.assertEqual(self.sudo_calls("update-setup")[-1], f"{command} --check", "empty: the newest release")
-        for tag in ("master", "v2.7", "v2.7.0; rm -rf /"):
+        status, _, body = self.preview("update-setup", target="master")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.sudo_calls("update-setup")[-1], f"{command} --check master")
+        self.assertIn("prod deploy&#x27;ai neveiks", body, "master is off a release tag: said above Vykdyti")
+        for tag in ("main", "v2.7", "v2.7.0; rm -rf /"):
             with self.subTest(tag=tag):
                 self.assertEqual(self.preview("update-setup", setup_tag=tag)[0], 400)
+
+    def test_setup_server_updates_to_the_newest_master_with_one_button(self):
+        self.library.mkdir(exist_ok=True)
+        (self.library / "install.env").write_text(f"VERSION=v0.4.0\nCHECKOUT={ROOT}\nADMIN={getpass.getuser()}\n")
+        page = self.request("GET", "/update")[2]
+        self.assertIn('name="latest" value="yes"', page)
+        self.assertIn('name="target" value="master"', page)
+        self.preview("update", latest="yes")
+        self.assertEqual(self.sudo_calls("update")[-1],
+                         f"-n -H -u {getpass.getuser()} {ROOT}/bin/update --check --server-ref origin/master")
+
+    def write_keys(self):
+        ssh = self.tree.root / ".ssh"
+        ssh.mkdir(exist_ok=True)
+        blob = "AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1"
+        (ssh / "authorized_keys").write_text(
+            f'from="10.8.0.0/24",command="/usr/local/sbin/setup-server-access --key tomas --grant asana_tracker:prod=full '
+            f'--grant forsena_docker:stage=docker",restrict,pty ssh-ed25519 {blob} tomas\n')
+        (self.tree.root / "access.log").write_text(
+            "2026-10-21T09:30:00Z key=tomas from=10.8.0.21 'shell asana_tracker prod' -> started (full): x session=20261021T093000Z-7.log\n"
+            "2026-10-21T09:40:00Z key=tomas from=10.8.0.21 'shell asana_tracker prod' -> exit 0\n")
+        sessions = self.tree.root / "access-sessions/tomas"
+        sessions.mkdir(parents=True)
+        (sessions / "20261021T093000Z-7.log").write_bytes(b"ls\rcat .env\r")
+
+    def test_the_access_pages_list_the_keys_their_reach_activity_and_sessions(self):
+        self.write_keys()
+        status, _, page = self.request("GET", "/access?fresh=1")
+        self.assertEqual(status, 200, page)
+        for text in ("tomas", "lv-full", "lv-docker", "/access/new", "shell"):
+            self.assertIn(text, page)
+        self.assertIn("Nė vienas raktas neatitinka", self.request("GET", "/access?q=nothing")[2])
+        status, _, key = self.request("GET", "/access/tomas")
+        self.assertEqual(status, 200, key)
+        self.assertRegex(key, r'name="grant:asana_tracker:prod" value="full" checked')
+        self.assertIn('name="action" value="key-bulk"', key)
+        self.assertIn("/access/tomas/session/20261021T093000Z-7.log", key)
+        self.assertNotIn("grant:forsena_docker:stage", self.request("GET", "/access/tomas?q=asana")[2], "filtered out")
+        session = self.request("GET", "/access/tomas/session/20261021T093000Z-7.log")[2]
+        self.assertIn("<li>cat .env</li>", session)
+        self.assertEqual(self.request("GET", "/access/nobody")[0], 404)
+        self.assertIn('/access/tomas?q=asana_tracker#projects', self.request("GET", "/project/asana_tracker")[2])
+        self.assertIn("Programuotojų veikla", self.request("GET", "/logs")[2])
+
+    def test_a_key_page_changes_only_what_it_shows_and_bulk_sets_a_level_everywhere(self):
+        self.write_keys()
+        self.request("GET", "/access?fresh=1")
+        library = f"-n {self.library}/bin/add-backup-key --check"
+        # A filtered page sends asana_tracker only: forsena_docker's grant stays.
+        status, _, body = self.preview("add-backup-key", key_name="tomas", merge="yes", **{"grant:asana_tracker:prod": "phpfpm"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.sudo_calls("add-backup-key")[-1],
+                         f"{library} --name tomas --grant asana_tracker:prod=phpfpm --grant forsena_docker:stage=docker")
+        self.assertIn("~ asana_tracker prod: full → phpfpm", body)
+        status, _, body = self.preview("key-bulk", key_name="tomas", scope="prod", level="phpfpm-readonly", only="all")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.sudo_calls("add-backup-key")[-1],
+                         f"{library} --name tomas --grant asana_tracker:prod=phpfpm-readonly --grant forsena_docker:stage=docker "
+                         "--grant shop-two:prod=phpfpm-readonly")
+        self.assertIn("+ shop-two prod: readonly", body)
+        self.preview("key-bulk", key_name="tomas", scope="all", level="", only="existing")
+        self.assertEqual(self.sudo_calls("add-backup-key")[-1], f"{library} --name tomas")
+        for action, fields, message in (("key-bulk", {"key_name": "nobody", "scope": "prod", "level": "full"}, "nėra"),
+                                        ("key-bulk", {"key_name": "tomas", "scope": "dev", "level": "full"}, "Pasirink"),
+                                        ("add-backup-key", {"key_name": "tomas", "merge": "yes", "grant:x:dev": "full"}, "netinkamas"),
+                                        ("add-backup-key", {"key_name": "tomas", "grant:asana_tracker:prod": "root"}, "nežinomas"),
+                                        ("add-backup-key", {"key_name": "ona", "sources": "10.8.0.0/24"}, "Įklijuok")):
+            with self.subTest(action=action, fields=fields):
+                status, _, body = self.preview(action, **fields)
+                self.assertEqual(status, 400, body)
+                self.assertIn(message, body)
 
     def test_a_failed_check_offers_no_run_and_prepare_host_may_need_attention(self):
         (self.stubs / "exit").write_text("65\n")

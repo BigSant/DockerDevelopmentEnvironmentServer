@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Move the shared setup checkout ($ROOT/setup, the setup account's) to a setup release tag: the newest of its
-# MAJOR version by default, or the vX.Y.Z given. Only release tags, only a clean checkout and never while a
-# pipeline step runs; when the switch fails the checkout returns. --check fetches and shows; it changes no
-# checkout. Runs as root (sudo, also the web UI's rule) and does the git work as the setup account, so it needs
-# no administrator password. bin/update is the full update of setup-server and setup together (with the health
-# check); a deploy also does this itself when its project needs a newer setup of the same MAJOR version.
+# MAJOR version by default, or the vX.Y.Z given; `master` takes the newest commit of origin's master instead (setup
+# builds ENV=prod releases only from a release tag, so prod deploys stop until it is back on one). Only release
+# tags or master, only a clean checkout and never while a pipeline step runs; when the switch fails the checkout
+# returns. --check fetches and shows; it changes no checkout. Runs as root (sudo, also the web UI's rule) and does
+# the git work as the setup account, so it needs no administrator password. bin/update is the full update of
+# setup-server and setup together (with the health check); a deploy also does this itself when its project needs a
+# newer setup of the same MAJOR version.
 set -euo pipefail
 
 ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
@@ -15,8 +17,9 @@ check=0
 ref=
 usage() {
     cat <<USAGE
-Usage: sudo $0 [--check] [vX.Y.Z]
+Usage: sudo $0 [--check] [vX.Y.Z | master]
   vX.Y.Z   the setup release to check out; by default the newest release of the current MAJOR version
+  master   the newest commit of origin's master (prod releases need a release tag: they stop until then)
   --check  fetch and show what would change; change no checkout
 USAGE
 }
@@ -24,12 +27,13 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --check) check=1 ;;
         -h|--help) usage; exit 0 ;;
-        v[0-9]*) [ -z "$ref" ] || { usage >&2; exit 64; }; ref=$1 ;;
+        v[0-9]*|master) [ -z "$ref" ] || { usage >&2; exit 64; }; ref=$1 ;;
         *) usage >&2; exit 64 ;;
     esac
     shift
 done
-[ -z "$ref" ] || [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Only release tags (vX.Y.Z), not $ref" >&2; exit 64; }
+[ -z "$ref" ] || [ "$ref" = master ] || [[ "$ref" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || { echo "Only release tags (vX.Y.Z) or master, not $ref" >&2; exit 64; }
 if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
     echo "Run with sudo (or use --check)" >&2
     exit 77
@@ -50,10 +54,14 @@ if [ -z "$ref" ]; then
     ref=$(git_setup tag --list "v${version%%.*}.*" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)
     [ -n "$ref" ] || fail "No release tag v${version%%.*}.x at origin"
 fi
-target=$(git_setup rev-parse -q --verify "refs/tags/$ref^{commit}") \
-    || fail "Unknown setup release $ref (newest: $(git_setup tag --list 'v*' --sort=-v:refname | head -n 5 | paste -sd ' '))"
+if [ "$ref" = master ]; then
+    target=$(git_setup rev-parse -q --verify "refs/remotes/origin/master^{commit}") || fail "origin has no master branch"
+else
+    target=$(git_setup rev-parse -q --verify "refs/tags/$ref^{commit}") \
+        || fail "Unknown setup release $ref (newest: $(git_setup tag --list 'v*' --sort=-v:refname | head -n 5 | paste -sd ' '))"
+fi
 head=$(git_setup rev-parse HEAD)
-echo "==> setup $version ($(git_setup describe --tags --always)) -> $ref"
+echo "==> setup $version ($(git_setup describe --tags --always)) -> $ref$([ "$ref" != master ] || echo " ($(git_setup rev-parse --short "$target"))")"
 if [ "$target" = "$head" ]; then
     echo "==> Nothing to do."
     exit 0
@@ -62,17 +70,22 @@ ahead=$(git_setup rev-list --count "$head..$target")
 behind=$(git_setup rev-list --count "$target..$head")
 echo "    $ahead commits ahead, $behind back"
 git_setup log --oneline -n 20 "$head..$target" | sed 's/^/    + /'
-major=${ref#v}
-[ "${major%%.*}" = "${version%%.*}" ] || echo "    note: $ref is a new MAJOR version: projects may need changes (doc/RELEASES.md)"
+if [ "$ref" = master ]; then
+    git_setup describe --tags --exact-match "$target" >/dev/null 2>&1 || echo "    note: master is past the newest release tag:" \
+        "make release ENV=prod refuses it, so prod deploys stop until setup is on a release tag again (update-setup without master)"
+else
+    major=${ref#v}
+    [ "${major%%.*}" = "${version%%.*}" ] || echo "    note: $ref is a new MAJOR version: projects may need changes (doc/RELEASES.md)"
+fi
 if [ "$check" = 1 ]; then
     echo "==> Check finished; nothing was changed (only fetched)."
     exit 0
 fi
 busy=$(pgrep -u "$ACCOUNT" -x make 2>/dev/null | tr '\n' ' ' || true)
 [ -z "$busy" ] || fail "A pipeline step of $ACCOUNT is running (make, PID ${busy% }); update when it has finished" 75
-if ! git_setup checkout -q --detach "$ref" || [ "$(git_setup rev-parse HEAD)" != "$target" ] \
+if ! git_setup checkout -q --detach "$target" || [ "$(git_setup rev-parse HEAD)" != "$target" ] \
         || [ -n "$(git_setup status --porcelain --untracked-files=no)" ]; then
     git_setup checkout -q --force --detach "$head" || fail "The switch failed and so did the return: git -C $SETUP checkout --force $head" 2
     fail "The switch to $ref failed; setup is back at $(git_setup describe --tags --always)" 1
 fi
-echo "==> setup at $ref ($(as_account cat "$SETUP/VERSION" | tr -d '[:space:]')); pipelines use it from their next step"
+echo "==> setup at $ref$([ "$ref" != master ] || echo " $(git_setup rev-parse --short HEAD)") ($(as_account cat "$SETUP/VERSION" | tr -d '[:space:]')); pipelines use it from their next step"

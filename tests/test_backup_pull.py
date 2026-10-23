@@ -200,6 +200,20 @@ class AddBackupKeyTest(unittest.TestCase):
             with self.subTest(grant=grant), self.assertRaisesRegex(SystemExit, "--grant"):
                 self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24", "--grant", grant)
 
+    def test_an_existing_key_changes_its_grants_and_fresh_permission_by_name_alone(self):
+        keys = self.root / "home/.ssh/authorized_keys"
+        self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24,10.9.0.5")
+        self.run_as_root("--name", "tomas", "--allow-fresh", "--grant", "shop:prod=phpfpm")
+        line = keys.read_text().splitlines()[0]
+        self.assertTrue(line.startswith('from="10.8.0.0/24,10.9.0.5/32",command="'), line)
+        self.assertIn("--key tomas --allow-fresh --grant shop:prod=phpfpm\",restrict,pty " + KEY.rsplit(" ", 1)[0] + " tomas", line)
+        self.run_as_root("--name", "tomas", "--from", "10.8.0.0/24")
+        line = keys.read_text().splitlines()[0]
+        self.assertEqual(line, f'from="10.8.0.0/24",command="{self.root / "sbin/setup-server-backup-pull"} --key tomas",'
+                               f'restrict {KEY.rsplit(" ", 1)[0]} tomas')
+        with self.assertRaises(SystemExit):
+            self.run_as_root("--name", "ona", "--grant", "shop:prod=phpfpm")
+
     def test_unsafe_requests_are_refused(self):
         private = self.root / "id_ed25519"
         private.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----\n")

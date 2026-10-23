@@ -7,9 +7,11 @@ Stopping it (Ctrl-C, SIGTERM) stops the UI and removes the temporary tree.
 
 import base64
 import http.client
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import time
 
@@ -30,6 +32,53 @@ def fixture():
     stamp = lambda age: time.strftime('%Y%m%dT%H%M%S', time.gmtime(time.time() - age))
     case.tree.backup(app, f'full-prod-{stamp(3 * 86400)}Z.sql.gz', 3 * 86400, 7_340_032)
     case.tree.backup(app, f'asana-prod-{stamp(5 * 3600)}123.sql.gz', 5 * 3600, 1_200_000)
+    # More projects, most with prod and stage, as a worker with many shops has them.
+    for shop in ('biofitus', 'joldija', 'nespresso', 'papildai', 'forsena', 'vaistai', 'zoo-shop', 'baldai', 'knygos', 'geles'):
+        case.tree.project(shop, 'prod', 'stage')
+    # Developer keys with grants (bin/add-backup-key), their requests, and a setup checkout past its release tag.
+    blob = 'AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1'
+    access = '/usr/local/sbin/setup-server-access'
+    (ssh / 'authorized_keys').write_text(
+        f'from="10.8.0.0/24",command="{access} --key tomas --allow-fresh --grant asana_tracker:prod=full '
+        f'--grant forsena_docker:stage=docker --grant shop-two:prod=phpfpm --grant biofitus:prod=phpfpm-readonly '
+        f'--grant biofitus:stage=docker --grant joldija:prod=phpfpm-readonly --grant joldija:stage=docker '
+        f'--grant nespresso:prod=phpfpm --grant nespresso:stage=docker",restrict,pty ssh-ed25519 {blob} tomas\n'
+        f'from="10.8.0.0/24",command="{access} --key ona --grant asana_tracker:prod=phpfpm-readonly '
+        f'--grant forsena_docker:stage=phpfpm",restrict,pty ssh-ed25519 {blob} ona\n'
+        f'from="10.8.0.0/24,10.9.0.5/32",command="/usr/local/sbin/setup-server-backup-pull --key qa-ci",restrict '
+        f'ssh-ed25519 {blob} qa-ci\n')
+    now = lambda age: time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - age))
+    (case.tree.root / 'access.log').write_text(
+        f"{now(7200)} key=tomas from=10.8.0.20 'shell asana_tracker prod' -> started (full): docker exec …\n"
+        f"{now(7100)} key=tomas from=10.8.0.20 'shell asana_tracker prod' -> exit 0\n"
+        f"{now(90000)} key=ona from=10.8.0.33 'docker forsena_docker stage ps' -> refused: needs docker\n")
+    with (case.tree.root / 'access.log').open('a') as handle:
+        handle.write(f"{now(3000)} key=tomas from=10.8.0.20 'shell biofitus prod' -> started (phpfpm-readonly): docker exec -it "
+                     f"biofitus-prod-php-fpm-1 sh session=20261023T080000Z-4242.log\n"
+                     f"{now(2400)} key=tomas from=10.8.0.20 'shell biofitus prod' -> exit 0\n"
+                     f"{now(1800)} key=tomas from=10.8.0.20 \"exec nespresso prod -- php bin/console cache:clear\" -> started (phpfpm): docker exec\n"
+                     f"{now(1790)} key=tomas from=10.8.0.20 \"exec nespresso prod -- php bin/console cache:clear\" -> exit 1\n"
+                     f"{now(600)} key=tomas from=10.8.0.20 'docker joldija stage logs --tail 200 php-fpm' -> started (docker): docker logs\n"
+                     f"{now(590)} key=tomas from=10.8.0.20 'docker joldija stage logs --tail 200 php-fpm' -> exit 0\n")
+    sessions = case.tree.root / 'access-sessions/tomas'
+    sessions.mkdir(parents=True)
+    (sessions / '20261023T080000Z-4242.log').write_bytes(
+        b'cd var/logs\rls -la\rtail -n 50 prod-2026-10-23.log | grep -i errr\x7for\r\x1b[Aphp bin/console about\rexit\r')
+    (case.tree.root / 'backup-pulls.log').write_text(f'{now(40000)} key=qa-ci from=10.9.0.5 info asana_tracker prod -> ok\n')
+    setup = case.tree.root / 'setup'
+    git = lambda *arguments: subprocess.run(['git', '-C', str(setup), *arguments], check=True, capture_output=True,
+                                            env={**os.environ, 'GIT_AUTHOR_NAME': 'p', 'GIT_AUTHOR_EMAIL': 'p@p',
+                                                 'GIT_COMMITTER_NAME': 'p', 'GIT_COMMITTER_EMAIL': 'p@p'})
+    setup.mkdir()
+    git('init', '-q', '-b', 'master')
+    for version in ('2.14.0', '2.14.1', '2.15.0'):
+        (setup / 'VERSION').write_text(version + '\n')
+        git('add', '-A')
+        git('commit', '-q', '-m', version)
+        if version != '2.15.0':
+            git('tag', f'v{version}')
+    git('update-ref', 'refs/remotes/origin/master', 'HEAD')
+    git('checkout', '-q', '--detach', 'HEAD')
     return case
 
 

@@ -3,6 +3,8 @@
 import json
 import os
 from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,6 +24,8 @@ if words[:1] == ['ps'] and '--format' in words:
 elif words[:1] == ['inspect'] and '--format' in words:
     sys.stdout.write(open(os.environ['FAKE_MOUNTS']).read() if words[-1].endswith('metrics-docker-1') else '/srv/x\n')
 else:
+    if os.environ.get('FAKE_READ'):
+        print('typed:', sys.stdin.readline().strip(), flush=True)
     sys.exit(int(os.environ.get('FAKE_EXIT', '0')))
 '''
 CONTAINERS = ("shop-prod-php-fpm-1\tphp-fpm\trunning\nshop-prod-database-1\tdatabase\trunning\n"
@@ -160,6 +164,26 @@ class ServerAccessTest(unittest.TestCase):
         self.access("shell shop prod\nforged line", "shop:prod=phpfpm")
         self.assertEqual(len(self.log().splitlines()), 1)
         self.assertIn("'shell shop prod\\nforged line'", self.log())
+
+    @unittest.skipUnless(shutil.which("script"), "util-linux script")
+    def test_what_is_typed_in_a_terminal_session_is_recorded_for_the_key(self):
+        gate = shlex.join([sys.executable, str(ROOT / "bin/server-access"), "--key", "tomas", "--grant", "shop:prod=phpfpm"])
+        environment = {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}", "SETUP_SERVER_ROOT": str(self.root),
+                       "SSH_ORIGINAL_COMMAND": "shell shop prod", "SSH_CONNECTION": "10.8.0.20 50000 10.8.0.14 22",
+                       "FAKE_CALLS": str(self.calls), "FAKE_CONTAINERS": str(self.root / "containers"),
+                       "FAKE_MOUNTS": str(self.root / "mounts"), "FAKE_READ": "1"}
+        # The outer script gives the gate a terminal, as ssh -t does.
+        result = subprocess.run(["script", "-q", "-e", "-c", gate, "/dev/null"], input="php bin/console about\n",
+                                env=environment, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("typed: php bin/console about", result.stdout)
+        records = list((self.root / "access-sessions/tomas").glob("*.log"))
+        self.assertEqual(len(records), 1)
+        self.assertRegex(records[0].name, r"^\d{8}T\d{6}Z-\d+\.log$")
+        self.assertEqual(records[0].stat().st_mode & 0o777, 0o600)
+        self.assertIn("php bin/console about", records[0].read_text())
+        self.assertIn(f"session={records[0].name}", self.log())
+        self.assertIn("started (phpfpm): docker --context setup-shop exec -it", self.log(), "the inner command is logged")
 
     def test_the_childs_exit_status_is_the_answer(self):
         os.environ["FAKE_EXIT"] = "3"

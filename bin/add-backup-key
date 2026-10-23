@@ -10,7 +10,9 @@ loads the project's database. --grant PROJECT[:ENV]=LEVEL (repeatable) makes the
 setup-server-access (a copy of bin/server-access) with those grants and `restrict,pty`: the same backups, and a
 shell or command on the granted targets at that level (phpfpm-readonly, phpfpm, docker, full; make ssh). Installs
 the commands (root-owned copies of bin/backup-pull and bin/server-access) first.
-Idempotent: a key of the same name is replaced. --refresh only rewrites the installed copies (bin/update).
+Idempotent: a key of the same name is replaced; without the key file (and --from) its stored key (and networks)
+are kept, so `--name tomas --grant …` alone changes what an existing key may do. --refresh only rewrites the
+installed copies (bin/update).
 """
 
 import argparse
@@ -122,6 +124,14 @@ def parsed(line):
     return match[1], match[3], bool(match[4]), match[5].split()[1::2]
 
 
+def stored_key(line):
+    """The "type base64" of an authorized_keys entry of ours (its options end at the first space outside quotes)."""
+    match = re.search(r'",restrict(?:,pty)? (\S+) (\S+)', line)
+    if not match or not KEY.fullmatch(f'{match[1]} {match[2]}'):
+        raise SystemExit('The stored entry has no public key this command understands; give the key file again')
+    return f'{match[1]} {match[2]}'
+
+
 def owned(line, name):
     """True when the authorized_keys line is our entry for `name` (either command, any options)."""
     found = parsed(line)
@@ -202,13 +212,21 @@ def main(argv=None):
             raise SystemExit(f'No backup key named {args.remove}')
         write_keys(kept, args.check)
         return 0
-    if not args.key or not args.name or not args.sources:
+    if not args.name:
         parser.error('give the public key file, --name and --from (or --remove NAME / --list)')
     if not NAME.fullmatch(args.name):
         raise SystemExit('--name: letters, digits, . _ @ - (up to 64)')
+    # A key of that name already here: without a key file (and --from) its key (and networks) stay, so a change
+    # of grants or of the fresh permission needs only the name.
+    existing = next((line for line in lines if owned(line, args.name)), None)
+    if not args.key and existing is None:
+        parser.error(f'no key named {args.name} yet: give its public key file (and --from)')
+    if not args.sources and existing is None:
+        parser.error('give --from: the networks the key may connect from')
     granted = parse_grants(args.grant)
-    key_part = public_key(args.key)
-    line = entry(args.name, networks(args.sources), key_part, args.allow_fresh, granted)
+    key_part = public_key(args.key) if args.key else stored_key(existing)
+    sources = networks(args.sources) if args.sources else parsed(existing)[0].split(',')
+    line = entry(args.name, sources, key_part, args.allow_fresh, granted)
     if any(key_part in other for other in lines if not owned(other, args.name)):
         raise SystemExit('This public key is already in authorized_keys under another entry; remove that one first')
     place_command(args.check)
@@ -221,7 +239,7 @@ def main(argv=None):
           + ('; make db-pull fresh=1 asks for a new backup' if args.allow_fresh else ''))
     if not shutil.which('sshd', path=os.environ.get('PATH', '') + ':/usr/sbin:/sbin'):
         print('==> note: this server has no sshd, so the key cannot connect yet; set it up with: sudo bin/install-ssh --from '
-              + ','.join(networks(args.sources)))
+              + ','.join(sources))
     for grant in granted:
         project = grant.split(':', 1)[0]
         if not (ROOT / 'projects' / project).is_dir():

@@ -19,10 +19,20 @@ Usage: server-status                 versions, units, backup timer, disk and eve
        server-status --metrics       the worker's /metrics exposition (setup-server-metrics --once, as the
                                      setup account; no server, no token)
        server-status --projects      only the projects (the part that runs as the setup account)
+       server-status --activity [KEY]
+                                     what the developer keys did, newest first (backup-pulls.log and access.log:
+                                     logins, downloads, shells and commands; a shell with its start, end and
+                                     recorded session), of one key or of all
+       server-status --session KEY FILE
+                                     what was typed in one recorded terminal session (access-sessions/KEY/FILE),
+                                     as lines: editing keys applied, terminal escapes left out
 """
 
+import ast
+import base64
 from datetime import datetime, timezone
 import errno
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -354,7 +364,168 @@ def projects():
             # An environment that is neither deployed from here nor has anything of its own is left out.
             if not (state['declared'] or state['deploys'] or (state['backups'] or {}).get('count') or state['containers']):
                 del entry['environments'][environment]
-    return {'projects': found, 'errors': errors}
+    return {'projects': found, 'keys': developer_keys(errors), 'errors': errors}
+
+
+# The developer keys bin/add-backup-key writes into the account's authorized_keys: what each may do. Public keys
+# and their options only; other entries (an administrator's own key) are not listed.
+KEY_ENTRY = re.compile(r'from="([^"]*)",command="\S*/setup-server-(backup-pull|access) --key ([A-Za-z0-9][A-Za-z0-9._@-]{0,63})'
+                       r'((?: --allow-fresh)?)((?: --grant [a-z0-9_:=-]+)*)",restrict(?:,pty)? (\S+) ([A-Za-z0-9+/]+={0,3})')
+GRANT = re.compile(r'([a-z0-9][a-z0-9_-]*):(stage|prod)=(phpfpm-readonly|phpfpm|docker|full)')
+# A request line of backup-pulls.log or access.log: its time, the key and the address.
+USE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) key=([A-Za-z0-9][A-Za-z0-9._@-]{0,63}) from=(\S+)')
+
+
+def last_uses():
+    """{key name: {'at': epoch, 'from': address, 'log': 'access'|'backups'}} of the newest request in the tails of
+    the two logs (the last 512 KiB of each)."""
+    found = {}
+    for kind, name in (('backups', 'backup-pulls.log'), ('access', 'access.log')):
+        try:
+            with open(ROOT / name, 'rb') as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - 512 * 1024))
+                text = handle.read().decode('utf-8', 'replace')
+        except OSError:
+            continue
+        for line in text.splitlines():
+            match = USE.match(line)
+            if not match:
+                continue
+            moment = int(datetime.strptime(match[1], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).timestamp())
+            if moment >= found.get(match[2], {}).get('at', 0):
+                found[match[2]] = {'at': moment, 'from': match[3][:45], 'log': kind}
+    return found
+
+
+# A line of either log: time, key, address, then the request and the answer. access.log writes the request as a
+# Python string literal (it may hold " -> "), backup-pulls.log as plain words.
+ACTIVITY = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) key=([A-Za-z0-9][A-Za-z0-9._@-]{0,63}|-) from=(\S+) (.*)')
+LITERAL = re.compile(r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*") -> (.*)""")
+SESSION_FILE = re.compile(r'\d{8}T\d{6}Z-\d+\.log')
+ACTIVITY_LIMIT, ACTIVITY_READ = 500, 4 * 1024 * 1024
+
+
+def log_tail(name, limit=ACTIVITY_READ):
+    try:
+        with open(ROOT / name, 'rb') as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - limit))
+            return handle.read().decode('utf-8', 'replace').splitlines()
+    except OSError:
+        return []
+
+
+def activity(key=None):
+    """The requests of the developer keys, newest first: a download or listing as one event, a shell or command
+    as one event from its start to its exit (with the recorded session's file)."""
+    events, open_runs = [], {}
+    for kind, name in (('backups', 'backup-pulls.log'), ('access', 'access.log')):
+        for line in log_tail(name):
+            match = ACTIVITY.fullmatch(line)
+            if not match or (key and match[2] != key):
+                continue
+            parts = LITERAL.fullmatch(match[4]) if kind == 'access' else None
+            if parts:
+                try:
+                    request, answer = str(ast.literal_eval(parts[1])), parts[2]
+                except (ValueError, SyntaxError):
+                    continue
+            else:
+                request, _, answer = match[4].partition(' -> ')
+            moment = int(datetime.strptime(match[1], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).timestamp())
+            run = (match[2], match[3], request)
+            if kind == 'access' and re.fullmatch(r'exit -?\d+', answer) and run in open_runs:
+                event = open_runs.pop(run)
+                event.update(exit=int(answer.split()[1]), ended=moment)
+                continue
+            words = request.split()
+            event = {'at': moment, 'key': match[2], 'from': match[3][:45], 'log': kind, 'request': request[:300],
+                     'verb': words[0] if words else '', 'answer': answer[:300], 'state': 'ok'}
+            if answer.startswith('refused'):
+                event['state'] = 'refused'
+            elif answer.startswith('failed'):
+                event['state'] = 'failed'
+            elif kind == 'access' and answer.startswith('started'):
+                event['state'] = 'running'
+                found = re.search(r' session=(\S+)$', answer)
+                event['session'] = found[1] if found and SESSION_FILE.fullmatch(found[1]) else None
+                level = re.match(r'started \(([a-z-]+)\)', answer)
+                event['level'] = level[1] if level else None
+                open_runs[run] = event
+            events.append(event)
+    for event in open_runs.values():  # no exit line (yet): still running, or cut off
+        event['state'] = 'running'
+    for event in events:
+        if event['state'] == 'running' and 'exit' in event:
+            event['state'] = 'ok' if event['exit'] == 0 else 'failed'
+    events.sort(key=lambda item: item['at'], reverse=True)
+    return {'events': events[:ACTIVITY_LIMIT]}
+
+
+def typed_lines(raw):
+    """What a person typed, as lines: Enter ends a line, Backspace takes back a character, Ctrl-U the line, escape
+    sequences (arrows, history) are left out, other control characters shown as ^X."""
+    text = re.sub(r'\x1b(?:\[[0-9;?]*[A-Za-z~]|O.|.)', '', raw.decode('utf-8', 'replace'))
+    lines, current = [], []
+    for character in text:
+        if character in '\r\n':
+            if current:
+                lines.append(''.join(current))
+            current = []
+        elif character in '\x7f\x08':
+            if current:
+                current.pop()
+        elif character == '\x15':
+            current = []
+        elif character == '\t':
+            current.append('\t')
+        elif ord(character) < 32:
+            lines.append(''.join(current) + '^' + chr(ord(character) + 64))
+            current = []
+        else:
+            current.append(character)
+    if current:
+        lines.append(''.join(current))
+    return lines
+
+
+def session(key, name):
+    path = ROOT / 'access-sessions' / key / name
+    text = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        with os.fdopen(descriptor, 'rb') as handle:
+            if stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                text = handle.read(READ_LIMIT)
+    except OSError as error:
+        return {'error': f'{name}: {error.strerror}'}
+    if text is None:
+        return {'error': f'{name}: not a regular file'}
+    return {'key': key, 'file': name, 'lines': typed_lines(text)}
+
+
+def developer_keys(errors):
+    text = read_text(ROOT / '.ssh/authorized_keys')
+    if text is None:
+        return []
+    uses, keys = last_uses(), []
+    for line in text.splitlines():
+        match = KEY_ENTRY.search(line)
+        if not match:
+            continue
+        try:
+            blob = base64.b64decode(match[7], validate=True)
+        except ValueError:
+            errors.append(f'authorized_keys: the key of {match[3]} does not decode')
+            continue
+        fingerprint = 'SHA256:' + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip('=')
+        keys.append({'name': match[3], 'sources': match[1].split(','), 'fresh': bool(match[4]), 'type': match[6],
+                     'fingerprint': fingerprint, 'command': match[2],
+                     'grants': [{'project': grant[1], 'environment': grant[2], 'level': grant[3]}
+                                for grant in map(GRANT.fullmatch, match[5].split()[1::2]) if grant],
+                     'last': uses.get(match[3])})
+    return keys
 
 
 # --- What root reads ------------------------------------------------------------------------------
@@ -393,12 +564,41 @@ def describe(checkout, owner=None):
     return output.strip()[:80] if code == 0 else None
 
 
+def git_state(checkout, owner=None):
+    """Where a checkout stands, from what it already fetched (nothing is fetched here): its commit, whether that is
+    exactly a release tag, how many commits origin's master has beyond it and when origin was last fetched."""
+    if not (checkout / '.git').exists():
+        return None
+    try:
+        owner = owner or pwd.getpwuid(checkout.stat().st_uid).pw_name
+        options = as_user(owner)
+    except (KeyError, OSError):
+        return None
+    git = lambda *arguments: run(['git', '-C', str(checkout), *arguments], timeout=15, **options)
+    code, commit, _ = git('rev-parse', '--short=12', 'HEAD')
+    if code:
+        return None
+    tag_code, tag, _ = git('describe', '--tags', '--exact-match', 'HEAD')
+    behind_code, behind, _ = git('rev-list', '--count', 'HEAD..refs/remotes/origin/master')
+    time_code, committed, _ = git('log', '-1', '--format=%ct', 'HEAD')
+    try:
+        fetched = int((checkout / '.git/FETCH_HEAD').stat().st_mtime)
+    except OSError:
+        fetched = None
+    tag = tag.strip()
+    return {'commit': commit.strip(), 'tag': tag if tag_code == 0 and re.fullmatch(r'v\d+\.\d+\.\d+', tag) else None,
+            'behind': int(behind) if behind_code == 0 and behind.strip().isdigit() else None,
+            'committed': int(committed) if time_code == 0 and committed.strip().isdigit() else None, 'fetched': fetched}
+
+
 def versions():
     installed = parse_env(read_text(LIBRARY / 'install.env'))
     checkout = installed.get('CHECKOUT')
+    known = bool(checkout and checkout.startswith('/'))
     return {'installed': installed.get('VERSION'), 'checkout_path': checkout,
-            'checkout': describe(Path(checkout)) if checkout and checkout.startswith('/') else None,
-            'setup': describe(ROOT / 'setup', ACCOUNT)}
+            'checkout': describe(Path(checkout)) if known else None,
+            'checkout_git': git_state(Path(checkout)) if known else None,
+            'setup': describe(ROOT / 'setup', ACCOUNT), 'setup_git': git_state(ROOT / 'setup', ACCOUNT)}
 
 
 def disk():
@@ -480,7 +680,8 @@ def overview():
     part = projects_as_account()
     shown = versions()
     return {'generated': int(time.time()), 'root': str(ROOT), 'versions': shown, 'units': found, 'github_runners': scopes,
-            'disk': disk(), 'deploy_key': deploy_key(), 'projects': part['projects'], 'errors': list(dict.fromkeys(errors + part['errors'] + ERRORS))}
+            'disk': disk(), 'deploy_key': deploy_key(), 'projects': part['projects'], 'keys': part.get('keys', []),
+            'errors': list(dict.fromkeys(errors + part['errors'] + ERRORS))}
 
 
 def logs(lines):
@@ -520,6 +721,18 @@ def main(arguments):
             result = as_account([*arguments[:4], count], lambda error: {'error': f'container logs: {error}'})
         else:
             result = container_logs(name, environment, container, int(count))
+    elif arguments[:1] == ['--activity'] and len(arguments) <= 2:
+        if len(arguments) == 2 and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', arguments[1]):
+            print('Expected a key name', file=sys.stderr)
+            return 64
+        result = as_account(arguments, lambda error: {'error': f'activity: {error}'}) if os.geteuid() == 0 \
+            else activity(arguments[1] if len(arguments) == 2 else None)
+    elif arguments[:1] == ['--session'] and len(arguments) == 3:
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', arguments[1]) or not SESSION_FILE.fullmatch(arguments[2]):
+            print('Expected KEY FILE (access-sessions/KEY/<time>-<pid>.log)', file=sys.stderr)
+            return 64
+        result = as_account(arguments, lambda error: {'error': f'session: {error}'}) if os.geteuid() == 0 \
+            else session(arguments[1], arguments[2])
     elif arguments == ['--metrics']:
         result = as_account(arguments, lambda error: {'error': f'metrics: {error}'}) if os.geteuid() == 0 else metrics()
     elif arguments[:1] == ['--logs'] and len(arguments) <= 2:
