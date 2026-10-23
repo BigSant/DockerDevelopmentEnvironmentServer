@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 # The shape of Bitbucket's runner installation dialog (6.0.x), with made-up identifiers and secret.
@@ -33,10 +34,18 @@ RUN_COMMAND = ("cd atlassian-bitbucket-pipelines-runner/bin; ./start.sh --accoun
 
 
 class ScriptTest(unittest.TestCase):
+    # Where the commands look for what bin/install-* installs. bin/update runs these tests on the worker itself as
+    # its health check, where the real ones exist: every test sees empty stand-ins unless it sets its own.
+    HOST_PATHS = {"SETUP_SERVER_SBIN": "sbin", "SETUP_SERVER_LIBRARY": "lib", "SETUP_SERVER_SYSTEMD": "systemd",
+                  "SETUP_SERVER_CONFIG": "etc", "SETUP_SERVER_SUDOERS": "sudoers.d"}
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        stand_ins = patch.dict(os.environ, {name: str(self.root / "host" / folder) for name, folder in self.HOST_PATHS.items()})
+        stand_ins.start()
+        self.addCleanup(stand_ins.stop)
         self.bin = self.root / "bin"
         self.bin.mkdir()
         self.os_release('ubuntu', '24.04')
