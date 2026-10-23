@@ -2,12 +2,15 @@
 """Hand a developer the newest database backup of one project environment, over SSH.
 
 The forced command of a developer key in the setup account's authorized_keys (bin/add-backup-key writes
-`from="<VPN>",command="setup-server-backup-pull --key <name> [--allow-fresh]",restrict <key>`): the key
-runs nothing else. SSH_ORIGINAL_COMMAND is one of
+`from="<VPN>",command="setup-server-backup-pull --key <name> --pull-all none|db|fresh [--pull PROJECT:ENV=db|fresh …]",
+restrict <key>`, or setup-server-access passes the same words on): the key runs nothing else and reaches only the
+project environments it is granted: db downloads their backups, fresh also asks for a new one; --pull-all is every
+project's (new ones too), a --pull raises one environment above it. A key written before these grants (no --pull
+and no --pull-all) keeps what it had: every project, fresh with --allow-fresh. SSH_ORIGINAL_COMMAND is one of
   latest PROJECT ENV [full]   print the file name of the newest backup of ENV (stage, prod or a STAGE_ENVIRONMENTS one)
   info PROJECT ENV [full]     print "<file name> <size in bytes>" of that backup
   get PROJECT ENV FILE        write that backup to stdout
-  fresh PROJECT ENV [full]    make a new backup now (keys with --allow-fresh only), streaming its progress on
+  fresh PROJECT ENV [full]    make a new backup now (keys granted fresh only), streaming its progress on
                               stderr ("progress backup BYTES EXPECTED"), then print "<file name> <size>"
 Without `full` a backup is setup's registry backup (structure of every table, the import tables' data): the
 nightly ones (worker-<env>-…Z.sql.gz), "fresh" ones (fresh-<env>-…Z) and the pre-deploy ones
@@ -38,6 +41,8 @@ BACKUP = re.compile(r'(?:(worker|full|fresh|fresh-full)-([a-z][a-z0-9]{1,15})-\d
 FULL = ('full', 'fresh-full')
 # The fresh backup bin/backup-projects hands out instead of a new one (its FRESH_REUSE), and how long it may run.
 FRESH_REUSE, FRESH_TIMEOUT = 30 * 60, 8 * 3600
+PULL_LEVELS = ('none', 'db', 'fresh')
+PULL = re.compile(r'([a-z0-9][a-z0-9_-]{0,63}):([a-z][a-z0-9]{1,15})=(db|fresh)')
 
 
 class Refused(Exception):
@@ -110,10 +115,47 @@ def content(words):
     raise Refused('the last word may only be full')
 
 
-def fresh(project, environment, kind, allowed):
+class Grants:
+    """What a key may pull: every project's level (--pull-all) and higher ones of single project environments
+    (--pull PROJECT:ENV=LEVEL); none < db (download) < fresh (also ask for a new backup)."""
+
+    def __init__(self, options):
+        self.everything, self.environments, legacy_fresh, valid = None, {}, False, True
+        index = 0
+        while index < len(options):
+            word, value = options[index], options[index + 1] if index + 1 < len(options) else ''
+            if word == '--allow-fresh':
+                legacy_fresh, index = True, index + 1
+                continue
+            if word == '--pull-all' and value in PULL_LEVELS:
+                self.everything = value
+            elif word == '--pull' and PULL.fullmatch(value):
+                match = PULL.fullmatch(value)
+                self.environments[(match[1], match[2])] = match[3]
+            elif word == '--grant':
+                pass  # setup-server-access's, not ours
+            else:
+                valid = False
+            index += 2
+        if not valid:
+            self.everything, self.environments = 'none', {}
+        elif self.everything is None and not self.environments:
+            # Written before these grants: every project, as the key always could.
+            self.everything = 'fresh' if legacy_fresh else 'db'
+        self.everything = self.everything or 'none'
+
+    def level(self, project, environment):
+        return max(self.everything, self.environments.get((project, environment), 'none'), key=PULL_LEVELS.index)
+
+    def need(self, project, environment, wanted):
+        if PULL_LEVELS.index(self.level(project, environment)) < PULL_LEVELS.index(wanted):
+            what = 'download backups of' if wanted == 'db' else 'ask for a fresh backup of'
+            raise Refused(f'this key may not {what} {project} {environment} '
+                          f'(bin/add-backup-key --name … --pull {project}:{environment}={wanted})')
+
+
+def fresh(project, environment, kind):
     """A new backup now, made by bin/backup-projects; its progress goes to stderr as it comes."""
-    if not allowed:
-        raise Refused('this key may not ask for a fresh backup (bin/add-backup-key --allow-fresh)')
     project_directory(project, environment)
     if not os.access(BACKUP_COMMAND, os.X_OK):
         raise Refused('fresh backups need the backup command on this server (bin/install-backups)')
@@ -141,8 +183,10 @@ def log(key, request, answer):
         pass  # the log is a record, not a gate
 
 
-def answer(key, request, allow_fresh=False):
+def answer(key, request, grants):
     words = request.split()
+    if len(words) in (3, 4, 5) and words[0] in ('latest', 'info', 'get', 'fresh'):
+        grants.need(words[1], words[2], 'fresh' if words[0] == 'fresh' else 'db')
     if len(words) in (3, 4) and words[0] in ('latest', 'info'):
         kind = content(words)
         found = backups(words[1], words[2], kind)
@@ -152,7 +196,7 @@ def answer(key, request, allow_fresh=False):
         print(found[0].name if words[0] == 'latest' else f'{found[0].name} {size}', flush=True)
         return found[0].name
     if len(words) in (3, 4) and words[0] == 'fresh':
-        path = fresh(words[1], words[2], content(words), allow_fresh)
+        path = fresh(words[1], words[2], content(words))
         print(f'{path.name} {path.stat().st_size}', flush=True)
         return f'fresh {path.name}'
     if len(words) == 4 and words[0] == 'get':
@@ -167,14 +211,14 @@ def answer(key, request, allow_fresh=False):
 
 
 def main(arguments):
-    allow_fresh = arguments[2:] == ['--allow-fresh']
-    named = len(arguments) in (2, 3) and arguments[0] == '--key' and KEY.fullmatch(arguments[1])
-    key = arguments[1] if named and (len(arguments) == 2 or allow_fresh) else '-'
+    named = len(arguments) >= 2 and arguments[0] == '--key' and KEY.fullmatch(arguments[1])
+    key = arguments[1] if named else '-'
+    grants = Grants(arguments[2:] if named else ['--invalid'])
     request = os.environ.get('SSH_ORIGINAL_COMMAND', '')
     if len(request) > 300:
         request = request[:300]
     try:
-        result = answer(key, request, allow_fresh and key != '-')
+        result = answer(key, request, grants)
     except Refused as refusal:
         log(key, request, f'refused: {refusal}')
         print(f'setup-server-backup-pull: {refusal}', file=sys.stderr)

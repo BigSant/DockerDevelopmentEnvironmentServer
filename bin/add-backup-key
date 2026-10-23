@@ -3,16 +3,20 @@
 --grant also reach the deploy targets of those projects through this worker.
 
 Writes the key into the setup account's authorized_keys as
-  from="<networks>",command="/usr/local/sbin/setup-server-backup-pull --key <name> [--allow-fresh]",restrict <key> <name>
+  from="<networks>",command="/usr/local/sbin/setup-server-backup-pull --key <name> --pull-all none|db|fresh
+  [--pull PROJECT:ENV=db|fresh …]",restrict <key> <name>
 so the key logs in only from the given networks and runs nothing but that command (no shell, no
-forwarding, no Docker). --allow-fresh also lets it ask for a new backup now (make db-pull fresh=1), which
-loads the project's database. --grant PROJECT[:ENV]=LEVEL (repeatable) makes the command
+forwarding, no Docker), for the backups it is granted: --pull PROJECT[:ENV]=db downloads that project
+environment's (make db-pull), =fresh also asks for a new one now (make db-pull fresh=1, which loads the project's
+database); --pull-all is the same for every project, new ones too (a new key: none unless given). An entry written
+before these options (no --pull-all) keeps every project, fresh with --allow-fresh, until it is changed here.
+--grant PROJECT[:ENV]=LEVEL (repeatable) makes the command
 setup-server-access (a copy of bin/server-access) with those grants and `restrict,pty`: the same backups, and a
 shell or command on the granted targets at that level (phpfpm-readonly, phpfpm, docker, full; make ssh). Installs
 the commands (root-owned copies of bin/backup-pull and bin/server-access) first.
-Idempotent: a key of the same name is replaced; without the key file (and --from) its stored key (and networks)
-are kept, so `--name tomas --grant …` alone changes what an existing key may do. --refresh only rewrites the
-installed copies (bin/update).
+Idempotent: a key of the same name is replaced; what is not given is kept (the key file, --from, the --grant and
+the --pull lists, --pull-all), so `--name tomas --pull shop=db` alone changes what an existing key may do;
+--no-grants and --no-pulls empty a list. --refresh only rewrites the installed copies (bin/update).
 """
 
 import argparse
@@ -36,6 +40,9 @@ ACCESS = SBIN / 'setup-server-access'
 COPIES = {COMMAND: 'backup-pull', ACCESS: 'server-access'}
 LEVELS = ('phpfpm-readonly', 'phpfpm', 'docker', 'full')
 GRANT = re.compile(r'([a-z0-9][a-z0-9_-]{0,63})(?::([a-z][a-z0-9]{1,15}))?=(' + '|'.join(LEVELS) + ')')
+# Backups (make db-pull): none, db (download), fresh (also ask for a new one); --pull-all is every project's.
+PULL_LEVELS = ('none', 'db', 'fresh')
+PULL = re.compile(r'([a-z0-9][a-z0-9_-]{0,63})(?::([a-z][a-z0-9]{1,15}))?=(db|fresh)')
 KEYS = ROOT / '.ssh/authorized_keys'
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
 KEY = re.compile(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)'
@@ -68,16 +75,20 @@ def place_command(check, command=COMMAND):
         print(f'==> wrote {command}')
 
 
-def parse_grants(values):
-    """PROJECT[:ENV]=LEVEL words as sorted PROJECT:ENV=LEVEL; a project without ENV gets both."""
+def parse_grants(values, pattern=GRANT, option='--grant', levels=LEVELS):
+    """PROJECT[:ENV]=LEVEL words as {(project, env): level}; a project without ENV gets stage and prod."""
     found = {}
     for word in [part.strip() for value in values for part in value.split(',') if part.strip()]:
-        match = GRANT.fullmatch(word)
+        match = pattern.fullmatch(word)
         if not match or match[2] in ('local', 'test'):
-            raise SystemExit(f'--grant {word}: expected PROJECT[:ENV]=' + '|'.join(LEVELS) + ' (ENV: stage, prod or a '
+            raise SystemExit(f'{option} {word}: expected PROJECT[:ENV]=' + '|'.join(levels) + ' (ENV: stage, prod or a '
                              'STAGE_ENVIRONMENTS name; without it stage and prod)')
         for environment in [match[2]] if match[2] else ['stage', 'prod']:
             found[(match[1], environment)] = match[3]
+    return found
+
+
+def words(found):
     return [f'{project}:{environment}={level}' for (project, environment), level in sorted(found.items())]
 
 
@@ -114,15 +125,49 @@ def public_key(path):
     return f'{match[1]} {match[2]}'
 
 
-ENTRY = re.compile(r'from="([^"]*)",command="(\S+) --key (\S+)((?: --allow-fresh)?)((?: --grant \S+)*)"')
+ENTRY = re.compile(r'from="([^"]*)",command="(\S+) --key (\S+)((?: [^" ]+)*)"')
+
+
+class Entry:
+    """One developer key of ours: its networks, grants (make ssh) and backups (make db-pull)."""
+
+    def __init__(self, name, sources, grants=None, pulls=None, pull_all='none'):
+        self.name, self.sources = name, sources
+        self.grants, self.pulls, self.pull_all = dict(grants or {}), dict(pulls or {}), pull_all
+
+    def line(self, key):
+        options = f' --pull-all {self.pull_all}' + ''.join(f' --pull {word}' for word in words(self.pulls))
+        if self.grants:
+            options += ''.join(f' --grant {word}' for word in words(self.grants))
+            return f'from="{",".join(self.sources)}",command="{ACCESS} --key {self.name}{options}",restrict,pty {key} {self.name}'
+        return f'from="{",".join(self.sources)}",command="{COMMAND} --key {self.name}{options}",restrict {key} {self.name}'
+
+    def described(self):
+        backups = ' '.join([f'all={self.pull_all}'] + words(self.pulls))
+        return (f'{self.name}  from {",".join(self.sources)}  backups {backups}'
+                + (f'  access {" ".join(words(self.grants))}' if self.grants else ''))
 
 
 def parsed(line):
-    """(networks, name, fresh, grants) of one of our authorized_keys entries, else None."""
+    """The Entry of one of our authorized_keys lines, else None. A line written before the backup grants (no
+    --pull-all) keeps what it gave: every project's backups, fresh ones with --allow-fresh."""
     match = ENTRY.search(line)
     if not match or match[2] not in (str(COMMAND), str(ACCESS)):
         return None
-    return match[1], match[3], bool(match[4]), match[5].split()[1::2]
+    tokens, grants, pulls, pull_all, fresh = match[4].split(), {}, {}, None, False
+    for index, token in enumerate(tokens):
+        value = tokens[index + 1] if index + 1 < len(tokens) else ''
+        if token == '--allow-fresh':
+            fresh = True
+        elif token == '--grant' and GRANT.fullmatch(value):
+            grants.update(parse_grants([value]))
+        elif token == '--pull' and PULL.fullmatch(value):
+            pulls.update(parse_grants([value], PULL, '--pull', PULL_LEVELS[1:]))
+        elif token == '--pull-all' and value in PULL_LEVELS:
+            pull_all = value
+    if pull_all is None and not pulls:
+        pull_all = 'fresh' if fresh else 'db'
+    return Entry(match[3], match[1].split(','), grants, pulls, pull_all or 'none')
 
 
 def stored_key(line):
@@ -136,15 +181,7 @@ def stored_key(line):
 def owned(line, name):
     """True when the authorized_keys line is our entry for `name` (either command, any options)."""
     found = parsed(line)
-    return found is not None and found[1] == name
-
-
-def entry(name, sources, key, fresh=False, granted=()):
-    fresh_option = ' --allow-fresh' if fresh else ''
-    if granted:
-        grant_options = ''.join(f' --grant {grant}' for grant in granted)
-        return f'from="{",".join(sources)}",command="{ACCESS} --key {name}{fresh_option}{grant_options}",restrict,pty {key} {name}'
-    return f'from="{",".join(sources)}",command="{COMMAND} --key {name}{fresh_option}",restrict {key} {name}'
+    return found is not None and found.name == name
 
 
 def current_lines():
@@ -179,11 +216,19 @@ def main(argv=None):
     parser.add_argument('key', nargs='?', help='the developer\'s public key file (.pub), or - for stdin')
     parser.add_argument('--name', help='who the key belongs to, e.g. tomas (logged with every download)')
     parser.add_argument('--from', dest='sources', help='networks it may connect from, e.g. the VPN 10.8.0.0/24')
-    parser.add_argument('--allow-fresh', action='store_true',
-                        help='the key may also ask for a new backup now (make db-pull fresh=1); it loads the database')
+    parser.add_argument('--pull', action='append', default=[], metavar='PROJECT[:ENV]=db|fresh',
+                        help='the key may download this project environment\'s backups (make db-pull; db), and ask '
+                             'for a new one (fresh, make db-pull fresh=1; it loads the database); without :ENV stage '
+                             'and prod; repeatable or comma-separated; on an existing key it replaces the list')
+    parser.add_argument('--pull-all', choices=PULL_LEVELS,
+                        help='the same for every project, new ones too (default for a new key: none)')
+    parser.add_argument('--no-pulls', action='store_true', help='an existing key: drop its --pull list')
+    parser.add_argument('--allow-fresh', action='store_true', help='as --pull-all fresh (the option before --pull)')
     parser.add_argument('--grant', action='append', default=[], metavar='PROJECT[:ENV]=LEVEL',
                         help='the key may also reach this project environment through this worker (make ssh); LEVEL: '
-                             + ', '.join(LEVELS) + '; without :ENV both stage and prod; repeatable or comma-separated')
+                             + ', '.join(LEVELS) + '; without :ENV both stage and prod; repeatable or comma-separated; '
+                             'on an existing key it replaces the list')
+    parser.add_argument('--no-grants', action='store_true', help='an existing key: drop its --grant list')
     parser.add_argument('--remove', metavar='NAME', help='remove the key of this name')
     parser.add_argument('--list', action='store_true', help='show the backup keys')
     parser.add_argument('--check', action='store_true', help='show what would change; change nothing')
@@ -201,9 +246,8 @@ def main(argv=None):
     lines = current_lines()
     ours = [parsed(line) for line in lines if parsed(line)]
     if args.list:
-        for sources, name, fresh, granted in ours:
-            print(f'{name}  from {sources}{"  fresh backups allowed" if fresh else ""}'
-                  + (f'  access {" ".join(granted)}' if granted else ''))
+        for found in ours:
+            print(found.described())
         if not ours:
             print('No backup keys.')
         return 0
@@ -217,17 +261,27 @@ def main(argv=None):
         parser.error('give the public key file, --name and --from (or --remove NAME / --list)')
     if not NAME.fullmatch(args.name):
         raise SystemExit('--name: letters, digits, . _ @ - (up to 64)')
-    # A key of that name already here: without a key file (and --from) its key (and networks) stay, so a change
-    # of grants or of the fresh permission needs only the name.
+    # A key of that name already here: what is not given stays (its key, networks, grants, backups), so a change of
+    # one of them needs only the name and that option.
     existing = next((line for line in lines if owned(line, args.name)), None)
     if not args.key and existing is None:
         parser.error(f'no key named {args.name} yet: give its public key file (and --from)')
     if not args.sources and existing is None:
         parser.error('give --from: the networks the key may connect from')
-    granted = parse_grants(args.grant)
+    if args.allow_fresh and args.pull_all and args.pull_all != 'fresh':
+        parser.error('--allow-fresh is --pull-all fresh: give one of them')
+    found = parsed(existing) if existing else Entry(args.name, [])
     key_part = public_key(args.key) if args.key else stored_key(existing)
-    sources = networks(args.sources) if args.sources else parsed(existing)[0].split(',')
-    line = entry(args.name, sources, key_part, args.allow_fresh, granted)
+    if args.sources:
+        found.sources = networks(args.sources)
+    if args.grant or args.no_grants:
+        found.grants = parse_grants(args.grant)
+    if args.pull or args.no_pulls:
+        found.pulls = parse_grants(args.pull, PULL, '--pull', PULL_LEVELS[1:])
+    if args.pull_all or args.allow_fresh:
+        found.pull_all = args.pull_all or 'fresh'
+    sources, granted = found.sources, words(found.grants)
+    line = found.line(key_part)
     if any(key_part in other for other in lines if not owned(other, args.name)):
         raise SystemExit('This public key is already in authorized_keys under another entry; remove that one first')
     place_command(args.check)
@@ -236,13 +290,16 @@ def main(argv=None):
     kept = [other for other in lines if not owned(other, args.name)]
     write_keys(kept + [line], args.check)
     host = os.environ.get('SETUP_SERVER_ADDRESS', '<server VPN address>')
-    print(f'==> {args.name} downloads with: make db-pull (asks for {ACCOUNT}@{host} the first time)'
-          + ('; make db-pull fresh=1 asks for a new backup' if args.allow_fresh else ''))
+    fresh = found.pull_all == 'fresh' or 'fresh' in found.pulls.values()
+    if found.pull_all == 'none' and not found.pulls:
+        print(f'==> note: {args.name} downloads no backups (give --pull PROJECT[:ENV]=db|fresh or --pull-all db|fresh)')
+    else:
+        print(f'==> {args.name} downloads with: make db-pull (asks for {ACCOUNT}@{host} the first time)'
+              + ('; make db-pull fresh=1 asks for a new backup where it may' if fresh else ''))
     if not shutil.which('sshd', path=os.environ.get('PATH', '') + ':/usr/sbin:/sbin'):
         print('==> note: this server has no sshd, so the key cannot connect yet; set it up with: sudo bin/install-ssh --from '
               + ','.join(sources))
-    for grant in granted:
-        project = grant.split(':', 1)[0]
+    for project in sorted({project for project, _ in [*found.grants, *found.pulls]}):
         if not (ROOT / 'projects' / project).is_dir():
             print(f'==> note: no project {project} on this server yet (projects/{project}); the grant waits for it')
     if any(grant.endswith('=full') for grant in granted):
@@ -250,7 +307,7 @@ def main(argv=None):
               'project, its secrets and Docker, i.e. root; on another server the deploy user\'s shell there')
     if granted:
         print(f'==> {args.name} connects with: make ssh from=prod (make ssh access=1 lists what the key reaches)')
-    if args.allow_fresh and not (SBIN / 'setup-server-backup').exists():
+    if fresh and not (SBIN / 'setup-server-backup').exists():
         print('==> note: fresh backups need the backup command; install it with: sudo bin/install-backups')
     return 0
 

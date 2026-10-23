@@ -19,7 +19,7 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
 | `bin/install-backups` | DB kopijos: naktinė (`setup-server-backup.timer`, pagal lentelių registrą) ir savaitinė pilna (`setup-server-backup-full.timer`, visų lentelių duomenys), komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
 | `bin/install-ssh` | SSH iš VPN: `openssh-server` (Ubuntu Desktop jo neturi), paleistas ir startuojantis po perkrovimo, nustatymai `/etc/ssh/sshd_config.d/10-setup-server.conf` – iš už nurodytų tinklų ir šio serverio tik raktu, be slaptažodžio; įjungtam ufw – leidimas tiems tinklams. Reikia `make db-pull` ir valdymo sąsajos tuneliui. |
-| `bin/add-backup-key` | Programuotojo SSH raktas DB kopijoms atsisiųsti (`make db-pull`), su `--allow-fresh` – ir naujai kopijai užsakyti (`make db-pull fresh=1`): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. Su `--grant PROJEKTAS:ENV=LYGIS` – ir prieiga prie to projekto taikinio per šį serverį (`make ssh`), per `/usr/local/sbin/setup-server-access` (kopija iš `bin/server-access`). |
+| `bin/add-backup-key` | Programuotojo SSH raktas DB kopijoms atsisiųsti (`make db-pull`) – tik leistų projektų aplinkų (`--pull PROJEKTAS:ENV=db`, `=fresh` – ir naujai kopijai užsakyti, `make db-pull fresh=1`; `--pull-all` – visų projektų): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. Su `--grant PROJEKTAS:ENV=LYGIS` – ir prieiga prie to projekto taikinio per šį serverį (`make ssh`), per `/usr/local/sbin/setup-server-access` (kopija iš `bin/server-access`). |
 | `bin/install-metrics` | Worker'io Prometheus `/metrics`: systemd paslauga `setup-server-metrics` (paskyra `setup`, tik skaito), komanda `/usr/local/sbin/setup-server-metrics` (kopija iš `bin/worker-metrics`), nustatymai `/etc/setup-server/metrics.env`. |
 | `bin/install-ui` | Valdymo sąsaja naršyklėje (tik `127.0.0.1`, per SSH tunelį): paslauga `setup-server-ui` (atskira paskyra `setup-ui`), komanda `/usr/local/sbin/setup-server-ui` (kopija iš `bin/web-ui`), komandų kopijos `/usr/local/lib/setup-server/bin/`, sudo taisyklė, nustatymai `/etc/setup-server/ui.env`. |
 | `bin/move-bitbucket-ssh` | Perkelia build katalogų Bitbucket remote'us iš `bitbucket.org` į `ssh.bitbucket.org` (Bitbucket SSH adresas nuo 2026-11-12); perkelia tik tada, kai naujas adresas atsako. Žr. „Bitbucket SSH adresas“. |
@@ -355,19 +355,30 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    Tada – programuotojo raktas:
 
    ```bash
-   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --check   # parodo, ką keistų
-   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24           # įrašo raktą (tik atsisiuntimas)
-   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --allow-fresh   # ir „fresh“ kopijos
-   sudo bin/add-backup-key --list                                                # kam leista, iš kur, ar „fresh“
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --pull shop=db --check   # parodo, ką keistų
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --pull shop=db           # shop stage ir prod kopijos
+   sudo bin/add-backup-key --name tomas --pull shop:prod=fresh --pull forsena:stage=db         # esamam – tik vardas
+   sudo bin/add-backup-key --name qa --pull-all db                    # visų projektų (ir naujų) kopijos
+   sudo bin/add-backup-key --list          # tomas  from 10.8.0.0/24  backups all=none forsena:stage=db shop:prod=fresh
    sudo bin/add-backup-key --remove tomas                                        # atima leidimą
    ```
 
+   **Kopijų leidimai** – kiekvienai projekto aplinkai atskirai, kaip prieiga (8 žingsnis): `db` – parsisiųsti kopijas
+   (registro ir pilnas, `make db-pull [full=1]`), `fresh` – ir užsakyti naują dabar (`make db-pull fresh=1`; apkrauna
+   projekto DB). `--pull PROJEKTAS[:ENV]=LYGIS` (be `:ENV` – stage ir prod, kartojamas ar per kablelį), `--pull-all
+   none|db|fresh` – visų projektų, ir naujų; projekto aplinkos leidimas jį gali tik padidinti. Naujas raktas be jų
+   kopijų negauna. Esamam raktui nenurodyti dalykai lieka (raktas, tinklai, `--pull` ir `--grant` sąrašai, `--pull-all`);
+   `--no-pulls`, `--no-grants` sąrašą išvalo. Patogiausia – sąsajos *Prieiga* → raktas → kortelė „Kopijos“ (masiškai
+   ir po projektą). **Iki šių leidimų įrašyti raktai** (be `--pull-all`) ir toliau traukia visų projektų kopijas
+   (`--allow-fresh` – ir šviežias), kol pirmą kartą pakeičiami: tada tai įrašoma aiškiai (`--pull-all db|fresh`).
+
    Raktas (programuotojo `.pub` failas, niekada ne privatus) įrašomas į paskyros `setup`
    `.ssh/authorized_keys` su apribojimais: `from="10.8.0.0/24"` – jungtis galima tik iš nurodyto tinklo (VPN;
-   `0.0.0.0/0` atmetamas), `command="/usr/local/sbin/setup-server-backup-pull --key tomas"` – raktas vykdo tik
-   šią komandą, `restrict` – be terminalo, port'ų ir agento persiuntimo. Shell'o, Docker ir kitų failų raktas
-   negauna. Tas pats vardas pakartotinai – raktas pakeičiamas; kiti `authorized_keys` įrašai nekeičiami.
-   Prisijungiama tik raktu (paskyra `setup` slaptažodžio neturi).
+   `0.0.0.0/0` atmetamas), `command="/usr/local/sbin/setup-server-backup-pull --key tomas --pull-all none --pull
+   shop:prod=db …"` – raktas vykdo tik šią komandą ir tik leistoms aplinkoms, `restrict` – be terminalo, port'ų ir
+   agento persiuntimo. Shell'o, Docker ir kitų failų raktas negauna. Tas pats vardas pakartotinai – raktas pakeičiamas;
+   kiti `authorized_keys` įrašai nekeičiami. Prisijungiama tik raktu (paskyra `setup` slaptažodžio neturi). Neleistos
+   aplinkos prašymas atmetamas: `this key may not download backups of PROJEKTAS ENV`.
 
    Komanda moka:
 
@@ -376,7 +387,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    | `latest <projektas> <stage\|prod> [full]` | naujausios kopijos vardas: be `full` – registro kopija (naktinė, „fresh“, prieš deploy'ų), su `full` – pilna (savaitinė ar „fresh“ pilna) |
    | `info <projektas> <stage\|prod> [full]` | tas pats ir dydis baitais: `<failas> <dydis>` (atsisiuntimo progresui) |
    | `get <projektas> <stage\|prod> <failas>` | tos kopijos turinys |
-   | `fresh <projektas> <stage\|prod> [full]` | tik raktui su `--allow-fresh`: paleidžia `setup-server-backup --fresh [--full]` paskyra `setup`, eigą siunčia į stderr (`progress backup BAITAI TIKĖTINA`), pabaigoje – `<failas> <dydis>` |
+   | `fresh <projektas> <stage\|prod> [full]` | tik tos aplinkos `fresh` leidimą turinčiam raktui: paleidžia `setup-server-backup --fresh [--full]` paskyra `setup`, eigą siunčia į stderr (`progress backup BAITAI TIKĖTINA`), pabaigoje – `<failas> <dydis>` |
 
    „Fresh“ apkrauna projekto DB, todėl jo nedaro du kartus: jei tos pačios rūšies (registro ar pilna) kopija
    jaunesnė nei 30 min., atiduodama ji; jei kopija tuo metu daroma, laukiama jos pabaigos (užraktas). Reikia
@@ -403,8 +414,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 
    `--grant` galima kartoti arba rašyti per kablelį; be `:stage`/`:prod` – abi aplinkos. Pakartotinai paleidus su tuo
    pačiu vardu įrašas pakeičiamas visas: išvardyk visus leidimus (be `--grant` – lieka tik kopijos). Esamam raktui
-   rakto failo ir `--from` nereikia – lieka įrašytas raktas ir tinklai: `sudo bin/add-backup-key --name tomas --grant
-   forsena=docker` pakeičia tik leidimus (ir `--allow-fresh`). Projektas – build katalogo vardas (`projects/<vardas>`);
+   rakto failo ir `--from` nereikia – lieka įrašytas raktas, tinklai ir kopijų leidimai: `sudo bin/add-backup-key --name
+   tomas --grant forsena=docker` pakeičia tik prieigos leidimus. Projektas – build katalogo vardas (`projects/<vardas>`);
    dar nesančiam projektui leidimas įrašomas su pastaba. Patogiausia – sąsajos puslapyje *Prieiga* (žr. „Valdymo sąsaja“).
 
    | Lygis | Ką leidžia | Ko neleidžia |
@@ -778,16 +789,18 @@ commit'as, raudonas, kai setup ne ant release tag'o.
   ar veikia `<PROJECT_NAME>-<env>-secrets`, konteineriai (būsena, sveikata) ir paskutiniai Bitbucket pipeline'ai.
   Projekto puslapyje – ir visos aplinkos kopijos (naktinės, pilnos, šviežios, prieš deploy'ų: failas, laikas, dydis),
   kiekvieno konteinerio `docker logs` (200, 500 ar 2000 paskutinių eilučių) ir „Kopija dabar serveryje“.
-- *Prieiga* – programuotojų raktai: kiekvienam – kiek prod, stage ir kitų aplinkų jis pasiekia kokiu lygiu, kopijų
-  teisės, tinklai ir paskutinis naudojimas; paieška pagal raktą ar projektą; visų raktų paskutinė veikla.
-  „Pridėti raktą“ – viešasis raktas, vardas, tinklai, „fresh“ ir pradinė prieiga visoms prod ir stage aplinkoms.
-  Rakto puslapyje:
+- *Prieiga* – programuotojų raktai: kiekvienam – kiek prod, stage ir kitų aplinkų jis pasiekia kokiu lygiu (`make ssh`),
+  kopijos (`make db-pull`: visų projektų lygis ir aplinkos virš jo), tinklai ir paskutinis naudojimas; paieška pagal raktą
+  ar projektą; visų raktų paskutinė veikla. „Pridėti raktą“ – viešasis raktas, vardas, tinklai, pradinės kopijos (visi
+  projektai, prod, stage) ir prieiga (prod, stage). Rakto puslapyje dvi kortelės – *Prieiga (make ssh)* ir *Kopijos
+  (make db-pull)*, abiejose:
   - *Visoms iš karto* – vienas lygis (arba „—“, atimti) visoms prod, visoms stage ar visoms aplinkoms, visiems projektams
-    arba tik ten, kur raktas jau turi prieigą;
-  - *Projektai* – po eilutę projektui, jo aplinkos (prod, stage, kitos) šalia, lygis – mygtukų juosta; filtras pagal
-    vardą ir „tik su prieiga“ (keičiamos tik rodomos aplinkos, paslėptos lieka);
-  - *Rakto nustatymai* – tinklai, „fresh“, naujas viešasis raktas (galioja visoms aplinkoms), dar nesančio projekto
-    leidimas; rakto atėmimas;
+    arba tik ten, kur raktas jau turi leidimą; kopijų kortelėje dar „visi projektai“ (ir nauji);
+  - *Projektai* – po eilutę projektui, jo aplinkos (prod, stage, kitos) šalia, lygis – mygtukų juosta (kopijose „visi: db“
+    – aplinka be savo leidimo, galioja visų projektų lygis); filtras pagal vardą ir „tik su leidimu“ (keičiamos tik
+    rodomos aplinkos, paslėptos lieka);
+  - *Rakto nustatymai* – tinklai, naujas viešasis raktas (galioja visoms aplinkoms), dar nesančio projekto leidimai;
+    rakto atėmimas;
   - *Veikla* – kas, kada, iš kur: prisijungimai, kopijos, shell'ai (lygis, trukmė, rezultatas, seanso įrašas), komandos,
     atmesti bandymai; seanso puslapyje – surinktos eilutės.
 
@@ -824,7 +837,7 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 | SSH iš VPN | `sudo -n L/install-ssh [--from TINKLAI]` |
 | Paslaugos (ir Apžvalgoje) | `sudo -n L/server-unit start\|stop\|restart UNIT` (žr. žemiau) |
 | Worker'io metrikos | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |
-| Raktai (*Prieiga*) | `sudo -n L/add-backup-key [-] --name … [--from …] [--allow-fresh] [--grant PROJEKTAS:ENV=LYGIS …]` (naujas raktas per stdin; esamam – be jo), `--remove VARDAS` |
+| Raktai (*Prieiga*) | `sudo -n L/add-backup-key [-] --name … [--from …] --pull-all … --pull …\|--no-pulls --grant …\|--no-grants` (visi sąrašai aiškiai; naujas raktas per stdin, esamam – be jo), `--remove VARDAS` |
 | Paruošti serverį | `sudo -n L/prepare-host [--setup-ref …]` (`--check` kodas 1 – „Needs attention“ – vykdyti leidžia) |
 | Atnaujinti setup (*Atnaujinimas*) | `sudo -n L/update-setup [vX.Y.Z]` (tik release tag'ai, be slaptažodžio) |
 | Atnaujinti setup-server (*Atnaujinimas*) | `sudo -n -H -u <klono savininkas> <klonas>/bin/update --server-ref origin/master` (ar kiti `--server-ref`/`--setup-ref`) |
@@ -957,8 +970,9 @@ sudo tail -n 20 /srv/setup-server/ui-actions.log
 - SSH (`bin/install-ssh`) iš už VPN tinklo ir ne iš šio serverio priima tik raktus; slaptažodžiu jungtis galima tik
   iš VPN (jei serverio nustatymai tai leidžia). Port'as iš interneto neatidaromas: tai lemia maršrutizatorius ar ufw.
 - Kopijų atsisiuntimo raktai (`bin/add-backup-key`) prisijungia prie paskyros `setup`, bet tik iš nurodyto tinklo
-  ir tik su priverstine komanda, kuri atiduoda vien kopijas (`restrict`: be terminalo ir persiuntimų). Kopijose
-  yra tikri klientų duomenys; kiekvienas atsisiuntimas registruojamas `backup-pulls.log`.
+  ir tik su priverstine komanda, kuri atiduoda vien leistų projektų aplinkų kopijas (`restrict`: be terminalo ir
+  persiuntimų). Kopijose yra tikri klientų duomenys: duok tik tų projektų, kurių reikia (`--pull`, ne `--pull-all`);
+  kiekvienas atsisiuntimas ir atmestas prašymas registruojamas `backup-pulls.log`.
 - Raktai su `--grant` per šį serverį pasiekia projektų taikinius tuo pačiu keliu, kaip deploy'us (žr. „Eiga“, 8
   žingsnį): leidimai įrašyti rakto eilutėje, juos tikrina priverstinė komanda, persiuntimų nėra (`restrict,pty`),
   kiekvienas prašymas – `access.log`, interaktyvaus seanso įvestis – `access-sessions/` (ir joje surinkti slaptažodžiai). `full` local taikiniui ir `docker` (`exec` kaip root į projekto konteinerius su

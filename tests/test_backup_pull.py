@@ -41,12 +41,14 @@ class BackupPullTest(unittest.TestCase):
             path.write_bytes(name.encode())
             os.utime(path, (1_760_000_000 + index * 100, 1_760_000_000 + index * 100))
 
-    def pull(self, request, key="tomas", fresh=False, command=None):
+    def pull(self, request, key="tomas", fresh=False, command=None, options=()):
+        """A key written before the backup grants (no options: every project; fresh with --allow-fresh), or with
+        the options bin/add-backup-key writes now."""
         environment = {**os.environ, "SETUP_SERVER_ROOT": str(self.root), "SSH_ORIGINAL_COMMAND": request,
                        "SSH_CONNECTION": "10.8.0.20 50000 10.8.0.14 22",
                        "SETUP_SERVER_BACKUP_COMMAND": str(command or self.root / "missing-backup-command")}
         return subprocess.run([sys.executable, str(ROOT / "bin/backup-pull"), "--key", key,
-                               *(["--allow-fresh"] if fresh else [])], env=environment, capture_output=True, timeout=30)
+                               *(["--allow-fresh"] if fresh else []), *options], env=environment, capture_output=True, timeout=30)
 
     def backup_command(self, body):
         command = self.root / "setup-server-backup"
@@ -132,6 +134,31 @@ class BackupPullTest(unittest.TestCase):
         self.assertEqual(refused.returncode, 65)
         self.assertIn(b"has no environment qa", refused.stderr)
 
+    def test_a_key_pulls_only_the_project_environments_it_is_granted(self):
+        command = self.backup_command(f'printf f > "{self.backups}/fresh-prod-20261013T150000Z.sql.gz"\n')
+        other = self.root / "projects/other/app"
+        (other / "env").mkdir(parents=True)
+        (other / "Makefile").write_text("include x\n")
+        granted = ["--pull-all", "none", "--pull", "shop:prod=db"]
+        self.assertEqual(self.pull("info shop prod", options=granted).returncode, 0)
+        for request, options, message in (("info shop stage", granted, b"may not download backups of shop stage"),
+                                          ("latest other prod", granted, b"may not download backups of other prod"),
+                                          ("get shop stage worker-stage-20261012T033000Z.sql.gz", granted, b"may not"),
+                                          ("fresh shop prod", granted, b"may not ask for a fresh backup of shop prod"),
+                                          ("info shop prod", ["--pull-all", "none"], b"may not download"),
+                                          ("info shop prod", ["--pull-all", "everything"], b"may not download"),
+                                          ("info shop prod", ["--grant", "shop:prod=full", "--bogus"], b"may not download")):
+            with self.subTest(request=request, options=options):
+                refused = self.pull(request, options=options, command=command)
+                self.assertEqual(refused.returncode, 65)
+                self.assertIn(message, refused.stderr)
+        self.assertFalse((self.backups / "fresh-prod-20261013T150000Z.sql.gz").exists(), "no fresh backup was made")
+        # Every project's level, raised for one environment; a grant of the gate is not ours to judge.
+        options = ["--pull-all", "db", "--pull", "shop:prod=fresh", "--grant", "shop:prod=full"]
+        self.assertEqual(self.pull("info shop stage", options=options).returncode, 0)
+        self.assertEqual(self.pull("fresh shop prod", options=options, command=command).returncode, 0)
+        self.assertEqual(self.pull("fresh shop stage", options=options, command=command).returncode, 65)
+
     def test_no_backup_yet_is_a_clear_refusal(self):
         for path in self.backups.iterdir():
             path.unlink()
@@ -162,35 +189,44 @@ class AddBackupKeyTest(unittest.TestCase):
     def test_the_key_logs_in_only_from_the_vpn_and_runs_only_the_pull_command(self):
         keys = self.root / "home/.ssh/authorized_keys"
         keys.write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOther other@admin\n")
-        self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24")
+        output = self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24")
         command = self.root / "sbin/setup-server-backup-pull"
         self.assertEqual(keys.read_text().splitlines()[1],
-                         f'from="10.8.0.0/24",command="{command} --key tomas",restrict {KEY.rsplit(" ", 1)[0]} tomas')
+                         f'from="10.8.0.0/24",command="{command} --key tomas --pull-all none",restrict {KEY.rsplit(" ", 1)[0]} tomas')
+        self.assertIn("tomas downloads no backups", output, "a new key gets nothing it was not given")
         self.assertEqual(keys.stat().st_mode & 0o777, 0o600)
         self.assertIn(f"'SETUP_SERVER_ROOT', '{self.root / 'home'}'", command.read_text(), "sshd starts it without our environment")
-        # Again with another network: replaced, not added; the other key stays.
-        self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24,10.9.0.5")
+        # Again with another network and backups: replaced, not added; the other key stays.
+        self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24,10.9.0.5", "--pull", "shop=db",
+                         "--pull", "other:prod=fresh")
         lines = keys.read_text().splitlines()
         self.assertEqual(len(lines), 2)
         self.assertIn('from="10.8.0.0/24,10.9.0.5/32"', lines[1])
-        self.assertIn("tomas  from 10.8.0.0/24,10.9.0.5/32", self.run_as_root("--list"))
-        # --allow-fresh replaces the same name's entry and is listed.
-        self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24", "--allow-fresh")
-        lines = keys.read_text().splitlines()
-        self.assertEqual(len(lines), 2)
-        self.assertIn(f'command="{command} --key tomas --allow-fresh"', lines[1])
-        self.assertIn("tomas  from 10.8.0.0/24  fresh backups allowed", self.run_as_root("--list"))
+        self.assertIn("--pull-all none --pull other:prod=fresh --pull shop:prod=db --pull shop:stage=db\"", lines[1])
+        self.assertIn("tomas  from 10.8.0.0/24,10.9.0.5/32  backups all=none other:prod=fresh shop:prod=db shop:stage=db",
+                      self.run_as_root("--list"))
+        # --allow-fresh (the option before --pull) is every project's fresh.
+        self.run_as_root("--name", "tomas", "--allow-fresh", "--no-pulls")
+        self.assertIn(f'command="{command} --key tomas --pull-all fresh"', keys.read_text())
         self.run_as_root("--remove", "tomas")
         self.assertEqual(keys.read_text(), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOther other@admin\n")
+
+    def test_an_entry_written_before_the_backup_grants_keeps_every_project_until_it_changes(self):
+        keys = self.root / "home/.ssh/authorized_keys"
+        command = self.root / "sbin/setup-server-backup-pull"
+        keys.write_text(f'from="10.8.0.0/24",command="{command} --key ona --allow-fresh",restrict {KEY.rsplit(" ", 1)[0]} ona\n')
+        self.assertIn("ona  from 10.8.0.0/24  backups all=fresh", self.run_as_root("--list"))
+        self.run_as_root("--name", "ona", "--grant", "shop:prod=phpfpm")
+        self.assertIn("--key ona --pull-all fresh --grant shop:prod=phpfpm\"", keys.read_text(), "written out explicitly")
 
     def test_grants_make_the_access_command_with_a_terminal_and_keep_the_backups(self):
         keys = self.root / "home/.ssh/authorized_keys"
         (self.root / "home/projects/shop").mkdir(parents=True)
-        output = self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24", "--allow-fresh",
+        output = self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24", "--pull-all", "db",
                                   "--grant", "shop=phpfpm-readonly", "--grant", "shop:prod=docker,other:stage=full")
         access = self.root / "sbin/setup-server-access"
         self.assertEqual(keys.read_text().splitlines()[0],
-                         f'from="10.8.0.0/24",command="{access} --key tomas --allow-fresh --grant other:stage=full '
+                         f'from="10.8.0.0/24",command="{access} --key tomas --pull-all db --grant other:stage=full '
                          f'--grant shop:prod=docker --grant shop:stage=phpfpm-readonly",restrict,pty {KEY.rsplit(" ", 1)[0]} tomas')
         self.assertIn("no project other on this server", output)
         self.assertIn("full on a target of this server", output)
@@ -198,30 +234,36 @@ class AddBackupKeyTest(unittest.TestCase):
         self.assertIn(f"'SETUP_SERVER_ROOT', '{self.root / 'home'}'", installed)
         self.assertIn(repr(str(self.root / "sbin/setup-server-backup-pull")), installed, "backups still go to the pull command")
         self.assertTrue((self.root / "sbin/setup-server-backup-pull").is_file())
-        self.assertIn("tomas  from 10.8.0.0/24  fresh backups allowed  access other:stage=full shop:prod=docker "
+        self.assertIn("tomas  from 10.8.0.0/24  backups all=db  access other:stage=full shop:prod=docker "
                       "shop:stage=phpfpm-readonly", self.run_as_root("--list"))
-        # Without grants again: back to the pull command alone, the same single entry.
-        self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24")
+        # Without the grants again: back to the pull command alone, the same single entry.
+        self.run_as_root("--name", "tomas", "--no-grants")
         self.assertEqual(len(keys.read_text().splitlines()), 1)
-        self.assertIn("setup-server-backup-pull --key tomas\",restrict ssh-ed25519", keys.read_text())
+        self.assertIn("setup-server-backup-pull --key tomas --pull-all db\",restrict ssh-ed25519", keys.read_text())
         self.assertIn("==> " + str(access) + ": unchanged", self.run_as_root("--refresh"))
         self.run_as_root("--remove", "tomas")
         self.assertEqual(keys.read_text(), "")
-        for grant in ("shop:local=phpfpm", "shop:x=phpfpm", "shop=root", "../x=full", "shop:prod"):
-            with self.subTest(grant=grant), self.assertRaisesRegex(SystemExit, "--grant"):
-                self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24", "--grant", grant)
+        for option, grant in (("--grant", "shop:local=phpfpm"), ("--grant", "shop:x=phpfpm"), ("--grant", "shop=root"),
+                              ("--grant", "../x=full"), ("--grant", "shop:prod"), ("--pull", "shop=full"),
+                              ("--pull", "shop:test=db")):
+            with self.subTest(option=option, grant=grant), self.assertRaisesRegex(SystemExit, option):
+                self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24", option, grant)
 
-    def test_an_existing_key_changes_its_grants_and_fresh_permission_by_name_alone(self):
+    def test_an_existing_key_changes_what_it_is_given_by_name_alone(self):
         keys = self.root / "home/.ssh/authorized_keys"
-        self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24,10.9.0.5")
-        self.run_as_root("--name", "tomas", "--allow-fresh", "--grant", "shop:prod=phpfpm")
+        self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24,10.9.0.5", "--pull-all", "db")
+        self.run_as_root("--name", "tomas", "--grant", "shop:prod=phpfpm", "--pull", "shop:prod=fresh")
         line = keys.read_text().splitlines()[0]
         self.assertTrue(line.startswith('from="10.8.0.0/24,10.9.0.5/32",command="'), line)
-        self.assertIn("--key tomas --allow-fresh --grant shop:prod=phpfpm\",restrict,pty " + KEY.rsplit(" ", 1)[0] + " tomas", line)
+        self.assertIn("--key tomas --pull-all db --pull shop:prod=fresh --grant shop:prod=phpfpm\",restrict,pty "
+                      + KEY.rsplit(" ", 1)[0] + " tomas", line)
+        # Only the networks: the rest stays.
         self.run_as_root("--name", "tomas", "--from", "10.8.0.0/24")
         line = keys.read_text().splitlines()[0]
-        self.assertEqual(line, f'from="10.8.0.0/24",command="{self.root / "sbin/setup-server-backup-pull"} --key tomas",'
-                               f'restrict {KEY.rsplit(" ", 1)[0]} tomas')
+        self.assertIn('from="10.8.0.0/24",command=', line)
+        self.assertIn("--pull-all db --pull shop:prod=fresh --grant shop:prod=phpfpm", line)
+        self.run_as_root("--name", "tomas", "--no-grants", "--no-pulls", "--pull-all", "none")
+        self.assertIn("setup-server-backup-pull --key tomas --pull-all none\",restrict ssh", keys.read_text())
         with self.assertRaises(SystemExit):
             self.run_as_root("--name", "ona", "--grant", "shop:prod=phpfpm")
 

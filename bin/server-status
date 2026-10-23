@@ -394,8 +394,9 @@ def projects():
 # The developer keys bin/add-backup-key writes into the account's authorized_keys: what each may do. Public keys
 # and their options only; other entries (an administrator's own key) are not listed.
 KEY_ENTRY = re.compile(r'from="([^"]*)",command="\S*/setup-server-(backup-pull|access) --key ([A-Za-z0-9][A-Za-z0-9._@-]{0,63})'
-                       r'((?: --allow-fresh)?)((?: --grant [a-z0-9_:=-]+)*)",restrict(?:,pty)? (\S+) ([A-Za-z0-9+/]+={0,3})')
+                       r'((?: [^" ]+)*)",restrict(?:,pty)? (\S+) ([A-Za-z0-9+/]+={0,3})')
 GRANT = re.compile(r'([a-z0-9][a-z0-9_-]*):([a-z][a-z0-9]{1,15})=(phpfpm-readonly|phpfpm|docker|full)')
+PULL = re.compile(r'([a-z0-9][a-z0-9_-]*):([a-z][a-z0-9]{1,15})=(db|fresh)')
 # A request line of backup-pulls.log or access.log: its time, the key and the address.
 USE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) key=([A-Za-z0-9][A-Za-z0-9._@-]{0,63}) from=(\S+)')
 
@@ -539,15 +540,26 @@ def developer_keys(errors):
         if not match:
             continue
         try:
-            blob = base64.b64decode(match[7], validate=True)
+            blob = base64.b64decode(match[6], validate=True)
         except ValueError:
             errors.append(f'authorized_keys: the key of {match[3]} does not decode')
             continue
         fingerprint = 'SHA256:' + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip('=')
-        keys.append({'name': match[3], 'sources': match[1].split(','), 'fresh': bool(match[4]), 'type': match[6],
-                     'fingerprint': fingerprint, 'command': match[2],
+        tokens = match[4].split()
+        values = lambda option, pattern: [found for index, token in enumerate(tokens[:-1]) if token == option
+                                          for found in [pattern.fullmatch(tokens[index + 1])] if found]
+        pull_all = next((tokens[index + 1] for index, token in enumerate(tokens[:-1])
+                         if token == '--pull-all' and tokens[index + 1] in ('none', 'db', 'fresh')), None)
+        pulls = values('--pull', PULL)
+        # Written before the backup grants (bin/add-backup-key): every project, fresh with --allow-fresh.
+        legacy = pull_all is None and not pulls
+        if legacy:
+            pull_all = 'fresh' if '--allow-fresh' in tokens else 'db'
+        keys.append({'name': match[3], 'sources': match[1].split(','), 'type': match[5],
+                     'fingerprint': fingerprint, 'command': match[2], 'legacy': legacy, 'pull_all': pull_all or 'none',
+                     'pulls': [{'project': pull[1], 'environment': pull[2], 'level': pull[3]} for pull in pulls],
                      'grants': [{'project': grant[1], 'environment': grant[2], 'level': grant[3]}
-                                for grant in map(GRANT.fullmatch, match[5].split()[1::2]) if grant],
+                                for grant in values('--grant', GRANT)],
                      'last': uses.get(match[3])})
     return keys
 

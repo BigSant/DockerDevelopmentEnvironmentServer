@@ -42,11 +42,12 @@ def fixture():
         return base64.b64encode(b'\0\0\0\x0bssh-ed25519\0\0\0\x20' + hashlib.sha256(seed.encode()).digest()).decode()
     access = case.sbin / 'setup-server-access'  # the UI's SETUP_SERVER_SBIN: bin/add-backup-key knows its entries by it
     (ssh / 'authorized_keys').write_text(
-        f'from="10.8.0.0/24",command="{access} --key tomas --allow-fresh --grant asana_tracker:prod=full '
+        f'from="10.8.0.0/24",command="{access} --key tomas --pull-all db --pull biofitus:prod=fresh --grant asana_tracker:prod=full '
         f'--grant forsena_docker:stage=docker --grant shop-two:prod=phpfpm --grant biofitus:prod=phpfpm-readonly '
         f'--grant biofitus:stage=docker --grant joldija:prod=phpfpm-readonly --grant joldija:stage=docker '
         f'--grant nespresso:prod=phpfpm --grant nespresso:stage=docker",restrict,pty ssh-ed25519 {blob("tomas")} tomas\n'
-        f'from="10.8.0.0/24",command="{access} --key ona --grant asana_tracker:prod=phpfpm-readonly '
+        f'from="10.8.0.0/24",command="{access} --key ona --pull-all none --pull asana_tracker:prod=db '
+        f'--pull joldija:stage=fresh --grant asana_tracker:prod=phpfpm-readonly '
         f'--grant forsena_docker:stage=phpfpm",restrict,pty ssh-ed25519 {blob("ona")} ona\n'
         f'from="10.8.0.0/24,10.9.0.5/32",command="{case.sbin / "setup-server-backup-pull"} --key qa-ci",restrict '
         f'ssh-ed25519 {blob("qa-ci")} qa-ci\n')
