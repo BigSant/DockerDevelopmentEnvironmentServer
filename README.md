@@ -513,6 +513,8 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
   `/usr/local/lib/setup-server/bin/` (tik tos, kurios įdiegtos) iš naujos versijos: `bin/install-backups --refresh`,
   `bin/install-metrics --refresh`, `bin/add-backup-key --refresh` ir `bin/install-ui --refresh`.
   Pasikeitus metrikų ar sąsajos kopijai, perkraunama paslauga `setup-server-metrics` ar `setup-server-ui` (runner'io – ne).
+  Jei klonas jau ant nurodyto ref'o (pvz. po `git pull`), `bin/update` vis tiek palygina įdiegtas kopijas su klonu
+  (`bin/… --refresh --check`) ir perrašo pasenusias – kitaip sąsaja, vartai ir laikmačiai liktų senos versijos.
   Kiti failai (unit'ai, sudo taisyklės, nustatymai) nekeičiami; jei naujoje versijoje jie kitokie, išvedama pastaba
   `note: … differs` – tada pakartok `sudo bin/install-backups` (laikas lieka), `sudo bin/install-metrics` arba
   `sudo bin/install-ui`. Nepavykus perrašymui ar sveikatos patikrai, kartu su checkout'ais grąžinamos ir ankstesnės kopijos.

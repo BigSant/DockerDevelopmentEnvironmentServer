@@ -72,20 +72,31 @@ installed_copies() {  # the installed command copies, as NAME:INSTALLER
         [ ! -e "$SBIN/${copy%%:*}" ] || echo "$copy"
     done
 }
+installer() {  # installer NAME ARGS — this checkout's bin/NAME as root, with this host's settings
+    local name=$1; shift
+    as_root env SETUP_SERVER_ROOT="$ROOT" SETUP_SERVER_USER="$ACCOUNT" SETUP_SERVER_SBIN="$SBIN" SETUP_SERVER_LIBRARY="$LIBRARY" \
+        SETUP_SERVER_CONFIG="${SETUP_SERVER_CONFIG:-/etc/setup-server}" \
+        SETUP_SERVER_SYSTEMD="${SETUP_SERVER_SYSTEMD:-/etc/systemd/system}" \
+        SETUP_SERVER_SUDOERS="${SETUP_SERVER_SUDOERS:-/etc/sudoers.d}" "$CHECKOUT/bin/$name" "$@"
+}
+stale_copies() {  # the installed copies this checkout would write differently, as NAME:INSTALLER
+    local copy output
+    for copy in $(installed_copies); do
+        grep -q -- '--refresh' "$CHECKOUT/bin/${copy#*:}" 2>/dev/null || continue
+        # Read whole first: grep -q stops at the first match, and under pipefail the installer's SIGPIPE would count.
+        output=$(installer "${copy#*:}" --refresh --check 2>/dev/null) || continue
+        ! grep -q '^==> would \(write\|restart\)' <<<"$output" || echo "$copy"
+    done
+}
 refresh_copies() {  # rewrite the installed copies from this (new) checkout; fails when one fails
-    local copy installer
+    local copy
     for copy in "${copies[@]}"; do
-        installer="$CHECKOUT/bin/${copy#*:}"
         say "Refreshing $SBIN/${copy%%:*} (sudo bin/${copy#*:} --refresh)"
-        if ! grep -q -- '--refresh' "$installer" 2>/dev/null; then
+        if ! grep -q -- '--refresh' "$CHECKOUT/bin/${copy#*:}" 2>/dev/null; then
             echo "    note: this version has no bin/${copy#*:} --refresh; the installed copy is left as it is"
             continue
         fi
-        as_root env SETUP_SERVER_ROOT="$ROOT" SETUP_SERVER_USER="$ACCOUNT" SETUP_SERVER_SBIN="$SBIN" SETUP_SERVER_LIBRARY="$LIBRARY" \
-            SETUP_SERVER_CONFIG="${SETUP_SERVER_CONFIG:-/etc/setup-server}" \
-            SETUP_SERVER_SYSTEMD="${SETUP_SERVER_SYSTEMD:-/etc/systemd/system}" \
-            SETUP_SERVER_SUDOERS="${SETUP_SERVER_SUDOERS:-/etc/sudoers.d}" "$installer" --refresh 2>&1 \
-            | sed 's/^/    /'
+        installer "${copy#*:}" --refresh 2>&1 | sed 's/^/    /'
         [ "${PIPESTATUS[0]}" = 0 ] || return 1
     done
 }
@@ -312,12 +323,19 @@ $changes"
         github_before+=("$unit:$(runner_pid "$unit")")
         say "runner $unit active (PID ${github_before[-1]##*:}); an update never restarts it"
     done
-    if [ -z "$server_target$setup_target" ]; then
+    copies=()
+    if [ -n "$server_target" ]; then
+        mapfile -t copies < <(installed_copies)
+    elif [ -n "$server_ref" ]; then
+        # The checkout is already there (a git pull, an update whose refresh was skipped): the installed copies may
+        # still be older than it, and the web UI, the gate and the timers run those.
+        mapfile -t copies < <(stale_copies)
+        [ ${#copies[@]} -eq 0 ] || say "setup-server is already at $server_ref, but installed copies are older than it"
+    fi
+    if [ -z "$server_target$setup_target" ] && [ ${#copies[@]} -eq 0 ]; then
         say "Nothing to do."
         exit 0
     fi
-    copies=()
-    [ -z "$server_target" ] || mapfile -t copies < <(installed_copies)
     if [ ${#copies[@]} -gt 0 ]; then
         say "Then refresh the installed copies:$(printf " $SBIN/%s" "${copies[@]%%:*}") (sudo; back with the checkouts on a failure)"
     fi

@@ -936,6 +936,25 @@ class UpdateTest(ScriptTest):
         self.assertEqual(self.update("--server-ref", "v0.2.0").returncode, 0)
         self.assertFalse((sbin / "setup-server-metrics").exists())
 
+    def test_copies_older_than_a_checkout_already_at_the_ref_are_refreshed_all_the_same(self):
+        self.fake_root()
+        sbin = self.root / "sbin"
+        sbin.mkdir()
+        (sbin / "setup-server-backup").write_text("previous backup copy\n")
+        self.release_with_installers("v0.5.0", PASSING_TESTS, "release 0.5.0")
+        # The admin pulled by hand: the checkout is at the release, the installed copy is not.
+        self.git("-C", str(self.server), "fetch", "-q", "--tags")
+        self.git("-C", str(self.server), "checkout", "-q", "v0.5.0")
+        check = self.update("--check", "--server-ref", "v0.5.0")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn("already at v0.5.0, but installed copies are older", check.stdout)
+        self.assertIn(f"refresh the installed copies: {sbin}/setup-server-backup", check.stdout)
+        self.assertEqual((sbin / "setup-server-backup").read_text(), "previous backup copy\n")
+        result = self.update("--server-ref", "v0.5.0")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("# release 0.5.0", (sbin / "setup-server-backup").read_text())
+        self.assertIn("Nothing to do", self.update("--server-ref", "v0.5.0").stdout, "now the copies match")
+
     def release_with_ui(self, tag, tests, marker):
         """A setup-server release with the whole real bin/ (what install-ui copies); its web-ui is marked."""
         files = {"tests/test_health.py": tests}
