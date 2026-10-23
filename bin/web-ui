@@ -89,8 +89,18 @@ LEVEL_NOTES = {'phpfpm-readonly': 'php-fpm kaip nobody: failų nekeičia, DB –
                'phpfpm': 'php-fpm projekto vartotoju (APP_UID) arba root konteineryje',
                'docker': 'projekto konteineriai: logs, exec, restart…; be docker run',
                'full': 'taikinio shell; local taikiniui – paskyra setup čia, t. y. root'}
-# A matrix cell of the key forms: grant:<project>:<env> = a level or empty.
-GRANT_FIELD = re.compile(r'grant:([a-z0-9][a-z0-9_-]{0,63}):((?!local$|test$)[a-z][a-z0-9]{1,15})')
+# Backups (make db-pull): db downloads a project environment's, fresh also asks for a new one; "every project"
+# (--pull-all, new projects too) is a level of its own, which a project environment's may raise.
+PULL_LEVELS = ('db', 'fresh')
+PULL = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}(?::(?!local=|test=)[a-z][a-z0-9]{1,15})?=(?:db|fresh)')
+LEVEL_LABELS.update({'db': 'db', 'fresh': 'fresh'})
+LEVEL_NOTES.update({'db': 'parsisiųsti kopijas (make db-pull: registro ir pilnas)',
+                    'fresh': 'ir užsakyti naują kopiją dabar (make db-pull fresh=1; apkrauna projekto DB)'})
+# The two kinds of what a key may do: its field prefix in the forms, its levels, add-backup-key's option.
+KINDS = {'access': ('grant', LEVELS, '--grant', 'Prieiga', 'make ssh'),
+         'backups': ('pull', PULL_LEVELS, '--pull', 'Kopijos', 'make db-pull')}
+# A cell of the key forms: grant:<project>:<env> or pull:<project>:<env> = a level or empty.
+GRANT_FIELD = re.compile(r'(grant|pull):([a-z0-9][a-z0-9_-]{0,63}):((?!local$|test$)[a-z][a-z0-9]{1,15})')
 PUBLIC_KEY = re.compile(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|'
                         r'sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}(?: [^\s]{1,100})?')
 JOB_ID = re.compile(r'\d{8}T\d{6}Z-[0-9a-f]{6}')
@@ -406,13 +416,14 @@ def stored_key(status, name):
     return next((item for item in (status or {}).get('keys', []) if item.get('name') == name), None)
 
 
-def text_grants(form):
-    """{(project, env): level} of the free text field: PROJECT[:ENV]=LEVEL, without ENV both stage and prod."""
+def text_grants(form, kind='access'):
+    """{(project, env): level} of a free text field: PROJECT[:ENV]=LEVEL, without ENV both stage and prod."""
+    field, levels, _, title, _ = KINDS[kind]
     found = {}
-    for grant in form.get('grants', '').replace(',', ' ').split():
-        if not GRANT.fullmatch(grant):
-            raise Invalid(f'„Prieiga“: {grant} – rašyk PROJEKTAS[:APLINKA]=LYGIS (aplinka stage, prod, mdv…; be jos – '
-                          'stage ir prod), lygis phpfpm-readonly, phpfpm, docker arba full.')
+    for grant in form.get(f'{field}s', '').replace(',', ' ').split():
+        if not (GRANT if kind == 'access' else PULL).fullmatch(grant):
+            raise Invalid(f'„{title}“: {grant} – rašyk PROJEKTAS[:APLINKA]=LYGIS (aplinka stage, prod, mdv…; be jos – '
+                          f'stage ir prod), lygis {", ".join(levels)}.')
         target, level = grant.split('=')
         project, _, environment = target.partition(':')
         for one in [environment] if environment else ['stage', 'prod']:
@@ -420,14 +431,14 @@ def text_grants(form):
     return found
 
 
-def grant_changes(before, after):
+def grant_changes(before, after, kind='access'):
     """What a key's grants become: (kind, text) lines for the preview, a project environment per line."""
-    changes = []
+    changes, prefix = [], '' if kind == 'access' else 'kopijos: '
     for item in sorted(set(before) | set(after), key=lambda pair: (pair[0], environment_order(pair[1]))):
         old, new = before.get(item), after.get(item)
         if old == new:
             continue
-        where = f'{item[0]} {item[1]}'
+        where = f'{prefix}{item[0]} {item[1]}'
         if new is None:
             changes.append(('bad', f'− {where}: atimama {LEVEL_LABELS[old]}'))
         elif old is None:
@@ -437,17 +448,21 @@ def grant_changes(before, after):
     return changes
 
 
-def key_plan(name, stored, granted, public_key, sources, fresh, title):
-    """bin/add-backup-key with the key's whole grant list; the preview lists what changes."""
+def key_plan(name, stored, granted, pulls, pull_all, public_key, sources, title):
+    """bin/add-backup-key with the key's whole lists (written explicitly, so nothing depends on what it kept);
+    the preview lists what changes."""
     arguments = (['-'] if public_key else []) + ['--name', name] + (['--from', ','.join(sources)] if sources else [])
-    arguments += ['--allow-fresh'] if fresh else []
+    arguments += ['--pull-all', pull_all]
+    arguments += [word for (project, environment), level in sorted(pulls.items())
+                  for word in ('--pull', f'{project}:{environment}={level}')] or ['--no-pulls']
     arguments += [word for (project, environment), level in sorted(granted.items())
-                  for word in ('--grant', f'{project}:{environment}={level}')]
+                  for word in ('--grant', f'{project}:{environment}={level}')] or ['--no-grants']
     plan = Plan('add-backup-key', title, *command('add-backup-key', arguments), stdin=public_key + '\n' if public_key else None)
-    plan.changes = grant_changes(key_grants(stored), granted)
+    plan.changes = grant_changes(key_grants(stored), granted) + grant_changes(key_grants(stored, 'backups'), pulls, 'backups')
+    before = (stored or {}).get('pull_all', 'none')
+    if before != pull_all:
+        plan.changes.append(('warn' if stored else 'ok', f'kopijos, visi projektai (ir nauji): {before} → {pull_all}'))
     if stored is not None:
-        if bool(stored.get('fresh')) != fresh:
-            plan.changes.append(('warn', 'šviežios kopijos: ' + ('leidžiamos' if fresh else 'nebeleidžiamos')))
         if sources and sources != stored.get('sources'):
             plan.changes.append(('warn', f'iš kur: {", ".join(stored.get("sources", []))} → {", ".join(sources)}'))
         if public_key:
@@ -457,9 +472,9 @@ def key_plan(name, stored, granted, public_key, sources, fresh, title):
 
 
 def plan_add_backup_key(form, status):
-    """A new developer key, or a change of an existing one. A key page sends merge=yes: the matrix cells it shows
-    change those project environments only (a filtered list keeps the rest), and without fresh_given the fresh
-    permission stays. Without a pasted key the stored key stays, with the networks left empty its networks."""
+    """A new developer key, or a change of an existing one. A key page sends merge=yes: the cells it shows change
+    those project environments only (a filtered list keeps the rest). Without a pasted key the stored key stays,
+    with the networks left empty its networks; pull_all, when sent, sets every project's backups."""
     lines = [line.strip() for line in form.get('public_key', '').splitlines() if line.strip()]
     name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
     stored = stored_key(status, name)
@@ -472,52 +487,63 @@ def plan_add_backup_key(form, status):
     sources = networks(form.get('sources', ''), 'Iš kur')
     if not sources and stored is None:
         raise Invalid('„Iš kur“: nurodyk VPN tinklą, pvz. 10.8.0.0/24.')
-    granted = dict(key_grants(stored)) if flag(form, 'merge') else {}
+    merge = flag(form, 'merge')
+    found = {'access': dict(key_grants(stored)) if merge else {},
+             'backups': dict(key_grants(stored, 'backups')) if merge else {}}
+    pull_all = form.get('pull_all', (stored or {}).get('pull_all', 'none') if merge else 'none') or 'none'
+    if pull_all not in ('none', *PULL_LEVELS):
+        raise Invalid(f'„Kopijos“: nežinomas lygis {pull_all}.')
     columns = access_columns(status)
-    for environment in ('prod', 'stage'):  # a new key's starting level for every project environment of that name
-        level = form.get(f'bulk:{environment}', '')
-        if level and level not in LEVELS:
-            raise Invalid(f'„Prieiga“: nežinomas lygis {level}.')
-        if level:
-            granted.update({(project, environment): level for project, one in columns if one == environment})
+    for kind, (field, levels, _, title, _) in KINDS.items():
+        for environment in ('prod', 'stage'):  # a new key's starting level for every project environment of that name
+            level = form.get(f'start:{field}:{environment}', '')
+            if level and level not in levels:
+                raise Invalid(f'„{title}“: nežinomas lygis {level}.')
+            if level:
+                found[kind].update({(project, environment): level for project, one in columns if one == environment})
     for key, chosen in form.items():
         match = GRANT_FIELD.fullmatch(key)
-        if key.startswith('grant:') and not match:
+        if key.startswith(('grant:', 'pull:')) and not match:
             raise Invalid('„Prieiga“: netinkamas projektas ar aplinka.')
         if match:
-            if chosen and chosen not in LEVELS:
-                raise Invalid(f'„Prieiga“: nežinomas lygis {chosen}.')
+            kind = 'access' if match[1] == 'grant' else 'backups'
+            if chosen and chosen not in KINDS[kind][1]:
+                raise Invalid(f'„{KINDS[kind][3]}“: nežinomas lygis {chosen}.')
             if chosen:
-                granted[(match[1], match[2])] = chosen
+                found[kind][(match[2], match[3])] = chosen
             else:
-                granted.pop((match[1], match[2]), None)
-    granted.update(text_grants(form))
-    fresh = flag(form, 'allow_fresh') if form.get('fresh_given') or stored is None else bool(stored.get('fresh'))
+                found[kind].pop((match[2], match[3]), None)
+    found['access'].update(text_grants(form))
+    found['backups'].update(text_grants(form, 'backups'))
     title = f'Naujas raktas {name}' if stored is None else f'Rakto {name} pakeitimas'
-    return key_plan(name, stored, granted, lines[0] if lines else '', sources, fresh, title)
+    return key_plan(name, stored, found['access'], found['backups'], pull_all, lines[0] if lines else '', sources, title)
 
 
 def plan_key_bulk(form, status):
-    """One level for every prod, every stage or every environment of an existing key, or only where it has access."""
+    """One level of access or backups for every prod, every stage or every environment of an existing key, or only
+    where it already has some."""
     name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
     stored = stored_key(status, name)
     if stored is None:
         raise Invalid(f'Rakto vardu {name} nėra.')
+    kind = form.get('kind', 'access')
     scope, level, only = form.get('scope', ''), form.get('level', ''), form.get('only') == 'existing'
-    if scope not in ('prod', 'stage', 'other', 'all') or (level and level not in LEVELS):
+    if kind not in KINDS or scope not in ('prod', 'stage', 'other', 'all') or (level and level not in KINDS[kind][1]):
         raise Invalid('Pasirink aplinką (prod, stage, kitos, visos) ir lygį.')
-    before = key_grants(stored)
-    granted = dict(before)
+    granted, pulls = dict(key_grants(stored)), dict(key_grants(stored, 'backups'))
+    changed = granted if kind == 'access' else pulls
+    before = dict(changed)
     for item in access_columns(status):
         wanted = scope == 'all' or item[1] == scope or (scope == 'other' and item[1] not in ('prod', 'stage'))
         if wanted and (not only or item in before):
             if level:
-                granted[item] = level
+                changed[item] = level
             else:
-                granted.pop(item, None)
+                changed.pop(item, None)
     what = {'prod': 'visos prod', 'stage': 'visos stage', 'other': 'kitos aplinkos', 'all': 'visos aplinkos'}[scope]
-    title = f'{name}: {what} → {LEVEL_LABELS.get(level, "be prieigos")}' + (' (tik kur jau turi)' if only else '')
-    plan = key_plan(name, stored, granted, '', [], bool(stored.get('fresh')), title)
+    title = (f'{name}: {KINDS[kind][3].lower()}, {what} → {LEVEL_LABELS.get(level, "be leidimo")}' +
+             (' (tik kur jau turi)' if only else ''))
+    plan = key_plan(name, stored, granted, pulls, stored.get('pull_all', 'none'), '', [], title)
     if not plan.changes:
         plan.changes = [('muted', 'nieko nesikeičia')]
     return plan
@@ -1479,6 +1505,23 @@ border-bottom:1px dashed var(--rule);margin:0}
 .board.activity td.text code{margin-left:4px}
 .board.activity td.text small{display:block;margin-top:2px}
 .term.typed li::before{content:"$";color:var(--amber)}
+.lv.lv-db{color:#cfe0fa;border-color:rgba(111,147,201,.6);background:rgba(111,147,201,.14)}
+.lv.lv-fresh{color:#1a1205;background:#e8c56b;border-color:#e8c56b}
+.ramp.backups{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:6px}
+.ramp .lv-db{border-top-color:var(--steel)}.ramp .lv-db b{color:#cfe0fa}
+.ramp .lv-fresh{border-top-color:#e8c56b}.ramp .lv-fresh b{color:#e8c56b}
+.seg .lv-db input:checked+span{background:rgba(111,147,201,.3);color:#d6e4fa}
+.seg .lv-fresh input:checked+span{background:#e8c56b;color:#1a1205}
+.tabs{display:flex;gap:4px;margin:26px 0 0;border-bottom:1px solid var(--rule);scroll-margin-top:16px}
+.tabs a{padding:9px 16px 8px;border:1px solid var(--rule);border-bottom:none;border-radius:4px 4px 0 0;color:var(--dim);
+font-size:11px;letter-spacing:.14em;text-transform:uppercase;font-weight:700;background:var(--panel);margin-bottom:-1px}
+.tabs a small{letter-spacing:0;text-transform:none;font-weight:400;color:var(--faint);margin-left:6px}
+.tabs a.on{color:var(--amber);background:var(--panel-2);border-color:var(--amber);border-bottom:1px solid var(--panel-2);
+box-shadow:inset 0 2px 0 var(--amber)}
+.tabs a:hover{text-decoration:none;color:var(--ink)}
+form.bulk.everything{grid-template-columns:9.5em auto minmax(0,1fr) auto;background:var(--panel-2);border:1px solid var(--rule);
+border-top:none;padding:10px 16px;margin:0 0 12px}
+.tabs+.bulkbox,.tabs+form+.bulkbox,.tabs+form+.callout+.bulkbox{border-top:none;border-radius:0 0 4px 4px}
 .foot{margin-top:28px;color:var(--faint);font-size:11px}
 """ + ''.join(f'.unit:nth-child({index}),.board tbody tr:nth-child({index}),.step:nth-child({index}){{animation-delay:{(index - 1) * 45}ms}}'
               for index in range(2, 21)) + """
@@ -1570,7 +1613,7 @@ def environment_kind(state):
 
 
 def level_chip(level):
-    if level not in LEVELS:
+    if level not in LEVEL_NOTES:
         return '<span class="lv lv-none">·</span>'
     return f'<span class="lv lv-{level}" title="{e(LEVEL_NOTES[level])}">{e(LEVEL_LABELS[level])}</span>'
 
@@ -1584,7 +1627,8 @@ def access_columns(data):
     """[(project, env)] a key may be granted: every environment the status shows, and any a key already has."""
     found = {(entry['name'], environment) for entry in (data or {}).get('projects', [])
              for environment in entry.get('environments', {})}
-    found |= {(grant['project'], grant['environment']) for key in (data or {}).get('keys', []) for grant in key.get('grants', [])}
+    found |= {(grant['project'], grant['environment']) for key in (data or {}).get('keys', [])
+              for grant in key.get('grants', []) + key.get('pulls', [])}
     return sorted(found, key=lambda item: (item[0], environment_order(item[1])))
 
 
@@ -1604,8 +1648,17 @@ ACTIVITY_WORDS = {'latest': 'kopijos vardas', 'info': 'kopijos dydis', 'get': 'p
                   '': 'prisijungė'}
 
 
-def key_grants(key):
-    return {(grant['project'], grant['environment']): grant['level'] for grant in (key or {}).get('grants', [])}
+def key_grants(key, kind='access'):
+    """{(project, env): level} of a key's access grants (make ssh) or its backups of single environments."""
+    return {(grant['project'], grant['environment']): grant['level']
+            for grant in (key or {}).get('grants' if kind == 'access' else 'pulls', [])}
+
+
+def pull_level(key, project, environment):
+    """The backups a key gets of one project environment: every project's level, or that environment's above it."""
+    levels = ('none', *PULL_LEVELS)
+    return max((key or {}).get('pull_all', 'none'), key_grants(key, 'backups').get((project, environment), 'none'),
+               key=levels.index)
 
 
 def git_line(state, tag_word=True):
@@ -2096,12 +2149,12 @@ class Page:
 
     # --- Access: developer keys and what each may reach ---
     @staticmethod
-    def seg(name, current):
-        """A segmented choice of a level (radios: no script needed); '' is no access."""
+    def seg(name, current, levels=LEVELS, none='—'):
+        """A segmented choice of a level (radios: no script needed); '' is none."""
         return '<div class="seg">' + ''.join(
             f'<label class="lv-{level or "none"}"><input type="radio" name="{e(name)}" value="{e(level)}"'
-            f'{" checked" if level == current else ""}><span>{e(LEVEL_LABELS.get(level, "—"))}</span></label>'
-            for level in ('', *LEVELS)) + '</div>'
+            f'{" checked" if level == current else ""}><span>{e(LEVEL_LABELS.get(level, none))}</span></label>'
+            for level in ('', *levels)) + '</div>'
 
     @staticmethod
     def last_use(key):
@@ -2112,8 +2165,8 @@ class Page:
         return f'{e(ago(last["at"]))} <span class="muted">{e(what)} · {e(last["from"])}</span>'
 
     @staticmethod
-    def summary(granted, wanted):
-        """How many environments of one kind (prod, stage, the others) the key reaches at each level."""
+    def summary(granted, wanted=lambda environment: True, levels=LEVELS):
+        """How many environments (of one kind: prod, stage, the others) a key has at each level."""
         counts = {}
         for (_, environment), level in granted.items():
             if wanted(environment):
@@ -2121,7 +2174,21 @@ class Page:
         if not counts:
             return '<span class="muted">—</span>'
         return ' '.join(f'<span class="tallied"><span class="tally">{count}</span>{level_chip(level)}</span>'
-                        for level, count in sorted(counts.items(), key=lambda item: -LEVELS.index(item[0])))
+                        for level, count in sorted(counts.items(), key=lambda item: -levels.index(item[0])))
+
+    def backups_summary(self, key, granted=None):
+        """Every project's backup level and the environments raised above it."""
+        everything = key.get('pull_all', 'none')
+        text = (f'<span class="tallied"><span class="tally">visi</span>{level_chip(everything)}</span>'
+                if everything != 'none' else '')
+        pulls = key_grants(key, 'backups') if granted is None else granted
+        raised = {item: level for item, level in pulls.items()
+                  if PULL_LEVELS.index(level) > (PULL_LEVELS.index(everything) if everything in PULL_LEVELS else -1)}
+        if raised:
+            text += ' ' + self.summary(raised, levels=PULL_LEVELS)
+        if key.get('legacy'):
+            text += ' <span class="chip muted" title="įrašas iš prieš kopijų leidimus: pakeitus taps aiškus">senas</span>'
+        return text.strip() or '<span class="muted">—</span>'
 
     def access(self, data, error, query=''):
         if data is None:
@@ -2129,15 +2196,20 @@ class Page:
                                section='access')
         keys, columns = data.get('keys', []), access_columns(data)
         wanted = query.strip().lower()
+        reaches = lambda key: {project for project, _ in [*key_grants(key), *key_grants(key, 'backups')]}
         shown = [key for key in keys if not wanted or wanted in key['name'].lower() or
-                 any(wanted in project for project, _ in key_grants(key))]
+                 any(wanted in project for project in reaches(key)) or key.get('pull_all', 'none') != 'none']
         with_access = sum(1 for key in keys if key.get('grants'))
-        stats = [(len(keys), 'raktai'), (with_access, 'su prieiga'), (len(keys) - with_access, 'tik kopijos'),
+        everything = sum(1 for key in keys if key.get('pull_all', 'none') != 'none')
+        stats = [(len(keys), 'raktai'), (with_access, 'su prieiga'), (everything, 'visų kopijos'),
                  (len(project_rows(columns)), 'projektai'), (len(columns), 'aplinkos')]
         body = '<div class="stats">' + ''.join(f'<div class="stat"><b>{e(number)}</b><span>{e(label)}</span></div>'
                                                for number, label in stats) + '</div>'
         body += ('<ol class="ramp">' + ''.join(f'<li class="lv-{level}"><b>{e(LEVEL_LABELS[level])}</b>'
-                                               f'<span>{e(LEVEL_NOTES[level])}</span></li>' for level in LEVELS) + '</ol>')
+                                               f'<span>{e(LEVEL_NOTES[level])}</span></li>' for level in LEVELS) + '</ol>'
+                 '<ol class="ramp backups">' + ''.join(f'<li class="lv-{level}"><b>{e(LEVEL_LABELS[level])}</b>'
+                                                       f'<span>{e(LEVEL_NOTES[level])}</span></li>' for level in PULL_LEVELS) +
+                 '</ol>')
         body += ('<div class="toolbar"><form class="search" method="get" action="/access">'
                  f'<input type="text" name="q" value="{e(query)}" placeholder="raktas ar projektas" autocomplete="off">'
                  '<button>Ieškoti</button></form><a class="btn go" href="/access/new">+ Pridėti raktą</a></div>')
@@ -2148,23 +2220,25 @@ class Page:
         else:
             rows = []
             for key in shown:
-                granted = key_grants(key)
+                granted, pulls = key_grants(key), key_grants(key, 'backups')
                 if wanted and wanted not in key['name'].lower():
                     granted = {item: level for item, level in granted.items() if wanted in item[0]}
-                backups = badge('db-pull', 'ok') + (' ' + badge('fresh', 'warn') if key.get('fresh') else '')
-                rows.append(f'<tr class="is-{"ok" if key.get("grants") else "idle"}">'
+                    pulls = {item: level for item, level in pulls.items() if wanted in item[0]}
+                rows.append(f'<tr class="is-{"ok" if key.get("grants") or key.get("pulls") or key.get("pull_all", "none") != "none" else "idle"}">'
                             f'<td class="keyname"><a href="/access/{e(quote(key["name"]))}">{e(key["name"])}</a>'
                             f'<small>{e(key.get("fingerprint", ""))}</small></td>'
                             f'<td>{self.summary(granted, lambda name: name == "prod")}</td>'
                             f'<td>{self.summary(granted, lambda name: name == "stage")}</td>'
                             f'<td>{self.summary(granted, lambda name: name not in ("prod", "stage"))}</td>'
-                            f'<td>{backups}</td><td>{" ".join(badge(source, "muted") for source in key.get("sources", []))}</td>'
+                            f'<td>{self.backups_summary(key, pulls)}</td>'
+                            f'<td>{" ".join(badge(source, "muted") for source in key.get("sources", []))}</td>'
                             f'<td>{self.last_use(key)}</td></tr>')
-            body += ('<div class="scroll"><table class="board keys"><thead><tr><th>Raktas</th><th>prod</th><th>stage</th>'
-                     '<th>kitos</th><th>Kopijos</th><th>Iš kur</th><th>Paskutinį kartą</th></tr></thead><tbody>' +
-                     ''.join(rows) + '</tbody></table></div>')
+            body += ('<div class="scroll"><table class="board keys"><thead><tr><th>Raktas</th><th>prieiga prod</th>'
+                     '<th>stage</th><th>kitos</th><th>Kopijos (db-pull)</th><th>Iš kur</th><th>Paskutinį kartą</th></tr></thead>'
+                     '<tbody>' + ''.join(rows) + '</tbody></table></div>')
             if wanted:
-                body += f'<p class="note">Rodoma, kur raktai pasiekia „{e(query)}“. <a href="/access">Visi raktai</a></p>'
+                body += (f'<p class="note">Rodoma, kur raktai pasiekia „{e(query)}“ (ir raktai su visų projektų kopijomis). '
+                         '<a href="/access">Visi raktai</a></p>')
         body += '<h2>Paskutinė veikla</h2>' + self.activity_table(self.recent, keys=True, limit=25)
         body += '<p class="note"><a href="/logs#activity">Visa veikla – Žurnalai</a></p>'
         return self.layout('Prieiga', body, section='access')
@@ -2181,38 +2255,60 @@ class Page:
         text = lambda name, label, placeholder='', value='': (
             f'<label><span>{e(label)}</span><input type="text" name="{name}" value="{e(value)}" placeholder="{e(placeholder)}" '
             'autocomplete="off"></label>')
-        start = ''.join(f'<tr><td><span class="sign {environment}">{environment}</span></td>'
-                        f'<td>{self.seg(f"bulk:{environment}", "")}</td></tr>' for environment in ('prod', 'stage'))
+        start = lambda field, levels: ''.join(
+            f'<tr><td><span class="sign {environment}">{environment}</span></td>'
+            f'<td>{self.seg(f"start:{field}:{environment}", "", levels)}</td></tr>' for environment in ('prod', 'stage'))
         fields = ('<input type="hidden" name="new" value="yes">'
                   '<label><span>Viešasis raktas (.pub)</span><textarea name="public_key" spellcheck="false" '
                   'placeholder="ssh-ed25519 AAAA… vardas@kompiuteris"></textarea></label>' +
                   text('key_name', 'Vardas (žurnaluose)', 'tomas') + text('sources', 'Iš kur (VPN tinklas)', '10.8.0.0/24', common) +
-                  '<label class="check"><input type="checkbox" name="allow_fresh" value="yes"> gali prašyti šviežios DB kopijos '
-                  '(make db-pull fresh=1; apkrauna projekto DB)</label>'
-                  '<p class="block-label">Pradinė prieiga visiems projektams</p><table class="grants">' + start + '</table>'
-                  '<p class="note">Atskiriems projektams ją pakeisi rakto puslapyje.</p>'
+                  '<p class="block-label">Kopijos (make db-pull)</p><table class="grants">'
+                  f'<tr><td><span class="chip muted">visi projektai</span></td><td>{self.seg("pull_all", "", PULL_LEVELS)}</td></tr>' +
+                  start('pull', PULL_LEVELS) + '</table>'
+                  '<p class="block-label">Prieiga (make ssh)</p><table class="grants">' + start('grant', LEVELS) + '</table>'
+                  '<p class="note">„Visi projektai“ galioja ir naujiems; prod/stage – visiems dabartiniams. Atskiriems projektams '
+                  'pakeisi rakto puslapyje.</p>'
                   '<details class="more"><summary>Tik konkretūs projektai</summary><div class="inner">' +
-                  text('grants', 'Leidimai', 'shop:prod=phpfpm-readonly shop:stage=docker') + '</div></details>')
+                  text('pulls', 'Kopijos', 'shop:prod=db shop:stage=fresh') +
+                  text('grants', 'Prieiga', 'shop:prod=phpfpm-readonly shop:stage=docker') + '</div></details>')
         body = '<p><a href="/access">← Prieiga</a></p><div class="deck wide">' + self.form(
-            'add-backup-key', 'Naujas raktas', fields, note='Kopijos (make db-pull) – visų projektų. Peržiūra parodo, ką '
-            'raktas gaus; „Vykdyti“ įrašo jį į authorized_keys.', command='bin/add-backup-key') + '</div>'
+            'add-backup-key', 'Naujas raktas', fields, note='Be pasirinkimų raktas nepasiekia nieko. Peržiūra parodo, ką raktas '
+            'gaus; „Vykdyti“ įrašo jį į authorized_keys.', command='bin/add-backup-key') + '</div>'
         return self.layout('Naujas raktas', body, section='access')
 
-    def key_page(self, data, name, events, query='', only_granted=False):
+    def key_page(self, data, name, events, query='', only_granted=False, tab='access'):
         key = next((item for item in (data or {}).get('keys', []) if item.get('name') == name), None)
         if key is None:
             return None
-        granted, columns = key_grants(key), access_columns(data)
-        hidden = lambda fields: ''.join(f'<input type="hidden" name="{e(field)}" value="{e(text)}">' for field, text in fields)
+        tab = tab if tab in KINDS else 'access'
+        field, levels, _, title, tool = KINDS[tab]
+        granted, columns = key_grants(key, tab), access_columns(data)
+        access = key_grants(key)
+        hidden = lambda fields: ''.join(f'<input type="hidden" name="{e(name_)}" value="{e(text)}">' for name_, text in fields)
         body = ('<p><a href="/access">← Prieiga</a></p><div class="keyhead">'
                 f'<div><p class="plate-name">raktas</p><p class="keytitle">{e(name)}</p>'
                 f'<p class="plate-line">{e(key.get("type", ""))} <code>{e(key.get("fingerprint", ""))}</code></p></div>'
                 f'<div><p class="plate-name">iš kur</p><p>{" ".join(badge(source, "muted") for source in key.get("sources", []))}</p></div>'
-                f'<div><p class="plate-name">kopijos</p><p>{badge("db-pull", "ok")}'
-                f'{" " + badge("fresh", "warn") if key.get("fresh") else ""}</p></div>'
-                f'<div><p class="plate-name">prod</p><p>{self.summary(granted, lambda one: one == "prod")}</p></div>'
-                f'<div><p class="plate-name">stage</p><p>{self.summary(granted, lambda one: one == "stage")}</p></div>'
+                f'<div><p class="plate-name">kopijos</p><p>{self.backups_summary(key)}</p></div>'
+                f'<div><p class="plate-name">prieiga prod</p><p>{self.summary(access, lambda one: one == "prod")}</p></div>'
+                f'<div><p class="plate-name">prieiga stage</p><p>{self.summary(access, lambda one: one == "stage")}</p></div>'
                 f'<div><p class="plate-name">paskutinį kartą</p><p>{self.last_use(key)}</p></div></div>')
+        link = lambda kind: f'/access/{quote(name)}?tab={kind}' + (f'&amp;q={quote(query)}' if query else '') + \
+            ('&amp;granted=1' if only_granted else '') + '#projects'
+        body += ('<nav class="tabs" id="projects">' + ''.join(
+            f'<a class="{"on" if kind == tab else ""}" href="{link(kind)}">{e(label)} <small>{e(command_)}</small></a>'
+            for kind, (_, _, _, label, command_) in KINDS.items()) + '</nav>')
+        if tab == 'backups':
+            everything = key.get('pull_all', 'none')
+            body += (f'<form class="bulk everything" method="post" action="/preview">'
+                     f'{self.hidden("add-backup-key", [("key_name", name), ("merge", "yes")])}'
+                     f'<span class="bulk-scope"><span class="chip muted">visi projektai</span></span>'
+                     f'{self.seg("pull_all", "" if everything == "none" else everything, PULL_LEVELS)}'
+                     '<span class="note">ir nauji; projekto aplinkos leidimas gali būti tik didesnis</span>'
+                     '<button>Peržiūrėti</button></form>')
+            if key.get('legacy'):
+                body += ('<div class="callout warn"><p>Šis įrašas sukurtas prieš kopijų leidimus: jis gali traukti visų projektų '
+                         f'kopijas ({e(everything)}). Pirmas pakeitimas tai įrašys aiškiai („visi projektai“).</p></div>')
         # Every prod, every stage or every environment at once.
         bulk = []
         others = sorted({environment for _, environment in columns if environment not in ('prod', 'stage')})
@@ -2220,53 +2316,59 @@ class Page:
         if others:
             scopes.append(('other', f'<span class="sign" title="{e(", ".join(others))}">kitos</span>'))
         for scope, label in scopes + [('all', '<span class="chip muted">visos</span>')]:
-            bulk.append(f'<form class="bulk" method="post" action="/preview">{self.hidden("key-bulk", [("key_name", name), ("scope", scope)])}'
-                        f'<span class="bulk-scope">{label}</span>{self.seg("level", "")}'
+            bulk.append(f'<form class="bulk" method="post" action="/preview">'
+                        f'{self.hidden("key-bulk", [("key_name", name), ("scope", scope), ("kind", tab)])}'
+                        f'<span class="bulk-scope">{label}</span>{self.seg("level", "", levels)}'
                         '<span class="bulk-only"><label class="check"><input type="radio" name="only" value="all" checked> visiems projektams'
                         '</label><label class="check"><input type="radio" name="only" value="existing"> tik kur jau turi</label></span>'
                         '<button>Peržiūrėti</button></form>')
-        body += ('<h2>Visoms iš karto</h2><div class="bulkbox">' + ''.join(bulk) +
-                 '<p class="note">„—“ atima prieigą. Peržiūra parodo kiekvieną pasikeisiančią aplinką; nieko nekeičia, kol nespaudi '
+        body += ('<div class="bulkbox"><p class="block-label">Visoms iš karto</p>' + ''.join(bulk) +
+                 '<p class="note">„—“ atima. Peržiūra parodo kiekvieną pasikeisiančią aplinką; nieko nekeičia, kol nespaudi '
                  '„Vykdyti“.</p></div>')
-        # One row per project, its environments side by side; a filter narrows a long list.
+        # One row per project, its environments side by side; a filter narrows a long list. Without a level of its
+        # own a project environment has every project's backups: the empty choice says which.
+        everything = key.get('pull_all', 'none') if tab == 'backups' else 'none'
+        inherited = f'visi: {everything}' if everything != 'none' else '—'
         wanted = query.strip().lower()
         rows = [(project, environments) for project, environments in project_rows(columns)
                 if (not wanted or wanted in project) and
                 (not only_granted or any((project, one) in granted for one in environments))]
-        body += (f'<h2 id="projects">Projektai</h2><form class="toolbar search" method="get" action="/access/{e(quote(name))}#projects">'
+        body += (f'<form class="toolbar search" method="get" action="/access/{e(quote(name))}#projects">'
+                 f'<input type="hidden" name="tab" value="{e(tab)}">'
                  f'<input type="text" name="q" value="{e(query)}" placeholder="projektas" autocomplete="off">'
                  f'<label class="check"><input type="checkbox" name="granted" value="1"{" checked" if only_granted else ""}> '
-                 f'tik su prieiga</label><button>Rodyti</button><span class="note">{len(rows)} iš {len(project_rows(columns))}</span></form>')
+                 f'tik su leidimu</label><button>Rodyti</button><span class="note">{len(rows)} iš {len(project_rows(columns))}</span></form>')
         if rows:
             def slot(project, environment, environments):
                 # prod and stage keep their place in every row, so the levels line up down the list.
                 if environment not in environments:
                     return '<div class="env"></div>'
                 return (f'<div class="env"><span class="sign {e(environment)}">{e(environment)}</span>'
-                        f'{self.seg(f"grant:{project}:{environment}", granted.get((project, environment), ""))}</div>')
+                        f'{self.seg(f"{field}:{project}:{environment}", granted.get((project, environment), ""), levels, inherited)}</div>')
             lines = ''.join(
-                f'<tr><td class="id">{e(project)}</td><td><div class="envs">' +
+                f'<tr><td class="id">{e(project)}</td><td><div class="envs {e(tab)}">' +
                 ''.join(slot(project, environment, environments)
                         for environment in ('prod', 'stage', *[one for one in environments if one not in ('prod', 'stage')])) +
                 '</div></td></tr>' for project, environments in rows)
+            note = ('Keičiamos tik rodomos aplinkos; filtro paslėptos lieka kaip yra.' +
+                    (' „—“ kopijoms – lieka „visi projektai“ lygis.' if tab == 'backups' else ''))
             body += (f'<form class="action" method="post" action="/preview">{self.hidden("add-backup-key", [("key_name", name), ("merge", "yes")])}'
-                     f'<table class="grants projects">{lines}</table><div class="form-foot"><p class="note">Keičiamos tik rodomos '
-                     'aplinkos; filtro paslėptos lieka kaip yra.</p><button>Peržiūrėti pakeitimus</button></div></form>')
+                     f'<table class="grants projects">{lines}</table><div class="form-foot"><p class="note">{note}</p>'
+                     '<button>Peržiūrėti pakeitimus</button></div></form>')
         else:
             body += '<div class="empty">Nė vienas projektas neatitinka filtro.</div>'
-        # The key itself: networks, fresh backups, a new public key, a project not on this server yet.
-        text = lambda field, label, placeholder='', current='': (
-            f'<label><span>{e(label)}</span><input type="text" name="{field}" value="{e(current)}" placeholder="{e(placeholder)}" '
+        # The key itself: networks, a new public key, a project not on this server yet.
+        text = lambda field_, label, placeholder='', current='': (
+            f'<label><span>{e(label)}</span><input type="text" name="{field_}" value="{e(current)}" placeholder="{e(placeholder)}" '
             'autocomplete="off"></label>')
-        settings = (hidden([('key_name', name), ('merge', 'yes'), ('fresh_given', 'yes')]) +
+        settings = (hidden([('key_name', name), ('merge', 'yes')]) +
                     text('sources', 'Iš kur (VPN tinklai)', '10.8.0.0/24', ','.join(key.get('sources', []))) +
-                    f'<label class="check"><input type="checkbox" name="allow_fresh" value="yes"{" checked" if key.get("fresh") else ""}> '
-                    'gali prašyti šviežios DB kopijos (make db-pull fresh=1)</label>' +
-                    text('grants', 'Projektas, kurio čia dar nėra', 'shop:prod=phpfpm-readonly') +
+                    text('pulls', 'Kopijos projektui, kurio čia dar nėra', 'shop:prod=db') +
+                    text('grants', 'Prieiga projektui, kurio čia dar nėra', 'shop:prod=phpfpm-readonly') +
                     '<label><span>Naujas viešasis raktas</span><textarea name="public_key" spellcheck="false" '
                     'placeholder="tuščia – lieka dabartinis"></textarea></label>')
         body += ('<h2>Rakto nustatymai</h2><div class="deck">' +
-                 self.form('add-backup-key', 'Tinklai, kopijos, raktas', settings,
+                 self.form('add-backup-key', 'Tinklai, raktas', settings,
                            note='Naujas raktas galioja visoms šio rakto aplinkoms iš karto.', command=f'bin/add-backup-key --name {name}') +
                  self.form('remove-backup-key', f'Atimti raktą {name}', f'<input type="hidden" name="key_name" value="{e(name)}">',
                            note='Raktas nebegalės nei parsisiųsti kopijų, nei prisijungti prie taikinių.',
@@ -2376,13 +2478,16 @@ class Page:
         rows = []
         for key in (data or {}).get('keys', []):
             granted = {environment: level for (project, environment), level in key_grants(key).items() if project == name}
-            if granted:
+            pulls = {environment: pull_level(key, name, environment) for environment in environments}
+            if granted or any(level != 'none' for level in pulls.values()):
                 rows.append(f'<tr><td class="id"><a href="/access/{e(quote(key["name"]))}?q={e(quote(name))}#projects">{e(key["name"])}</a></td>' +
-                            ''.join(f'<td>{level_chip(granted.get(environment))}</td>' for environment in environments) + '</tr>')
+                            ''.join(f'<td>{level_chip(granted.get(environment))} {level_chip(pulls[environment])}</td>'
+                                    for environment in environments) + '</tr>')
         if not rows:
-            return '<div class="empty">Šio projekto taikinių per šį serverį niekas nepasiekia. <a href="/access">Prieiga</a></div>'
+            return '<div class="empty">Šio projekto niekas nepasiekia nei per make ssh, nei per make db-pull. <a href="/access">Prieiga</a></div>'
         return ('<table class="list"><tr><th>Raktas</th>' +
-                ''.join(f'<th><span class="sign {e(environment)}">{e(environment)}</span></th>' for environment in environments) +
+                ''.join(f'<th><span class="sign {e(environment)}">{e(environment)}</span> <small class="muted">prieiga · kopijos</small></th>'
+                        for environment in environments) +
                 '</tr>' + ''.join(rows) + '</table><p class="note"><a href="/access">Keisti – Prieiga</a></p>')
 
     # --- Actions ---
@@ -2723,8 +2828,8 @@ def handler(user, stored):
             if match:
                 data, error = status(fresh='fresh' in query)
                 events = (helper('--activity', match[1])[0] or {}).get('events')
-                rendered = page.key_page(data, match[1], events, query.get('q', [''])[0][:64], query.get('granted') == ['1']) \
-                    if data else None
+                rendered = page.key_page(data, match[1], events, query.get('q', [''])[0][:64], query.get('granted') == ['1'],
+                                         query.get('tab', ['access'])[0]) if data else None
                 return self.reply(200, rendered) if rendered else \
                     self.reply(404, page.layout('Nėra rakto', '<p><a href="/access">← Prieiga</a></p>', section='access'))
             if path == '/update':

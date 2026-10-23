@@ -184,8 +184,9 @@ class ServerStatusTest(Worker):
         (ssh / "authorized_keys").write_text(
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOther admin@laptop\n"
             f'from="10.8.0.0/24",command="/usr/local/sbin/setup-server-backup-pull --key ona",restrict ssh-ed25519 {blob} ona\n'
-            f'from="10.8.0.0/24,10.9.0.5/32",command="/usr/local/sbin/setup-server-access --key tomas --allow-fresh '
-            f'--grant asana_tracker:prod=phpfpm --grant shop-two:stage=full",restrict,pty ssh-ed25519 {blob} tomas\n')
+            f'from="10.8.0.0/24,10.9.0.5/32",command="/usr/local/sbin/setup-server-access --key tomas --pull-all none '
+            f'--pull asana_tracker:prod=fresh --grant asana_tracker:prod=phpfpm --grant shop-two:stage=full",restrict,pty '
+            f'ssh-ed25519 {blob} tomas\n')
         (self.tree.root / "backup-pulls.log").write_text("2026-10-20T08:00:00Z key=tomas from=10.8.0.20 info x prod -> ok\n")
         (self.tree.root / "access.log").write_text("2026-10-21T09:30:00Z key=tomas from=10.8.0.21 'shell asana_tracker prod' -> exit 0\n"
                                                    "garbage line\n")
@@ -193,14 +194,16 @@ class ServerStatusTest(Worker):
         self.assertEqual(result.returncode, 0, result.stderr)
         keys = {item["name"]: item for item in json.loads(result.stdout)["keys"]}
         self.assertEqual(sorted(keys), ["ona", "tomas"], "an administrator's own key is not listed")
-        self.assertEqual(keys["ona"], {"name": "ona", "sources": ["10.8.0.0/24"], "fresh": False, "type": "ssh-ed25519",
+        self.assertEqual(keys["ona"], {"name": "ona", "sources": ["10.8.0.0/24"], "type": "ssh-ed25519",
                                        "fingerprint": keys["tomas"]["fingerprint"], "command": "backup-pull", "grants": [],
-                                       "last": None})
+                                       "pulls": [], "pull_all": "db", "legacy": True, "last": None},
+                         "written before the backup grants: every project, as before")
         self.assertTrue(keys["tomas"]["fingerprint"].startswith("SHA256:"))
         self.assertEqual(keys["tomas"]["grants"], [{"project": "asana_tracker", "environment": "prod", "level": "phpfpm"},
                                                    {"project": "shop-two", "environment": "stage", "level": "full"}])
         self.assertEqual(keys["tomas"]["last"], {"at": 1792575000, "from": "10.8.0.21", "log": "access"})
-        self.assertTrue(keys["tomas"]["fresh"])
+        self.assertEqual((keys["tomas"]["pull_all"], keys["tomas"]["legacy"], keys["tomas"]["pulls"]),
+                         ("none", False, [{"project": "asana_tracker", "environment": "prod", "level": "fresh"}]))
 
     def test_the_versions_tell_a_release_tag_from_a_branch_and_count_what_master_has_beyond(self):
         git = lambda *arguments: subprocess.run(["git", *arguments], env={**os.environ, "GIT_AUTHOR_NAME": "t",
@@ -796,8 +799,9 @@ class WebUiTest(Worker):
         ssh.mkdir(exist_ok=True)
         blob = "AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1"
         (ssh / "authorized_keys").write_text(
-            f'from="10.8.0.0/24",command="/usr/local/sbin/setup-server-access --key tomas --grant asana_tracker:prod=full '
-            f'--grant forsena_docker:stage=docker",restrict,pty ssh-ed25519 {blob} tomas\n')
+            f'from="10.8.0.0/24",command="/usr/local/sbin/setup-server-access --key tomas --pull-all none '
+            f'--pull asana_tracker:prod=db --grant asana_tracker:prod=full --grant forsena_docker:stage=docker",restrict,pty '
+            f'ssh-ed25519 {blob} tomas\n')
         (self.tree.root / "access.log").write_text(
             "2026-10-21T09:30:00Z key=tomas from=10.8.0.21 'shell asana_tracker prod' -> started (full): x session=20261021T093000Z-7.log\n"
             "2026-10-21T09:40:00Z key=tomas from=10.8.0.21 'shell asana_tracker prod' -> exit 0\n")
@@ -831,21 +835,39 @@ class WebUiTest(Worker):
         # A filtered page sends asana_tracker only: forsena_docker's grant stays.
         status, _, body = self.preview("add-backup-key", key_name="tomas", merge="yes", **{"grant:asana_tracker:prod": "phpfpm"})
         self.assertEqual(status, 200, body)
+        kept = "--pull-all none --pull asana_tracker:prod=db"
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
-                         f"{library} --name tomas --grant asana_tracker:prod=phpfpm --grant forsena_docker:stage=docker")
+                         f"{library} --name tomas {kept} --grant asana_tracker:prod=phpfpm --grant forsena_docker:stage=docker")
         self.assertIn("~ asana_tracker prod: full → phpfpm", body)
         status, _, body = self.preview("key-bulk", key_name="tomas", scope="prod", level="phpfpm-readonly", only="all")
         self.assertEqual(status, 200, body)
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
-                         f"{library} --name tomas --grant asana_tracker:prod=phpfpm-readonly --grant forsena_docker:stage=docker "
-                         "--grant shop-two:prod=phpfpm-readonly")
+                         f"{library} --name tomas {kept} --grant asana_tracker:prod=phpfpm-readonly "
+                         "--grant forsena_docker:stage=docker --grant shop-two:prod=phpfpm-readonly")
         self.assertIn("+ shop-two prod: readonly", body)
         self.preview("key-bulk", key_name="tomas", scope="all", level="", only="existing")
-        self.assertEqual(self.sudo_calls("add-backup-key")[-1], f"{library} --name tomas")
+        self.assertEqual(self.sudo_calls("add-backup-key")[-1], f"{library} --name tomas {kept} --no-grants")
+        # Backups: the same bulk and cells, and every project's level.
+        status, _, body = self.preview("key-bulk", key_name="tomas", kind="backups", scope="stage", level="fresh", only="all")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.sudo_calls("add-backup-key")[-1],
+                         f"{library} --name tomas --pull-all none --pull asana_tracker:prod=db --pull forsena_docker:stage=fresh "
+                         "--grant asana_tracker:prod=full --grant forsena_docker:stage=docker")
+        self.assertIn("+ kopijos: forsena_docker stage: fresh", body)
+        status, _, body = self.preview("add-backup-key", key_name="tomas", merge="yes", pull_all="db",
+                                       **{"pull:asana_tracker:prod": "", "pull:shop-two:prod": "fresh"})
+        self.assertEqual(self.sudo_calls("add-backup-key")[-1],
+                         f"{library} --name tomas --pull-all db --pull shop-two:prod=fresh "
+                         "--grant asana_tracker:prod=full --grant forsena_docker:stage=docker")
+        self.assertIn("kopijos, visi projektai (ir nauji): none → db", body)
+        self.assertIn("− kopijos: asana_tracker prod: atimama db", body)
         for action, fields, message in (("key-bulk", {"key_name": "nobody", "scope": "prod", "level": "full"}, "nėra"),
                                         ("key-bulk", {"key_name": "tomas", "scope": "dev", "level": "full"}, "Pasirink"),
                                         ("add-backup-key", {"key_name": "tomas", "merge": "yes", "grant:x:local": "full"}, "netinkamas"),
                                         ("add-backup-key", {"key_name": "tomas", "grant:asana_tracker:prod": "root"}, "nežinomas"),
+                                        ("add-backup-key", {"key_name": "tomas", "pull:asana_tracker:prod": "full"}, "nežinomas"),
+                                        ("add-backup-key", {"key_name": "tomas", "pull_all": "all"}, "nežinomas"),
+                                        ("key-bulk", {"key_name": "tomas", "kind": "backups", "scope": "prod", "level": "docker"}, "Pasirink"),
                                         ("add-backup-key", {"key_name": "ona", "sources": "10.8.0.0/24"}, "Įklijuok")):
             with self.subTest(action=action, fields=fields):
                 status, _, body = self.preview(action, **fields)
@@ -957,13 +979,15 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("install-backups"),
                          [f"-n {self.library}/bin/install-backups --check --at 02:15 --full-at Sat 05:00"])
         key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1 tomas@laptop"
-        self.preview("add-backup-key", public_key=key, key_name="tomas", sources="10.8.0.0/24", allow_fresh="yes")
+        self.preview("add-backup-key", public_key=key, key_name="tomas", sources="10.8.0.0/24", pull_all="fresh")
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
-                         f"-n {self.library}/bin/add-backup-key --check - --name tomas --from 10.8.0.0/24 --allow-fresh")
+                         f"-n {self.library}/bin/add-backup-key --check - --name tomas --from 10.8.0.0/24 --pull-all fresh "
+                         "--no-pulls --no-grants")
         self.preview("add-backup-key", public_key=key, key_name="tomas", sources="10.8.0.0/24",
-                     grants="shop:prod=phpfpm-readonly, shop:stage=docker")
+                     grants="shop:prod=phpfpm-readonly, shop:stage=docker", pulls="shop=db", **{"start:pull:prod": "fresh"})
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
-                         f"-n {self.library}/bin/add-backup-key --check - --name tomas --from 10.8.0.0/24 "
+                         f"-n {self.library}/bin/add-backup-key --check - --name tomas --from 10.8.0.0/24 --pull-all none "
+                         "--pull asana_tracker:prod=fresh --pull shop:prod=db --pull shop:stage=db --pull shop-two:prod=fresh "
                          "--grant shop:prod=phpfpm-readonly --grant shop:stage=docker")
         status, _, body = self.preview("pipeline", project="shop-two", pipeline="backup-now", branch="master", full="yes")
         self.assertEqual(status, 200, body)
@@ -1135,8 +1159,8 @@ class WebUiTest(Worker):
         self.assertIn('name="scope" value="other"', key)
         self.preview("key-bulk", key_name="tomas", scope="other", level="docker", only="all")
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
-                         f"-n {self.library}/bin/add-backup-key --check --name tomas --grant asana_tracker:mdv=docker "
-                         "--grant asana_tracker:prod=full --grant forsena_docker:stage=docker")
+                         f"-n {self.library}/bin/add-backup-key --check --name tomas --pull-all none --pull asana_tracker:prod=db "
+                         "--grant asana_tracker:mdv=docker --grant asana_tracker:prod=full --grant forsena_docker:stage=docker")
         self.preview("add-backup-key", key_name="tomas", merge="yes", grants="shop-two:mdv=phpfpm")
         self.assertIn("--grant shop-two:mdv=phpfpm", self.sudo_calls("add-backup-key")[-1])
         self.assertEqual(self.preview("backup-local", project="asana_tracker", environment="mdv")[0], 200)

@@ -2,7 +2,7 @@
 """Let a developer key reach the deploy targets of the projects it was granted, through this worker.
 
 The forced command of a developer key in the setup account's authorized_keys (bin/add-backup-key --grant writes
-`from="<VPN>",command="setup-server-access --key <name> [--allow-fresh] --grant PROJECT:ENV=LEVEL …",restrict,pty
+`from="<VPN>",command="setup-server-access --key <name> --pull-all … [--pull …] --grant PROJECT:ENV=LEVEL …",restrict,pty
 <key>`): the key runs nothing else and reaches no target itself. This worker already reaches every target (the
 deploy does: DEPLOY_SSH with its key, DEPLOY_CONTEXT through Docker), so the developer goes the same way and needs
 no key on LIVE. SSH_ORIGINAL_COMMAND is one of
@@ -361,6 +361,20 @@ def docker(granted, words):
     raise Refused(f'docker {verb} is not allowed (ps, logs, exec, start, stop, restart, top, stats, inspect)')
 
 
+def pull_options(arguments):
+    """The forced command's words for setup-server-backup-pull: --pull-all, --pull and --allow-fresh (a key written
+    before the backup grants), without the --grant ones."""
+    found, index = [], 0
+    while index < len(arguments):
+        if arguments[index] == '--allow-fresh':
+            found.append('--allow-fresh')
+        elif arguments[index] in ('--pull', '--pull-all') and index + 1 < len(arguments):
+            found += arguments[index:index + 2]
+            index += 1
+        index += 1
+    return found
+
+
 def access_lines(granted):
     return [f'{project} {environment} {level}' for (project, environment), level in sorted(granted.items())]
 
@@ -416,13 +430,12 @@ def log(key, request, answer):
 def main(arguments):
     named = arguments[:1] == ['--key'] and len(arguments) > 1 and KEY.fullmatch(arguments[1])
     key = arguments[1] if named else '-'
-    allow_fresh = '--allow-fresh' in arguments[2:]
     granted = grants(arguments[2:]) if named else {}
     request = os.environ.get('SSH_ORIGINAL_COMMAND', '')
     first = request.split()[:1]
     if first and first[0] in BACKUP_REQUESTS:
         # The backup requests are setup-server-backup-pull's, as for a key without access; it logs them itself.
-        os.execv(BACKUP_PULL, [BACKUP_PULL, '--key', key, *(['--allow-fresh'] if allow_fresh and named else [])])
+        os.execv(BACKUP_PULL, [BACKUP_PULL, '--key', key, *(pull_options(arguments[2:]) if named else ['--invalid'])])
     if first in ([], ['access']):
         lines = access_lines(granted)
         print('\n'.join(lines) if lines else 'This key reaches no project.')

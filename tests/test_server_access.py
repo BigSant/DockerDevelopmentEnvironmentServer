@@ -86,6 +86,9 @@ class ServerAccessTest(unittest.TestCase):
         self.assertIn("reaches no project", result.stdout)
         result, _ = self.access("info shop prod full", "shop:prod=phpfpm", extra=["--allow-fresh"])
         self.assertEqual(result.stdout.strip(), "pull --key tomas --allow-fresh [info shop prod full]")
+        result, _ = self.access("get shop prod x", "shop:prod=phpfpm", extra=["--pull-all", "none", "--pull", "shop:prod=db"])
+        self.assertEqual(result.stdout.strip(), "pull --key tomas --pull-all none --pull shop:prod=db [get shop prod x]",
+                         "the backup grants go on, the access grants do not")
 
     def test_shell_runs_in_php_fpm_as_the_project_account_root_or_nobody(self):
         shell = ["sh", "-c", "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi"]
