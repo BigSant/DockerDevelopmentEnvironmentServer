@@ -768,11 +768,7 @@ class WebUiTest(Worker):
         newest = self.preview("update-setup", setup_tag="")
         self.assertEqual(newest[0], 200, newest[2])
         self.assertEqual(self.sudo_calls("update-setup")[-1], f"{command} --check", "empty: the newest release")
-        status, _, body = self.preview("update-setup", target="master")
-        self.assertEqual(status, 200, body)
-        self.assertEqual(self.sudo_calls("update-setup")[-1], f"{command} --check master")
-        self.assertIn("prod deploy&#x27;ai neveiks", body, "master is off a release tag: said above Vykdyti")
-        for tag in ("main", "v2.7", "v2.7.0; rm -rf /"):
+        for tag in ("master", "v2.7", "v2.7.0; rm -rf /"):
             with self.subTest(tag=tag):
                 self.assertEqual(self.preview("update-setup", setup_tag=tag)[0], 400)
 
@@ -781,7 +777,7 @@ class WebUiTest(Worker):
         (self.library / "install.env").write_text(f"VERSION=v0.4.0\nCHECKOUT={ROOT}\nADMIN={getpass.getuser()}\n")
         page = self.request("GET", "/update")[2]
         self.assertIn('name="latest" value="yes"', page)
-        self.assertIn('name="target" value="master"', page)
+        self.assertNotIn('value="master"', page, "setup updates to release tags only")
         self.preview("update", latest="yes")
         self.assertEqual(self.sudo_calls("update")[-1],
                          f"-n -H -u {getpass.getuser()} {ROOT}/bin/update --check --server-ref origin/master")

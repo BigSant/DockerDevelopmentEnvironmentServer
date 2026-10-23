@@ -563,15 +563,11 @@ def plan_update(form, status):
 
 
 def plan_update_setup(form, status):
-    """setup to the newest commit of master, to the newest release tag of its MAJOR version, or to the tag given."""
-    tag = value(form, 'setup_tag', re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+|master'), 'setup tag\'as')
-    if form.get('target') == 'master':
-        tag = 'master'
-    title = {'': 'Atnaujinti setup į naujausią release tag\'ą', 'master': 'Atnaujinti setup į naujausią (master)'}.get(
-        tag, f'Atnaujinti setup į {tag}')
-    danger = ('setup bus ne ant release tag\'o: make release ENV=prod atsisakys, prod deploy\'ai neveiks, kol setup '
-              'negrįš į tag\'ą (mygtukas „Release tag\'as“).') if tag == 'master' else None
-    return Plan('update-setup', title, *command('update-setup', [tag] if tag else []), timeout=600, danger=danger)
+    """setup to the newest release of its MAJOR version (setup releases every merge to master: it is master), or to
+    the release tag given."""
+    tag = value(form, 'setup_tag', re.compile(r'v[0-9]+\.[0-9]+\.[0-9]+'), 'setup tag\'as')
+    return Plan('update-setup', f'Atnaujinti setup {"į " + tag if tag else "į naujausią"}',
+                *command('update-setup', [tag] if tag else []), timeout=600)
 
 
 def plan_pipeline(form, status):
@@ -2338,7 +2334,7 @@ class Page:
         body = ''
         if setup and not setup.get('tag'):
             body += ('<div class="tape"><span>setup ne ant release tag\'o: make release ENV=prod atsisako, todėl prod '
-                     'deploy\'ai neveiks, kol setup negrįš į tag\'ą („Release tag\'as“ žemiau).</span></div>')
+                     'deploy\'ai neveiks, kol setup negrįš į tag\'ą („Atnaujinti į naujausią“ žemiau).</span></div>')
         plate_server = (f'<div class="plate"><p class="plate-name">setup-server</p><p class="plate-version">'
                         f'{e(versions.get("installed") or "?")}</p><p class="plate-line">įdiegtos kopijos</p>'
                         f'<p class="plate-line">klonas {e(versions.get("checkout") or "?")} · {git_line(server, False)}</p>')
@@ -2353,18 +2349,19 @@ class Page:
         plate_setup = (f'<div class="plate"><p class="plate-name">setup (bendras checkout\'as)</p><p class="plate-version">'
                        f'{e(versions.get("setup") or "?")}</p><p class="plate-line">{e(ROOT)}/setup</p>'
                        f'<p class="plate-line">{git_line(setup)}</p><div class="plate-actions">' +
-                       self.button('update-setup', {'target': 'master'}, 'Į naujausią (master)', 'go') +
-                       self.button('update-setup', {}, 'Release tag\'as') + '</div>'
-                       '<p class="note">Be slaptažodžio, kaip paskyra setup; ne tada, kai vyksta pipeline\'o žingsnis. '
-                       '„Release tag\'as“ – naujausias to paties MAJOR (prod deploy\'ams reikia jo).</p></div>')
+                       self.button('update-setup', {}, 'Atnaujinti į naujausią', 'go') + '</div>'
+                       '<p class="note">Naujausias to paties MAJOR release\'as. setup kiekvieną sujungimą į master išleidžia '
+                       'pats (release tag\'as po sėkmingo CI), todėl tai ir yra master. Be slaptažodžio, kaip paskyra '
+                       'setup; ne tada, kai vyksta pipeline\'o žingsnis. Naujas MAJOR – tik nurodžius tag\'ą žemiau.</p></div>')
         body += '<div class="plates">' + plate_server + plate_setup + '</div>'
-        body += ('<p class="note">„master +N“ – kiek naujų commit\'ų buvo origin/master per paskutinį fetch. Kiekvienas mygtukas '
-                 'pirmiausia paleidžia --check: jis parsiunčia naujausią ir parodo commit\'ų sąrašą, tik tada „Vykdyti“.</p>')
+        body += ('<p class="note">„master +N“ – kiek naujų commit\'ų buvo origin/master per paskutinį fetch (setup – kiek '
+                 'naujesnis naujausias release\'as). Kiekvienas mygtukas pirmiausia paleidžia --check: jis parsiunčia naujausią '
+                 'ir parodo commit\'ų sąrašą, tik tada „Vykdyti“.</p>')
         text = lambda name, label, placeholder: (f'<label><span>{e(label)}</span><input type="text" name="{name}" '
                                                  f'placeholder="{e(placeholder)}" autocomplete="off"></label>')
         body += '<details class="more"><summary>Konkreti versija ar ref\'as</summary><div class="inner deck">' + self.form(
-            'update-setup', 'setup į release tag\'ą', text('setup_tag', 'setup tag\'as', 'v2.14.1'),
-            note='Tik release tag\'ai (vX.Y.Z).', command='bin/update-setup vX.Y.Z')
+            'update-setup', 'setup į release tag\'ą', text('setup_tag', 'setup tag\'as', 'v2.15.0'),
+            note='Tik release tag\'ai (vX.Y.Z); ir naujas MAJOR ar grįžimas atgal.', command='bin/update-setup vX.Y.Z')
         if where['checkout']:
             body += self.form('update', 'setup-server ir setup kartu',
                               text('server_ref', 'setup-server ref\'as', 'origin/master') + text('setup_ref', 'setup ref\'as', 'v2.14.1'),

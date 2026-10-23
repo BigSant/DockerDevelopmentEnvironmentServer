@@ -557,20 +557,20 @@ išvedamos komandos rankiniam atstatymui.
 ### Tik setup (be slaptažodžio)
 
 Bendrą setup checkout'ą (`/srv/setup-server/setup`) atnaujina viena komanda, be administratoriaus slaptažodžio ir be
-setup-server atnaujinimo – arba sąsajoje *Atnaujinimas* („Į naujausią (master)“, „Release tag'as“):
+setup-server atnaujinimo – arba sąsajoje *Atnaujinimas* („Atnaujinti į naujausią“):
 
 ```bash
 sudo bin/update-setup --check          # dabartinė versija, naujausias to paties MAJOR release'as, commit'ai
 sudo bin/update-setup                  # perjungia į jį
 sudo bin/update-setup v2.6.0           # arba į nurodytą release tag'ą
-sudo bin/update-setup master           # naujausias origin/master commit'as
 ```
 
-- Release tag'ai (`vX.Y.Z`) arba `master`, tik švarus checkout'as, ne pipeline žingsnio metu (`make` paskyros `setup`).
+- Tik release tag'ai (`vX.Y.Z`), tik švarus checkout'as, ne pipeline žingsnio metu (`make` paskyros `setup`).
   Nepavykus perjungti checkout'as grįžta. Git darbą atlieka paskyra `setup`.
-- **`master` – ne release'as:** setup `make release ENV=prod` stato tik iš release tag'o, todėl kol setup ant `master`
-  (už naujausio tag'o), **prod deploy'ai neveikia**; stage – veikia. Peržiūra ir sąsaja (*Atnaujinimas*, *Apžvalga* –
-  „Reikia dėmesio“) tai rodo; grįžti – `sudo bin/update-setup` (be argumentų) arba „Release tag'as“.
+- **Naujausias release'as yra `master`:** setup kiekvieną sujungimą į `master` po sėkmingo CI išleidžia pats
+  (`Release X.Y.Z`, tag'as `vX.Y.Z`), todėl „į naujausią“ – tai, ką turi `master`, o prod deploy'ai veikia (setup
+  `make release ENV=prod` stato tik iš release tag'o). Jei setup kada nors liko ne ant tag'o (ranka perjungtas),
+  *Atnaujinimas* ir *Apžvalga* („Reikia dėmesio“) tai rodo; grįžti – „Atnaujinti į naujausią“.
 - Naujas MAJOR – tik nurodžius tag'ą; peržiūra perspėja, kad projektams gali reikėti pakeitimų.
 - **Deploy'us tai daro ir pats:** kai deploy'inamo commit'o `SETUP_MIN_VERSION` naujesnis už serverio setup, setup 2.7.0+
   `pipeline-deploy` perjungia setup į naujausią to paties MAJOR release'ą ir žingsnį paleidžia iš naujo.
@@ -794,8 +794,9 @@ commit'as, raudonas, kai setup ne ant release tag'o.
   Visi pakeitimai – ta pati `add-backup-key` komanda su visu rakto leidimų sąrašu; peržiūra virš komandos parodo, kas
   pasikeis (`+` nauja, `~` kitas lygis, `−` atimama). Projekto puslapyje – kas pasiekia to projekto aplinkas.
 - *Atnaujinimas* – setup-server ir setup: versija, commit'as, ar release tag'as, kiek naujesnis origin/master.
-  „Atnaujinti į naujausią“ – setup-server į `origin/master` (`bin/update`, žr. „Atnaujinimas“), setup – „Į naujausią
-  (master)“ arba „Release tag'as“ (`bin/update-setup`); konkreti versija – „Konkreti versija ar ref'as“.
+  „Atnaujinti į naujausią“ – setup-server į `origin/master` (`bin/update`, žr. „Atnaujinimas“), setup – į naujausią
+  to paties MAJOR release'ą (`bin/update-setup`; setup release'ą daro kiekvienas sujungimas į master); konkreti versija
+  ar naujas MAJOR – „Konkreti versija ar ref'as“.
 - *Metrikos* – worker'io `/metrics`, kaip jį mato Prometheus (`setup-server-metrics --once`, be token'o), ir kurios
   grupės surinktos.
 - *Žurnalai* – programuotojų veikla (visų raktų), `ui-actions.log`, `backup-pulls.log`, `access.log`, setup-server paslaugų journal (po 50 eilučių) ir paskutiniai
@@ -825,7 +826,7 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 | Worker'io metrikos | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |
 | Raktai (*Prieiga*) | `sudo -n L/add-backup-key [-] --name … [--from …] [--allow-fresh] [--grant PROJEKTAS:ENV=LYGIS …]` (naujas raktas per stdin; esamam – be jo), `--remove VARDAS` |
 | Paruošti serverį | `sudo -n L/prepare-host [--setup-ref …]` (`--check` kodas 1 – „Needs attention“ – vykdyti leidžia) |
-| Atnaujinti setup (*Atnaujinimas*) | `sudo -n L/update-setup [master\|vX.Y.Z]` (be slaptažodžio) |
+| Atnaujinti setup (*Atnaujinimas*) | `sudo -n L/update-setup [vX.Y.Z]` (tik release tag'ai, be slaptažodžio) |
 | Atnaujinti setup-server (*Atnaujinimas*) | `sudo -n -H -u <klono savininkas> <klonas>/bin/update --server-ref origin/master` (ar kiti `--server-ref`/`--setup-ref`) |
 | Deploy'us, „backup dabar“, runner'io testas | Bitbucket API (žr. žemiau) |
 
