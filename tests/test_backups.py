@@ -158,9 +158,25 @@ class BackupProjectsTest(ScriptTest):
         self.assertTrue((backups / "worker-prod-notes.txt").exists())
         for environment in ("stage", "prod"):
             self.assertTrue((forsena / f".generated/backups/worker-{environment}-20261009T013000Z.sql.gz").is_file())
-        self.assertIn("not_deployed: no env/stage.env or env/prod.env", result.stdout)
+        self.assertIn("not_deployed: no env/<env>.env (not deployed from here)", result.stdout)
         self.assertIn("removed 30", result.stdout)
         self.assertIn("Backups: 3 ok, 0 failed", result.stdout)
+
+    def test_an_environment_the_project_lists_in_stage_environments_is_backed_up_like_stage(self):
+        os.environ["STORES"] += " demo-mdv-secrets"
+        shop = self.project("shop", "prod", "mdv", "old")
+        (shop / "env/common.env").write_text('PROJECT_NAME=demo\nSTAGE_ENVIRONMENTS="mdv, test bad_Name"\n')
+        self.seed(shop, "mdv", 40)
+        result = self.run_script("backup-projects")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        made = sorted(path.name for path in (shop / ".generated/backups").glob("worker-*-20261009T013000Z.sql.gz"))
+        self.assertEqual(made, ["worker-mdv-20261009T013000Z.sql.gz", "worker-prod-20261009T013000Z.sql.gz"],
+                         "old has an env file but is not listed; test is reserved")
+        self.assertEqual(len(list((shop / ".generated/backups").glob("worker-mdv-*"))), 11, "rotated as any series")
+        one = self.run_script("backup-projects", "shop", "mdv")
+        self.assertEqual(one.returncode, 0, one.stdout + one.stderr)
+        self.assertIn("ENV=mdv", self.make_log.read_text())
+        self.assertEqual(self.run_script("backup-projects", "shop", "old").returncode, 65)
 
     def test_one_failing_project_does_not_stop_the_others_and_keeps_its_backups(self):
         broken = self.project("a_broken", "prod")
@@ -196,7 +212,8 @@ class BackupProjectsTest(ScriptTest):
         for arguments, message in ((["missing"], "No build root"), (["Bad.Name"], "NAME must be"),
                                    (["../etc"], "not a build root under"),
                                    ([str(self.root)], f"not a build root under {self.projects}"),
-                                   (["asana_tracker", "local"], "ENV must be stage or prod"),
+                                   (["asana_tracker", "local"], "ENV must be stage, prod or one of"),
+                                   (["asana_tracker", "mdv"], "ENV must be stage, prod or one of"),
                                    (["other", "stage"], "other has no env/stage.env")):
             with self.subTest(arguments=arguments):
                 refused = self.run_script("backup-projects", *arguments)
@@ -304,7 +321,7 @@ class InstallBackupsTest(ScriptTest):
         # optionally stage/prod.
         self.stub("sudo", 'echo "Sudo version 1.9.15p5"\n')
         exact = self.run_script("install-backups", "--check")
-        self.assertIn(rule + f"^(--full )?{projects}[a-z0-9][a-z0-9_-]*( (stage|prod))?$\n", exact.stdout)
+        self.assertIn(rule + f"^(--full )?{projects}[a-z0-9][a-z0-9_-]*( [a-z][a-z0-9]{{1,15}})?$\n", exact.stdout)
         # Older sudo (Ubuntu 22.04: 1.9.9) has only wildcards: the first argument must be a build root (or
         # --full and then a build root), the command refuses anything else after it.
         self.stub("sudo", 'echo "Sudo version 1.9.9"\n')

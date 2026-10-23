@@ -160,6 +160,23 @@ class ServerAccessTest(unittest.TestCase):
                 self.assertIn(message, result.stderr)
                 self.assertFalse(any(call[3:4] in (["exec"], ["run"], ["stop"]) for call in calls))
 
+    def test_a_stage_class_environment_the_project_lists_is_reached_like_stage(self):
+        (self.build_root / "app/env/common.env").write_text('PROJECT_NAME=shop\nSTAGE_ENVIRONMENTS="mdv"\n')
+        (self.build_root / "target.mdv.env").write_text("DEPLOY_CONTEXT=setup-shop-mdv\nDEPLOY_SSH=deploy@mdv.example\n"
+                                                         "DEPLOY_PATH=/home/deploy/mdv\nAPP_UID=1003\nAPP_GID=1003\n")
+        (self.root / "containers").write_text("shop-mdv-php-fpm-1\tphp-fpm\trunning\n")
+        result, calls = self.access("shell shop mdv", "shop:mdv=phpfpm")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(["docker", "--context", "setup-shop-mdv", "ps", "--all", "--filter",
+                       "label=com.docker.compose.project=shop-mdv", "--format",
+                       '{{.Names}}\t{{.Label "com.docker.compose.service"}}\t{{.State}}'], calls)
+        self.assertEqual(self.last(calls)[3:7], ["exec", "-i", "-u", "1003:1003"])
+        result, _ = self.access("host shop mdv", "shop:mdv=full")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result, _ = self.access("shell shop qa", "shop:qa=full")
+        self.assertEqual(result.returncode, 65)
+        self.assertIn("shop has no environment qa", result.stderr)
+
     def test_the_log_keeps_one_line_per_answer_whatever_the_request_holds(self):
         self.access("shell shop prod\nforged line", "shop:prod=phpfpm")
         self.assertEqual(len(self.log().splitlines()), 1)

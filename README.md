@@ -201,8 +201,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
      `VARTOTOJAS` `authorized_keys`, ir sustoja), patikrina Docker ir ar `KELIAS` rašomas, perima vartotojo
      `id -u`/`id -g` ir sukuria Docker context'ą `setup-<vardas>[-<env>]`. Naujas host raktas įrašomas
      pirmo prisijungimo metu (parodomas).
-   - **`stage=…` / `prod=…`** – tik viena aplinka (`target.<env>.env`, laimi prieš bendrą `target.env`),
-     kai stage ir prod skirtinguose serveriuose. `--target` galima kartoti.
+   - **`stage=…` / `prod=…` / `mdv=…`** – tik viena aplinka (`target.<env>.env`, laimi prieš bendrą `target.env`),
+     kai stage ir prod skirtinguose serveriuose, ar papildomai aplinkai (žr. „Papildomos aplinkos“). `--target` galima kartoti.
    - Pakartotinai paleistas be `--target` taikinio nekeičia; su `--target` – perrašo. `remove-project`
      pašalina ir build katalogą (su `target*.env`), ir projekto Docker context'us.
 
@@ -257,7 +257,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    asana_tracker prod`) rodoma juosta: parašyti baitai, palyginti su ankstesnės tokios pat kopijos dydžiu.
 
    **Kurie projektai ir aplinkos.** Kopijuojama kiekviena `/srv/setup-server/projects/<vardas>` aplinka,
-   kuriai aplinkos repo (`app/`, senesniame išdėstyme `app/docker/`) turi `env/stage.env` arba `env/prod.env`.
+   kuriai aplinkos repo (`app/`, senesniame išdėstyme `app/docker/`) turi `env/stage.env`, `env/prod.env` ar
+   papildomos aplinkos (`STAGE_ENVIRONMENTS`, žr. „Papildomos aplinkos“) `env/<env>.env`.
    Šį failą sukuria projekto deploy pipeline'as (`cp env/prod.env.example env/prod.env`), todėl kopijuojama
    tai, kas iš šio serverio deploy'inama. `local` ir `test` nekopijuojamos. Kopija – setup `make db-backup
    ENV=<env>`: stage/prod pagal lentelių registrą, su `DATABASE_EXTRA_SCHEMAS` – visos schemos vienu dump'u
@@ -443,6 +444,28 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    slaptažodis (pvz. `mysql -p`) įrašomas taip pat. Be terminalo įrašo nėra: komanda jau yra prašyme. Sąsaja rodo
    kiekvieno rakto veiklą (prisijungimai, kopijos, shell'ai su trukme, komandos, atmesti bandymai) ir seansų įrašus –
    `server-status --activity [RAKTAS]`, `--session RAKTAS FAILAS`. Įdiegtą komandos kopiją atnaujina `bin/update`.
+
+## Papildomos aplinkos (pvz. laikina `mdv`)
+
+Didesniam darbui projektas gali turėti daugiau aplinkų nei stage ir prod. Jas išvardija projekto `env/common.env`:
+`STAGE_ENVIRONMENTS="mdv"` (setup; vardas – mažosios raidės ir skaitmenys, 2–16 simbolių, ne `local`/`test`/`stage`/`prod`).
+Kiekviena tokia aplinka setup'e elgiasi kaip stage (žr. setup `doc/lt/09-aplinkos.md`), o šiame serveryje – kaip bet kuri
+kita aplinka:
+
+- **Taikinys** – bendras `target.env` arba savas: `sudo bin/add-project --target mdv=ssh://deploy@mdv.example/home/deploy/shop VARDAS URL`
+  (`target.mdv.env`). Tame pačiame taikinyje kaip stage ar prod aplinkai reikia savo port'ų ar adreso (setup tai tikrina).
+- **Deploy'us** – projekto `bitbucket-pipelines.yml` custom pipeline'as `deploy-mdv` su `deployment: mdv` (Bitbucket
+  deployment environment `mdv`, tipas Staging) arba GitHub environment `mdv`; sąsajos projekto puslapyje – „Deploy į mdv“
+  (rodomas, kai aplinka išvardyta, dar prieš pirmą deploy'ų).
+- **Kopijos** – naktinės, savaitinės pilnos ir „backup dabar“ (`… setup-server-backup "$BUILD_ROOT" mdv`), kai yra
+  `env/mdv.env`; `make db-pull from=mdv`. Sudo taisyklė „backup dabar“ priima ir papildomos aplinkos vardą: atnaujinus
+  setup-server pakartok `sudo bin/install-backups` (`bin/update` parodo, kad taisyklė skiriasi).
+- **Metrikos** – tos pačios eilutės su `environment="mdv"`.
+- **Prieiga** – `--grant projektas:mdv=LYGIS` ir sąsajos *Prieiga* (rakto puslapyje mdv stovi greta prod ir stage;
+  „Visoms iš karto“ – eilutė „kitos“). `--grant projektas=LYGIS` be aplinkos – tik stage ir prod.
+- **Kai aplinkos nebereikia** – setup pusėje `make down ENV=mdv`, `data/mdv` pašalinimas ir vardas iš `STAGE_ENVIRONMENTS`;
+  čia – `target.mdv.env` ir `app/.generated/backups/*-mdv-*` (jei kopijų nebereikia) ištrinami ranka, raktų `…:mdv` leidimai
+  atimami *Prieigoje* (neišvardytai aplinkai vartai ir taip neleidžia jungtis).
 
 ## Bitbucket SSH adresas (nuo 2026-11-12)
 
@@ -828,7 +851,8 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 - **Ko sąsaja nedaro:** `bin/install-ui` (port'as, vardas, slaptažodis) ir rankinis atstatymas po nepavykusio
   `bin/update` (žr. „Rankinis atstatymas“) lieka terminale: jie keičia pačią sąsają arba reikalingi, kai ji neveikia.
 
-**Deploy'ai per Bitbucket.** Projekto puslapyje – „Deploy į stage“ ir „Deploy į prod“ (custom pipeline'ai `deploy-stage`,
+**Deploy'ai per Bitbucket.** Projekto puslapyje – „Deploy į stage“, „Deploy į prod“ ir kiekvienai papildomai aplinkai
+„Deploy į mdv“ (custom pipeline'ai `deploy-stage`, `deploy-<env>`,
 `deploy-production` su kintamaisiais `REF`, `IMAGES`, `BACKUP`, `ROLLBACK`), „Backup dabar“ (`backup-now`, pažymėjus
 FULL – su kintamuoju `FULL=yes`; nepažymėjus kintamasis nesiunčiamas) ir „Runner'io
 testas“ (`runner-test`). Sąsaja juos paleidžia per Bitbucket API, todėl istorija lieka Bitbucket'e (Pipelines,

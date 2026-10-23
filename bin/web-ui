@@ -74,12 +74,14 @@ NAME = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}')
 GIT_URL = re.compile(r'(?:git@[A-Za-z0-9.-]+:|ssh://git@[A-Za-z0-9.-]+(?::[0-9]{1,5})?/|https://[A-Za-z0-9.-]+/)'
                      r'[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*')
 # bin/add-project's own pattern of a target, with the optional ENV= of one environment.
-TARGET = re.compile(r'(?:(?:stage|prod)=)?(?:local(?::/[A-Za-z0-9._/-]+)?|ssh://(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+)')
+TARGET = re.compile(r'(?:(?!local=|test=)[a-z][a-z0-9]{1,15}=)?(?:local(?::/[A-Za-z0-9._/-]+)?|ssh://(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+)')
 REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,99}')
 RUNNER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
 KEY_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
 # What a developer key may reach through this worker (bin/add-backup-key --grant, bin/server-access).
-GRANT = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}(?::(?:stage|prod))?=(?:phpfpm-readonly|phpfpm|docker|full)')
+GRANT = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}(?::(?!local=|test=)[a-z][a-z0-9]{1,15})?=(?:phpfpm-readonly|phpfpm|docker|full)')
+# An environment name: stage, prod or a stage-class one a project lists in STAGE_ENVIRONMENTS (setup), e.g. mdv.
+ENVIRONMENT = re.compile(r'(?!local$|test$)[a-z][a-z0-9]{1,15}')
 # The levels, each with everything before it, and what each lets a developer do (make ssh).
 LEVELS = ('phpfpm-readonly', 'phpfpm', 'docker', 'full')
 LEVEL_LABELS = {'phpfpm-readonly': 'readonly', 'phpfpm': 'phpfpm', 'docker': 'docker', 'full': 'full'}
@@ -88,7 +90,7 @@ LEVEL_NOTES = {'phpfpm-readonly': 'php-fpm kaip nobody: failų nekeičia, DB –
                'docker': 'projekto konteineriai: logs, exec, restart…; be docker run',
                'full': 'taikinio shell; local taikiniui – paskyra setup čia, t. y. root'}
 # A matrix cell of the key forms: grant:<project>:<env> = a level or empty.
-GRANT_FIELD = re.compile(r'grant:([a-z0-9][a-z0-9_-]{0,63}):(stage|prod)')
+GRANT_FIELD = re.compile(r'grant:([a-z0-9][a-z0-9_-]{0,63}):((?!local$|test$)[a-z][a-z0-9]{1,15})')
 PUBLIC_KEY = re.compile(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|'
                         r'sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}(?: [^\s]{1,100})?')
 JOB_ID = re.compile(r'\d{8}T\d{6}Z-[0-9a-f]{6}')
@@ -111,6 +113,13 @@ BITBUCKET_URL = re.compile(r'(?:git@(?:ssh\.)?bitbucket\.org:|ssh://git@(?:ssh\.
 PIPELINES = {'deploy-stage': 'Deploy į stage', 'deploy-production': 'Deploy į prod', 'backup-now': 'Backup dabar',
              'runner-test': "Runner'io testas"}
 DEPLOY_PIPELINES = ('deploy-stage', 'deploy-production')
+# The deploy of a stage-class environment (STAGE_ENVIRONMENTS): custom pipeline deploy-<env> (setup's template).
+EXTRA_DEPLOY = re.compile(r'deploy-((?!local$|test$|stage$|prod$|production$)[a-z][a-z0-9]{1,15})')
+
+
+def pipeline_title(pipeline):
+    extra = EXTRA_DEPLOY.fullmatch(pipeline)
+    return f'Deploy į {extra[1]}' if extra and pipeline not in PIPELINES else PIPELINES[pipeline]
 
 
 def log(text):
@@ -262,7 +271,7 @@ class PipelinePlan:
         self.action, self.kind = 'pipeline', 'pipeline'
         self.project, self.workspace, self.slug = project, workspace, slug
         self.pipeline, self.branch, self.variables = pipeline, branch, variables
-        self.title = f'{PIPELINES[pipeline]}: {project}'
+        self.title = f'{pipeline_title(pipeline)}: {project}'
         self.path = f'/repositories/{quote(workspace)}/{quote(slug)}/pipelines/'
         self.body = {'target': {'type': 'pipeline_ref_target', 'ref_type': 'branch', 'ref_name': branch,
                                 'selector': {'type': 'custom', 'pattern': pipeline}},
@@ -356,8 +365,8 @@ def plan_install_metrics(form, status):
 def plan_backup_local(form, status):
     name = value(form, 'project', NAME, 'Projektas')
     environment = form.get('environment', '')
-    if environment not in ('', 'stage', 'prod'):
-        raise Invalid('Aplinka: stage arba prod.')
+    if environment and not ENVIRONMENT.fullmatch(environment):
+        raise Invalid('Aplinka: stage, prod ar projekto STAGE_ENVIRONMENTS (pvz. mdv).')
     if environment and not name:
         raise Invalid('Aplinka nurodoma tik kartu su projektu.')
     full = flag(form, 'full')
@@ -402,8 +411,8 @@ def text_grants(form):
     found = {}
     for grant in form.get('grants', '').replace(',', ' ').split():
         if not GRANT.fullmatch(grant):
-            raise Invalid(f'„Prieiga“: {grant} – rašyk PROJEKTAS[:stage|prod]=LYGIS, lygis phpfpm-readonly, phpfpm, docker '
-                          'arba full.')
+            raise Invalid(f'„Prieiga“: {grant} – rašyk PROJEKTAS[:APLINKA]=LYGIS (aplinka stage, prod, mdv…; be jos – '
+                          'stage ir prod), lygis phpfpm-readonly, phpfpm, docker arba full.')
         target, level = grant.split('=')
         project, _, environment = target.partition(':')
         for one in [environment] if environment else ['stage', 'prod']:
@@ -495,17 +504,18 @@ def plan_key_bulk(form, status):
     if stored is None:
         raise Invalid(f'Rakto vardu {name} nėra.')
     scope, level, only = form.get('scope', ''), form.get('level', ''), form.get('only') == 'existing'
-    if scope not in ('prod', 'stage', 'all') or (level and level not in LEVELS):
-        raise Invalid('Pasirink aplinką (prod, stage, visos) ir lygį.')
+    if scope not in ('prod', 'stage', 'other', 'all') or (level and level not in LEVELS):
+        raise Invalid('Pasirink aplinką (prod, stage, kitos, visos) ir lygį.')
     before = key_grants(stored)
     granted = dict(before)
     for item in access_columns(status):
-        if (scope == 'all' or item[1] == scope) and (not only or item in before):
+        wanted = scope == 'all' or item[1] == scope or (scope == 'other' and item[1] not in ('prod', 'stage'))
+        if wanted and (not only or item in before):
             if level:
                 granted[item] = level
             else:
                 granted.pop(item, None)
-    what = {'prod': 'visos prod', 'stage': 'visos stage', 'all': 'visos aplinkos'}[scope]
+    what = {'prod': 'visos prod', 'stage': 'visos stage', 'other': 'kitos aplinkos', 'all': 'visos aplinkos'}[scope]
     title = f'{name}: {what} → {LEVEL_LABELS.get(level, "be prieigos")}' + (' (tik kur jau turi)' if only else '')
     plan = key_plan(name, stored, granted, '', [], bool(stored.get('fresh')), title)
     if not plan.changes:
@@ -573,11 +583,12 @@ def plan_pipeline(form, status):
     if repository is None:
         raise Invalid('Pipeline\'ai paleidžiami tik Bitbucket projektams (GitHub dar nepalaikomas).')
     pipeline = form.get('pipeline', '')
-    if pipeline not in PIPELINES:
+    extra = EXTRA_DEPLOY.fullmatch(pipeline)
+    if pipeline not in PIPELINES and not (extra and extra[1] in entry.get('environments', {})):
         raise Invalid('Nežinomas pipeline\'as.')
     branch = git_ref(form, 'branch', 'Šaka') or entry.get('branch') or 'master'
     variables = []
-    if pipeline in DEPLOY_PIPELINES:
+    if pipeline in DEPLOY_PIPELINES or extra:
         ref = git_ref(form, 'ref', 'REF')
         if ref:
             variables.append(('REF', ref))
@@ -1994,8 +2005,10 @@ class Page:
         hidden = f'<input type="hidden" name="project" value="{name}">'
         branch_field = f'<label><span>Šaka (pipeline\'o apibrėžimas)</span><input type="text" name="branch" value="{branch}"></label>'
         forms = []
-        for pipeline in DEPLOY_PIPELINES:
-            forms.append(self.form('pipeline', PIPELINES[pipeline],
+        extra = [f'deploy-{environment}' for environment in sorted(entry.get('environments', {}), key=environment_order)
+                 if EXTRA_DEPLOY.fullmatch(f'deploy-{environment}')]
+        for pipeline in (*DEPLOY_PIPELINES, *extra):
+            forms.append(self.form('pipeline', pipeline_title(pipeline),
                                    hidden + f'<input type="hidden" name="pipeline" value="{pipeline}">' + branch_field +
                                    '<label><span>REF (tag\'as ar commit\'as)</span><input type="text" name="ref" autocomplete="off"></label>'
                                    '<label class="check"><input type="checkbox" name="images" value="yes"> IMAGES – perkurti image\'us</label>'
@@ -2206,8 +2219,11 @@ class Page:
                 f'<div><p class="plate-name">paskutinį kartą</p><p>{self.last_use(key)}</p></div></div>')
         # Every prod, every stage or every environment at once.
         bulk = []
-        for scope, label in (('prod', '<span class="sign prod">prod</span>'), ('stage', '<span class="sign stage">stage</span>'),
-                             ('all', '<span class="chip muted">visos</span>')):
+        others = sorted({environment for _, environment in columns if environment not in ('prod', 'stage')})
+        scopes = [('prod', '<span class="sign prod">prod</span>'), ('stage', '<span class="sign stage">stage</span>')]
+        if others:
+            scopes.append(('other', f'<span class="sign" title="{e(", ".join(others))}">kitos</span>'))
+        for scope, label in scopes + [('all', '<span class="chip muted">visos</span>')]:
             bulk.append(f'<form class="bulk" method="post" action="/preview">{self.hidden("key-bulk", [("key_name", name), ("scope", scope)])}'
                         f'<span class="bulk-scope">{label}</span>{self.seg("level", "")}'
                         '<span class="bulk-only"><label class="check"><input type="radio" name="only" value="all" checked> visiems projektams'
@@ -2358,17 +2374,19 @@ class Page:
 
     def project_access(self, data, name):
         """Who reaches this project's environments through the worker."""
+        environments = sorted({environment for project, environment in access_columns(data) if project == name},
+                              key=environment_order)
         rows = []
         for key in (data or {}).get('keys', []):
             granted = {environment: level for (project, environment), level in key_grants(key).items() if project == name}
             if granted:
                 rows.append(f'<tr><td class="id"><a href="/access/{e(quote(key["name"]))}?q={e(quote(name))}#projects">{e(key["name"])}</a></td>' +
-                            ''.join(f'<td><span class="sign {environment}">{environment}</span> {level_chip(granted.get(environment))}</td>'
-                                    for environment in ('stage', 'prod')) + '</tr>')
+                            ''.join(f'<td>{level_chip(granted.get(environment))}</td>' for environment in environments) + '</tr>')
         if not rows:
             return '<div class="empty">Šio projekto taikinių per šį serverį niekas nepasiekia. <a href="/access">Prieiga</a></div>'
-        return ('<table class="list"><tr><th>Raktas</th><th>stage</th><th>prod</th></tr>' + ''.join(rows) +
-                '</table><p class="note"><a href="/access">Keisti – Prieiga</a></p>')
+        return ('<table class="list"><tr><th>Raktas</th>' +
+                ''.join(f'<th><span class="sign {e(environment)}">{e(environment)}</span></th>' for environment in environments) +
+                '</tr>' + ''.join(rows) + '</table><p class="note"><a href="/access">Keisti – Prieiga</a></p>')
 
     # --- Actions ---
     def actions(self, scopes=(), target=''):
@@ -2677,7 +2695,7 @@ def handler(user, stored):
             if match:
                 environment, container = query.get('env', [''])[0], query.get('container', [''])[0]
                 lines = query.get('lines', [CONTAINER_LINES[0]])[0]
-                if environment not in ('stage', 'prod') or not CONTAINER.fullmatch(container) or lines not in CONTAINER_LINES:
+                if not ENVIRONMENT.fullmatch(environment) or not CONTAINER.fullmatch(container) or lines not in CONTAINER_LINES:
                     return self.reply(400, page.invalid('Netinkama aplinka, konteineris ar eilučių skaičius.'))
                 data, error = helper('--container-logs', match[1], environment, container, lines)
                 return self.reply(200, page.container_logs(match[1], environment, container, lines, data, error))

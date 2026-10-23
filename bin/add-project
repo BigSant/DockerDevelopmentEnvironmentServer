@@ -35,7 +35,9 @@ Usage: sudo $0 [--check] [--shared-key] [--target [ENV=]local|ssh://USER@HOST/PA
   --target       where stage/prod deploy (target.env), required for a new project: local = this host, the build root, the
                  account's ids; local:/PATH = this host, project root PATH (created for $ACCOUNT, or writable by it);
                  ssh://USER@HOST/PATH = a server reached as USER (key: $ROOT/.ssh/id_ed25519),
-                 project root PATH. stage=... or prod=... registers one environment (target.<env>.env).
+                 project root PATH. ENV=... registers one environment (target.<env>.env): stage, prod or one
+                 of the project's STAGE_ENVIRONMENTS (e.g. mdv=...; without its own target an environment
+                 deploys to target.env).
                  Repeatable. Without it a rerun keeps the registered target.
 EOF
 }
@@ -202,7 +204,11 @@ target_lines() {  # target_lines ENV SPEC — the target.env lines of one target
 planned_files=() planned_environments=() planned_lines=()
 prepare_target() {  # prepare_target [ENV=]SPEC — check a target and work out its lines before any clone
     local environment= spec=$1 lines
-    case "$spec" in stage=*|prod=*) environment=${spec%%=*}; spec=${spec#*=} ;; esac
+    # ENV= in front: stage, prod or a stage-class environment the project lists (setup's STAGE_ENVIRONMENTS, e.g. mdv).
+    if [[ "$spec" =~ ^([a-z][a-z0-9]{1,15})=(.*)$ ]]; then
+        environment=${BASH_REMATCH[1]} spec=${BASH_REMATCH[2]}
+        case "$environment" in local|test) echo "--target $1: $environment is not a deploy environment" >&2; exit 64 ;; esac
+    fi
     lines=$(target_lines "$environment" "$spec")
     planned_files+=("$build_root/target${environment:+.$environment}.env")
     planned_environments+=("$environment")
@@ -226,7 +232,7 @@ write_target() {  # write_target INDEX — target.env or target.<env>.env of one
 # The target is always named: nothing is created for a project without one.
 if [ ${#targets[@]} -eq 0 ] && [ ! -f "$build_root/target.env" ]; then
     echo "Name the deploy target: --target local (this host, the build root $build_root) or" >&2
-    echo "--target ssh://USER@HOST/PATH (another server); stage=/prod= in front for one environment." >&2
+    echo "--target ssh://USER@HOST/PATH (another server); stage=/prod=/mdv= in front for one environment." >&2
     exit 64
 fi
 # Every target is checked (and a remote one reached) before anything of the project is created.

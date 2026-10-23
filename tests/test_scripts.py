@@ -505,6 +505,14 @@ class AddProjectTargetTest(ScriptTest):
         self.assertIn(f"would write {build_root}/target.prod.env:", remote.stdout)
         self.assertIn("DEPLOY_CONTEXT=setup-asana_tracker-prod\n    DEPLOY_SSH=deploy@shop.example\n"
                       "    DEPLOY_PATH=/home/deploy/shop", remote.stdout)
+        mdv = self.run_script("add-project", "--target", "local", "--check", "--target", "mdv=ssh://deploy@mdv.example/home/deploy/mdv",
+                              "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(mdv.returncode, 0, mdv.stdout + mdv.stderr)
+        self.assertIn(f"would write {build_root}/target.mdv.env:", mdv.stdout)
+        self.assertIn("DEPLOY_CONTEXT=setup-asana_tracker-mdv\n", mdv.stdout)
+        reserved = self.run_script("add-project", "--check", "--target", "test=local", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(reserved.returncode, 64)
+        self.assertIn("test is not a deploy environment", reserved.stderr)
         bad = self.run_script("add-project", "--target", "local", "--check", "--target", "ftp://x/y", "git@bitbucket.org:rsmaizys/asana_tracker.git")
         self.assertEqual(bad.returncode, 64)
         self.assertIn("expected local, local:/PATH or ssh://USER@HOST/ABSOLUTE/PATH", bad.stderr)

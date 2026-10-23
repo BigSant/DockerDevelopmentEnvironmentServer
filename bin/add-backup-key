@@ -35,7 +35,7 @@ ACCESS = SBIN / 'setup-server-access'
 # Installed copy : its source in bin/.
 COPIES = {COMMAND: 'backup-pull', ACCESS: 'server-access'}
 LEVELS = ('phpfpm-readonly', 'phpfpm', 'docker', 'full')
-GRANT = re.compile(r'([a-z0-9][a-z0-9_-]{0,63})(?::(stage|prod))?=(' + '|'.join(LEVELS) + ')')
+GRANT = re.compile(r'([a-z0-9][a-z0-9_-]{0,63})(?::([a-z][a-z0-9]{1,15}))?=(' + '|'.join(LEVELS) + ')')
 KEYS = ROOT / '.ssh/authorized_keys'
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
 KEY = re.compile(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)'
@@ -73,8 +73,9 @@ def parse_grants(values):
     found = {}
     for word in [part.strip() for value in values for part in value.split(',') if part.strip()]:
         match = GRANT.fullmatch(word)
-        if not match:
-            raise SystemExit(f'--grant {word}: expected PROJECT[:stage|prod]=' + '|'.join(LEVELS))
+        if not match or match[2] in ('local', 'test'):
+            raise SystemExit(f'--grant {word}: expected PROJECT[:ENV]=' + '|'.join(LEVELS) + ' (ENV: stage, prod or a '
+                             'STAGE_ENVIRONMENTS name; without it stage and prod)')
         for environment in [match[2]] if match[2] else ['stage', 'prod']:
             found[(match[1], environment)] = match[3]
     return [f'{project}:{environment}={level}' for (project, environment), level in sorted(found.items())]

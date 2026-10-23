@@ -49,10 +49,9 @@ LIBRARY = Path(os.environ.get('SETUP_SERVER_LIBRARY', '/usr/local/lib/setup-serv
 SBIN = Path(os.environ.get('SETUP_SERVER_SBIN', '/usr/local/sbin'))
 PROJECTS = ROOT / 'projects'
 GITHUB_RUNNERS = ROOT / 'github-runner'
-ENVIRONMENTS = ('stage', 'prod')
 # NAME, SERIES and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
-SERIES = re.compile(r'(worker|full|fresh|fresh-full)-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
+SERIES = re.compile(r'(worker|full|fresh|fresh-full)-([a-z][a-z0-9]{1,15})-(\d{8}T\d{6})Z\.sql\.gz')
 SCOPE = re.compile(r'[a-z0-9][a-z0-9._-]*')
 # What leaves the env and target files: the deploy target and the names, nothing secret.
 TARGET_KEYS = ('DEPLOY_CONTEXT', 'DEPLOY_SSH', 'DEPLOY_PATH', 'APP_UID', 'APP_GID')
@@ -71,9 +70,31 @@ DEFAULT_LINES, MAXIMUM_LINES = 50, 500
 CONTAINER_LINES, MAXIMUM_CONTAINER_LINES = 200, 2000
 # Every backup file of an environment the project page lists: the series above and setup's pre-deploy
 # backups (<PROJECT_NAME>-<env>-<time>.sql.gz, as bin/backup-pull knows them).
-PREDEPLOY = re.compile(r'[a-z0-9][a-z0-9_-]*-(stage|prod)-\d{8}T\d{6}\d*\.sql\.gz')
+PREDEPLOY = re.compile(r'[a-z0-9][a-z0-9_-]*-([a-z][a-z0-9]{1,15})-\d{8}T\d{6}\d*\.sql\.gz')
 LISTED_BACKUPS = 100
 PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+
+# ENVIRONMENTS, ENVIRONMENT and server_environments are identical in bin/backup-projects, bin/backup-pull,
+# bin/server-access, bin/server-status and bin/worker-metrics (tests/test_metrics.py).
+ENVIRONMENTS = ('stage', 'prod')
+ENVIRONMENT = re.compile(r'[a-z][a-z0-9]{1,15}')
+
+
+def server_environments(directory):
+    """stage, prod and the stage-class environments env/common.env lists (setup's STAGE_ENVIRONMENTS, e.g. a
+    temporary mdv): every environment a deploy from here may have. None (no environment repository): stage, prod."""
+    extra = []
+    try:
+        text = (directory / 'env/common.env').read_text(errors='replace') if directory else ''
+    except OSError:
+        text = ''
+    for line in text.splitlines():
+        match = re.fullmatch(r'\s*(?:export\s+)?STAGE_ENVIRONMENTS\s*=\s*(["\']?)([^"\'#]*)\1\s*(?:#.*)?', line)
+        if match:
+            extra = [name for name in re.split(r'[\s,]+', match[2])
+                     if ENVIRONMENT.fullmatch(name) and name not in ('local', 'test', *ENVIRONMENTS)]
+    return ENVIRONMENTS + tuple(dict.fromkeys(extra))
 
 
 def environment_directory(build_root):
@@ -312,12 +333,13 @@ def project(build_root, errors):
     common = {**parse_env(read_text(directory / 'env/common.env'))}
     entry['project_name'] = common.get('PROJECT_NAME') if NAME.fullmatch(common.get('PROJECT_NAME', '')) else name
     # The deploy target bin/add-project registered: target.env for both, target.<env>.env for one.
+    environments = server_environments(directory)
     targets = {'': parse_env(read_text(build_root / 'target.env'))}
-    for environment in ENVIRONMENTS:
+    for environment in environments:
         targets[environment] = parse_env(read_text(build_root / f'target.{environment}.env'))
     entry['targets'] = {scope or 'all': {key: values[key] for key in TARGET_KEYS if key in values}
                         for scope, values in targets.items() if values}
-    for environment in ENVIRONMENTS:
+    for environment in environments:
         declared = (directory / f'env/{environment}.env').is_file()
         values = {**common, **parse_env(read_text(directory / f'env/{environment}.env')), **targets[''],
                   **targets[environment]}
@@ -361,8 +383,10 @@ def projects():
             state['containers'] = running.get((state['context'], state['compose_project']), [])
             store = [item for item in state['containers'] if item['name'] == state['compose_project'] + '-secrets']
             state['secrets'] = (('running' if store[0]['state'] == 'running' else 'stopped') if store else 'missing')
-            # An environment that is neither deployed from here nor has anything of its own is left out.
-            if not (state['declared'] or state['deploys'] or (state['backups'] or {}).get('count') or state['containers']):
+            # An environment that is neither deployed from here nor has anything of its own is left out; one the
+            # project lists in STAGE_ENVIRONMENTS stays (it is declared there, e.g. before its first deploy).
+            if environment in ENVIRONMENTS and not (state['declared'] or state['deploys'] or
+                                                    (state['backups'] or {}).get('count') or state['containers']):
                 del entry['environments'][environment]
     return {'projects': found, 'keys': developer_keys(errors), 'errors': errors}
 
@@ -371,7 +395,7 @@ def projects():
 # and their options only; other entries (an administrator's own key) are not listed.
 KEY_ENTRY = re.compile(r'from="([^"]*)",command="\S*/setup-server-(backup-pull|access) --key ([A-Za-z0-9][A-Za-z0-9._@-]{0,63})'
                        r'((?: --allow-fresh)?)((?: --grant [a-z0-9_:=-]+)*)",restrict(?:,pty)? (\S+) ([A-Za-z0-9+/]+={0,3})')
-GRANT = re.compile(r'([a-z0-9][a-z0-9_-]*):(stage|prod)=(phpfpm-readonly|phpfpm|docker|full)')
+GRANT = re.compile(r'([a-z0-9][a-z0-9_-]*):([a-z][a-z0-9]{1,15})=(phpfpm-readonly|phpfpm|docker|full)')
 # A request line of backup-pulls.log or access.log: its time, the key and the address.
 USE = re.compile(r'(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) key=([A-Za-z0-9][A-Za-z0-9._@-]{0,63}) from=(\S+)')
 
@@ -712,10 +736,10 @@ def main(arguments):
     elif arguments[:1] == ['--container-logs'] and len(arguments) in (4, 5):
         name, environment, container = arguments[1:4]
         count = arguments[4] if len(arguments) == 5 else str(CONTAINER_LINES)
-        if not NAME.fullmatch(name) or environment not in ENVIRONMENTS or \
+        if not NAME.fullmatch(name) or not ENVIRONMENT.fullmatch(environment) or \
                 not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', container) or \
                 not count.isdigit() or not 1 <= int(count) <= MAXIMUM_CONTAINER_LINES:
-            print(f'Expected PROJECT stage|prod CONTAINER [LINES 1 to {MAXIMUM_CONTAINER_LINES}]', file=sys.stderr)
+            print(f'Expected PROJECT ENV CONTAINER [LINES 1 to {MAXIMUM_CONTAINER_LINES}]', file=sys.stderr)
             return 64
         if os.geteuid() == 0:
             result = as_account([*arguments[:4], count], lambda error: {'error': f'container logs: {error}'})

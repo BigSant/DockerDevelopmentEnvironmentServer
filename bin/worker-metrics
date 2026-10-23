@@ -44,10 +44,9 @@ RUNNER_UNIT = os.environ.get('SETUP_SERVER_RUNNER_UNIT', 'setup-server-runner.se
 GITHUB_RUNNERS = ROOT / 'github-runner'
 GITHUB_RUNNER_UNIT = 'setup-server-github-runner@{}.service'
 SCOPE = re.compile(r'[a-z0-9][a-z0-9._-]*')
-ENVIRONMENTS = ('stage', 'prod')
 # NAME, SERIES and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
-SERIES = re.compile(r'(worker|full|fresh|fresh-full)-(stage|prod)-(\d{8}T\d{6})Z\.sql\.gz')
+SERIES = re.compile(r'(worker|full|fresh|fresh-full)-([a-z][a-z0-9]{1,15})-(\d{8}T\d{6})Z\.sql\.gz')
 TOKEN_MINIMUM = 24
 DEFAULT_PORT = 9101
 CONFIGURATION_ERROR = 78  # EX_CONFIG: systemd does not restart the service for it
@@ -95,6 +94,28 @@ def number(value):
 
 
 # --- What the worker knows -----------------------------------------------------------------------
+# ENVIRONMENTS, ENVIRONMENT and server_environments are identical in bin/backup-projects, bin/backup-pull,
+# bin/server-access, bin/server-status and bin/worker-metrics (tests/test_metrics.py).
+ENVIRONMENTS = ('stage', 'prod')
+ENVIRONMENT = re.compile(r'[a-z][a-z0-9]{1,15}')
+
+
+def server_environments(directory):
+    """stage, prod and the stage-class environments env/common.env lists (setup's STAGE_ENVIRONMENTS, e.g. a
+    temporary mdv): every environment a deploy from here may have. None (no environment repository): stage, prod."""
+    extra = []
+    try:
+        text = (directory / 'env/common.env').read_text(errors='replace') if directory else ''
+    except OSError:
+        text = ''
+    for line in text.splitlines():
+        match = re.fullmatch(r'\s*(?:export\s+)?STAGE_ENVIRONMENTS\s*=\s*(["\']?)([^"\'#]*)\1\s*(?:#.*)?', line)
+        if match:
+            extra = [name for name in re.split(r'[\s,]+', match[2])
+                     if ENVIRONMENT.fullmatch(name) and name not in ('local', 'test', *ENVIRONMENTS)]
+    return ENVIRONMENTS + tuple(dict.fromkeys(extra))
+
+
 def environment_directory(build_root):
     """The environment repository of a build root: app/, or app/docker/ in older layouts."""
     for directory in (build_root / 'app', build_root / 'app/docker'):
@@ -133,7 +154,7 @@ def backups(metrics, found, now):
                         if match and match[1] in ('worker', 'full') and item.is_file(follow_symlinks=False):
                             info = item.stat(follow_symlinks=False)
                             series.setdefault((match[1], match[2]), []).append((info.st_mtime, info.st_size))
-            declared = {env for env in ENVIRONMENTS if (directory / f'env/{env}.env').is_file()}
+            declared = {env for env in server_environments(directory) if (directory / f'env/{env}.env').is_file()}
         except OSError as error:
             log(f'backups {name}: {error}')
             complete = False
@@ -168,7 +189,7 @@ def deploys(metrics, found, now):
     at, rollback, and "failed": "after-rsync" when the code reached the target but the deploy stopped)."""
     complete = True
     for name, directory in found:
-        for environment in ENVIRONMENTS:
+        for environment in server_environments(directory):
             path = directory / f'.generated/release/{environment}/deployments.json'
             try:
                 if not path.is_file():

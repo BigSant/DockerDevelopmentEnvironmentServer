@@ -129,6 +129,20 @@ class SharedHelpersTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(access.get(name), backups[name])
 
+    def test_every_command_knows_a_projects_environments_the_same_way(self):
+        names = ("ENVIRONMENTS", "ENVIRONMENT", "server_environments")
+        saved = self.SHARED
+        self.SHARED = names
+        try:
+            found = {command: self.definitions(command) for command in
+                     ("backup-projects", "backup-pull", "server-access", "server-status", "worker-metrics")}
+        finally:
+            self.SHARED = saved
+        for command, definitions in found.items():
+            for name in names:
+                with self.subTest(command=command, name=name):
+                    self.assertEqual(definitions.get(name), found["backup-projects"][name])
+
     def test_the_duplicated_helpers_are_identical(self):
         backups = self.definitions("backup-projects")
         self.assertEqual(sorted(backups), sorted(self.SHARED))
@@ -279,6 +293,18 @@ class EndpointTest(ScriptTest):
         (systemd / "setup-server-backup-full.timer").write_text("[Timer]\n")
         samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
         self.assertEqual(value(samples, "setup_worker_full_backups", project="forsena_docker", environment="stage"), 0)
+
+    def test_a_stage_class_environment_the_project_lists_has_its_backups_and_deploys(self):
+        shop = self.tree.project("shop", "prod", "mdv", "old")
+        (shop / "env/common.env").write_text('STAGE_ENVIRONMENTS="mdv"\n')
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - 3600))
+        self.tree.backup(shop, f"worker-mdv-{stamp}Z.sql.gz", 3600, 777)
+        self.tree.deployments(shop, "mdv", [entry("feature/x", "c" * 40, "2026-10-07T10:00:00+00:00")])
+        samples = parse(self.scrape())
+        self.assertEqual(value(samples, "setup_worker_backup_newest_size_bytes", project="shop", environment="mdv"), 777)
+        self.assertEqual(value(samples, "setup_worker_backups", project="shop", environment="prod"), 0)
+        self.assertNotIn(("setup_worker_backups", (("environment", "old"), ("project", "shop"))), samples, "not listed")
+        self.assertEqual(value(samples, "setup_worker_deploy_last_success", project="shop", environment="mdv"), 1)
 
     def test_the_last_deploy_tells_a_rollback_and_a_failed_deploy_apart(self):
         self.fixtures()

@@ -252,6 +252,18 @@ class ServerStatusTest(Worker):
         self.assertEqual(lines, ["ls", "cat var/log\tx", "exit", "^D"])
         self.assertEqual(self.status("--session", "tomas", "../../etc/passwd").returncode, 64)
 
+    def test_a_stage_class_environment_is_one_more_environment_of_the_project(self):
+        asana = self.tree.projects / "asana_tracker/app"
+        (asana / "env/common.env").write_text('PROJECT_NAME=asana\nSTAGE_ENVIRONMENTS="mdv"\n')
+        (asana / "env/mdv.env").write_text("DOMAIN=mdv.asana.example\n")
+        (self.tree.projects / "asana_tracker/target.mdv.env").write_text("DEPLOY_CONTEXT=setup-asana-mdv\nDEPLOY_SSH=d@mdv\n")
+        result = self.status("--projects")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        asana_entry = next(item for item in json.loads(result.stdout)["projects"] if item["name"] == "asana_tracker")
+        mdv = asana_entry["environments"]["mdv"]
+        self.assertEqual((mdv["declared"], mdv["compose_project"], mdv["context"]), (True, "asana-mdv", "setup-asana-mdv"))
+        self.assertEqual(asana_entry["targets"]["mdv"]["DEPLOY_SSH"], "d@mdv")
+
     def test_only_listed_values_leave_and_a_planted_symlink_is_not_followed(self):
         asana = self.tree.projects / "asana_tracker"
         (self.root / "root-only.env").write_text("DEPLOY_SSH=from-a-root-file\nBITBUCKET_ACCESS_TOKEN=leaked\n")
@@ -291,7 +303,9 @@ class ServerStatusTest(Worker):
         self.assertIn("has no prod environment", missing["error"])
         self.assertEqual([call for call in self.calls("docker") if " logs " in f" {call} "],
                          ["logs --timestamps --tail 20 asana-prod-cron"], "nothing else was asked for its logs")
-        for arguments in (["--container-logs", "asana_tracker", "dev", "c"], ["--container-logs", "../x", "prod", "c"],
+        unlisted = json.loads(self.status("--container-logs", "asana_tracker", "dev", "c").stdout)
+        self.assertIn("has no dev environment", unlisted["error"], "an environment name the project does not list")
+        for arguments in (["--container-logs", "asana_tracker", "Dev", "c"], ["--container-logs", "../x", "prod", "c"],
                           ["--container-logs", "asana_tracker", "prod", "-f"], ["--container-logs", "asana_tracker", "prod", "c", "9999"],
                           ["--container-logs", "asana_tracker", "prod"]):
             with self.subTest(arguments=arguments):
@@ -834,7 +848,7 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("add-backup-key")[-1], f"{library} --name tomas")
         for action, fields, message in (("key-bulk", {"key_name": "nobody", "scope": "prod", "level": "full"}, "nėra"),
                                         ("key-bulk", {"key_name": "tomas", "scope": "dev", "level": "full"}, "Pasirink"),
-                                        ("add-backup-key", {"key_name": "tomas", "merge": "yes", "grant:x:dev": "full"}, "netinkamas"),
+                                        ("add-backup-key", {"key_name": "tomas", "merge": "yes", "grant:x:local": "full"}, "netinkamas"),
                                         ("add-backup-key", {"key_name": "tomas", "grant:asana_tracker:prod": "root"}, "nežinomas"),
                                         ("add-backup-key", {"key_name": "ona", "sources": "10.8.0.0/24"}, "Įklijuok")):
             with self.subTest(action=action, fields=fields):
@@ -860,7 +874,8 @@ class WebUiTest(Worker):
                  ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "name": "-rf"}, "Vardas"),
                  ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "ftp://x/y"}, "Netinkamas taikinys"),
                  ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "ssh://u@h/p -oProxyCommand=x"}, "Netinkamas taikinys"),
-                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "dev=local"}, "Netinkamas taikinys"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "test=local"}, "Netinkamas taikinys"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "Dev=local"}, "Netinkamas taikinys"),
                  ("remove-project", {"name": "../etc"}, "Projektas"),
                  ("install-backups", {"at": "25:00"}, "Laikas"),
                  ("install-backups", {"full_at": "Sunday 04:30"}, "Pilnos kopijos diena"),
@@ -879,7 +894,7 @@ class WebUiTest(Worker):
                  ("pipeline", {"project": "asana_tracker", "pipeline": "deploy-production", "ref": "$(id)"}, "REF"),
                  ("pipeline", {"project": "asana_tracker", "pipeline": "custom-anything"}, "Nežinomas pipeline"),
                  ("backup-local", {"environment": "prod"}, "tik kartu su projektu"),
-                 ("backup-local", {"project": "asana_tracker", "environment": "dev"}, "stage arba prod"),
+                 ("backup-local", {"project": "asana_tracker", "environment": "test"}, "STAGE_ENVIRONMENTS"),
                  ("backup-local", {"project": "--full"}, "Projektas"),
                  ("unit", {"unit": "ssh", "operation": "restart"}, "Nežinoma paslauga"),
                  ("unit", {"unit": "github-runner@../x", "operation": "stop"}, "Nežinoma paslauga"),
@@ -1016,7 +1031,7 @@ class WebUiTest(Worker):
         self.assertIn(f"-n {self.library}/bin/server-status --container-logs asana_tracker prod asana-prod-cron 500",
                       self.sudo_calls())
         self.assertIn("is not a container of", self.request("GET", "/project/asana_tracker/logs?env=prod&container=other-prod-web")[2])
-        for query in ("env=dev&container=x", "env=prod&container=-f", "env=prod&container=x&lines=10", "env=prod"):
+        for query in ("env=Dev&container=x", "env=prod&container=-f", "env=prod&container=x&lines=10", "env=prod"):
             with self.subTest(query=query):
                 self.assertEqual(self.request("GET", f"/project/asana_tracker/logs?{query}")[0], 400)
         status, _, metrics = self.request("GET", "/worker-metrics")
@@ -1107,6 +1122,29 @@ class WebUiTest(Worker):
         self.assertNotIn("ProxyCommand", refused)
 
     # --- Bitbucket -------------------------------------------------------------------------------
+    def test_a_stage_class_environment_gets_its_deploy_its_grants_and_a_bulk_row(self):
+        asana = self.tree.projects / "asana_tracker/app"
+        (asana / "env/common.env").write_text('PROJECT_NAME=asana\nSTAGE_ENVIRONMENTS="mdv"\n')
+        self.write_keys()
+        project = self.request("GET", "/project/asana_tracker?fresh=1")[2]
+        self.assertIn('name="pipeline" value="deploy-mdv"', project, "listed: offered before its first deploy")
+        self.assertIn("Deploy į mdv", project)
+        status, _, body = self.preview("pipeline", project="asana_tracker", pipeline="deploy-mdv", ref="feature/x")
+        self.assertEqual(status, 200, body)
+        self.assertIn("&quot;pattern&quot;: &quot;deploy-mdv&quot;", body)
+        self.assertIn("&quot;key&quot;: &quot;REF&quot;,\n      &quot;value&quot;: &quot;feature/x&quot;", body)
+        self.assertEqual(self.preview("pipeline", project="asana_tracker", pipeline="deploy-qa")[0], 400, "not listed")
+        key = self.request("GET", "/access/tomas")[2]
+        self.assertIn('name="grant:asana_tracker:mdv"', key)
+        self.assertIn('name="scope" value="other"', key)
+        self.preview("key-bulk", key_name="tomas", scope="other", level="docker", only="all")
+        self.assertEqual(self.sudo_calls("add-backup-key")[-1],
+                         f"-n {self.library}/bin/add-backup-key --check --name tomas --grant asana_tracker:mdv=docker "
+                         "--grant asana_tracker:prod=full --grant forsena_docker:stage=docker")
+        self.preview("add-backup-key", key_name="tomas", merge="yes", grants="shop-two:mdv=phpfpm")
+        self.assertIn("--grant shop-two:mdv=phpfpm", self.sudo_calls("add-backup-key")[-1])
+        self.assertEqual(self.preview("backup-local", project="asana_tracker", environment="mdv")[0], 200)
+
     def test_a_deploy_starts_the_custom_pipeline_with_its_variables_and_the_projects_token(self):
         status, _, body = self.preview("pipeline", project="asana_tracker", pipeline="deploy-production",
                                        ref="v1.2.0", images="yes", backup="yes")

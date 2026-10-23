@@ -43,12 +43,11 @@ SESSION_DAYS = 180
 SCRIPT = os.environ.get('SETUP_SERVER_SCRIPT', 'script')
 BACKUP_PULL = os.environ.get('SETUP_SERVER_BACKUP_PULL', '/usr/local/sbin/setup-server-backup-pull')
 BACKUP_REQUESTS = ('latest', 'info', 'get', 'fresh')
-ENVIRONMENTS = ('stage', 'prod')
 LEVELS = ('phpfpm-readonly', 'phpfpm', 'docker', 'full')
 # NAME and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
 KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
-GRANT = re.compile(r'([a-z0-9][a-z0-9_-]*):(stage|prod)=(' + '|'.join(LEVELS) + ')')
+GRANT = re.compile(r'([a-z0-9][a-z0-9_-]*):([a-z][a-z0-9]{1,15})=(' + '|'.join(LEVELS) + ')')
 CONTEXT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
 SSH_TARGET = re.compile(r'(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+')
 DIRECTORY = re.compile(r'/[A-Za-z0-9._/-]*')
@@ -67,6 +66,28 @@ USAGE = ('expected: access | shell PROJECT ENV [root|readonly] | exec PROJECT EN
 
 class Refused(Exception):
     """A request this key may not make, or one this command does not answer."""
+
+
+# ENVIRONMENTS, ENVIRONMENT and server_environments are identical in bin/backup-projects, bin/backup-pull,
+# bin/server-access, bin/server-status and bin/worker-metrics (tests/test_metrics.py).
+ENVIRONMENTS = ('stage', 'prod')
+ENVIRONMENT = re.compile(r'[a-z][a-z0-9]{1,15}')
+
+
+def server_environments(directory):
+    """stage, prod and the stage-class environments env/common.env lists (setup's STAGE_ENVIRONMENTS, e.g. a
+    temporary mdv): every environment a deploy from here may have. None (no environment repository): stage, prod."""
+    extra = []
+    try:
+        text = (directory / 'env/common.env').read_text(errors='replace') if directory else ''
+    except OSError:
+        text = ''
+    for line in text.splitlines():
+        match = re.fullmatch(r'\s*(?:export\s+)?STAGE_ENVIRONMENTS\s*=\s*(["\']?)([^"\'#]*)\1\s*(?:#.*)?', line)
+        if match:
+            extra = [name for name in re.split(r'[\s,]+', match[2])
+                     if ENVIRONMENT.fullmatch(name) and name not in ('local', 'test', *ENVIRONMENTS)]
+    return ENVIRONMENTS + tuple(dict.fromkeys(extra))
 
 
 def environment_directory(build_root):
@@ -152,6 +173,8 @@ class Target:
         directory = environment_directory(build_root)
         if directory is None:
             raise Refused(f'no project {project} on this server')
+        if environment not in server_environments(directory):
+            raise Refused(f'{project} has no environment {environment} (stage, prod and its STAGE_ENVIRONMENTS)')
         common = parse_env(read_text(directory / 'env/common.env'))
         values = {**common, **parse_env(read_text(directory / f'env/{environment}.env')),
                   **parse_env(read_text(build_root / 'target.env')),
@@ -215,8 +238,8 @@ def grants(arguments):
 
 
 def level_of(granted, project, environment):
-    if not NAME.fullmatch(project) or environment not in ENVIRONMENTS:
-        raise Refused('expected a project name and stage or prod')
+    if not NAME.fullmatch(project) or not ENVIRONMENT.fullmatch(environment):
+        raise Refused('expected a project name and an environment (stage, prod or one of STAGE_ENVIRONMENTS)')
     level = granted.get((project, environment))
     if level is None:
         raise Refused(f'this key may not reach {project} {environment}')

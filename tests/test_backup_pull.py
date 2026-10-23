@@ -121,6 +121,17 @@ class BackupPullTest(unittest.TestCase):
         self.assertIn("key=tomas from=10.8.0.20 get shop prod worker-prod-20261010T033000Z.sql.gz -> sent 35 bytes", log)
         self.assertIn("refused: no such backup", log)
 
+    def test_an_environment_the_project_lists_is_pulled_like_stage(self):
+        app = self.root / "projects/shop/app"
+        (app / "env/common.env").write_text('STAGE_ENVIRONMENTS="mdv"\n')
+        (self.backups / "worker-mdv-20261013T033000Z.sql.gz").write_bytes(b"mdv")
+        result = self.pull("info shop mdv")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.decode().strip(), "worker-mdv-20261013T033000Z.sql.gz 3")
+        refused = self.pull("latest shop qa")
+        self.assertEqual(refused.returncode, 65)
+        self.assertIn(b"has no environment qa", refused.stderr)
+
     def test_no_backup_yet_is_a_clear_refusal(self):
         for path in self.backups.iterdir():
             path.unlink()
@@ -196,7 +207,7 @@ class AddBackupKeyTest(unittest.TestCase):
         self.assertIn("==> " + str(access) + ": unchanged", self.run_as_root("--refresh"))
         self.run_as_root("--remove", "tomas")
         self.assertEqual(keys.read_text(), "")
-        for grant in ("shop:live=phpfpm", "shop=root", "../x=full", "shop:prod"):
+        for grant in ("shop:local=phpfpm", "shop:x=phpfpm", "shop=root", "../x=full", "shop:prod"):
             with self.subTest(grant=grant), self.assertRaisesRegex(SystemExit, "--grant"):
                 self.run_as_root(str(self.key), "--name", "tomas", "--from", "10.8.0.0/24", "--grant", grant)
 

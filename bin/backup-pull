@@ -4,7 +4,7 @@
 The forced command of a developer key in the setup account's authorized_keys (bin/add-backup-key writes
 `from="<VPN>",command="setup-server-backup-pull --key <name> [--allow-fresh]",restrict <key>`): the key
 runs nothing else. SSH_ORIGINAL_COMMAND is one of
-  latest PROJECT ENV [full]   print the file name of the newest backup of ENV (stage or prod)
+  latest PROJECT ENV [full]   print the file name of the newest backup of ENV (stage, prod or a STAGE_ENVIRONMENTS one)
   info PROJECT ENV [full]     print "<file name> <size in bytes>" of that backup
   get PROJECT ENV FILE        write that backup to stdout
   fresh PROJECT ENV [full]    make a new backup now (keys with --allow-fresh only), streaming its progress on
@@ -30,12 +30,11 @@ ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
 PROJECTS = ROOT / 'projects'
 LOG = ROOT / 'backup-pulls.log'
 BACKUP_COMMAND = os.environ.get('SETUP_SERVER_BACKUP_COMMAND', '/usr/local/sbin/setup-server-backup')
-ENVIRONMENTS = ('stage', 'prod')
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
 KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
 # The series of bin/backup-projects and the pre-deploy backups of setup's make db-backup.
-BACKUP = re.compile(r'(?:(worker|full|fresh|fresh-full)-(stage|prod)-\d{8}T\d{6}Z'
-                    r'|[a-z0-9][a-z0-9_-]*-(stage|prod)-\d{8}T\d{6}\d*)\.sql\.gz')
+BACKUP = re.compile(r'(?:(worker|full|fresh|fresh-full)-([a-z][a-z0-9]{1,15})-\d{8}T\d{6}Z'
+                    r'|[a-z0-9][a-z0-9_-]*-([a-z][a-z0-9]{1,15})-\d{8}T\d{6}\d*)\.sql\.gz')
 FULL = ('full', 'fresh-full')
 # The fresh backup bin/backup-projects hands out instead of a new one (its FRESH_REUSE), and how long it may run.
 FRESH_REUSE, FRESH_TIMEOUT = 30 * 60, 8 * 3600
@@ -43,6 +42,28 @@ FRESH_REUSE, FRESH_TIMEOUT = 30 * 60, 8 * 3600
 
 class Refused(Exception):
     """A request this command does not answer."""
+
+
+# ENVIRONMENTS, ENVIRONMENT and server_environments are identical in bin/backup-projects, bin/backup-pull,
+# bin/server-access, bin/server-status and bin/worker-metrics (tests/test_metrics.py).
+ENVIRONMENTS = ('stage', 'prod')
+ENVIRONMENT = re.compile(r'[a-z][a-z0-9]{1,15}')
+
+
+def server_environments(directory):
+    """stage, prod and the stage-class environments env/common.env lists (setup's STAGE_ENVIRONMENTS, e.g. a
+    temporary mdv): every environment a deploy from here may have. None (no environment repository): stage, prod."""
+    extra = []
+    try:
+        text = (directory / 'env/common.env').read_text(errors='replace') if directory else ''
+    except OSError:
+        text = ''
+    for line in text.splitlines():
+        match = re.fullmatch(r'\s*(?:export\s+)?STAGE_ENVIRONMENTS\s*=\s*(["\']?)([^"\'#]*)\1\s*(?:#.*)?', line)
+        if match:
+            extra = [name for name in re.split(r'[\s,]+', match[2])
+                     if ENVIRONMENT.fullmatch(name) and name not in ('local', 'test', *ENVIRONMENTS)]
+    return ENVIRONMENTS + tuple(dict.fromkeys(extra))
 
 
 def environment_directory(build_root):
@@ -54,11 +75,13 @@ def environment_directory(build_root):
 
 
 def project_directory(project, environment):
-    if not NAME.fullmatch(project) or environment not in ENVIRONMENTS:
-        raise Refused('expected a project name and stage or prod')
+    if not NAME.fullmatch(project) or not ENVIRONMENT.fullmatch(environment):
+        raise Refused('expected a project name and an environment (stage, prod or one of STAGE_ENVIRONMENTS)')
     directory = environment_directory(PROJECTS / project)
     if directory is None:
         raise Refused(f'no project {project} on this server')
+    if environment not in server_environments(directory):
+        raise Refused(f'{project} has no environment {environment} (stage, prod and its STAGE_ENVIRONMENTS)')
     return directory
 
 
