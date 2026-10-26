@@ -70,6 +70,29 @@ class BackupPullTest(unittest.TestCase):
         self.assertEqual(self.pull("latest shop stage full").returncode, 65)
         self.assertIn(b"no stage full backup of shop yet", self.pull("latest shop stage full").stderr)
         self.assertEqual(self.pull("latest shop prod everything").returncode, 65)
+        self.assertIn(b"may only be full or files", self.pull("latest shop prod everything").stderr)
+
+    def test_files_backups_are_a_content_of_their_own_with_the_same_grants(self):
+        older, newest = self.backups / "files-prod-20261010T033000Z.tar.gz", self.backups / "files-prod-20261011T033000Z.tar.gz"
+        for index, path in enumerate((older, newest)):
+            path.write_bytes(b"tar" * (index + 1))
+            os.utime(path, (1_760_001_000 + index, 1_760_001_000 + index))
+        self.assertEqual(self.pull("info shop prod files").stdout.decode().strip(), f"{newest.name} 6")
+        self.assertEqual(self.pull("latest shop prod").stdout.decode().strip(), "shop-prod-20261011T120000123456.sql.gz",
+                         "a newer files backup is not a database backup")
+        self.assertNotIn(b"files-", self.pull("latest shop prod full").stdout)
+        self.assertEqual(self.pull(f"get shop prod {older.name}").stdout, b"tar")
+        self.assertIn(b"no stage files backup of shop yet", self.pull("info shop stage files").stderr)
+        granted = ["--pull-all", "none", "--pull", "shop:prod=db"]
+        self.assertEqual(self.pull("info shop prod files", options=granted).returncode, 0)
+        self.assertIn(b"may not download backups of shop stage", self.pull("info shop stage files", options=granted).stderr)
+        command = self.backup_command('echo "$*" >> "$(dirname "$0")/calls"\n'
+                                      f'printf new > "{self.backups}/files-prod-20261013T150000Z.tar.gz"\n')
+        self.assertIn(b"may not ask for a fresh backup", self.pull("fresh shop prod files", command=command, options=granted).stderr)
+        made = self.pull("fresh shop prod files", command=command, options=["--pull-all", "fresh"])
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.assertEqual(made.stdout.decode().strip(), "files-prod-20261013T150000Z.tar.gz 3")
+        self.assertEqual((self.root / "calls").read_text(), "--fresh --files --progress shop prod\n")
 
     def test_fresh_needs_the_key_permission_and_streams_the_progress(self):
         command = self.backup_command(
