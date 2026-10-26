@@ -102,6 +102,12 @@ KINDS = {'access': ('grant', LEVELS, '--grant', 'Prieiga', 'make ssh'),
          'backups': ('pull', PULL_LEVELS, '--pull', 'Kopijos', 'make db-pull')}
 # A cell of the key forms: grant:<project>:<env> or pull:<project>:<env> = a level or empty.
 GRANT_FIELD = re.compile(r'(grant|pull):([a-z0-9][a-z0-9_-]{0,63}):((?!local$|test$)[a-z][a-z0-9]{1,15})')
+# The browser tools of a project environment (bin/tool-access): pma, cron, mailpit… behind the user's own password,
+# from this server's addresses. A cell tool:<project>:<env> = tools or empty.
+TOOL_FIELD = re.compile(r'tool:([a-z0-9][a-z0-9_-]{0,63}):((?!local$|test$)[a-z][a-z0-9]{1,15})')
+LEVEL_LABELS['tools'] = 'įrankiai'
+LEVEL_NOTES['tools'] = 'pma, cron, mailpit… su savo slaptažodžiu (bin/tool-access)'
+TOOL_PASSWORD = (12, 128)
 PUBLIC_KEY = re.compile(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|'
                         r'sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}(?: [^\s]{1,100})?')
 JOB_ID = re.compile(r'\d{8}T\d{6}Z-[0-9a-f]{6}')
@@ -559,6 +565,76 @@ def plan_key_bulk(form, status):
     return plan
 
 
+def tool_state(status):
+    return (status or {}).get('tool_access') or {}
+
+
+def tool_user(status, name):
+    return (tool_state(status).get('users') or {}).get(name) or {}
+
+
+def plan_tool_access(form, status):
+    """The project environments whose tools a key's user opens: the cells the page shows change, the rest stays."""
+    name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
+    if stored_key(status, name) is None:
+        raise Invalid(f'Rakto vardu {name} nėra.')
+    user = tool_user(status, name)
+    before = set(user.get('projects', []))
+    after = set(before)
+    for key, chosen in form.items():
+        if not key.startswith('tool:'):
+            continue
+        match = TOOL_FIELD.fullmatch(key)
+        if not match or chosen not in ('', 'tools'):
+            raise Invalid('„Įrankiai“: netinkamas projektas ar aplinka.')
+        (after.add if chosen else after.discard)(f'{match[1]}:{match[2]}')
+    arguments = ['--name', name] + ([word for item in sorted(after) for word in ('--tools', item)] or ['--no-tools'])
+    plan = Plan('tool-access', f'{name}: įrankiai', *command('tool-access', arguments), timeout=3600)
+    plan.changes = ([('bad', f'− {item.replace(":", " ")}: įrankiai nebeįleis') for item in sorted(before - after)] +
+                    [('ok', f'+ {item.replace(":", " ")}: įrankiai įleis') for item in sorted(after - before)])
+    if not plan.changes:
+        plan.changes = [('muted', 'nieko nesikeičia')]
+    if after and not user.get('password'):
+        plan.changes.append(('warn', 'slaptažodis nenustatytas: kol jo nėra, įrankiai šio vartotojo neįleidžia'))
+    plan.back = (f'/access/{quote(name)}?tab=tools', 'access')
+    return plan
+
+
+def plan_tool_password(form, status):
+    """The tools password of a key's user, set by the administrator; it reaches bin/tool-access on stdin only."""
+    name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
+    if stored_key(status, name) is None:
+        raise Invalid(f'Rakto vardu {name} nėra.')
+    if flag(form, 'remove'):
+        plan = Plan('tool-password', f'{name}: pašalinti įrankių slaptažodį', *command('tool-access', ['--name', name, '--no-password']),
+                    timeout=3600, danger=f'{name} nebepateks į jokio projekto įrankius.')
+    else:
+        password = form.get('tool_password', '')
+        if not TOOL_PASSWORD[0] <= len(password) <= TOOL_PASSWORD[1] or any(ord(character) < 32 for character in password):
+            raise Invalid(f'Slaptažodis: {TOOL_PASSWORD[0]}–{TOOL_PASSWORD[1]} simbolių, be valdymo simbolių.')
+        plan = Plan('tool-password', f'{name}: įrankių slaptažodis', *command('tool-access', ['--name', name, '--password', '-']),
+                    stdin=password + '\n', timeout=3600)
+        plan.changes = [('warn' if tool_user(status, name).get('password') else 'ok',
+                         'slaptažodis pakeičiamas nauju' if tool_user(status, name).get('password') else 'naujas slaptažodis')]
+    plan.back = (f'/access/{quote(name)}?tab=tools', 'access')
+    return plan
+
+
+def plan_tool_ips(form, status):
+    """This server's addresses every managed target lets reach its tools."""
+    addresses = networks(form.get('allowed_ips', ''), 'Adresai')
+    arguments = ['--allowed-ips', ','.join(addresses)] if addresses else ['--no-allowed-ips']
+    plan = Plan('tool-ips', 'Įrankių adresai', *command('tool-access', arguments), timeout=3600)
+    plan.back = ('/access#tools', 'access')
+    return plan
+
+
+def plan_tool_apply(form, status):
+    plan = Plan('tool-apply', 'Įrankių prieiga – siųsti iš naujo', *command('tool-access', ['--apply']), timeout=3600)
+    plan.back = ('/access#tools', 'access')
+    return plan
+
+
 def plan_remove_backup_key(form, status):
     name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
     plan = Plan('remove-backup-key', f'Atimti raktą {name}', *command('add-backup-key', ['--remove', name]),
@@ -638,12 +714,16 @@ ACTIONS = {'add-project': plan_add_project, 'remove-project': plan_remove_projec
            'remove-backup-key': plan_remove_backup_key, 'list-backup-keys': plan_list_backup_keys,
            'prepare-host': plan_prepare_host, 'update': plan_update, 'update-setup': plan_update_setup,
            'pipeline': plan_pipeline, 'backup-local': plan_backup_local, 'unit': plan_unit, 'install-ssh': plan_install_ssh,
-           'move-bitbucket-ssh': plan_move_bitbucket_ssh}
+           'move-bitbucket-ssh': plan_move_bitbucket_ssh, 'tool-access': plan_tool_access,
+           'tool-password': plan_tool_password, 'tool-ips': plan_tool_ips, 'tool-apply': plan_tool_apply}
 
 
 # --- Running commands ----------------------------------------------------------------------------
-def hidden_values(stdin):
-    """The secrets of a pasted runner dialog or page (--OAuthClientSecret, --token): never shown back."""
+def hidden_values(stdin, action=''):
+    """The secrets of a pasted runner dialog or page (--OAuthClientSecret, --token), or a typed tools password: never
+    shown back."""
+    if action == 'tool-password':
+        return [line for line in (stdin or '').splitlines() if line]
     return [found for found in re.findall(r'(?:--OAuthClientSecret|--token)[\s=]+([^\s\\]+)', stdin or '') if len(found) >= 4]
 
 
@@ -666,7 +746,7 @@ def check(plan):
     except subprocess.TimeoutExpired:
         stop(process)
         output, code = f'(no answer within {CHECK_TIMEOUT} s; stopped)', 124
-    return code, redact(output, hidden_values(plan.stdin))
+    return code, redact(output, hidden_values(plan.stdin, plan.action))
 
 
 def stop(process, grace=30):
@@ -690,7 +770,7 @@ def job_main(directory):
     given = sys.stdin.buffer.read()  # e.g. a runner dialog: kept in memory, never written anywhere
     (directory / 'pid').write_text(f'{os.getpid()}\n')
     started = time.time()
-    hidden = [found.encode() for found in hidden_values(given.decode('utf-8', 'replace'))]
+    hidden = [found.encode() for found in hidden_values(given.decode('utf-8', 'replace'), meta.get('action', ''))]
     with open(directory / 'output.log', 'ab', buffering=0) as output:
         try:
             process = subprocess.Popen(meta['argv'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1525,6 +1605,8 @@ border-bottom:1px dashed var(--rule);margin:0}
 .ramp .lv-fresh{border-top-color:#e8c56b}.ramp .lv-fresh b{color:#e8c56b}
 .seg .lv-db input:checked+span{background:rgba(111,147,201,.3);color:#d6e4fa}
 .seg .lv-fresh input:checked+span{background:#e8c56b;color:#1a1205}
+.lv.lv-tools{color:#d3eed6;border-color:rgba(108,178,122,.6);background:rgba(108,178,122,.14)}
+.seg .lv-tools input:checked+span{background:rgba(108,178,122,.3);color:#e0f4e3}
 .tabs{display:flex;gap:4px;margin:26px 0 0;border-bottom:1px solid var(--rule);scroll-margin-top:16px}
 .tabs a{padding:9px 16px 8px;border:1px solid var(--rule);border-bottom:none;border-radius:4px 4px 0 0;color:var(--dim);
 font-size:11px;letter-spacing:.14em;text-transform:uppercase;font-weight:700;background:var(--panel);margin-bottom:-1px}
@@ -2453,20 +2535,58 @@ class Page:
                             f'<td>{self.summary(granted, lambda name: name == "prod")}</td>'
                             f'<td>{self.summary(granted, lambda name: name == "stage")}</td>'
                             f'<td>{self.summary(granted, lambda name: name not in ("prod", "stage"))}</td>'
-                            f'<td>{self.backups_summary(key, pulls)}</td>'
+                            f'<td>{self.backups_summary(key, pulls)}</td><td>{self.tools_summary(data, key["name"])}</td>'
                             f'<td>{" ".join(badge(source, "muted") for source in key.get("sources", []))}</td>'
                             f'<td>{self.last_use(key)}</td></tr>')
             body += ('<div class="scroll"><table class="board keys"><thead><tr><th>Raktas</th><th>prieiga prod</th>'
-                     '<th>stage</th><th>kitos</th><th>Kopijos (db-pull)</th><th>Iš kur</th><th>Paskutinį kartą</th></tr></thead>'
+                     '<th>stage</th><th>kitos</th><th>Kopijos (db-pull)</th><th>Įrankiai</th><th>Iš kur</th><th>Paskutinį kartą</th></tr></thead>'
                      '<tbody>' + ''.join(rows) + '</tbody></table></div>')
             if wanted:
                 body += (f'<p class="note">Rodoma, kur raktai pasiekia „{e(query)}“ (ir raktai su visų projektų kopijomis). '
                          '<a href="/access">Visi raktai</a></p>')
+        body += self.tools_section(data)
         body += '<h2>Paskutinė veikla</h2>' + self.activity_table(self.recent, keys=True, limit=25)
         body += '<p class="note"><a href="/logs#activity">Visa veikla – Žurnalai</a></p>'
         return self.layout('Prieiga', body, section='access')
 
     recent = None  # the activity of every key, set by the handler before access() and logs()
+
+    @staticmethod
+    def tools_summary(data, name):
+        """How many project environments' tools a key's user opens, and whether it has a password."""
+        user = (((data or {}).get('tool_access') or {}).get('users') or {}).get(name) or {}
+        count = len(user.get('projects', []))
+        if not count:
+            return '<span class="muted">—</span>'
+        text = f'<span class="tallied"><span class="tally">{count}</span>{level_chip("tools")}</span>'
+        return text + ('' if user.get('password') else ' ' + badge('be slaptažodžio', 'warn'))
+
+    def tools_section(self, data):
+        """This server's addresses the targets let reach their tools, and how the last sending went (bin/tool-access)."""
+        tools = (data or {}).get('tool_access') or {}
+        addresses, managed = tools.get('allowed_ips') or [], tools.get('managed') or []
+        applied = tools.get('applied') or {}
+        failed = sorted(item for item, result in applied.items() if result.get('ok') is False)
+        waiting = sorted(item for item, result in applied.items() if result.get('ok') is None)
+        rows = [('Adresai', ' '.join(badge(address, 'muted') for address in addresses) or
+                 '<span class="muted">nenurodyti: įleidžia tik projekto ALLOWED_IPS</span>'),
+                ('Aplinkos su slaptažodžiais', e(len(managed)))]
+        if failed:
+            rows.append(('Nepritaikyta', ' '.join(f'<span class="chip bad" title="{e(applied[item].get("note", ""))}">'
+                                                  f'{e(item.replace(":", " "))}</span>' for item in failed)))
+        if waiting:
+            rows.append(('Laukia deploy\'aus', ' '.join(f'<span class="chip warn" title="{e(applied[item].get("note", ""))}">'
+                                                         f'{e(item.replace(":", " "))}</span>' for item in waiting)))
+        field = (f'<label><span>setup-server adresai (IP ar CIDR, per kablelį)</span><input type="text" name="allowed_ips" '
+                 f'value="{e(",".join(addresses))}" placeholder="198.51.100.7" autocomplete="off"></label>')
+        return ('<h2 id="tools">Įrankių prieiga</h2>' + facts(rows) +
+                '<p class="note">Kas kurios aplinkos įrankius atidaro – rakto puslapio skirtuke „Įrankiai“. Adresai pridedami prie '
+                'kiekvieno įrankio IP sąrašo (ne svetainės) tose aplinkose, kurias saugo slaptažodžiai; pakeitimas galioja iš karto.</p>'
+                '<div class="deck">' + self.form('tool-ips', 'Adresai', field, note='Pvz. VPN serverio viešas IP: per jį eina '
+                                                 'programuotojų srautas į taikinius.', command='bin/tool-access --allowed-ips') +
+                self.form('tool-apply', 'Siųsti iš naujo', '', note='Visų aplinkų vartotojų failai ir adresai – į taikinius '
+                          'dar kartą (pvz. po nepavykusio siuntimo ar setup atnaujinimo).', command='bin/tool-access --apply') +
+                '</div>')
 
     def new_key(self, data, error):
         if data is None:
@@ -2503,11 +2623,8 @@ class Page:
         key = next((item for item in (data or {}).get('keys', []) if item.get('name') == name), None)
         if key is None:
             return None
-        tab = tab if tab in KINDS else 'access'
-        field, levels, _, title, tool = KINDS[tab]
-        granted, columns = key_grants(key, tab), access_columns(data)
+        tab = tab if tab in KINDS or tab == 'tools' else 'access'
         access = key_grants(key)
-        hidden = lambda fields: ''.join(f'<input type="hidden" name="{e(name_)}" value="{e(text)}">' for name_, text in fields)
         body = ('<p><a href="/access">← Prieiga</a></p><div class="keyhead">'
                 f'<div><p class="plate-name">raktas</p><p class="keytitle">{e(name)}</p>'
                 f'<p class="plate-line">{e(key.get("type", ""))} <code>{e(key.get("fingerprint", ""))}</code></p></div>'
@@ -2518,9 +2635,23 @@ class Page:
                 f'<div><p class="plate-name">paskutinį kartą</p><p>{self.last_use(key)}</p></div></div>')
         link = lambda kind: f'/access/{quote(name)}?tab={kind}' + (f'&amp;q={quote(query)}' if query else '') + \
             ('&amp;granted=1' if only_granted else '') + '#projects'
+        tabs = [(kind, label, command_) for kind, (_, _, _, label, command_) in KINDS.items()] + \
+            [('tools', 'Įrankiai', 'pma, cron…')]
         body += ('<nav class="tabs" id="projects">' + ''.join(
             f'<a class="{"on" if kind == tab else ""}" href="{link(kind)}">{e(label)} <small>{e(command_)}</small></a>'
-            for kind, (_, _, _, label, command_) in KINDS.items()) + '</nav>')
+            for kind, label, command_ in tabs) + '</nav>')
+        if tab == 'tools':
+            body += self.tools_tab(data, name, query, only_granted)
+        else:
+            body += self.grants_tab(data, key, name, tab, query, only_granted)
+        body += self.key_settings(key, name, events)
+        return self.layout(f'Raktas {name}', body, section='access')
+
+    def grants_tab(self, data, key, name, tab, query, only_granted):
+        """A key's access (make ssh) or backups (make db-pull): every prod/stage at once, then one row per project."""
+        field, levels = KINDS[tab][:2]
+        granted, columns = key_grants(key, tab), access_columns(data)
+        body = ''
         if tab == 'backups':
             everything = key.get('pull_all', 'none')
             body += (f'<form class="bulk everything" method="post" action="/preview">'
@@ -2580,7 +2711,12 @@ class Page:
                      '<button>Peržiūrėti pakeitimus</button></div></form>')
         else:
             body += '<div class="empty">Nė vienas projektas neatitinka filtro.</div>'
-        # The key itself: networks, a new public key, a project not on this server yet.
+        return body
+
+    def key_settings(self, key, name, events):
+        """The key itself (networks, a new public key, a project not on this server yet) and its activity."""
+        hidden = lambda fields: ''.join(f'<input type="hidden" name="{e(name_)}" value="{e(text)}">' for name_, text in fields)
+        body = ''
         text = lambda field_, label, placeholder='', current='': (
             f'<label><span>{e(label)}</span><input type="text" name="{field_}" value="{e(current)}" placeholder="{e(placeholder)}" '
             'autocomplete="off"></label>')
@@ -2594,10 +2730,68 @@ class Page:
                  self.form('add-backup-key', 'Tinklai, raktas', settings,
                            note='Naujas raktas galioja visoms šio rakto aplinkoms iš karto.', command=f'bin/add-backup-key --name {name}') +
                  self.form('remove-backup-key', f'Atimti raktą {name}', f'<input type="hidden" name="key_name" value="{e(name)}">',
-                           note='Raktas nebegalės nei parsisiųsti kopijų, nei prisijungti prie taikinių.',
+                           note='Raktas nebegalės nei parsisiųsti kopijų, nei prisijungti prie taikinių, nei atidaryti įrankių.',
                            command=f'bin/add-backup-key --remove {name}', danger=True) + '</div>')
         body += '<h2 id="activity">Veikla</h2>' + self.activity_table(events, keys=False, limit=200)
-        return self.layout(f'Raktas {name}', body, section='access')
+        return body
+
+    def tools_tab(self, data, name, query, only_granted):
+        """The key's tools password and the project environments whose tools it opens (bin/tool-access): a change holds
+        at once, setup-server sends the user file to the target and reloads its nginx-proxy."""
+        tools = (data or {}).get('tool_access') or {}
+        user = (tools.get('users') or {}).get(name) or {}
+        granted = set(user.get('projects', []))
+        applied = tools.get('applied') or {}
+        addresses = tools.get('allowed_ips') or []
+        state = (f'{badge("nustatytas", "ok")} <span class="muted">{e(user.get("password_set") or "")}</span>'
+                 if user.get('password') else badge('nenustatytas', 'warn'))
+        body = ('<div class="callout"><p>Pažymėtų aplinkų pma, cron, mailpit, backup, metrics ir projekto PROXY_TOOLS paklaus '
+                f'vardo <code>{e(name)}</code> ir šio slaptažodžio. Įleidžiama tik iš setup-server adresų '
+                f'({e(", ".join(addresses)) if addresses else "nenurodyti – tik projekto ALLOWED_IPS"}; '
+                '<a href="/access#tools">keisti</a>). Pakeitimas galioja iš karto, be deploy\'aus.</p></div>')
+        fields = (f'<input type="hidden" name="key_name" value="{e(name)}"><p>Slaptažodis: {state}</p>'
+                  f'<label><span>Naujas slaptažodis ({TOOL_PASSWORD[0]}+ simbolių)</span><input type="password" name="tool_password" '
+                  f'autocomplete="new-password" minlength="{TOOL_PASSWORD[0]}" maxlength="{TOOL_PASSWORD[1]}"></label>' +
+                  ('<label class="check"><input type="checkbox" name="remove" value="yes"> pašalinti slaptažodį '
+                   '(įrankiai neįleis niekur)</label>' if user.get('password') else ''))
+        body += '<div class="deck">' + self.form(
+            'tool-password', 'Įrankių slaptažodis', fields, note='Slaptažodį sugalvoja ir perduoda administratorius; serveryje '
+            'lieka tik jo hash\'as.', command=f'bin/tool-access --name {name} --password -') + '</div>'
+        wanted = query.strip().lower()
+        columns = access_columns(data)
+        rows = [(project, environments) for project, environments in project_rows(columns)
+                if (not wanted or wanted in project) and
+                (not only_granted or any(f'{project}:{one}' in granted for one in environments))]
+        body += (f'<form class="toolbar search" method="get" action="/access/{e(quote(name))}#projects">'
+                 '<input type="hidden" name="tab" value="tools">'
+                 f'<input type="text" name="q" value="{e(query)}" placeholder="projektas" autocomplete="off">'
+                 f'<label class="check"><input type="checkbox" name="granted" value="1"{" checked" if only_granted else ""}> '
+                 f'tik su leidimu</label><button>Rodyti</button><span class="note">{len(rows)} iš {len(project_rows(columns))}</span></form>')
+        if not rows:
+            return body + '<div class="empty">Nė vienas projektas neatitinka filtro.</div>'
+
+        def slot(project, environment, environments):
+            if environment not in environments:
+                return '<div class="env"></div>'
+            item = f'{project}:{environment}'
+            result = applied.get(item) or {}
+            mark = ''
+            if item in granted and result.get('ok') is False:
+                mark = f' <span class="chip bad" title="{e(result.get("note", ""))}">nepritaikyta</span>'
+            elif item in granted and result.get('ok') is None and result:
+                mark = f' <span class="chip warn" title="{e(result.get("note", ""))}">laukia deploy\'aus</span>'
+            return (f'<div class="env"><span class="sign {e(environment)}">{e(environment)}</span>'
+                    f'{self.seg(f"tool:{project}:{environment}", "tools" if item in granted else "", ("tools",))}{mark}</div>')
+        lines = ''.join(
+            f'<tr><td class="id">{e(project)}</td><td><div class="envs tools">' +
+            ''.join(slot(project, environment, environments)
+                    for environment in ('prod', 'stage', *[one for one in environments if one not in ('prod', 'stage')])) +
+            '</div></td></tr>' for project, environments in rows)
+        body += (f'<form class="action" method="post" action="/preview">{self.hidden("tool-access", [("key_name", name)])}'
+                 f'<table class="grants projects">{lines}</table><div class="form-foot"><p class="note">Keičiamos tik rodomos '
+                 'aplinkos. Aplinka, kurioje kas nors kada nors turėjo įrankių leidimą, lieka saugoma slaptažodžiu: atėmus '
+                 'paskutinį, neįleidžiamas niekas.</p><button>Peržiūrėti pakeitimus</button></div></form>')
+        return body
 
     @staticmethod
     def activity_table(events, keys=True, limit=100):
@@ -2820,6 +3014,8 @@ class Page:
                       ('Kodas', badge('—' if code is None else code, 'ok' if code == 0 else 'bad'))])
         if plan.stdin and plan.action == 'install-runner':
             body += '<p class="note">Įklijuotas tekstas perduotas per stdin (nerodomas).</p>'
+        if plan.stdin and plan.action == 'tool-password':
+            body += '<p class="note">Slaptažodis perduotas per stdin (nerodomas, nesaugomas; serveryje lieka tik jo hash\'as).</p>'
         body += term(output)
         if plan.run is None:
             return self.layout(plan.title, body, section=section)
@@ -3162,7 +3358,8 @@ def handler(user, stored):
             if builder is None:
                 return self.reply(400, page.invalid('Nežinomas veiksmas.'))
             try:
-                plan = builder(form, status()[0] if form.get('action') in ('pipeline', 'add-backup-key', 'key-bulk') else None)
+                plan = builder(form, status()[0] if form.get('action') in ('pipeline', 'add-backup-key', 'key-bulk', 'tool-access',
+                                                                           'tool-password') else None)
             except Invalid as error:
                 return self.reply(400, page.invalid(str(error)))
             if plan.kind == 'pipeline':

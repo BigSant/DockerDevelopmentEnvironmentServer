@@ -21,6 +21,7 @@ the --pull lists, --pull-all), so `--name tomas --pull shop=db` alone changes wh
 
 import argparse
 import ipaddress
+import json
 import os
 from pathlib import Path
 import pwd
@@ -33,6 +34,7 @@ import tempfile
 HERE = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
 ACCOUNT = os.environ.get('SETUP_SERVER_USER', 'setup')
+CONFIG = Path(os.environ.get('SETUP_SERVER_CONFIG', '/etc/setup-server'))
 SBIN = Path(os.environ.get('SETUP_SERVER_SBIN', '/usr/local/sbin'))
 COMMAND = SBIN / 'setup-server-backup-pull'
 ACCESS = SBIN / 'setup-server-access'
@@ -256,6 +258,15 @@ def main(argv=None):
         if len(kept) == len(lines):
             raise SystemExit(f'No backup key named {args.remove}')
         write_keys(kept, args.check)
+        # The tools password goes with the key (bin/tool-access): its user file lines leave every target now.
+        try:
+            users = json.loads((CONFIG / 'tool-access.json').read_text()).get('users') or {}
+        except (OSError, ValueError, AttributeError):
+            users = {}
+        if args.remove in users and (HERE / 'tool-access').is_file():
+            subprocess.run([sys.executable, str(HERE / 'tool-access'), '--remove', args.remove] + (['--check'] if args.check else []),
+                           env={**os.environ, 'SETUP_SERVER_ROOT': str(ROOT), 'SETUP_SERVER_USER': ACCOUNT,
+                                'SETUP_SERVER_CONFIG': str(CONFIG)})
         return 0
     if not args.name:
         parser.error('give the public key file, --name and --from (or --remove NAME / --list)')

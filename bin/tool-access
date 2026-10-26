@@ -1,0 +1,405 @@
+#!/usr/bin/python3
+"""Who may open the browser tools of the projects deployed from here, and from which addresses: one place for
+every project instead of an allowlist and htpasswd lines in each.
+
+The tools are setup's pma, mailpit, cron, backup and metrics and a project's own PROXY_TOOLS sites. The state is
+$CONFIG/tool-access.json (root only):
+  allowed_ips  this server's addresses the targets let in, e.g. the VPN server's public IP (a developer's traffic
+               to the targets goes out through it)
+  users        a developer key's name (bin/add-backup-key) -> the crypt hash of the tools password the administrator
+               set (openssl passwd -6; the password itself is never kept) and the PROJECT:ENV it may open
+  managed      every PROJECT:ENV a user was ever granted: it keeps its user file, so taking the last grant away lets
+               nobody in instead of falling back to the IP rule alone
+For each managed project environment it writes $ROOT/projects/<name>/tool-access/<env>/users.htpasswd (the granted
+users that have a password) and allowed-ips, and runs `make tool-access ENV=<env>` there as the setup account
+(setup 3.6.0+): the target's nginx-proxy takes them at once, and every deploy brings them again. The tools then ask
+for the user's name and password on top of their IP rule; a tool's own <TOOL>_HTPASSWD still wins.
+"""
+
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
+ACCOUNT = os.environ.get('SETUP_SERVER_USER', 'setup')
+CONFIG = Path(os.environ.get('SETUP_SERVER_CONFIG', '/etc/setup-server'))
+PROJECTS = ROOT / 'projects'
+STATE = CONFIG / 'tool-access.json'
+KEYS = ROOT / '.ssh/authorized_keys'
+SOURCE = 'tool-access'
+APPLY_TIMEOUT = 300
+# The key names of bin/add-backup-key; a project, as the build roots under projects/ are named.
+USER = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
+NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
+TOOLS = re.compile(r'([a-z0-9][a-z0-9_-]{0,63})(?::([a-z][a-z0-9]{1,15}))?')
+ENVIRONMENTS = ('stage', 'prod')
+ENVIRONMENT = re.compile(r'[a-z][a-z0-9]{1,15}')
+PASSWORD_LENGTH = (12, 128)
+
+
+class Refused(Exception):
+    pass
+
+
+def server_environments(directory):
+    """stage, prod and the stage-class environments env/common.env lists (setup's STAGE_ENVIRONMENTS, e.g. a
+    temporary mdv): every environment a deploy from here may have. None (no environment repository): stage, prod."""
+    extra = []
+    try:
+        text = (directory / 'env/common.env').read_text(errors='replace') if directory else ''
+    except OSError:
+        text = ''
+    for line in text.splitlines():
+        match = re.fullmatch(r'\s*(?:export\s+)?STAGE_ENVIRONMENTS\s*=\s*(["\']?)([^"\'#]*)\1\s*(?:#.*)?', line)
+        if match:
+            extra = [name for name in re.split(r'[\s,]+', match[2])
+                     if ENVIRONMENT.fullmatch(name) and name not in ('local', 'test', *ENVIRONMENTS)]
+    return ENVIRONMENTS + tuple(dict.fromkeys(extra))
+
+
+def environment_directory(build_root):
+    """The environment repository of a build root: app/, or app/docker/ in older layouts."""
+    for directory in (build_root / 'app', build_root / 'app/docker'):
+        if (directory / 'Makefile').is_file() and (directory / 'env').is_dir():
+            return directory
+    return None
+
+
+# --- The state ---------------------------------------------------------------------------------------------------
+def load():
+    try:
+        state = json.loads(STATE.read_text())
+    except FileNotFoundError:
+        state = {}
+    except (OSError, ValueError) as error:
+        raise Refused(f'{STATE} cannot be read ({error}); fix or remove it') from None
+    state.setdefault('allowed_ips', [])
+    state.setdefault('users', {})
+    state.setdefault('managed', [])
+    state.setdefault('applied', {})
+    return state
+
+
+def save(state):
+    CONFIG.mkdir(mode=0o755, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile('w', dir=CONFIG, prefix='.tool-access.', delete=False) as handle:
+        json.dump(state, handle, indent=1, sort_keys=True)
+        handle.write('\n')
+    os.chmod(handle.name, 0o600)
+    os.replace(handle.name, STATE)
+
+
+def shown(state):
+    """The state for the UI and --show: no hash."""
+    return {'allowed_ips': state['allowed_ips'], 'managed': sorted(state['managed']), 'applied': state['applied'],
+            'users': {name: {'password': bool(user.get('hash')), 'password_set': user.get('password_set'),
+                             'projects': sorted(user.get('projects', []))} for name, user in sorted(state['users'].items())}}
+
+
+def key_names():
+    """The developer keys of bin/add-backup-key (their names in authorized_keys)."""
+    try:
+        text = KEYS.read_text(errors='replace')
+    except OSError:
+        return set()
+    return set(re.findall(r'command="\S+ --key (\S+)', text))
+
+
+def networks(value):
+    import ipaddress
+    found = []
+    for part in re.split(r'[\s,]+', value.strip()):
+        if not part:
+            continue
+        try:
+            network = ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            raise Refused(f'--allowed-ips: {part[:60]} is not an IP address or network') from None
+        if network.prefixlen == 0:
+            raise Refused(f'--allowed-ips: {part} would let every address in')
+        text = str(network.network_address) if network.num_addresses == 1 else str(network)
+        if text not in found:
+            found.append(text)
+    return found
+
+
+def project_environments(values):
+    """PROJECT[:ENV] words (repeatable, comma-separated) as ['project:env']; without ENV stage and prod."""
+    found = []
+    for value in values:
+        for word in value.replace(',', ' ').split():
+            match = TOOLS.fullmatch(word)
+            if not match:
+                raise Refused(f'--tools: {word[:60]} is not PROJECT[:ENV] (ENV stage, prod, mdv…; without it stage and prod)')
+            directory = environment_directory(PROJECTS / match[1])
+            if not (PROJECTS / match[1]).is_dir():
+                raise Refused(f'--tools: no project {match[1]} on this server (projects/{match[1]})')
+            for environment in [match[2]] if match[2] else ENVIRONMENTS:
+                if environment not in server_environments(directory):
+                    raise Refused(f'--tools: {match[1]} has no environment {environment} (stage, prod and its STAGE_ENVIRONMENTS)')
+                if f'{match[1]}:{environment}' not in found:
+                    found.append(f'{match[1]}:{environment}')
+    return found
+
+
+def password_hash(password):
+    """The crypt SHA-512 hash nginx checks (openssl passwd -6, the password on its stdin)."""
+    result = subprocess.run(['openssl', 'passwd', '-6', '-stdin'], input=password + '\n', capture_output=True, text=True)
+    hashed = result.stdout.strip()
+    if result.returncode or not hashed.startswith('$6$'):
+        raise Refused('openssl passwd -6 did not hash the password')
+    return hashed
+
+
+def read_password():
+    """One line of stdin; never shown."""
+    password = sys.stdin.readline().rstrip('\r\n')
+    if not PASSWORD_LENGTH[0] <= len(password) <= PASSWORD_LENGTH[1]:
+        raise Refused(f'the password needs {PASSWORD_LENGTH[0]} to {PASSWORD_LENGTH[1]} characters')
+    if any(ord(character) < 32 for character in password):
+        raise Refused('the password cannot hold control characters')
+    return password
+
+
+# --- The files of each project environment ----------------------------------------------------------------------
+def exists(item):
+    return (PROJECTS / item.split(':')[0]).is_dir()
+
+
+def wanted(state):
+    """{'project:env': {'users.htpasswd': text, 'allowed-ips': text}} of every managed project environment here."""
+    files = {}
+    for item in sorted(set(state['managed'])):
+        if not exists(item):
+            continue
+        lines = [f'{name}:{user["hash"]}' for name, user in sorted(state['users'].items())
+                 if user.get('hash') and item in user.get('projects', [])]
+        files[item] = {'users.htpasswd': ''.join(line + '\n' for line in lines),
+                       'allowed-ips': ''.join(address + '\n' for address in state['allowed_ips'])}
+    return files
+
+
+def directory_of(item):
+    project, environment = item.split(':')
+    return PROJECTS / project / SOURCE / environment
+
+
+def current(item):
+    found = {}
+    for name in ('users.htpasswd', 'allowed-ips'):
+        try:
+            found[name] = (directory_of(item) / name).read_text()
+        except OSError:
+            found[name] = None
+    return found
+
+
+def account_ids():
+    if os.geteuid() != 0:
+        return None
+    account = pwd.getpwnam(ACCOUNT)
+    return account.pw_uid, account.pw_gid
+
+
+def write_files(item, files):
+    """The files in the build root, the setup account's (its deploys and make tool-access read them)."""
+    directory = directory_of(item)
+    ids = account_ids()
+    for path in (directory.parent, directory):
+        path.mkdir(mode=0o700, exist_ok=True)
+        if ids:
+            os.chown(path, *ids)
+    for name, text in files.items():
+        with tempfile.NamedTemporaryFile('w', dir=directory, prefix=f'.{name}.', delete=False) as handle:
+            handle.write(text)
+        os.chmod(handle.name, 0o600)
+        if ids:
+            os.chown(handle.name, *ids)
+        os.replace(handle.name, directory / name)
+
+
+def setup_knows_tool_access():
+    """Whether the setup checkout make uses has `make tool-access` (setup 3.6.0+)."""
+    makefile = Path(os.environ.get('SETUP_DIRECTORY') or ROOT / 'setup') / 'docker/project.mk'
+    try:
+        return re.search(r'(?m)^tool-access:', makefile.read_text(errors='replace')) is not None
+    except OSError:
+        return False
+
+
+def child_options():
+    """make as the setup account, with its own environment (sudo left root's)."""
+    env = {'PATH': '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C.UTF-8',
+           'SETUP_DIRECTORY': os.environ.get('SETUP_DIRECTORY') or str(ROOT / 'setup')}
+    if os.geteuid() != 0:
+        return {'env': {**os.environ, **env}}
+    account = pwd.getpwnam(ACCOUNT)
+    env.update(HOME=account.pw_dir, USER=ACCOUNT, LOGNAME=ACCOUNT, SHELL='/bin/bash')
+    return {'env': env, 'user': account.pw_uid, 'group': account.pw_gid,
+            'extra_groups': os.getgrouplist(ACCOUNT, account.pw_gid), 'cwd': '/'}
+
+
+def apply(item):
+    """make tool-access ENV=<env> in the project's build root: (True, note) applied, (None, note) waits for the
+    first deploy or a newer setup, (False, note) failed."""
+    project, environment = item.split(':')
+    directory = environment_directory(PROJECTS / project)
+    if directory is None or not (directory / f'env/{environment}.env').is_file():
+        return None, 'not deployed from here yet: its first deploy brings the files'
+    if not setup_knows_tool_access():
+        return None, 'setup has no make tool-access (3.6.0+): update it (bin/update-setup); the next deploy brings them'
+    try:
+        result = subprocess.run(['make', '--no-print-directory', '-C', str(directory), 'tool-access', f'ENV={environment}'],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace',
+                                timeout=APPLY_TIMEOUT, **child_options())
+    except subprocess.TimeoutExpired:
+        return False, f'make tool-access did not finish within {APPLY_TIMEOUT} s'
+    # setup's own last words, not make's "*** Error" line after them.
+    lines = [line for line in result.stdout.splitlines() if line.strip() and not re.match(r'make(\[\d+\])?: ', line)]
+    if result.returncode:
+        return False, (lines[-1] if lines else f'make tool-access exit {result.returncode}')[:300]
+    return True, 'applied'
+
+
+# --- The command ------------------------------------------------------------------------------------------------
+def changes(before, after):
+    """What a change does, a line each, without a hash."""
+    lines = []
+    if before['allowed_ips'] != after['allowed_ips']:
+        lines.append(f'allowed IPs: {" ".join(before["allowed_ips"]) or "-"} -> {" ".join(after["allowed_ips"]) or "-"}')
+    for name in sorted(set(before['users']) | set(after['users'])):
+        old, new = before['users'].get(name), after['users'].get(name)
+        if new is None:
+            lines.append(f'{name}: removed (and from {len(old.get("projects", []))} project environments)')
+            continue
+        old = old or {}
+        if old.get('hash') != new.get('hash'):
+            lines.append(f'{name}: {"new password" if new.get("hash") else "password removed: no tool lets it in"}')
+        for item in sorted(set(old.get('projects', [])) - set(new.get('projects', []))):
+            lines.append(f'{name}: - {item.replace(":", " ")}')
+        for item in sorted(set(new.get('projects', [])) - set(old.get('projects', []))):
+            lines.append(f'{name}: + {item.replace(":", " ")}')
+    return lines
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument('--name', help='a developer key\'s name (bin/add-backup-key): the user the tools ask for')
+    parser.add_argument('--password', choices=['-'], help='- : the tools password from stdin (one line, 12+ characters)')
+    parser.add_argument('--no-password', action='store_true', help='drop the password: the tools let the user in nowhere')
+    parser.add_argument('--tools', action='append', default=[], metavar='PROJECT[:ENV]',
+                        help='the project environments whose tools the user may open (without :ENV stage and prod); '
+                             'repeatable or comma-separated; replaces the user\'s list')
+    parser.add_argument('--no-tools', action='store_true', help='take every project environment away from the user')
+    parser.add_argument('--remove', metavar='NAME', help='forget this user (bin/add-backup-key --remove does it too)')
+    parser.add_argument('--allowed-ips', metavar='LIST', help='this server\'s addresses the targets let in (IP or CIDR, '
+                                                               'comma-separated), e.g. the VPN server\'s public IP')
+    parser.add_argument('--no-allowed-ips', action='store_true', help='no address of this server joins the tools\' lists')
+    parser.add_argument('--apply', nargs='?', const='', metavar='PROJECT[:ENV]',
+                        help='send the files to every managed project environment (or this one) again')
+    parser.add_argument('--show', action='store_true', help='the state as JSON, without hashes')
+    parser.add_argument('--check', action='store_true', help='show what would change; change nothing')
+    args = parser.parse_args(argv)
+    if args.show:
+        print(json.dumps(shown(load()), indent=1, sort_keys=True))
+        return 0
+    if not args.check and os.geteuid() != 0:
+        raise SystemExit('Run with sudo (or use --check / --show)')
+    user_options = args.password or args.no_password or args.tools or args.no_tools
+    if user_options and not args.name:
+        parser.error('--password, --no-password, --tools and --no-tools need --name')
+    if args.name and not user_options:
+        parser.error('--name: give --password -, --no-password, --tools or --no-tools')
+    if args.password and args.no_password or args.tools and args.no_tools or args.allowed_ips and args.no_allowed_ips:
+        parser.error('an option and its --no- form exclude each other')
+    if not (user_options or args.remove or args.allowed_ips is not None or args.no_allowed_ips or args.apply is not None):
+        parser.error('nothing to do: give --name with --password/--tools, --remove, --allowed-ips or --apply')
+    if not args.check:  # one change at a time: the UI and a terminal may both run it
+        CONFIG.mkdir(mode=0o755, parents=True, exist_ok=True)
+        lock = open(CONFIG / '.tool-access.lock', 'w')
+        fcntl.flock(lock, fcntl.LOCK_EX)
+    before = load()
+    state = json.loads(json.dumps(before))
+    if args.allowed_ips is not None or args.no_allowed_ips:
+        state['allowed_ips'] = [] if args.no_allowed_ips else networks(args.allowed_ips)
+    if args.name:
+        if not USER.fullmatch(args.name):
+            raise Refused('--name: letters, digits, . _ @ - (up to 64)')
+        if args.name not in key_names() and args.name not in state['users']:
+            raise Refused(f'no developer key named {args.name}: add it first (bin/add-backup-key, the UI\'s Prieiga)')
+        user = state['users'].setdefault(args.name, {'projects': []})
+        if args.password:
+            user['hash'] = password_hash(read_password())
+            user['password_set'] = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        elif args.no_password:
+            user.pop('hash', None)
+            user.pop('password_set', None)
+        if args.tools or args.no_tools:
+            user['projects'] = [] if args.no_tools else project_environments(args.tools)
+    if args.remove:
+        if args.remove not in state['users'] and not (user_options or args.allowed_ips is not None or
+                                                      args.no_allowed_ips or args.apply is not None):
+            print(f'==> {args.remove} has no tool access; nothing to forget')
+            return 0
+        state['users'].pop(args.remove, None)
+    # A project environment once granted keeps its user file: the last revocation leaves nobody in.
+    granted = {item for user in state['users'].values() for item in user.get('projects', [])}
+    state['managed'] = sorted(item for item in set(state['managed']) | granted if exists(item))
+    for user in state['users'].values():
+        user['projects'] = sorted(item for item in user.get('projects', []) if exists(item))
+    for line in changes(before, state) or ['no change of the tool access']:
+        print(f'==> {line}')
+    files = wanted(state)
+    if args.apply:
+        match = TOOLS.fullmatch(args.apply)
+        if not match:
+            raise Refused('--apply: PROJECT[:ENV]')
+        chosen = [item for item in files if item.split(':')[0] == match[1] and (not match[2] or item.split(':')[1] == match[2])]
+        if not chosen:
+            raise Refused(f'--apply: {args.apply} has no tool access kept here')
+    else:
+        chosen = list(files)
+    pending = [item for item in chosen if args.apply is not None or current(item) != files[item]]
+    if args.check:
+        for item in pending:
+            users = files[item]['users.htpasswd'].count('\n')
+            print(f'==> would send {item.replace(":", " ")}: {users} users, {len(state["allowed_ips"])} addresses')
+        if not files:
+            print('==> no project environment is granted to anybody: nothing is sent')
+        return 0
+    save(state)
+    failed = 0
+    for item in pending:
+        write_files(item, files[item])
+        ok, note = apply(item)
+        state['applied'][item] = {'at': int(datetime.now(timezone.utc).timestamp()), 'ok': ok, 'note': note}
+        failed += ok is False
+        mark = {True: 'ok', None: 'waits', False: 'FAILED'}[ok]
+        print(f'==> {item.replace(":", " ")}: {mark}: {note}', flush=True)
+    for item in list(state['applied']):
+        if item not in files:
+            del state['applied'][item]
+    save(state)
+    if not pending:
+        print('==> every target has the tool access already')
+    if not state['allowed_ips'] and files:
+        print('==> note: no --allowed-ips: the tools let in only the addresses each project lists (ALLOWED_IPS)')
+    if failed:
+        print(f'==> {failed} failed: fix it and run sudo bin/tool-access --apply (the files are in the build roots)')
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except Refused as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(65)

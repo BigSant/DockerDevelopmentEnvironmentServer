@@ -20,6 +20,7 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/install-backups` | DB kopijos: naktinė (`setup-server-backup.timer`, pagal lentelių registrą) ir savaitinė pilna (`setup-server-backup-full.timer`, visų lentelių duomenys); naktinė failų kopija (`setup-server-backup-files.timer`, projekto `BACKUP_FILE_PATHS` keliai iš taikinio); komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
 | `bin/install-ssh` | SSH iš VPN: `openssh-server` (Ubuntu Desktop jo neturi), paleistas ir startuojantis po perkrovimo, nustatymai `/etc/ssh/sshd_config.d/10-setup-server.conf` – iš už nurodytų tinklų ir šio serverio tik raktu, be slaptažodžio; įjungtam ufw – leidimas tiems tinklams. Reikia `make db-pull` ir valdymo sąsajos tuneliui. |
 | `bin/add-backup-key` | Programuotojo SSH raktas DB kopijoms atsisiųsti (`make db-pull`) – tik leistų projektų aplinkų (`--pull PROJEKTAS:ENV=db`, `=fresh` – ir naujai kopijai užsakyti, `make db-pull fresh=1`; `--pull-all` – visų projektų): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. Su `--grant PROJEKTAS:ENV=LYGIS` – ir prieiga prie to projekto taikinio per šį serverį (`make ssh`), per `/usr/local/sbin/setup-server-access` (kopija iš `bin/server-access`). |
+| `bin/tool-access` | Kas atidaro projektų naršyklės įrankius (pma, cron, mailpit, backup, metrics, projekto `PROXY_TOOLS`) ir iš kokių adresų: rakto vardas su administratoriaus nustatytu slaptažodžiu ir leistos projektų aplinkos, šio serverio adresai. Pakeitimas taikinyje galioja iš karto (setup 3.6.0+ `make tool-access`). Žr. „Įrankių prieiga“. |
 | `bin/install-metrics` | Worker'io Prometheus `/metrics`: systemd paslauga `setup-server-metrics` (paskyra `setup`, tik skaito), komanda `/usr/local/sbin/setup-server-metrics` (kopija iš `bin/worker-metrics`), nustatymai `/etc/setup-server/metrics.env`. |
 | `bin/install-ui` | Valdymo sąsaja naršyklėje (tik `127.0.0.1`, per SSH tunelį): paslauga `setup-server-ui` (atskira paskyra `setup-ui`), komanda `/usr/local/sbin/setup-server-ui` (kopija iš `bin/web-ui`), komandų kopijos `/usr/local/lib/setup-server/bin/`, sudo taisyklė, nustatymai `/etc/setup-server/ui.env`. |
 | `bin/move-bitbucket-ssh` | Perkelia build katalogų Bitbucket remote'us iš `bitbucket.org` į `ssh.bitbucket.org` (Bitbucket SSH adresas nuo 2026-11-12); perkelia tik tada, kai naujas adresas atsako. Žr. „Bitbucket SSH adresas“. |
@@ -497,6 +498,46 @@ sudo setup-server-backup --files shop prod        # vienos aplinkos kopija dabar
 - **Metrikos** – `setup_worker_files_backup*` (žr. „Worker'io metrikos“). Atnaujinus setup-server, `bin/update` parodo, kad
   laikmačio dar nėra (`note: … differs`) – paleisk `sudo bin/install-backups`.
 
+## Įrankių prieiga (`bin/tool-access`)
+
+Projektų įrankiai (`pma.`, `cron.`, `mailpit.`, `backup.`, `metrics.<domenas>` ir projekto `PROXY_TOOLS`) stage/prod
+įleidžia tik iš IP sąrašo. Iki šiol kiekvienas projektas jį ir htpasswd eilutes turėjo savo Deployment variables:
+tą patį VPN adresą reikėjo kartoti visur, o atimant žmogaus prieigą – keisti ir deploy'inti kiekvieną projektą.
+Dabar tai valdoma čia, vienoje vietoje (setup 3.6.0+):
+
+- **Adresai** – šio serverio adresai, kuriuos taikiniai įleidžia, pvz. VPN serverio viešas IP (per jį eina
+  programuotojų srautas į taikinius). Jie pridedami prie kiekvieno įrankio IP sąrašo, bet ne prie svetainės.
+- **Vartotojai** – programuotojų raktų vardai (`bin/add-backup-key`). Kiekvienam administratorius nustato įrankių
+  slaptažodį ir pažymi, kurių projektų aplinkų įrankius jis atidaro. Įrankis paklausia vardo ir slaptažodžio prie IP
+  taisyklės; projekto savas `<ĮRANKIS>_HTPASSWD` laimi.
+- **Iš karto.** Po kiekvieno pakeitimo komanda įrašo `projects/<vardas>/tool-access/<env>/users.htpasswd` ir
+  `allowed-ips` ir paleidžia ten `make tool-access ENV=<env>`: setup juos nukopijuoja į taikinio `data/<env>/tool-access/`
+  ir perkrauna nginx-proxy. Leidimas ar jo atėmimas galioja per kelias sekundes, be deploy'aus; kiekvienas deploy'us juos
+  atveža dar kartą. Dar nedeploy'intai aplinkai failai laukia pirmo deploy'aus.
+- **Atėmus paskutinį leidimą** aplinkos failas lieka tuščias: įrankiai neįleidžia nieko, o ne grįžta prie vien IP
+  sąrašo. Aplinkos, kurios niekas niekada negavo, nekeičiamos.
+
+```bash
+sudo bin/tool-access --allowed-ips 198.51.100.7                 # VPN serverio viešas IP
+sudo bin/tool-access --name tomas --password - < slaptazodis.txt # 12+ simbolių, per stdin; saugomas tik hash'as
+sudo bin/tool-access --name tomas --tools shop:prod,blog         # be :ENV – stage ir prod; sąrašas pakeičiamas
+sudo bin/tool-access --name tomas --no-tools                     # atima visas
+sudo bin/tool-access --apply                                     # siunčia visus failus dar kartą (pvz. po klaidos)
+sudo bin/tool-access --show                                      # būsena JSON, be hash'ų
+```
+
+- Būsena – `/etc/setup-server/tool-access.json` (root, 0600): adresai, vartotojų slaptažodžių hash'ai (crypt SHA-512,
+  `openssl passwd -6`), leistos aplinkos ir paskutinio siuntimo rezultatas. Slaptažodis niekur neįrašomas.
+- `bin/add-backup-key --remove VARDAS` pašalina ir vartotoją: jo eilutės iškart dingsta iš visų taikinių.
+- Atnaujinus setup-server sąsajai reikia naujos sudo taisyklės (`tool-access`): `sudo bin/install-ui`. Bendras setup
+  turi būti 3.6.0+ (`sudo bin/update-setup`); kol jis senesnis, failai laukia build kataloguose – atnaujinus
+  `sudo bin/tool-access --apply`.
+- Sąsajoje – rakto puslapio skirtukas *Įrankiai* (slaptažodis ir aplinkos) ir *Prieiga* → „Įrankių prieiga“ (adresai,
+  nepavykę siuntimai, „Siųsti iš naujo“).
+- Taikinio DNS ir TLS: įrankių subdomenai gali būti vienas wildcard įrašas `*.<domenas>` ir wildcard sertifikatas
+  `*.<domenas>` – tada Certificate Transparency žurnaluose nesimato atskirų įrankių vardų. Saugo ne vardai, o IP sąrašas
+  ir slaptažodis.
+
 ## Papildomos aplinkos (pvz. laikina `mdv`)
 
 Didesniam darbui projektas gali turėti daugiau aplinkų nei stage ir prod. Jas išvardija projekto `env/common.env`:
@@ -849,6 +890,9 @@ commit'as, raudonas, kai setup ne ant release tag'o.
 
   Visi pakeitimai – ta pati `add-backup-key` komanda su visu rakto leidimų sąrašu; peržiūra virš komandos parodo, kas
   pasikeis (`+` nauja, `~` kitas lygis, `−` atimama). Projekto puslapyje – kas pasiekia to projekto aplinkas.
+  Trečias skirtukas *Įrankiai* – `bin/tool-access`: rakto įrankių slaptažodis (įvedamas, nerodomas, nustatymo data) ir
+  projektų aplinkos, kurių įrankius jis atidaro (nepavykęs siuntimas pažymimas). Sąraše – stulpelis *Įrankiai*, puslapio
+  apačioje „Įrankių prieiga“ – šio serverio adresai ir „Siųsti iš naujo“ (žr. „Įrankių prieiga“).
 - *Failai* – failų kopijos (`BACKUP_FILE_PATHS`, žr. „Failų kopijos“): kiekviena aplinka su keliais ir naujausia kopija;
   aplinkos puslapyje – visos jos kopijos ir „Failų kopija dabar“; kopijos puslapyje – failai su paieška, kas nauja, pakeista
   ir dingo nuo ankstesnės kopijos; failo puslapyje – turinys, skirtumai nuo ankstesnės kopijos ir „Atsisiųsti“. Tik
@@ -885,6 +929,7 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 | Paslaugos (ir Apžvalgoje) | `sudo -n L/server-unit start\|stop\|restart UNIT` (žr. žemiau) |
 | Worker'io metrikos | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |
 | Raktai (*Prieiga*) | `sudo -n L/add-backup-key [-] --name … [--from …] --pull-all … --pull …\|--no-pulls --grant …\|--no-grants` (visi sąrašai aiškiai; naujas raktas per stdin, esamam – be jo), `--remove VARDAS` |
+| Įrankių prieiga (rakto *Įrankiai*, *Prieiga*) | `sudo -n L/tool-access --name … --tools …\|--no-tools`, `--name … --password -` (slaptažodis per stdin, išvestyje – `<hidden>`) `\|--no-password`, `--allowed-ips …\|--no-allowed-ips`, `--apply` |
 | Paruošti serverį | `sudo -n L/prepare-host [--setup-ref …]` (`--check` kodas 1 – „Needs attention“ – vykdyti leidžia) |
 | Atnaujinti setup (*Atnaujinimas*) | `sudo -n L/update-setup [vX.Y.Z]` (tik release tag'ai, be slaptažodžio) |
 | Atnaujinti setup-server (*Atnaujinimas*) | `sudo -n -H -u <klono savininkas> <klonas>/bin/update --server-ref origin/master` (ar kiti `--server-ref`/`--setup-ref`) |
@@ -1027,6 +1072,10 @@ sudo tail -n 20 /srv/setup-server/ui-actions.log
   kiekvienas prašymas – `access.log`, interaktyvaus seanso įvestis – `access-sessions/` (ir joje surinkti slaptažodžiai). `full` local taikiniui ir `docker` (`exec` kaip root į projekto konteinerius su
   jų prijungtais katalogais) – didelės teisės; `phpfpm-readonly` saugo tik failus, ne duomenų bazę. `authorized_keys`
   priklauso paskyrai `setup`, todėl pipeline žingsnis galėtų jį keisti – bet jis ir taip yra `setup` su Docker.
+- Įrankių slaptažodžius (`bin/tool-access`) nustato administratorius; sąsaja juos perduoda tik per stdin, išvestyje jie
+  keičiami į `<hidden>`, o serveryje lieka tik crypt SHA-512 hash'ai (`/etc/setup-server/tool-access.json`, root 0600;
+  build kataloge ir taikinyje – `users.htpasswd`). Įrankiai Basic-auth slaptažodį gauna kiekviena užklausa, todėl jų
+  subdomenams reikia HTTPS.
 - Failų kopijos (`BACKUP_FILE_PATHS`) taikinį tik skaito, tuo pačiu `setup` raktu, kaip deploy'us; į jį nerašoma. Kopijos –
   paskyros `setup` failai (0600) build kataloge, šalia DB kopijų; sąsaja jas tik rodo. Neįrašyk į `BACKUP_FILE_PATHS`
   kelių su paslaptimis (pvz. `app/config/parameters.php`): sąsaja rodo failų turinį.
