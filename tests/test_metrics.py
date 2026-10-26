@@ -135,13 +135,24 @@ class SharedHelpersTest(unittest.TestCase):
         self.SHARED = names
         try:
             found = {command: self.definitions(command) for command in
-                     ("backup-projects", "backup-pull", "server-access", "server-status", "worker-metrics")}
+                     ("backup-projects", "backup-pull", "server-access", "server-status", "worker-metrics", "tool-access")}
         finally:
             self.SHARED = saved
         for command, definitions in found.items():
             for name in names:
                 with self.subTest(command=command, name=name):
                     self.assertEqual(definitions.get(name), found["backup-projects"][name])
+
+    def test_the_tool_access_command_finds_build_roots_as_the_backups(self):
+        saved = self.SHARED
+        self.SHARED = ("environment_directory", "NAME")
+        try:
+            backups, tools = self.definitions("backup-projects"), self.definitions("tool-access")
+        finally:
+            self.SHARED = saved
+        for name in ("environment_directory", "NAME"):
+            with self.subTest(name=name):
+                self.assertEqual(tools.get(name), backups[name])
 
     def test_the_duplicated_helpers_are_identical(self):
         backups = self.definitions("backup-projects")

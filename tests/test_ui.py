@@ -29,7 +29,7 @@ GENERAL_TOKEN = "general-token-XYZxyz9876543210"
 SECRET = "ATOAfake_secret-VALUE_9"  # the OAuthClientSecret of test_scripts.DIALOG
 ROOT_COMMANDS = ("add-project", "remove-project", "install-backups", "install-metrics", "install-runner", "install-ssh",
                  "add-backup-key", "backup-projects", "move-bitbucket-ssh", "prepare-host", "server-status", "server-unit",
-                 "update-setup")
+                 "tool-access", "update-setup")
 
 
 def load_web_ui():
@@ -655,7 +655,7 @@ class WebUiTest(Worker):
                 "SERVER_STATUS": str(ROOT / "bin/server-status"), "UI_USER": "admin", "UI_PASSWORD_HASH": PASSWORD_HASH,
                 "UI_PORT": "0", "BITBUCKET_API": f"http://127.0.0.1:{self.api.server_port}/2.0",
                 "BITBUCKET_ACCESS_TOKEN_ASANA_TRACKER": PROJECT_TOKEN, "BITBUCKET_ACCESS_TOKEN": GENERAL_TOKEN,
-                "SETUP_SERVER_SBIN": str(self.sbin), **settings}
+                "SETUP_SERVER_SBIN": str(self.sbin), "SETUP_SERVER_CONFIG": str(self.root / "config"), **settings}
 
     def start(self, **settings):
         self.stderr = self.root / "ui.stderr"
@@ -930,6 +930,65 @@ class WebUiTest(Worker):
                                         ("add-backup-key", {"key_name": "tomas", "pull_all": "all"}, "nežinomas"),
                                         ("key-bulk", {"key_name": "tomas", "kind": "backups", "scope": "prod", "level": "docker"}, "Pasirink"),
                                         ("add-backup-key", {"key_name": "ona", "sources": "10.8.0.0/24"}, "Įklijuok")):
+            with self.subTest(action=action, fields=fields):
+                status, _, body = self.preview(action, **fields)
+                self.assertEqual(status, 400, body)
+                self.assertIn(message, body)
+
+    def test_the_tools_tab_grants_project_environments_and_sets_a_password_never_shown(self):
+        self.write_keys()
+        config = self.root / "config"
+        config.mkdir()
+        (config / "tool-access.json").write_text(json.dumps({
+            "allowed_ips": ["198.51.100.7"], "managed": ["asana_tracker:prod", "forsena_docker:stage"],
+            "applied": {"forsena_docker:stage": {"at": 1, "ok": False, "note": "ssh: connection refused"}},
+            "users": {"tomas": {"hash": "$6$salt$never-shown-hash", "password_set": "2026-10-26T10:00:00Z",
+                                "projects": ["asana_tracker:prod", "forsena_docker:stage"]}}}))
+        status, _, page = self.request("GET", "/access?fresh=1")
+        self.assertEqual(status, 200, page)
+        self.assertIn('id="tools"', page)
+        self.assertIn("198.51.100.7", page)
+        self.assertIn("forsena_docker stage", page, "a failed sending is named")
+        self.assertNotIn("never-shown-hash", page)
+        status, _, key = self.request("GET", "/access/tomas?tab=tools")
+        self.assertEqual(status, 200, key)
+        self.assertRegex(key, r'name="tool:asana_tracker:prod" value="tools" checked')
+        self.assertIn("nepritaikyta", key)
+        self.assertIn('type="password" name="tool_password"', key)
+        self.assertNotIn("never-shown-hash", key)
+        library = f"-n {self.library}/bin/tool-access --check"
+        # The cells shown change; the others stay.
+        status, _, body = self.preview("tool-access", key_name="tomas", **{"tool:asana_tracker:prod": "",
+                                                                          "tool:shop-two:prod": "tools"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.sudo_calls("tool-access")[-1],
+                         f"{library} --name tomas --tools forsena_docker:stage --tools shop-two:prod")
+        self.assertIn("− asana_tracker prod: įrankiai nebeįleis", body)
+        self.assertIn("+ shop-two prod: įrankiai įleis", body)
+        # The password: on stdin only, never in a page, a log or the job's files.
+        password = "Typed-By-Admin-2026"
+        status, _, body = self.preview("tool-password", key_name="tomas", tool_password=password)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.sudo_calls("tool-access")[-1], f"{library} --name tomas --password -")
+        self.assertNotIn(password, body, "the stub echoes its stdin: even then the page hides it")
+        self.assertIn("&lt;hidden&gt;", body)
+        self.assertIn("perduotas per stdin", body)
+        self.assertEqual(self.stubs.joinpath("sudo.stdin").read_text().split("\n----\n")[-2], password)
+        status, page = self.confirm(body)
+        self.assertEqual(status, 200, page)
+        self.assertNotIn(password, page)
+        self.assertNotIn(password, self.everything_written())
+        self.assertNotIn(password, "".join(self.sudo_calls()))
+        status, _, body = self.preview("tool-ips", allowed_ips="198.51.100.7, 203.0.113.0/24")
+        self.assertEqual(self.sudo_calls("tool-access")[-1], f"{library} --allowed-ips 198.51.100.7,203.0.113.0/24")
+        self.assertEqual(self.sudo_calls("tool-access --check --no")[-1:], [])
+        self.preview("tool-ips", allowed_ips="")
+        self.assertEqual(self.sudo_calls("tool-access")[-1], f"{library} --no-allowed-ips")
+        for action, fields, message in (("tool-password", {"key_name": "tomas", "tool_password": "short"}, "Slaptažodis"),
+                                        ("tool-password", {"key_name": "nobody", "tool_password": password}, "nėra"),
+                                        ("tool-access", {"key_name": "tomas", "tool:x:local": "tools"}, "netinkamas"),
+                                        ("tool-access", {"key_name": "tomas", "tool:asana_tracker:prod": "full"}, "netinkamas"),
+                                        ("tool-ips", {"allowed_ips": "0.0.0.0/0"}, "konkretų tinklą")):
             with self.subTest(action=action, fields=fields):
                 status, _, body = self.preview(action, **fields)
                 self.assertEqual(status, 400, body)
