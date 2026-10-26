@@ -30,6 +30,7 @@ Usage: setup-server-ui            serve (settings from the environment, see bin/
 
 import base64
 from datetime import datetime, timezone
+import difflib
 import hashlib
 import hmac
 import html
@@ -110,13 +111,17 @@ TARBALL = re.compile(r'https://[A-Za-z0-9.-]+/[A-Za-z0-9._~%/+-]{1,400}|/[A-Za-z
 SHA256 = re.compile(r'[0-9a-f]{64}')
 # bin/server-unit's units and what may be done to each (a registered GitHub runner: github-runner@SCOPE).
 UNIT_OPERATIONS = {'runner': ('start', 'stop', 'restart'), 'metrics': ('start', 'stop', 'restart'),
-                   'backup': ('start',), 'backup-full': ('start',), 'ui': ('restart',)}
+                   'backup': ('start',), 'backup-full': ('start',), 'backup-files': ('start',), 'ui': ('restart',)}
 UNIT_TITLES = {'runner': "Bitbucket runner'is", 'metrics': 'Metrikos (/metrics)', 'backup': 'Naktinė DB kopija',
-               'backup-full': 'Savaitinė pilna DB kopija', 'ui': 'Valdymo sąsaja'}
+               'backup-full': 'Savaitinė pilna DB kopija', 'backup-files': 'Naktinė failų kopija', 'ui': 'Valdymo sąsaja'}
 OPERATION_TITLES = {'start': 'Paleisti', 'stop': 'Sustabdyti', 'restart': 'Perkrauti'}
 CONTAINER_LINES = ('200', '500', '2000')
+# A files backup (bin/backup-projects --files) and a path inside it; how many of its files a page lists.
+FILES_ARCHIVE = re.compile(r'files-(?!local-|test-)[a-z][a-z0-9]{1,15}-\d{8}T\d{6}Z\.tar\.gz')
+FILE_MEMBER = re.compile(r'[^\x00-\x1f\x7f]{1,1024}')
+FILE_ROWS = 5000
 BACKUP_KINDS = {'worker': 'naktinė', 'full': 'pilna', 'fresh': 'šviežia', 'fresh-full': 'šviežia pilna',
-                'predeploy': "prieš deploy'ų"}
+                'predeploy': "prieš deploy'ų", 'files': 'failai'}
 # git over SSH: ssh.bitbucket.org from 2026-11-12, bitbucket.org before (bin/move-bitbucket-ssh moves the remotes).
 BITBUCKET_URL = re.compile(r'(?:git@(?:ssh\.)?bitbucket\.org:|ssh://git@(?:ssh\.)?bitbucket\.org/|https://(?:[^@/\s]+@)?bitbucket\.org/)'
                            r'([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*?)(?:\.git)?/?')
@@ -346,8 +351,10 @@ def plan_install_backups(form, status):
     at = value(form, 'at', re.compile(r'([01][0-9]|2[0-3]):[0-5][0-9]'), 'Laikas')
     full_at = value(form, 'full_at', re.compile(r'(Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([01][0-9]|2[0-3]):[0-5][0-9]'),
                     'Pilnos kopijos diena ir laikas')
-    arguments = (['--at', at] if at else []) + (['--full-at', full_at] if full_at else [])
-    return Plan('install-backups', 'DB kopijos (naktinės ir savaitinės pilnos)', *command('install-backups', arguments))
+    files_at = value(form, 'files_at', re.compile(r'([01][0-9]|2[0-3]):[0-5][0-9]'), 'Failų kopijos laikas')
+    arguments = (['--at', at] if at else []) + (['--full-at', full_at] if full_at else []) + \
+        (['--files-at', files_at] if files_at else [])
+    return Plan('install-backups', 'Kopijos (naktinės, savaitinės pilnos ir failų)', *command('install-backups', arguments))
 
 
 def plan_install_metrics(form, status):
@@ -379,10 +386,13 @@ def plan_backup_local(form, status):
         raise Invalid('Aplinka: stage, prod ar projekto STAGE_ENVIRONMENTS (pvz. mdv).')
     if environment and not name:
         raise Invalid('Aplinka nurodoma tik kartu su projektu.')
-    full = flag(form, 'full')
-    arguments = (['--full'] if full else []) + ([name] if name else []) + ([environment] if environment else [])
+    full, files = flag(form, 'full'), flag(form, 'files')
+    if full and files:
+        raise Invalid('Failų kopija nėra DB kopija: „pilna“ su ja nežymima.')
+    arguments = (['--full'] if full else ['--files'] if files else []) + ([name] if name else []) + \
+        ([environment] if environment else [])
     what = ' '.join(part for part in (name or 'visi projektai', environment) if part)
-    title = f'{"Pilna DB kopija" if full else "DB kopija"} dabar: {what}'
+    title = f'{"Pilna DB kopija" if full else "Failų kopija" if files else "DB kopija"} dabar: {what}'
     return Plan('backup-local', title, *command('backup-projects', arguments), timeout=12 * 3600)
 
 
@@ -1325,6 +1335,9 @@ box-shadow:inset 0 0 40px rgba(0,0,0,.6)}
 .term li{counter-increment:l;display:grid;grid-template-columns:56px 1fr;min-height:1.5em;white-space:pre-wrap;word-break:break-all;color:#d8e8c8}
 .term li::before{content:counter(l);text-align:right;padding-right:14px;color:var(--faint);user-select:none}
 .term li:hover{background:#10140c}
+.term.diff li.add{color:var(--go)}
+.term.diff li.del{color:var(--stop)}
+.term.diff li.hunk{color:var(--steel)}
 pre.json{margin:0 0 16px;padding:12px 16px;background:#070806;border:1px solid var(--rule);border-radius:4px;color:#d8e8c8;
 font:inherit;overflow:auto;max-height:60vh}
 .subnav{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
@@ -1536,7 +1549,8 @@ label{grid-template-columns:1fr;gap:4px}.board thead{display:none}.board,.board 
 .board td:first-child{padding-top:12px}.runs li{grid-template-columns:18px 1fr 100px}.runs li .hide{display:none}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important}}
 """
-NAVIGATION = (('overview', '/', 'Apžvalga'), ('access', '/access', 'Prieiga'), ('update', '/update', 'Atnaujinimas'),
+NAVIGATION = (('overview', '/', 'Apžvalga'), ('access', '/access', 'Prieiga'), ('files', '/files', 'Failai'),
+              ('update', '/update', 'Atnaujinimas'),
               ('actions', '/actions', 'Veiksmai'), ('instructions', '/instructions', 'Instrukcijos'),
               ('logs', '/logs', 'Žurnalai'), ('metrics', '/worker-metrics', 'Metrikos'))
 
@@ -1567,6 +1581,25 @@ def badge(text, kind):
 
 def lamp(kind):
     return f'<span class="lamp {kind}"></span>'
+
+
+def file_text(content):
+    """A backed-up file's content as text, or None when it is binary (a NUL byte or not UTF-8)."""
+    if b'\0' in content:
+        return None
+    try:
+        return content.decode('utf-8')
+    except UnicodeDecodeError:
+        return None
+
+
+def diff_term(lines):
+    """A unified diff on the dark terminal: added lines green, removed red."""
+    def kind(line):
+        if line.startswith(('+++', '---', '@@')):
+            return ' class="hunk"'
+        return ' class="add"' if line.startswith('+') else ' class="del"' if line.startswith('-') else ''
+    return '<div class="term diff"><ol>' + ''.join(f'<li{kind(line)}>{e(line)}</li>' for line in lines) + '</ol></div>'
 
 
 def term(text, empty='(tuščia)'):
@@ -1776,7 +1809,8 @@ class Page:
             tiles.append(self.tile(f"GitHub runner'is {scope}", unit_kind(units, name), unit_state(units, name),
                                    controls=self.unit_controls(f'github-runner@{scope}', ('start', 'stop', 'restart'))))
         for unit, label, operation in (('setup-server-backup', 'Naktinės DB kopijos', 'backup'),
-                                       ('setup-server-backup-full', 'Savaitinės pilnos DB kopijos', 'backup-full')):
+                                       ('setup-server-backup-full', 'Savaitinės pilnos DB kopijos', 'backup-full'),
+                                       ('setup-server-backup-files', 'Naktinės failų kopijos', 'backup-files')):
             timer, service = units.get(f'{unit}.timer', {}), units.get(f'{unit}.service', {})
             if timer and timer.get('LoadState') != 'not-found':
                 result = service.get('Result')
@@ -1853,6 +1887,11 @@ class Page:
                 newest = (state.get('backups') or {}).get('newest')
                 if state.get('declared') and (not newest or time.time() - newest['time'] >= 26 * 3600):
                     items.append(('bad', f'{where}: naujausia kopija ' + (e(ago(newest['time'])) if newest else 'nėra'), link))
+                newest = (state.get('files_backups') or {}).get('newest')
+                if state.get('declared') and state.get('file_paths') and installed(units, 'setup-server-backup-files.timer') and \
+                        (not newest or time.time() - newest['time'] >= 26 * 3600):
+                    items.append(('bad', f'{where}: naujausia failų kopija ' + (e(ago(newest['time'])) if newest else 'nėra'),
+                                  f'/files/{quote(entry["name"])}/{quote(environment)}'))
         if not items:
             return f'<div class="attention calm">{lamp("ok")}<span>Viskas tvarkoje: nieko, kam reikėtų dėmesio.</span></div>'
         return ('<div class="attention"><p class="attention-title">Reikia dėmesio · ' + str(len(items)) + '</p><ul>' +
@@ -1996,6 +2035,9 @@ class Page:
             rows += [('Naujausia kopija', self.backup_cell(state) + newest('backups')),
                      ('Pilna kopija (savaitinė)', self.full_backup_cell(state) + newest('full_backups')),
                      ('Šviežia kopija (db-pull fresh=1)', self.fresh_backup_cell(state)),
+                     *([('Failų kopija (BACKUP_FILE_PATHS)', self.files_cell(state) +
+                         f' <a class="btn" href="/files/{e(quote(name))}/{e(environment)}">Peržiūrėti</a>')]
+                       if state.get('file_paths') or (state.get('files_backups') or {}).get('count') else []),
                      ('Secret store', f'{self.secrets_cell(state)} <span class="muted">{e(state["compose_project"])}-secrets</span>')]
             body += facts(rows)
             if state.get('containers'):
@@ -2100,6 +2142,187 @@ class Page:
                 f'<div class="stat"><b>{samples}</b><span>reikšmės</span></div></div>'
                 '<p class="note">setup-server-metrics --once kaip setup paskyra: tai, ką mato Prometheus (be token\'o).</p>' + term(text))
         return self.layout('Metrikos', body, section='metrics')
+
+    # --- Files backups (BACKUP_FILE_PATHS) ---
+    @staticmethod
+    def files_environments(data):
+        """(project, environment, state) of every environment with BACKUP_FILE_PATHS or files backups kept."""
+        return [(entry['name'], environment, state) for entry in (data or {}).get('projects', [])
+                for environment, state in sorted(entry.get('environments', {}).items(), key=lambda item: environment_order(item[0]))
+                if state.get('file_paths') or (state.get('files_backups') or {}).get('count')]
+
+    @staticmethod
+    def files_cell(state):
+        """The newest files backup: fine up to 26 hours, as the nightly database one."""
+        backups = state.get('files_backups') or {}
+        newest = backups.get('newest')
+        if not newest:
+            return badge('nėra', 'bad' if state.get('file_paths') and state.get('declared') else 'muted')
+        age = time.time() - newest['time']
+        return badge(ago(newest['time']), 'ok' if age < 26 * 3600 else 'bad') + \
+            f' {e(size(newest["size"]))}, laikoma {backups.get("count", 0)}'
+
+    @staticmethod
+    def file_paths(state):
+        return ' '.join(f'<code>{e(item)}</code>' for item in state.get('file_paths') or []) or '<span class="muted">nenurodyta</span>'
+
+    def files(self, data, error):
+        if data is None:
+            return self.layout('Failų kopijos', f'<div class="callout bad"><p>Būsenos nepavyko gauti: {e(error)}</p></div>',
+                               section='files')
+        found = self.files_environments(data)
+        body = ('<p class="note">Kodo medžio failai, kurių nėra git\'e (pvz. vertimai), kuriuos projektas išvardija '
+                '<code>BACKUP_FILE_PATHS</code>: kas naktį worker\'is juos nuskaito iš taikinio (setup <code>make files-backup</code>) '
+                'ir laiko <code>files-&lt;env&gt;-…Z.tar.gz</code> (7 dienos + 4 savaitės). Čia jie tik peržiūrimi: taikinys nekeičiamas.</p>')
+        if not found:
+            body += ('<div class="empty">Nė vienas projektas nenurodo BACKUP_FILE_PATHS. Įrašyk jį į projekto env/common.env '
+                     '(pvz. <code>BACKUP_FILE_PATHS="modules/*/translations/"</code>).</div>')
+            return self.layout('Failų kopijos', body, section='files')
+        rows = ''.join(
+            f'<tr class="is-{"ok" if (state.get("files_backups") or {}).get("newest") else "idle"}">'
+            f'<td class="project"><a href="/project/{e(quote(name))}">{e(name)}</a></td>'
+            f'<td><span class="sign {e(environment)}">{e(environment)}</span></td><td>{self.file_paths(state)}</td>'
+            f'<td>{self.files_cell(state)}</td>'
+            f'<td><a class="btn" href="/files/{e(quote(name))}/{e(environment)}">Kopijos</a></td></tr>'
+            for name, environment, state in found)
+        body += ('<div class="scroll"><table class="board"><thead><tr><th>Projektas</th><th>Aplinka</th><th>Keliai</th>'
+                 '<th>Naujausia kopija</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>')
+        return self.layout('Failų kopijos', body, section='files')
+
+    @staticmethod
+    def files_archives(state):
+        """The files backups of an environment, newest first."""
+        return [item for item in state.get('backup_files') or [] if item.get('kind') == 'files']
+
+    def files_environment(self, data, name, environment):
+        entry = next((item for item in (data or {}).get('projects', []) if item.get('name') == name), None)
+        state = (entry or {}).get('environments', {}).get(environment)
+        if state is None:
+            return None
+        archives = self.files_archives(state)
+        body = f'<p><a href="/files">← Failų kopijos</a> · <a href="/project/{e(quote(name))}">{e(name)}</a></p>'
+        body += facts([('Keliai (BACKUP_FILE_PATHS)', self.file_paths(state)),
+                       ('Naujausia kopija', self.files_cell(state)),
+                       ('Iš kur', self.target(entry, environment))])
+        if not state.get('file_paths'):
+            body += ('<div class="callout warn"><p>Projektas BACKUP_FILE_PATHS šiai aplinkai nebenurodo: naujų failų kopijų '
+                     'nedaroma, esamos laikomos, kol jas ištrins rotacija ar žmogus.</p></div>')
+        if archives:
+            body += ('<table class="list"><tr><th>Kopija</th><th>Laikas</th><th>Dydis</th></tr>' + ''.join(
+                f'<tr><td><a href="/files/{e(quote(name))}/{e(environment)}/{e(item["name"])}">{e(item["name"])}</a></td>'
+                f'<td>{e(local_time(item["time"]))} <span class="muted">{e(ago(item["time"]))}</span></td>'
+                f'<td>{e(size(item["size"]))}</td></tr>' for item in archives) + '</table>')
+        else:
+            body += '<div class="empty">Failų kopijų dar nėra.</div>'
+        if state.get('file_paths'):
+            body += '<div class="deck">' + self.form(
+                'backup-local', 'Failų kopija dabar',
+                f'<input type="hidden" name="project" value="{e(name)}"><input type="hidden" name="environment" value="{e(environment)}">'
+                '<input type="hidden" name="files" value="yes">',
+                note='Tas pats, ką daro naktinis failų laikmatis. Taikinys tik skaitomas.',
+                command=f'setup-server-backup --files {name} {environment}') + '</div>'
+        return self.layout(f'Failai: {name} {environment}', body, section='files')
+
+    @staticmethod
+    def file_changes(entries, previous):
+        """({path: 'nauja'|'pakeista'}, [paths gone]) of an archive's files against the previous archive, or ({}, [])."""
+        if previous is None:
+            return {}, []
+        before = {item['path']: item for item in previous if item['type'] != 'dir'}
+        marks = {}
+        for item in entries:
+            if item['type'] == 'dir':
+                continue
+            old = before.pop(item['path'], None)
+            if old is None:
+                marks[item['path']] = 'nauja'
+            elif (old['size'], old['time'], old.get('link')) != (item['size'], item['time'], item.get('link')):
+                marks[item['path']] = 'pakeista'
+        return marks, sorted(before)
+
+    def files_archive(self, name, environment, archive, listing, previous, query, changed_only, error):
+        base = f'/files/{quote(name)}/{environment}'
+        body = (f'<p><a href="{e(base)}">← {e(name)} <span class="sign {e(environment)}">{e(environment)}</span></a> · '
+                f'<code>{e(archive)}</code></p>')
+        problem = error or (listing or {}).get('error')
+        if problem:
+            body += f'<div class="callout bad"><p>{e(problem)}</p></div>'
+            return self.layout('Failų kopija', body, section='files')
+        entries = listing.get('entries', [])
+        old = previous.get('entries') if previous and not previous.get('error') else None
+        marks, gone = self.file_changes(entries, old)
+        files = [item for item in entries if item['type'] != 'dir']
+        stats = [(len(files), 'failai'), (size(sum(item['size'] for item in files)), 'nesuspausta'),
+                 (size(listing.get('size', 0)), 'kopija')]
+        if old is not None:
+            stats += [(sum(1 for mark in marks.values() if mark == 'nauja'), 'nauji'),
+                      (sum(1 for mark in marks.values() if mark == 'pakeista'), 'pakeisti'), (len(gone), 'dingo')]
+        body += '<div class="stats">' + ''.join(f'<div class="stat"><b>{e(number)}</b><span>{e(label)}</span></div>'
+                                               for number, label in stats) + '</div>'
+        body += (f'<p class="note">Palyginta su ankstesne kopija <code>{e(previous["archive"])}</code> (dydis ir laikas).</p>'
+                 if old is not None else '<p class="note">Ankstesnės kopijos nėra: palyginti nėra su kuo.</p>')
+        if listing.get('truncated'):
+            body += f'<div class="callout warn"><p>Kopijoje daugiau nei {len(entries)} įrašų: rodomi pirmieji.</p></div>'
+        wanted = query.lower()
+        shown = [item for item in files if wanted in item['path'].lower() and (not changed_only or item['path'] in marks)]
+        body += (f'<div class="toolbar"><form class="search" method="get" action="{e(base)}/{e(archive)}">'
+                 f'<input type="text" name="q" value="{e(query)}" placeholder="kelio dalis" autocomplete="off">'
+                 f'<label class="check"><input type="checkbox" name="changed" value="1"{" checked" if changed_only else ""}> '
+                 'tik nauji ir pakeisti</label><button>Rodyti</button></form></div>')
+        view = f'{base}/{archive}/view?path='
+        rows = ''.join(
+            f'<tr><td>' + (f'<a href="{e(view + quote(item["path"]))}">{e(item["path"])}</a>' if item['type'] == 'file' else
+                           f'{e(item["path"])} <span class="muted">→ {e(item.get("link") or "")}</span>') + '</td>'
+            f'<td class="num">{e(size(item["size"]))}</td><td>{e(local_time(item["time"]))}</td>'
+            f'<td>{badge(marks[item["path"]], "warn" if marks[item["path"]] == "pakeista" else "ok") if item["path"] in marks else ""}</td></tr>'
+            for item in shown[:FILE_ROWS])
+        if shown:
+            body += ('<div class="scroll"><table class="list"><tr><th>Failas</th><th>Dydis</th><th>Laikas</th><th></th></tr>' +
+                     rows + '</table></div>')
+            if len(shown) > FILE_ROWS:
+                body += f'<p class="note">Rodoma {FILE_ROWS} iš {len(shown)}: susiaurink paiešką.</p>'
+        else:
+            body += '<div class="empty">Nė vienas failas neatitinka.</div>'
+        if gone:
+            older = f'/files/{quote(name)}/{environment}/{previous["archive"]}/view?path='
+            body += (f'<details><summary>Dingo nuo ankstesnės kopijos ({len(gone)})</summary><div class="inner"><table class="list">' +
+                     ''.join(f'<tr><td><a href="{e(older + quote(path))}">{e(path)}</a></td></tr>' for path in gone) +
+                     '</table></div></details>')
+        return self.layout(f'Failų kopija {archive}', body, section='files')
+
+    def files_view(self, name, environment, archive, path, data, previous, error):
+        base = f'/files/{quote(name)}/{environment}/{archive}'
+        body = f'<p><a href="{e(base)}">← <code>{e(archive)}</code></a></p>'
+        problem = error or (data or {}).get('error')
+        if problem:
+            body += f'<div class="callout bad"><p>{e(problem)}</p></div>'
+            return self.layout('Failas', body, section='files')
+        content = base64.b64decode(data.get('content', ''))
+        text = file_text(content)
+        download = '' if data.get('truncated') else f' <a class="btn" href="{e(base)}/download?path={e(quote(path))}">Atsisiųsti</a>'
+        body += facts([('Failas', f'<code>{e(path)}</code>{download}'), ('Dydis', e(size(data.get('size', 0)))),
+                       ('Laikas', f'{e(local_time(data.get("time", 0)))} <span class="muted">(failo taikinyje)</span>'),
+                       ('Kopija', f'<code>{e(archive)}</code> <span class="muted">{e(name)} {e(environment)}</span>')])
+        if data.get('truncated'):
+            body += (f'<div class="callout warn"><p>Failas didesnis nei {e(size(len(content)))}: rodoma tik pradžia, atsisiųsti '
+                     'neleidžiama (serveryje: tar -xzf kopija failas).</p></div>')
+        if previous is not None:
+            if previous.get('error'):
+                body += (f'<p class="note">Ankstesnėje kopijoje <code>{e(previous["archive"])}</code> šio failo nėra '
+                         f'<span class="muted">({e(previous["error"])})</span>.</p>')
+            else:
+                old = file_text(base64.b64decode(previous.get('content', '')))
+                if old == text and previous.get('size') == data.get('size'):
+                    body += f'<p class="note">Nepasikeitė nuo ankstesnės kopijos <code>{e(previous["archive"])}</code>.</p>'
+                elif old is not None and text is not None:
+                    lines = list(difflib.unified_diff(old.splitlines(), text.splitlines(), previous['archive'], archive,
+                                                      lineterm='', n=2))
+                    body += f'<h2>Skirtumai nuo {e(previous["archive"])}</h2>' + diff_term(lines)
+                else:
+                    body += f'<p class="note">Skiriasi nuo ankstesnės kopijos <code>{e(previous["archive"])}</code> (dvejetainis).</p>'
+        body += '<h2>Turinys</h2>' + (term(text) if text is not None else
+                                      '<div class="empty">Dvejetainis failas: atsisiųsk, kad peržiūrėtum.</div>')
+        return self.layout(path.rsplit('/', 1)[-1], body, section='files')
 
     # --- Instructions ---
     def instructions(self, choice, values, errors, given, key_known, complete):
@@ -2529,15 +2752,19 @@ class Page:
             text('project', 'Projektas (nebūtina)', 'tuščia – visi projektai') +
             '<label><span>Aplinka</span><select name="environment"><option value="">visos projekto</option>'
             '<option value="stage">stage</option><option value="prod">prod</option></select></label>'
-            '<label class="check"><input type="checkbox" name="full" value="yes"> pilna – visų lentelių duomenys (--full)</label>',
-            note='Tas pats, ką daro naktinis (be --full) ar savaitinis (su --full) laikmatis; be Bitbucket, veikia ir GitHub projektams.',
-            command='setup-server-backup [--full] [PROJEKTAS [ENV]]')
+            '<label class="check"><input type="checkbox" name="full" value="yes"> pilna – visų lentelių duomenys (--full)</label>'
+            '<label class="check"><input type="checkbox" name="files" value="yes"> failai – BACKUP_FILE_PATHS, ne DB (--files)</label>',
+            note='Tas pats, ką daro naktinis (be --full), savaitinis (su --full) ar failų (--files) laikmatis; be Bitbucket, '
+                 'veikia ir GitHub projektams.',
+            command='setup-server-backup [--full|--files] [PROJEKTAS [ENV]]')
         body += self.form(
-            'install-backups', 'DB kopijų laikmačiai',
+            'install-backups', 'Kopijų laikmačiai',
             text('at', 'Naktinės kopijos laikas', '03:30') +
-            text('full_at', 'Savaitinės pilnos diena ir laikas', 'Sun 04:30'),
-            note='Naktinė – pagal lentelių registrą (7 dienos + 4 savaitės), savaitinė – visų lentelių duomenys (laikomos 2). '
-                 'Be reikšmių paliekamos įdiegtos (numatyta 03:30 ir Sun 04:30).', command='bin/install-backups')
+            text('full_at', 'Savaitinės pilnos diena ir laikas', 'Sun 04:30') +
+            text('files_at', 'Failų kopijos laikas', 'kaip naktinės'),
+            note='Naktinė – pagal lentelių registrą (7 dienos + 4 savaitės), savaitinė – visų lentelių duomenys (laikomos 2), '
+                 'failų – BACKUP_FILE_PATHS keliai iš taikinio (7 dienos + 4 savaitės). Be reikšmių paliekamos įdiegtos '
+                 '(numatyta 03:30, Sun 04:30, failų – kaip naktinės).', command='bin/install-backups')
         body += ('<div class="pointer"><h3>Kopijų ir prieigos raktai</h3><p class="note">Programuotojų raktai (make db-pull, '
                  'make ssh) ir kas kokią prieigą turi – atskirame puslapyje.</p><a class="btn" href="/access">Prieiga →</a></div>')
         body += '</div>'
@@ -2721,7 +2948,7 @@ def handler(user, stored):
         timeout = 60
 
         def reply(self, status, body, content_type='text/html; charset=utf-8', headers=()):
-            data = body.encode()
+            data = body if isinstance(body, bytes) else body.encode()
             self.send_response(status)
             self.send_header('Content-Type', content_type)
             self.send_header('Content-Length', str(len(data)))
@@ -2832,6 +3059,46 @@ def handler(user, stored):
                                          query.get('tab', ['access'])[0]) if data else None
                 return self.reply(200, rendered) if rendered else \
                     self.reply(404, page.layout('Nėra rakto', '<p><a href="/access">← Prieiga</a></p>', section='access'))
+            match = re.fullmatch(r'/files/([a-z0-9][a-z0-9_-]{0,63})/(' + ENVIRONMENT.pattern + r')(?:/(' +
+                                 FILES_ARCHIVE.pattern + r')(/view|/download)?)?', path)
+            if match:
+                name, environment, archive, part = match.groups()
+                data, error = status(fresh='fresh' in query)
+                state = next((item.get('environments', {}).get(environment) for item in (data or {}).get('projects', [])
+                              if item.get('name') == name), None)
+                if not archive:
+                    rendered = page.files_environment(data, name, environment) if data else \
+                        page.layout('Failai', f'<div class="callout bad"><p>{e(error)}</p></div>', section='files')
+                    return self.reply(200, rendered) if rendered else \
+                        self.reply(404, page.layout('Nėra aplinkos', '<p><a href="/files">← Failų kopijos</a></p>', section='files'))
+                # The previous archive: the next older one of the same series (the status lists them newest first).
+                names = [item['name'] for item in Page.files_archives(state or {})]
+                older = names[names.index(archive) + 1] if archive in names[:-1] else None
+                if not part:
+                    listing, error = helper('--files', name, environment, archive)
+                    previous = helper('--files', name, environment, older)[0] if older and listing else None
+                    return self.reply(200, page.files_archive(name, environment, archive, listing, previous,
+                                                              query.get('q', [''])[0][:200], query.get('changed') == ['1'], error))
+                member = query.get('path', [''])[0]
+                if not FILE_MEMBER.fullmatch(member):
+                    return self.reply(400, page.invalid('Netinkamas failo kelias.'))
+                data, error = helper('--file', name, environment, archive, member)
+                if part == '/download':
+                    if error or not data or data.get('error') or data.get('truncated'):
+                        return self.reply(404, page.layout('Failas', f'<div class="callout bad"><p>{e(error or (data or {}).get("error") or "per didelis")}</p></div>',
+                                                           section='files'))
+                    filename = member.rsplit('/', 1)[-1]
+                    fallback = re.sub(r'[^A-Za-z0-9._-]', '_', filename) or 'file'
+                    return self.reply(200, base64.b64decode(data['content']), 'application/octet-stream', headers=[
+                        ('Content-Disposition', f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(filename)}")])
+                previous = None
+                if older and data and not data.get('error'):
+                    previous, problem = helper('--file', name, environment, older, member)
+                    previous = {**(previous or {'error': problem}), 'archive': older}
+                return self.reply(200, page.files_view(name, environment, archive, member, data, previous, error))
+            if path == '/files':
+                data, error = status(fresh='fresh' in query)
+                return self.reply(200, page.files(data, error))
             if path == '/update':
                 data, error = status(fresh='fresh' in query)
                 return self.reply(200, page.update_page(data, error, installation()))

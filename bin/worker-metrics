@@ -10,7 +10,8 @@ under $SETUP_SERVER_ROOT/projects, asks systemd for the runners' state and the f
 
 Groups (setup_metrics_group_up{group} is 0 when a part of the group could not be read; details in the journal):
   backups  per project and ENV: age and size of the newest worker-<env>-…Z.sql.gz backup, how many are kept,
-           and the same of the weekly full-<env>-…Z.sql.gz series (setup_worker_full_backup*)
+           and the same of the weekly full-<env>-…Z.sql.gz series (setup_worker_full_backup*) and of the nightly
+           files-<env>-…Z.tar.gz series of BACKUP_FILE_PATHS (setup_worker_files_backup*)
   deploys  per project and ENV: the last entry of .generated/release/<env>/deployments.json
   runner   the systemd state of setup-server-runner.service (Bitbucket)
   github_runner  per registered GitHub runner ($SETUP_SERVER_ROOT/github-runner/<scope>): the systemd state of
@@ -46,7 +47,9 @@ GITHUB_RUNNER_UNIT = 'setup-server-github-runner@{}.service'
 SCOPE = re.compile(r'[a-z0-9][a-z0-9._-]*')
 # NAME, SERIES and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
-SERIES = re.compile(r'(worker|full|fresh|fresh-full)-([a-z][a-z0-9]{1,15})-(\d{8}T\d{6})Z\.sql\.gz')
+# The database series are .sql.gz, the files series .tar.gz (the lookahead pairs them); groups: kind, ENV, time.
+SERIES = re.compile(r'(?=files-.*\.tar\.gz$|(?!files-).*\.sql\.gz$)(worker|full|fresh|fresh-full|files)-'
+                    r'([a-z][a-z0-9]{1,15})-(\d{8}T\d{6})Z\.(?:sql|tar)\.gz')
 TOKEN_MINIMUM = 24
 DEFAULT_PORT = 9101
 CONFIGURATION_ERROR = 78  # EX_CONFIG: systemd does not restart the service for it
@@ -140,9 +143,12 @@ def backups(metrics, found, now):
     """Nightly and "backup now" backups (worker-<env>-…Z.sql.gz); pre-deploy and fresh backups do not count,
     so neither hides a stopped timer. An ENV deployed from here (env/<env>.env) without any backup gets a
     count of 0 and no age. The weekly full series (full-<env>-…Z.sql.gz) has metrics of its own, with a
-    count of 0 only once its timer is installed, so a worker without weekly backups raises no alert."""
+    count of 0 only once its timer is installed, so a worker without weekly backups raises no alert. So has the
+    files series (files-<env>-…Z.tar.gz): a count of 0 for an ENV with BACKUP_FILE_PATHS once its timer is installed."""
     complete = True
-    full_timer = (Path(os.environ.get('SETUP_SERVER_SYSTEMD', '/etc/systemd/system')) / 'setup-server-backup-full.timer').is_file()
+    systemd = Path(os.environ.get('SETUP_SERVER_SYSTEMD', '/etc/systemd/system'))
+    full_timer = (systemd / 'setup-server-backup-full.timer').is_file()
+    files_timer = (systemd / 'setup-server-backup-files.timer').is_file()
     for name, directory in found:
         try:
             folder = directory / '.generated/backups'
@@ -151,18 +157,21 @@ def backups(metrics, found, now):
                 with os.scandir(folder) as entries:
                     for item in entries:
                         match = SERIES.fullmatch(item.name)
-                        if match and match[1] in ('worker', 'full') and item.is_file(follow_symlinks=False):
+                        if match and match[1] in ('worker', 'full', 'files') and item.is_file(follow_symlinks=False):
                             info = item.stat(follow_symlinks=False)
                             series.setdefault((match[1], match[2]), []).append((info.st_mtime, info.st_size))
             declared = {env for env in server_environments(directory) if (directory / f'env/{env}.env').is_file()}
+            with_files = {env for env in declared if files_declared(directory, env)} if files_timer else set()
         except OSError as error:
             log(f'backups {name}: {error}')
             complete = False
             continue
+        expected = {'worker': declared, 'full': declared if full_timer else set(), 'files': with_files}
         for prefix, metric, what in (('worker', 'setup_worker_backup', 'nightly and "backup now"'),
-                                     ('full', 'setup_worker_full_backup', 'weekly full')):
+                                     ('full', 'setup_worker_full_backup', 'weekly full'),
+                                     ('files', 'setup_worker_files_backup', 'nightly files (BACKUP_FILE_PATHS)')):
             present = {environment for kind, environment in series if kind == prefix}
-            for environment in sorted(present | (declared if prefix == 'worker' or full_timer else set())):
+            for environment in sorted(present | expected[prefix]):
                 labels = {'project': name, 'environment': environment}
                 files = series.get((prefix, environment), [])
                 metrics.add(f'{metric}s', f'Backups of the worker kept for the project and environment ({what}; '
@@ -174,6 +183,21 @@ def backups(metrics, found, now):
                                 round(max(0.0, now - modified)), labels)
                     metrics.add(f'{metric}_newest_size_bytes', f'Size of the newest {what} backup in bytes', size, labels)
     return complete
+
+
+def files_declared(directory, environment):
+    """Whether env/<env>.env (or else env/common.env) sets a BACKUP_FILE_PATHS that is not empty (one line)."""
+    found = None
+    for name in ('common.env', f'{environment}.env'):
+        try:
+            text = (directory / 'env' / name).read_text(errors='replace')
+        except OSError:
+            continue
+        for line in text.splitlines():
+            match = re.fullmatch(r'\s*(?:export\s+)?BACKUP_FILE_PATHS\s*=\s*(["\']?)([^"\'#]*)\1\s*(?:#.*)?', line)
+            if match:
+                found = bool(match[2].strip())
+    return bool(found)
 
 
 def timestamp(text):

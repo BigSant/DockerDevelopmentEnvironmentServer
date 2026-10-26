@@ -26,6 +26,11 @@ Usage: server-status                 versions, units, backup timer, disk and eve
        server-status --session KEY FILE
                                      what was typed in one recorded terminal session (access-sessions/KEY/FILE),
                                      as lines: editing keys applied, terminal escapes left out
+       server-status --files PROJECT ENV ARCHIVE
+                                     what one files backup (files-<env>-…Z.tar.gz, BACKUP_FILE_PATHS) holds: every
+                                     entry's path, type, size and time; nothing is extracted
+       server-status --file PROJECT ENV ARCHIVE PATH
+                                     one regular file of that backup, base64 (at most 2 MiB of it)
 """
 
 import ast
@@ -41,6 +46,7 @@ import re
 import stat
 import subprocess
 import sys
+import tarfile
 import time
 
 ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
@@ -51,17 +57,21 @@ PROJECTS = ROOT / 'projects'
 GITHUB_RUNNERS = ROOT / 'github-runner'
 # NAME, SERIES and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
-SERIES = re.compile(r'(worker|full|fresh|fresh-full)-([a-z][a-z0-9]{1,15})-(\d{8}T\d{6})Z\.sql\.gz')
+# The database series are .sql.gz, the files series .tar.gz (the lookahead pairs them); groups: kind, ENV, time.
+SERIES = re.compile(r'(?=files-.*\.tar\.gz$|(?!files-).*\.sql\.gz$)(worker|full|fresh|fresh-full|files)-'
+                    r'([a-z][a-z0-9]{1,15})-(\d{8}T\d{6})Z\.(?:sql|tar)\.gz')
 SCOPE = re.compile(r'[a-z0-9][a-z0-9._-]*')
 # What leaves the env and target files: the deploy target and the names, nothing secret.
 TARGET_KEYS = ('DEPLOY_CONTEXT', 'DEPLOY_SSH', 'DEPLOY_PATH', 'APP_UID', 'APP_GID')
 UNITS = ('setup-server-runner.service', 'setup-server-backup.service', 'setup-server-backup.timer',
          'setup-server-backup-full.service', 'setup-server-backup-full.timer',
+         'setup-server-backup-files.service', 'setup-server-backup-files.timer',
          'setup-server-metrics.service', 'setup-server-ui.service')
 GITHUB_UNIT = 'setup-server-github-runner@{}.service'
 # The journal of these only (a glob for the GitHub runners).
 JOURNAL_UNITS = ('setup-server-runner.service', 'setup-server-github-runner@*.service', 'setup-server-backup.service',
-                 'setup-server-backup-full.service', 'setup-server-metrics.service', 'setup-server-ui.service')
+                 'setup-server-backup-full.service', 'setup-server-backup-files.service', 'setup-server-metrics.service',
+                 'setup-server-ui.service')
 PROPERTIES = ('Id', 'LoadState', 'ActiveState', 'SubState', 'Result', 'NRestarts', 'ActiveEnterTimestamp',
               'ExecMainExitTimestamp', 'ExecMainStatus', 'LastTriggerUSec', 'NextElapseUSecRealtime')
 CONTAINERS = '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.State}}\t{{.Status}}'
@@ -72,6 +82,11 @@ CONTAINER_LINES, MAXIMUM_CONTAINER_LINES = 200, 2000
 # backups (<PROJECT_NAME>-<env>-<time>.sql.gz, as bin/backup-pull knows them).
 PREDEPLOY = re.compile(r'[a-z0-9][a-z0-9_-]*-([a-z][a-z0-9]{1,15})-\d{8}T\d{6}\d*\.sql\.gz')
 LISTED_BACKUPS = 100
+# A files backup: how many entries are listed and how much of one file is read (bin/backup-projects --files).
+ARCHIVE_ENTRIES, ARCHIVE_FILE_LIMIT = 20000, 2 * 1024 * 1024
+MEMBER = re.compile(r'[^\x00-\x1f\x7f]{1,1024}')
+# A BACKUP_FILE_PATHS entry as setup accepts it (a code-tree path, `*` allowed); only such entries are shown.
+FILE_PATH = re.compile(r'/?[A-Za-z0-9._*-]+(/[A-Za-z0-9._*-]+)*/?')
 PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 
@@ -345,7 +360,9 @@ def project(build_root, errors):
                   **targets[environment]}
         state = {'declared': declared, 'compose_project': f"{entry['project_name']}-{environment}",
                  'context': values.get('DEPLOY_CONTEXT') or 'default', 'deploys': None, 'backups': None,
-                 'full_backups': None, 'fresh_backups': None, 'backup_files': [], 'containers': [], 'secrets': None}
+                 'full_backups': None, 'fresh_backups': None, 'files_backups': None, 'backup_files': [],
+                 'file_paths': [item for item in (values.get('BACKUP_FILE_PATHS') or '').split() if FILE_PATH.fullmatch(item)][:50],
+                 'containers': [], 'secrets': None}
         try:
             state['deploys'] = deploys(directory, environment)
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -354,6 +371,7 @@ def project(build_root, errors):
             state['backups'] = backups(directory, environment)
             state['full_backups'] = backups(directory, environment, 'full')
             state['fresh_backups'] = backups(directory, environment, 'fresh')
+            state['files_backups'] = backups(directory, environment, 'files')
             state['backup_files'] = backup_files(directory, environment)
         except OSError as error:
             errors.append(f'{name} {environment}: backups: {error.strerror}')
@@ -386,7 +404,8 @@ def projects():
             # An environment that is neither deployed from here nor has anything of its own is left out; one the
             # project lists in STAGE_ENVIRONMENTS stays (it is declared there, e.g. before its first deploy).
             if environment in ENVIRONMENTS and not (state['declared'] or state['deploys'] or
-                                                    (state['backups'] or {}).get('count') or state['containers']):
+                                                    (state['backups'] or {}).get('count') or
+                                                    (state['files_backups'] or {}).get('count') or state['containers']):
                 del entry['environments'][environment]
     return {'projects': found, 'keys': developer_keys(errors), 'errors': errors}
 
@@ -693,6 +712,64 @@ def container_logs(name, environment, container, lines):
             'lines': text.splitlines()[-lines:]}
 
 
+def files_archive(name, environment, archive):
+    """The path of one files backup of a project environment, or an {'error': …}."""
+    build_root = PROJECTS / name
+    directory = environment_directory(build_root) if build_root.is_dir() and not build_root.is_symlink() else None
+    if directory is None:
+        return {'error': f'no build root {name}'}
+    match = SERIES.fullmatch(archive)
+    if not match or match[1] != 'files' or match[2] != environment:
+        return {'error': f'{archive} is not a files backup of {environment}'}
+    folder = directory / '.generated/backups'
+    path = folder / archive
+    if folder.is_symlink() or path.is_symlink() or not path.is_file():
+        return {'error': f'{name} has no {archive}'}
+    return path
+
+
+def files_listing(name, environment, archive):
+    """Every entry of one files backup (at most ARCHIVE_ENTRIES): path, type, size, time; nothing is extracted."""
+    path = files_archive(name, environment, archive)
+    if isinstance(path, dict):
+        return path
+    entries, truncated = [], False
+    try:
+        with tarfile.open(path, 'r:gz') as archive_file:
+            for member in archive_file:
+                if len(entries) >= ARCHIVE_ENTRIES:
+                    truncated = True
+                    break
+                kind = 'dir' if member.isdir() else 'file' if member.isfile() else 'link' if member.issym() else 'other'
+                entries.append({'path': member.name.strip('/')[:1024], 'type': kind, 'size': member.size if kind == 'file' else 0,
+                                'time': int(member.mtime), 'link': member.linkname[:1024] if kind == 'link' else None})
+    except (OSError, tarfile.TarError, EOFError) as error:
+        return {'error': f'{archive}: {error}'}
+    info = path.stat()
+    return {'archive': archive, 'size': info.st_size, 'time': int(info.st_mtime), 'entries': entries, 'truncated': truncated}
+
+
+def files_member(name, environment, archive, member):
+    """One regular file of a files backup: its first ARCHIVE_FILE_LIMIT bytes, base64."""
+    path = files_archive(name, environment, archive)
+    if isinstance(path, dict):
+        return path
+    try:
+        with tarfile.open(path, 'r:gz') as archive_file:
+            for item in archive_file:
+                if item.name.strip('/') != member:
+                    continue
+                if not item.isfile():
+                    return {'error': f'{member} is not a regular file in {archive}'}
+                with archive_file.extractfile(item) as handle:
+                    content = handle.read(ARCHIVE_FILE_LIMIT)
+                return {'archive': archive, 'path': member, 'size': item.size, 'time': int(item.mtime),
+                        'truncated': item.size > len(content), 'content': base64.b64encode(content).decode()}
+    except (OSError, tarfile.TarError, EOFError) as error:
+        return {'error': f'{archive}: {error}'}
+    return {'error': f'{archive} has no {member}'}
+
+
 def metrics():
     """The exposition of the installed setup-server-metrics (--once: no server, no token)."""
     command = SBIN / 'setup-server-metrics'
@@ -769,6 +846,18 @@ def main(arguments):
             return 64
         result = as_account(arguments, lambda error: {'error': f'session: {error}'}) if os.geteuid() == 0 \
             else session(arguments[1], arguments[2])
+    elif arguments[:1] in (['--files'], ['--file']) and len(arguments) == (4 if arguments[0] == '--files' else 5):
+        name, environment, archive = arguments[1:4]
+        if not NAME.fullmatch(name) or not ENVIRONMENT.fullmatch(environment) or not SERIES.fullmatch(archive) or \
+                (len(arguments) == 5 and not MEMBER.fullmatch(arguments[4])):
+            print('Expected PROJECT ENV files-<env>-<time>Z.tar.gz' + (' PATH' if len(arguments) == 5 else ''), file=sys.stderr)
+            return 64
+        if os.geteuid() == 0:
+            result = as_account(arguments, lambda error: {'error': f'files backup: {error}'})
+        elif len(arguments) == 4:
+            result = files_listing(name, environment, archive)
+        else:
+            result = files_member(name, environment, archive, arguments[4])
     elif arguments == ['--metrics']:
         result = as_account(arguments, lambda error: {'error': f'metrics: {error}'}) if os.geteuid() == 0 else metrics()
     elif arguments[:1] == ['--logs'] and len(arguments) <= 2:

@@ -2,8 +2,9 @@
 # Install the worker's database backups: setup-server-backup.timer starts setup-server-backup.service every
 # night, which runs /usr/local/sbin/setup-server-backup (a root-owned copy of bin/backup-projects) as root; it
 # backs up every deployed project as the setup account (setup's registry backup). setup-server-backup-full.timer
-# does the same once a week with --full (every table's data, the full-<env> series). A sudoers rule lets that
-# account start the same command for one project ("backup now" pipeline, also --full).
+# does the same once a week with --full (every table's data, the full-<env> series), and
+# setup-server-backup-files.timer every night with --files (the files BACKUP_FILE_PATHS lists, the files-<env>
+# series). A sudoers rule lets that account start the same command for one project ("backup now" pipeline, also --full).
 # Idempotent (a rerun keeps the installed times); --check shows the units and what tonight's run would do,
 # and changes nothing. --refresh only rewrites an installed command copy: bin/update runs it.
 set -euo pipefail
@@ -17,18 +18,21 @@ SYSTEMD=${SETUP_SERVER_SYSTEMD:-/etc/systemd/system}
 SUDOERS=${SETUP_SERVER_SUDOERS:-/etc/sudoers.d}
 NAME=setup-server-backup
 FULL=setup-server-backup-full
+FILES=setup-server-backup-files
 
 check=0
 refresh=0
 at=
 full_at=
+files_at=
 usage() {
     cat <<EOF
-Usage: sudo $0 [--check] [--at HH:MM] [--full-at "DAY HH:MM"] | --refresh
+Usage: sudo $0 [--check] [--at HH:MM] [--full-at "DAY HH:MM"] [--files-at HH:MM] | --refresh
   --at       local time of the nightly run (default: the installed one, else 03:30; a missed run starts
              after the next boot)
   --full-at  day and local time of the weekly full backup, e.g. "Sun 04:30" (default: the installed one,
              else Sun 04:30)
+  --files-at local time of the nightly files backup (BACKUP_FILE_PATHS; default: the installed one, else --at)
   --check    show the units and what tonight's run would back up and delete; change nothing
   --refresh  only rewrite $SBIN/$NAME from this checkout, when it is installed (bin/update runs it)
 EOF
@@ -39,6 +43,7 @@ while [ $# -gt 0 ]; do
         --refresh) refresh=1 ;;
         --at) at=${2:-}; shift ;;
         --full-at) full_at=${2:-}; shift ;;
+        --files-at) files_at=${2:-}; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 64 ;;
     esac
@@ -51,6 +56,9 @@ full_at=${full_at:-$(sed -n 's/^OnCalendar=\([A-Z][a-z][a-z]\) \*-\*-\* \([0-9][
 full_at=${full_at:-Sun 04:30}
 [[ "$full_at" =~ ^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\ ([01][0-9]|2[0-3]):[0-5][0-9]$ ]] \
     || { echo "--full-at needs a day and a time such as \"Sun 04:30\"" >&2; exit 64; }
+files_at=${files_at:-$(sed -n 's/^OnCalendar=\*-\*-\* \([0-9][0-9]:[0-9][0-9]\):00$/\1/p' "$SYSTEMD/$FILES.timer" 2>/dev/null || true)}
+files_at=${files_at:-$at}
+[[ "$files_at" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "--files-at needs a time such as 03:30" >&2; exit 64; }
 for value in "$ROOT" "$CONFIG" "$SBIN" "$ACCOUNT"; do
     [[ "$value" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "Unexpected characters in $value" >&2; exit 65; }
 done
@@ -129,6 +137,35 @@ Persistent=true
 WantedBy=timers.target
 EOF
 
+cat > "$staging/files-service" <<EOF
+[Unit]
+Description=Nightly files backups of the setup-server projects (BACKUP_FILE_PATHS, 7 daily + 4 weekly)
+Documentation=https://github.com/BigSant/DockerDevelopmentEnvironmentServer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Root plans; setup (make files-backup) reads the files from each deploy target as $ACCOUNT, with its key.
+ExecStart=$command --files
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+EOF
+
+cat > "$staging/files-timer" <<EOF
+[Unit]
+Description=Nightly files backups of the setup-server projects
+
+[Timer]
+OnCalendar=*-*-* $files_at:00
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 # Only the "backup now" form: sudo -n $command [--full] "$BUILD_ROOT" [ENV] (stage, prod or a STAGE_ENVIRONMENTS
 # name; the command checks the project has it). sudo 1.9.10+ matches the
 # arguments with a regular expression; older ones (Ubuntu 22.04: 1.9.9) only with wildcards, where `*` also
@@ -162,7 +199,8 @@ if [ "$refresh" = 1 ]; then
     [ -e "$command" ] || { echo "==> $command is not installed; nothing to refresh"; exit 0; }
     place "$staging/command" "$command" 0755 quiet
     for file in "service:$SYSTEMD/$NAME.service" "timer:$SYSTEMD/$NAME.timer" "full-service:$SYSTEMD/$FULL.service" \
-                "full-timer:$SYSTEMD/$FULL.timer" "sudoers:$SUDOERS/$NAME"; do
+                "full-timer:$SYSTEMD/$FULL.timer" "files-service:$SYSTEMD/$FILES.service" \
+                "files-timer:$SYSTEMD/$FILES.timer" "sudoers:$SUDOERS/$NAME"; do
         cmp -s "$staging/${file%%:*}" "${file#*:}" 2>/dev/null \
             || echo "==> note: ${file#*:} differs from this version; apply it with: sudo bin/install-backups"
     done
@@ -173,19 +211,25 @@ place "$staging/service" "$SYSTEMD/$NAME.service" 0644
 place "$staging/timer" "$SYSTEMD/$NAME.timer" 0644
 place "$staging/full-service" "$SYSTEMD/$FULL.service" 0644
 place "$staging/full-timer" "$SYSTEMD/$FULL.timer" 0644
+place "$staging/files-service" "$SYSTEMD/$FILES.service" 0644
+place "$staging/files-timer" "$SYSTEMD/$FILES.timer" 0644
 place "$staging/sudoers" "$SUDOERS/$NAME" 0440
 
 if [ "$check" = 1 ]; then
-    echo "==> would enable $NAME.timer and $FULL.timer"
+    echo "==> would enable $NAME.timer, $FULL.timer and $FILES.timer"
     echo "==> Tonight's run:"
     "$here/backup-projects" --check || true
+    echo "==> Tonight's files run:"
+    "$here/backup-projects" --check --files || true
     exit 0
 fi
 
 systemctl daemon-reload
-for timer in "$NAME.timer" "$FULL.timer"; do
+for timer in "$NAME.timer" "$FULL.timer" "$FILES.timer"; do
     systemctl enable --now "$timer"
     echo "==> $timer: $(systemctl is-active "$timer"); next: $(systemctl show -P NextElapseUSecRealtime "$timer")"
 done
 echo "==> Tonight's run:"
 "$command" --check || echo "Needs attention: deploy the projects named above with setup 2.5.0+ (secret store; README, Kopijos)" >&2
+echo "==> Tonight's files run:"
+"$command" --check --files || echo "Needs attention: see the files backups named above (README, Failų kopijos)" >&2
