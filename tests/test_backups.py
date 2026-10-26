@@ -293,6 +293,63 @@ class BackupProjectsTest(ScriptTest):
         self.assertTrue((backups / "fresh-full-prod-20261009T013000Z.sql.gz").is_file())
         self.assertTrue((backups / ".lock-prod").is_file())
 
+    def setup_checkout(self, files=True):
+        """A setup checkout whose project.mk has (or, an older release, lacks) make files-backup."""
+        setup = self.root / ("setup" if files else "old-setup")
+        (setup / "docker").mkdir(parents=True, exist_ok=True)
+        (setup / "docker/project.mk").write_text("db-backup:\n\t@true\n" + ("files-backup:\n\t@true\n" if files else ""))
+        os.environ["SETUP_DIRECTORY"] = str(setup)
+        self.addCleanup(os.environ.pop, "SETUP_DIRECTORY", None)
+        return setup
+
+    def test_files_backups_follow_backup_file_paths_and_need_no_secret_store(self):
+        self.setup_checkout()
+        os.environ["STORES"] = ""  # a files backup reads the target, not the database
+        shop = self.project("shop", "stage", "prod")
+        (shop / "env/common.env").write_text('PROJECT_NAME=demo\nBACKUP_FILE_PATHS="modules/*/translations/ config/local.php"\n')
+        (shop / "env/stage.env").write_text("DOMAIN=example.test\nBACKUP_FILE_PATHS=\n")  # an env file wins
+        self.project("other", "prod")
+        backups = shop / ".generated/backups"
+        backups.mkdir(parents=True)
+        for n in range(1, 41):
+            (backups / f"files-prod-{datetime(2026, 10, 9) - timedelta(days=n):%Y%m%d}T013000Z.tar.gz").write_text("old")
+        (backups / nightly(datetime(2026, 10, 8))).write_text("db")
+        check = self.run_script("backup-projects", "--check", "--files")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn(f"would back up shop prod into {backups}/files-prod-20261009T013000Z.tar.gz", check.stdout)
+        self.assertIn("paths: modules/*/translations/ config/local.php", check.stdout)
+        self.assertNotIn("secrets", check.stdout + check.stderr)
+        self.assertFalse(self.make_log.exists(), "--check runs no backup")
+        result = self.run_script("backup-projects", "--files")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.make_log.read_text()
+        self.assertIn(f"files-backup ENV=prod file={backups}/files-prod-20261009T013000Z.tar.gz", calls)
+        self.assertNotIn("ENV=stage", calls)
+        self.assertNotIn("db-backup", calls)
+        self.assertIn("other: no BACKUP_FILE_PATHS of a deployed environment; skipped", result.stdout)
+        self.assertEqual(len(list(backups.glob("files-prod-*.tar.gz"))), 11, "7 daily + 4 weekly, as the nightly series")
+        self.assertTrue((backups / nightly(datetime(2026, 10, 8))).exists(), "the database series is not touched")
+        self.assertTrue((backups / ".lock-files-prod").is_file(), "a lock of its own: it does not wait for a database backup")
+        self.assertIn("Backups: 1 ok, 0 failed", result.stdout)
+        refused = self.run_script("backup-projects", "--files", "other")
+        self.assertEqual(refused.returncode, 65)
+        self.assertIn("other sets no BACKUP_FILE_PATHS", refused.stderr)
+        for arguments in (["--files", "--full"], ["--files", "--fresh"]):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.run_script("backup-projects", *arguments).returncode, 64)
+
+    def test_a_setup_without_make_files_backup_is_named_and_nothing_runs(self):
+        self.setup_checkout(files=False)
+        shop = self.project("shop", "prod")
+        (shop / "env/common.env").write_text("BACKUP_FILE_PATHS=modules/*/translations/\n")
+        check = self.run_script("backup-projects", "--check", "--files")
+        self.assertEqual(check.returncode, 1, check.stdout + check.stderr)
+        self.assertIn("setup has no make files-backup; update it", check.stderr)
+        result = self.run_script("backup-projects", "--files")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("shop prod: setup has no make files-backup", result.stderr)
+        self.assertFalse(self.make_log.exists())
+
 
 class InstallBackupsTest(ScriptTest):
     def setUp(self):
@@ -334,7 +391,8 @@ class InstallBackupsTest(ScriptTest):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn(f"ExecStart={self.root}/sbin/setup-server-backup --full\n", result.stdout)
         self.assertIn("OnCalendar=Sat *-*-* 05:15:00", result.stdout)
-        self.assertIn("would enable setup-server-backup.timer and setup-server-backup-full.timer", result.stdout)
+        self.assertIn("would enable setup-server-backup.timer, setup-server-backup-full.timer and "
+                      "setup-server-backup-files.timer", result.stdout)
         default = self.run_script("install-backups", "--check")
         self.assertIn("OnCalendar=Sun *-*-* 04:30:00", default.stdout)
         # A rerun without --full-at keeps the installed day and time.
@@ -344,6 +402,24 @@ class InstallBackupsTest(ScriptTest):
         for bad in ("Sunday 04:30", "Sun 4:30", "04:30", "Sun 04:30; rm"):
             with self.subTest(bad=bad):
                 self.assertEqual(self.run_script("install-backups", "--check", "--full-at", bad).returncode, 64)
+
+    def test_the_files_timer_runs_the_files_backup_at_the_nightly_time_unless_told_otherwise(self):
+        result = self.run_script("install-backups", "--check", "--at", "02:15")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"ExecStart={self.root}/sbin/setup-server-backup --files\n", result.stdout)
+        files_timer = result.stdout.split("setup-server-backup-files.timer")[1]
+        self.assertIn("OnCalendar=*-*-* 02:15:00", files_timer, "by default with the nightly database backup")
+        self.assertIn("Tonight's files run:", result.stdout)
+        own = self.run_script("install-backups", "--check", "--files-at", "23:40")
+        self.assertIn("OnCalendar=*-*-* 23:40:00", own.stdout.split("setup-server-backup-files.timer")[1])
+        # A rerun without --files-at keeps the installed time.
+        (self.root / "systemd").mkdir()
+        (self.root / "systemd/setup-server-backup-files.timer").write_text("[Timer]\nOnCalendar=*-*-* 01:05:00\n")
+        kept = self.run_script("install-backups", "--check")
+        self.assertIn("OnCalendar=*-*-* 01:05:00", kept.stdout.split("setup-server-backup-files.timer")[1])
+        for bad in ("1:05", "24:00", "01:05; rm"):
+            with self.subTest(bad=bad):
+                self.assertEqual(self.run_script("install-backups", "--check", "--files-at", bad).returncode, 64)
 
     def test_a_rerun_keeps_the_installed_time_and_refresh_only_touches_an_installed_copy(self):
         (self.root / "systemd").mkdir()

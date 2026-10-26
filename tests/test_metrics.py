@@ -294,6 +294,32 @@ class EndpointTest(ScriptTest):
         samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
         self.assertEqual(value(samples, "setup_worker_full_backups", project="forsena_docker", environment="stage"), 0)
 
+    def test_the_files_series_has_metrics_of_its_own_and_counts_zero_only_where_paths_are_set(self):
+        self.fixtures()
+        asana = self.tree.projects / "asana_tracker/app"
+        (asana / "env/common.env").write_text('BACKUP_FILE_PATHS="modules/*/translations/"\n')
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - 3600))
+        self.tree.backup(asana, f"files-prod-{stamp}Z.tar.gz", 3600, 700)
+        self.tree.backup(asana, f"files-prod-{stamp}Z.sql.gz", 60, 5)  # not of the series
+        forsena = self.tree.projects / "forsena_docker/app/docker"
+        (forsena / "env/stage.env").write_text("BACKUP_FILE_PATHS=themes/*/lang/  # translations\n")
+        self.tree.project("shop", "prod")
+        samples = parse(self.scrape())
+        labels = {"project": "asana_tracker", "environment": "prod"}
+        self.assertEqual(value(samples, "setup_worker_files_backups", **labels), 1)
+        self.assertEqual(value(samples, "setup_worker_files_backup_newest_size_bytes", **labels), 700)
+        self.assertAlmostEqual(value(samples, "setup_worker_files_backup_newest_age_seconds", **labels), 3600, delta=60)
+        self.assertEqual(value(samples, "setup_worker_backups", **labels), 3, "files backups are not database ones")
+        self.assertFalse([key for key in samples if key[0] == "setup_worker_files_backups" and ("project", "forsena_docker") in key[1]],
+                         "without the files timer an ENV without files backups raises no alert")
+        systemd = self.root / "systemd"
+        systemd.mkdir()
+        (systemd / "setup-server-backup-files.timer").write_text("[Timer]\n")
+        samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
+        self.assertEqual(value(samples, "setup_worker_files_backups", project="forsena_docker", environment="stage"), 0)
+        self.assertFalse([key for key in samples if key[0] == "setup_worker_files_backups" and ("project", "shop") in key[1]],
+                         "an ENV without BACKUP_FILE_PATHS expects no files backups")
+
     def test_a_stage_class_environment_the_project_lists_has_its_backups_and_deploys(self):
         shop = self.tree.project("shop", "prod", "mdv", "old")
         (shop / "env/common.env").write_text('STAGE_ENVIRONMENTS="mdv"\n')

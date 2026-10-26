@@ -89,6 +89,32 @@ METRICS_STUB = ('[ "$*" = --once ] || exit 64\n'
 JOURNALCTL_STUB = 'echo "$*" >> "$STUB_DIR/journalctl.calls"\nfor unit; do :; done\necho "2026-10-12T00:30:00+0000 host journal of ${unit#--unit=}"\n'
 
 
+def files_archive(directory, environment, age, members):
+    """A files backup as setup's make files-backup writes it: a tar.gz of code-tree paths, members without ./;
+    members maps a path to bytes (a file), None (a directory) or a str (a symlink to it)."""
+    import io
+    import tarfile
+    stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - age))
+    path = directory / f".generated/backups/files-{environment}-{stamp}Z.tar.gz"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    moment = time.time() - age
+    with tarfile.open(path, "w:gz") as archive:
+        for name, content in sorted(members.items()):
+            info = tarfile.TarInfo(name)
+            info.mtime = int(moment)
+            if content is None:
+                info.type = tarfile.DIRTYPE
+                archive.addfile(info)
+            elif isinstance(content, str):
+                info.type, info.linkname = tarfile.SYMTYPE, content
+                archive.addfile(info)
+            else:
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+    os.utime(path, (moment, moment))
+    return path.name
+
+
 class Worker(ScriptTest):
     """A worker tree with three build roots and the stubbed system commands."""
 
@@ -293,6 +319,39 @@ class ServerStatusTest(Worker):
         self.assertEqual([(item["kind"], item["size"]) for item in prod["backup_files"]],
                          [("predeploy", 500), ("full", 9000), ("worker", 4096), ("worker", 3000), ("worker", 2000)])
 
+    def test_files_backups_are_listed_and_read_one_file_at_a_time(self):
+        asana = self.tree.projects / "asana_tracker/app"
+        (asana / "env/common.env").write_text('PROJECT_NAME=asana\nBACKUP_FILE_PATHS="modules/*/translations/ $(bad) config/local.php"\n')
+        older = files_archive(asana, "prod", 26 * 3600, {"modules/a/translations/lt.php": b"<?php $a = 1;\n"})
+        newest = files_archive(asana, "prod", 3600, {"modules": None, "modules/a/translations/lt.php": b"<?php $a = 2;\n",
+                                                    "modules/b/translations/en.php": b"\0binary", "config/local.php": "../x"})
+        data = json.loads(self.status().stdout)
+        prod = next(item for item in data["projects"] if item["name"] == "asana_tracker")["environments"]["prod"]
+        self.assertEqual(prod["file_paths"], ["modules/*/translations/", "config/local.php"], "only plain code-tree paths leave")
+        self.assertEqual(prod["files_backups"]["count"], 2)
+        self.assertEqual(prod["files_backups"]["newest"]["name"], newest)
+        self.assertEqual([item["name"] for item in prod["backup_files"] if item["kind"] == "files"], [newest, older])
+        listing = json.loads(self.status("--files", "asana_tracker", "prod", newest).stdout)
+        self.assertEqual({item["path"]: (item["type"], item["size"], item["link"]) for item in listing["entries"]},
+                         {"modules": ("dir", 0, None), "modules/a/translations/lt.php": ("file", 14, None),
+                          "modules/b/translations/en.php": ("file", 7, None), "config/local.php": ("link", 0, "../x")})
+        one = json.loads(self.status("--file", "asana_tracker", "prod", newest, "modules/a/translations/lt.php").stdout)
+        self.assertEqual(base64.b64decode(one["content"]), b"<?php $a = 2;\n")
+        self.assertFalse(one["truncated"])
+        for arguments, error in (([newest, "config/local.php"], "not a regular file"), ([newest, "missing.php"], "has no missing.php"),
+                                 ([older.replace("files-", "worker-").replace(".tar.gz", ".sql.gz"), "x"], "not a files backup"),
+                                 ([older.replace("prod", "stage"), "x"], "not a files backup of prod")):
+            with self.subTest(arguments=arguments):
+                answer = json.loads(self.status("--file", "asana_tracker", "prod", *arguments).stdout)
+                self.assertIn(error, answer["error"])
+        planted = asana / ".generated/backups/files-prod-20200101T000000Z.tar.gz"
+        planted.symlink_to("/etc/passwd")
+        self.assertIn("has no", json.loads(self.status("--files", "asana_tracker", "prod", planted.name).stdout)["error"])
+        for arguments in (["--files", "asana_tracker", "prod", "../../x.tar.gz"], ["--files", "Bad", "prod", newest],
+                          ["--file", "asana_tracker", "prod", newest, "a\x01b"], ["--files", "asana_tracker", "prod"]):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(self.status(*arguments).returncode, 64)
+
     def test_container_logs_only_of_a_container_of_that_project_environment(self):
         result = self.status("--container-logs", "asana_tracker", "prod", "asana-prod-cron", "20")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -348,7 +407,8 @@ class ServerStatusTest(Worker):
         self.assertEqual(data["access"], [f"access {n}" for n in range(5, 10)])
         self.assertEqual(sorted(data["journal"]), sorted(["setup-server-runner.service", "setup-server-github-runner@*.service",
                                                           "setup-server-backup.service", "setup-server-backup-full.service",
-                                                          "setup-server-metrics.service", "setup-server-ui.service"]))
+                                                          "setup-server-backup-files.service", "setup-server-metrics.service",
+                                                          "setup-server-ui.service"]))
         self.assertTrue(all("--lines=5" in call for call in self.calls("journalctl")))
         for arguments in (["--logs", "9999"], ["--logs", "0"], ["--logs", "5;ls"], ["--unit", "ssh"], ["--logs", "5", "x"]):
             with self.subTest(arguments=arguments):
@@ -388,7 +448,8 @@ class ServerUnitTest(Worker):
         self.assertEqual(self.changes(), [])
 
     def test_only_the_listed_units_and_what_may_be_done_to_each(self):
-        for arguments in (["start", "ui"], ["stop", "ui"], ["restart", "backup"], ["stop", "backup-full"], ["restart", "ssh"],
+        for arguments in (["start", "ui"], ["stop", "ui"], ["restart", "backup"], ["stop", "backup-full"], ["stop", "backup-files"],
+                          ["restart", "ssh"],
                           ["restart", "setup-server-runner.service"], ["restart", "github-runner@other"],
                           ["restart", "github-runner@../bigsant"], ["kill", "runner"], ["restart", "metrics"]):
             with self.subTest(arguments=arguments):
@@ -974,6 +1035,59 @@ class WebUiTest(Worker):
             time.sleep(0.1)
         self.assertIn("finished", self.log.read_text())
 
+    def test_the_files_tab_shows_the_backups_their_files_changes_and_one_file_read_only(self):
+        asana = self.tree.projects / "asana_tracker/app"
+        (asana / "env/common.env").write_text('PROJECT_NAME=asana\nBACKUP_FILE_PATHS="modules/*/translations/"\n')
+        older = files_archive(asana, "prod", 26 * 3600, {"modules/a/translations/lt.php": b"<?php\n$a = 1;\n$keep = 0;\n",
+                                                         "modules/c/translations/gone.php": b"old\n"})
+        newest = files_archive(asana, "prod", 3600, {"modules/a/translations/lt.php": b"<?php\n$a = 2;\n$keep = 0;\n",
+                                                     "modules/b/translations/en.php": b"\0\1binary"})
+        status, _, body = self.request("GET", "/files?fresh=1")
+        self.assertEqual(status, 200, body)
+        self.assertIn('href="/files">Failai', body)
+        self.assertIn("<code>modules/*/translations/</code>", body)
+        self.assertIn('href="/files/asana_tracker/prod"', body)
+        self.assertNotIn("/files/shop-two/", body, "a project without BACKUP_FILE_PATHS is not listed")
+        status, _, body = self.request("GET", "/files/asana_tracker/prod")
+        self.assertEqual(status, 200, body)
+        self.assertLess(body.index(newest), body.index(older), "newest first")
+        self.assertIn('name="files" value="yes"', body)
+        self.assertIn("setup-server-backup --files asana_tracker prod", body)
+        status, _, body = self.request("GET", f"/files/asana_tracker/prod/{newest}")
+        self.assertEqual(status, 200, body)
+        self.assertRegex(body, r'lt\.php</a></td>.*?pakeista')
+        self.assertRegex(body, r'en\.php</a></td>.*?nauja')
+        self.assertIn("Dingo nuo ankstesnės kopijos (1)", body)
+        self.assertIn(f"/files/asana_tracker/prod/{older}/view?path=modules/c/translations/gone.php", body)
+        filtered = self.request("GET", f"/files/asana_tracker/prod/{newest}?q=EN.php")[2]
+        self.assertIn("en.php", filtered)
+        self.assertNotIn("lt.php</a>", filtered)
+        status, _, body = self.request("GET", f"/files/asana_tracker/prod/{newest}/view?path=modules/a/translations/lt.php")
+        self.assertEqual(status, 200, body)
+        self.assertIn('<li class="del">-$a = 1;</li>', body)
+        self.assertIn('<li class="add">+$a = 2;</li>', body)
+        self.assertIn("<li>$keep = 0;</li>", body)
+        self.assertIn("/download?path=modules/a/translations/lt.php", body)
+        binary = self.request("GET", f"/files/asana_tracker/prod/{newest}/view?path=modules/b/translations/en.php")[2]
+        self.assertIn("Dvejetainis failas", binary)
+        self.assertIn("šio failo nėra", binary)
+        status, headers, content = self.request("GET", f"/files/asana_tracker/prod/{newest}/download?path=modules/a/translations/lt.php")
+        self.assertEqual((status, content), (200, "<?php\n$a = 2;\n$keep = 0;\n"))
+        self.assertEqual(headers["Content-Type"], "application/octet-stream")
+        self.assertIn('attachment; filename="lt.php"', headers["Content-Disposition"])
+        for path in (f"/files/asana_tracker/prod/{newest}/view?path=", f"/files/asana_tracker/prod/{newest}/view?path=a%01b"):
+            with self.subTest(path=path):
+                self.assertEqual(self.request("GET", path)[0], 400)
+        self.assertEqual(self.request("GET", "/files/asana_tracker/mdv")[0], 404)
+        self.assertEqual(self.request("GET", "/files/asana_tracker/prod/worker-prod-20261009T013000Z.sql.gz")[0], 404)
+        self.preview("backup-local", project="asana_tracker", environment="prod", files="yes")
+        self.assertEqual(self.sudo_calls("backup-projects")[-1],
+                         f"-n {self.library}/bin/backup-projects --check --files asana_tracker prod")
+        status, _, body = self.preview("backup-local", project="asana_tracker", full="yes", files="yes")
+        self.assertIn("nėra DB kopija", body)
+        self.preview("install-backups", files_at="02:40")
+        self.assertEqual(self.sudo_calls("install-backups")[-1], f"-n {self.library}/bin/install-backups --check --files-at 02:40")
+
     def test_backup_forms_pass_the_weekly_time_the_fresh_permission_and_full(self):
         self.preview("install-backups", at="02:15", full_at="Sat 05:00")
         self.assertEqual(self.sudo_calls("install-backups"),
@@ -1013,9 +1127,11 @@ class WebUiTest(Worker):
         self.assertIn("pipeline&#x27;o žingsnis nutrūktų", body, "what can go wrong is shown above Vykdyti")
         self.preview("unit", unit="github-runner@bigsant", operation="stop")
         self.preview("unit", unit="backup", operation="start")
+        self.preview("unit", unit="backup-files", operation="start")
         self.assertEqual(self.sudo_calls("server-unit"), [f"{library}/server-unit --check restart runner",
                                                           f"{library}/server-unit --check stop github-runner@bigsant",
-                                                          f"{library}/server-unit --check start backup"])
+                                                          f"{library}/server-unit --check start backup",
+                                                          f"{library}/server-unit --check start backup-files"])
         self.preview("install-ssh", sources="10.8.0.0/24, 10.9.0.0/24")
         self.preview("install-ssh")
         self.assertEqual(self.sudo_calls("install-ssh"), [f"{library}/install-ssh --check --from 10.8.0.0/24,10.9.0.0/24",

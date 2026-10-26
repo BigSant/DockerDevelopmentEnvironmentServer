@@ -19,6 +19,7 @@ Usage: sudo $0 [--check] ACTION UNIT
     start|stop|restart  metrics                the worker /metrics (setup-server-metrics.service)
     start               backup                 the nightly backup now (setup-server-backup.service; waits for it)
     start               backup-full            the weekly full backup now (setup-server-backup-full.service; waits)
+    start               backup-files           the nightly files backup now (setup-server-backup-files.service; waits)
     restart             ui                     the web UI (setup-server-ui.service): reads ui.env again
   --check  show the unit's state and what would be done; change nothing (no root needed)
 Exit: 0 done, 1 the unit failed, 64 usage, 65 refused, 77 not root.
@@ -44,6 +45,7 @@ case "$name" in
     metrics) unit=setup-server-metrics.service; allowed="start stop restart" ;;
     backup) unit=setup-server-backup.service; allowed="start" ;;
     backup-full) unit=setup-server-backup-full.service; allowed="start" ;;
+    backup-files) unit=setup-server-backup-files.service; allowed="start" ;;
     ui) unit=setup-server-ui.service; allowed="restart" ;;
     github-runner@*)
         scope=${name#github-runner@}
@@ -51,7 +53,7 @@ case "$name" in
         [ -f "$ROOT/github-runner/$scope/.runner" ] && [ ! -L "$ROOT/github-runner/$scope" ] \
             || refuse "No GitHub runner registered as $scope in $ROOT/github-runner (bin/install-runner --provider github)"
         unit="setup-server-github-runner@$scope.service"; allowed="start stop restart" ;;
-    *) refuse "Unknown unit $name (runner, github-runner@SCOPE, metrics, backup, backup-full, ui)" ;;
+    *) refuse "Unknown unit $name (runner, github-runner@SCOPE, metrics, backup, backup-full, backup-files, ui)" ;;
 esac
 case " $allowed " in
     *" $action "*) ;;

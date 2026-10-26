@@ -17,7 +17,7 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<repo vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`. GitHub repo – su savo deploy key. |
 | `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
 | `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
-| `bin/install-backups` | DB kopijos: naktinė (`setup-server-backup.timer`, pagal lentelių registrą) ir savaitinė pilna (`setup-server-backup-full.timer`, visų lentelių duomenys), komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
+| `bin/install-backups` | DB kopijos: naktinė (`setup-server-backup.timer`, pagal lentelių registrą) ir savaitinė pilna (`setup-server-backup-full.timer`, visų lentelių duomenys); naktinė failų kopija (`setup-server-backup-files.timer`, projekto `BACKUP_FILE_PATHS` keliai iš taikinio); komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
 | `bin/install-ssh` | SSH iš VPN: `openssh-server` (Ubuntu Desktop jo neturi), paleistas ir startuojantis po perkrovimo, nustatymai `/etc/ssh/sshd_config.d/10-setup-server.conf` – iš už nurodytų tinklų ir šio serverio tik raktu, be slaptažodžio; įjungtam ufw – leidimas tiems tinklams. Reikia `make db-pull` ir valdymo sąsajos tuneliui. |
 | `bin/add-backup-key` | Programuotojo SSH raktas DB kopijoms atsisiųsti (`make db-pull`) – tik leistų projektų aplinkų (`--pull PROJEKTAS:ENV=db`, `=fresh` – ir naujai kopijai užsakyti, `make db-pull fresh=1`; `--pull-all` – visų projektų): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. Su `--grant PROJEKTAS:ENV=LYGIS` – ir prieiga prie to projekto taikinio per šį serverį (`make ssh`), per `/usr/local/sbin/setup-server-access` (kopija iš `bin/server-access`). |
 | `bin/install-metrics` | Worker'io Prometheus `/metrics`: systemd paslauga `setup-server-metrics` (paskyra `setup`, tik skaito), komanda `/usr/local/sbin/setup-server-metrics` (kopija iš `bin/worker-metrics`), nustatymai `/etc/setup-server/metrics.env`. |
@@ -34,7 +34,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 ├── setup/                      bendras setup checkout'as (serveriuose – ant release tag'o)
 ├── projects/<vardas>/app/      projekto build katalogas (BUILD_ROOT = projects/<vardas>)
 │   └── .generated/backups/     DB kopijos: worker-<env>-<UTC laikas>Z.sql.gz – naktinės ir „backup dabar“,
-│                               full-<env>-…Z – savaitinės pilnos, fresh(-full)-<env>-…Z – programuotojų „fresh“
+│                               full-<env>-…Z – savaitinės pilnos, fresh(-full)-<env>-…Z – programuotojų „fresh“;
+│                               files-<env>-…Z.tar.gz – failų kopijos (BACKUP_FILE_PATHS), .files-<env>/ – jų veidrodis
 ├── runner/current/             Bitbucket runner'io versija; runner/temp – jo darbo katalogas
 ├── github-runner/<scope>/      GitHub runner'is (organizacijai `bigsant`, repo `bigsant.<repo>`); _work – darbo katalogas
 ├── ui-actions.log              valdymo sąsajos veiksmų žurnalas (setup-ui, 0640)
@@ -322,6 +323,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    ```
 
    Antras argumentas (`stage` arba `prod`) apriboja aplinką, `FULL=yes` – pilna kopija (į `full-<env>` seriją).
+   Kodo medžio failus, kurių nėra git'e (pvz. vertimus), saugo atskiros failų kopijos – žr. „Failų kopijos“.
    Įdiegtą komandos kopiją atnaujina `bin/update` (žr. „Atnaujinimas“). Pakartotinai paleistas
    `sudo bin/install-backups` palieka įdiegtus laikus, jei nenurodyti `--at` ir `--full-at`.
 
@@ -455,6 +457,41 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    slaptažodis (pvz. `mysql -p`) įrašomas taip pat. Be terminalo įrašo nėra: komanda jau yra prašyme. Sąsaja rodo
    kiekvieno rakto veiklą (prisijungimai, kopijos, shell'ai su trukme, komandos, atmesti bandymai) ir seansų įrašus –
    `server-status --activity [RAKTAS]`, `--session RAKTAS FAILAS`. Įdiegtą komandos kopiją atnaujina `bin/update`.
+
+## Failų kopijos (`BACKUP_FILE_PATHS`)
+
+Kai kuriuos kodo medžio failus rašo pati parduotuvė taikinyje, o git'e jų nėra (pvz. modulių vertimai
+`modules/*/translations/`). Deploy'us jų netrina, bet ir niekur kitur jų nėra: sugedus taikiniui jie dingtų. Projektas juos
+išvardija setup kintamuoju `BACKUP_FILE_PATHS` (kaip `DEPLOY_PROTECTED_PATHS`: keliai nuo kodo šaknies, per tarpą, katalogas
+baigiasi `/`, leidžiamas `*`), o worker'is kas naktį juos parsisiunčia ir laiko kopijas:
+
+```dotenv
+# env/common.env (env/<env>.env reikšmė laimi)
+BACKUP_FILE_PATHS="modules/*/translations/ themes/*/lang/"
+```
+
+```bash
+sudo bin/install-backups --check                  # be kitko – setup-server-backup-files.timer ir ką šią naktį kopijuotų
+sudo bin/install-backups [--files-at 02:30]       # numatyta – tuo pačiu laiku kaip naktinė DB kopija (--at)
+sudo setup-server-backup --check --files          # kurių projektų aplinkos ir kokie keliai
+sudo setup-server-backup --files shop prod        # vienos aplinkos kopija dabar (ar sąsajoje „Failų kopija dabar“)
+```
+
+- **Kurios aplinkos** – tos pačios, kurių DB kopijuojama (`env/<env>.env` build kataloge), jei joms `BACKUP_FILE_PATHS`
+  netuščias. Kitų projektų naktinis paleidimas nekeičia.
+- **Kaip** – setup `make files-backup ENV=<env> file=…` (setup 3.1.0+; senesnis – „setup has no make files-backup“; iš 2.x – naujas MAJOR,
+  `sudo bin/update-setup v3.1.0`), paskyra `setup`, tuo pačiu keliu kaip deploy'us (`DEPLOY_SSH` jos raktu arba vietinis katalogas). rsync
+  parsiunčia tik išvardytus kelius į veidrodį `.generated/backups/.files-<env>/` (kitą naktį – tik pasikeitimus), iš jo
+  supakuojama `files-<env>-<UTC laikas>Z.tar.gz`. **Taikinys tik skaitomas**: niekas į jį nerašoma ir niekas iš ten
+  neatkuriama.
+- **Rotacija** – kaip naktinių DB kopijų: 7 paskutinių dienų ir 4 savaičių naujausios (iki 11); senesnės trinamos tik po
+  sėkmingos naujos. DB kopijų ji neliečia, o DB kopijos – jos. Savas užraktas (`.lock-files-<env>`): DB kopijos nelaukia.
+- **Slaptažodžių nereikia** (secret store neskaitomas). Klaidos – kaip DB kopijų: vienos aplinkos klaida kitų nestabdo,
+  paslauga baigiasi `failed`, `journalctl -u setup-server-backup-files.service`.
+- **Peržiūra** – sąsajos *Failai*: aplinkos su `BACKUP_FILE_PATHS`, jų kopijos, kopijos failai (nauji, pakeisti ir dingę
+  nuo ankstesnės kopijos), failo turinys, skirtumai nuo ankstesnės kopijos ir atsisiuntimas (iki 2 MiB). Tik skaitoma.
+- **Metrikos** – `setup_worker_files_backup*` (žr. „Worker'io metrikos“). Atnaujinus setup-server, `bin/update` parodo, kad
+  laikmačio dar nėra (`note: … differs`) – paleisk `sudo bin/install-backups`.
 
 ## Papildomos aplinkos (pvz. laikina `mdv`)
 
@@ -691,6 +728,7 @@ viešai jis nematomas; VPN adresą jis užima ir tada, kai VPN sąsaja pakyla v�
 | `setup_worker_deploy_last_success_timestamp_seconds` | Paskutinio baigto deploy'aus laikas |
 | `setup_worker_deploy_last_rollback` | `1` – paskutinis deploy'us buvo `rollback=1` |
 | `setup_worker_deploy_last_info{ref,commit}` | Paskutinio deploy'aus ref'as (iki 64 simbolių) ir commit'as (12 simbolių) |
+| `setup_worker_files_backups`, `setup_worker_files_backup_newest_age_seconds`, `_newest_size_bytes` | Tas pats failų kopijoms (`files-<env>-…Z.tar.gz`, `BACKUP_FILE_PATHS`); `0` – tik aplinkai su `BACKUP_FILE_PATHS` ir tik įdiegus `setup-server-backup-files.timer` |
 | `setup_worker_runner_up`, `setup_worker_runner_state{state}`, `setup_worker_runner_restarts` | `setup-server-runner` (Bitbucket) būsena iš `systemctl show` (`active`, `failed`, `not-found` …) ir automatiniai perkrovimai |
 | `setup_worker_github_runner_up{scope}`, `setup_worker_github_runner_state{scope,state}`, `setup_worker_github_runner_restarts{scope}` | Tas pats kiekvienam užregistruotam GitHub runner'iui (`github-runner/<scope>` su `.runner`): paslauga `setup-server-github-runner@<scope>`. Nė vieno nėra – šių eilučių nėra |
 | `setup_worker_disk_size_bytes`, `_used_bytes`, `_available_bytes` `{path}` | Failų sistema, kurioje `/srv/setup-server` (kaip `df`) |
@@ -734,6 +772,7 @@ max by (project, environment) (setup_worker_backup_newest_age_seconds) > 26 * 36
   or setup_worker_backups == 0
 ```
 
+Failų kopijai – tas pats su `setup_worker_files_backup_newest_age_seconds` ir `setup_worker_files_backups`.
 Savaitinei pilnai kopijai – „senesnė nei 8 dienos“:
 
 ```promql
@@ -781,7 +820,7 @@ commit'as, raudonas, kai setup ne ant release tag'o.
   kiekvienas su nuoroda. Toliau – setup-server versija (įdiegta ir administratoriaus klono), bendro setup checkout'o versija
   (commit'as, ar release tag'as, kiek naujesnis origin/master pagal paskutinį fetch), Bitbucket ir
   GitHub runner'ių paslaugos, naktinių ir savaitinių pilnų kopijų laikmačiai (paskutinis paleidimas, rezultatas, kitas), metrikų paslauga,
-  pati sąsaja, laisva vieta diske, kuriame `/srv/setup-server`. Prie kiekvienos įdiegtos paslaugos – jos mygtukai
+  naktinių failų kopijų laikmatis, pati sąsaja, laisva vieta diske, kuriame `/srv/setup-server`. Prie kiekvienos įdiegtos paslaugos – jos mygtukai
   (paleisti, sustabdyti, perkrauti; kopijoms – „Paleisti dabar“), kurie veda į tą pačią peržiūrą kaip kiti veiksmai.
 - *Projektai* – kiekvienas build katalogas: repo URL, aplinkos (stage/prod), taikinys (`target*.env`, ne paslaptis),
   paskutinis deploy'us (laikas, commit'as, pavyko ar ne, rollback), naujausia naktinė ir savaitinė pilna kopija (amžius,
@@ -806,6 +845,10 @@ commit'as, raudonas, kai setup ne ant release tag'o.
 
   Visi pakeitimai – ta pati `add-backup-key` komanda su visu rakto leidimų sąrašu; peržiūra virš komandos parodo, kas
   pasikeis (`+` nauja, `~` kitas lygis, `−` atimama). Projekto puslapyje – kas pasiekia to projekto aplinkas.
+- *Failai* – failų kopijos (`BACKUP_FILE_PATHS`, žr. „Failų kopijos“): kiekviena aplinka su keliais ir naujausia kopija;
+  aplinkos puslapyje – visos jos kopijos ir „Failų kopija dabar“; kopijos puslapyje – failai su paieška, kas nauja, pakeista
+  ir dingo nuo ankstesnės kopijos; failo puslapyje – turinys, skirtumai nuo ankstesnės kopijos ir „Atsisiųsti“. Tik
+  skaitoma: nei kopijos, nei taikinys nekeičiami. „Reikia dėmesio“ rodo senesnę nei 26 val. failų kopiją (kai laikmatis įdiegtas).
 - *Atnaujinimas* – setup-server ir setup: versija, commit'as, ar release tag'as, kiek naujesnis origin/master.
   „Atnaujinti į naujausią“ – setup-server į `origin/master` (`bin/update`, žr. „Atnaujinimas“), setup – į naujausią
   to paties MAJOR release'ą (`bin/update-setup`; setup release'ą daro kiekvienas sujungimas į master); konkreti versija
@@ -832,8 +875,8 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 | Pridėti projektą | `sudo -n L/add-project [--shared-key] --target … [VARDAS] URL [KODO_URL]` (naujam projektui taikinys privalomas) |
 | Pašalinti projektą (projekto puslapyje) | `sudo -n L/remove-project [--with-backups] VARDAS` |
 | Įdiegti runner'į | `sudo -n L/install-runner --provider bitbucket\|github [--name …] [--tarball URL\|FAILAS [--sha256 …]]`; dialogo tekstas – per stdin |
-| DB kopijų laikmačiai (naktinės ir savaitinės pilnos) | `sudo -n L/install-backups [--at HH:MM] [--full-at "DAY HH:MM"]` |
-| Kopija dabar serveryje (ir projekto puslapyje) | `sudo -n L/backup-projects [--full] [PROJEKTAS [ENV]]` – be Bitbucket, veikia ir GitHub projektams |
+| Kopijų laikmačiai (naktinės, savaitinės pilnos ir failų) | `sudo -n L/install-backups [--at HH:MM] [--full-at "DAY HH:MM"] [--files-at HH:MM]` |
+| Kopija dabar serveryje (ir projekto bei *Failų* puslapiuose) | `sudo -n L/backup-projects [--full\|--files] [PROJEKTAS [ENV]]` – be Bitbucket, veikia ir GitHub projektams |
 | SSH iš VPN | `sudo -n L/install-ssh [--from TINKLAI]` |
 | Paslaugos (ir Apžvalgoje) | `sudo -n L/server-unit start\|stop\|restart UNIT` (žr. žemiau) |
 | Worker'io metrikos | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |
@@ -860,7 +903,7 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
   | `runner` | start, stop, restart | `setup-server-runner.service` |
   | `github-runner@SCOPE` | start, stop, restart | `setup-server-github-runner@SCOPE.service` (tik užregistruotas SCOPE) |
   | `metrics` | start, stop, restart | `setup-server-metrics.service` |
-  | `backup`, `backup-full` | start (laukia, kol kopija baigsis) | `setup-server-backup.service`, `setup-server-backup-full.service` |
+  | `backup`, `backup-full`, `backup-files` | start (laukia, kol kopija baigsis) | `setup-server-backup.service`, `setup-server-backup-full.service`, `setup-server-backup-files.service` |
   | `ui` | restart (perskaito `ui.env`, pvz. naujus token'us) | `setup-server-ui.service` |
 
   Ranka: `sudo bin/server-unit --check restart runner`.
@@ -908,7 +951,9 @@ neperduodamas, puslapiuose nerodomas, į žurnalus nerašomas (žurnale – tik 
   simlink'as todėl nieko daugiau neatskleidžia, o iš env failų išeina tik taikinio reikšmės. Konteinerio log'ai –
   tik to projekto aplinkos konteinerio (to paties sąrašo, kurį rodo apžvalga), jo Docker context'e. Ranka:
   `sudo /usr/local/lib/setup-server/bin/server-status | less` (`--logs 100` – žurnalai,
-  `--container-logs PROJEKTAS ENV KONTEINERIS [EILUTĖS]`, `--metrics`).
+  `--container-logs PROJEKTAS ENV KONTEINERIS [EILUTĖS]`, `--metrics`, `--files PROJEKTAS ENV KOPIJA` – failų kopijos sąrašas,
+  `--file PROJEKTAS ENV KOPIJA KELIAS` – vienas jos failas). Failų kopijos skaitomos paskyros `setup` teisėmis ir niekur
+  neišpakuojamos: tik perskaitomas prašytas failas.
 - **systemd.** `NoNewPrivileges` išjungtas: su juo neveiktų nė vienas `sudo`. `ProtectSystem`, `ProtectHome`, `PrivateTmp`
   taip pat išjungti: veiksmai vyksta paslaugos vardų erdvėje ir rašo `/usr`, `/etc` (diegimai), administratoriaus kloną
   (`bin/update`) ir `/tmp` (ankstesnės kopijos rankiniam grąžinimui). Palikta, kas netrukdo: `ProtectKernelModules`,
@@ -978,6 +1023,9 @@ sudo tail -n 20 /srv/setup-server/ui-actions.log
   kiekvienas prašymas – `access.log`, interaktyvaus seanso įvestis – `access-sessions/` (ir joje surinkti slaptažodžiai). `full` local taikiniui ir `docker` (`exec` kaip root į projekto konteinerius su
   jų prijungtais katalogais) – didelės teisės; `phpfpm-readonly` saugo tik failus, ne duomenų bazę. `authorized_keys`
   priklauso paskyrai `setup`, todėl pipeline žingsnis galėtų jį keisti – bet jis ir taip yra `setup` su Docker.
+- Failų kopijos (`BACKUP_FILE_PATHS`) taikinį tik skaito, tuo pačiu `setup` raktu, kaip deploy'us; į jį nerašoma. Kopijos –
+  paskyros `setup` failai (0600) build kataloge, šalia DB kopijų; sąsaja jas tik rodo. Neįrašyk į `BACKUP_FILE_PATHS`
+  kelių su paslaptimis (pvz. `app/config/parameters.php`): sąsaja rodo failų turinį.
 - Worker'io `/metrics` token'as (jei naudojamas) yra tik `/etc/setup-server/metrics.env` (root, 0600); paslauga
   jį gauna per aplinką. Endpoint'as klauso tik nurodytu adresu (VPN), atsako tik leidžiamiems adresams (ir, kai
   token'as nustatytas, tik su juo) ir nieko nekeičia.

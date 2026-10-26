@@ -34,6 +34,16 @@ def fixture():
     stamp = lambda age: time.strftime('%Y%m%dT%H%M%S', time.gmtime(time.time() - age))
     case.tree.backup(app, f'full-prod-{stamp(3 * 86400)}Z.sql.gz', 3 * 86400, 7_340_032)
     case.tree.backup(app, f'asana-prod-{stamp(5 * 3600)}123.sql.gz', 5 * 3600, 1_200_000)
+    # Files backups (BACKUP_FILE_PATHS): two nights, one translation changed, one added, one gone.
+    (app / 'env/common.env').write_text('PROJECT_NAME=asana\nBACKUP_FILE_PATHS="modules/*/translations/ themes/*/lang/"\n')
+    lt = "<?php\nglobal $_MODULE;\n$_MODULE = array();\n$_MODULE['<{ps_shoppingcart}prestashop>cart_1'] = 'Krepšelis';\n"
+    test_ui.files_archive(app, 'prod', 26 * 3600, {'modules/ps_shoppingcart/translations/lt.php': lt.encode(),
+                                                    'modules/ps_contact/translations/lt.php': b'<?php\n$_MODULE = array();\n',
+                                                    'themes/classic/lang/old.php': b'<?php\n'})
+    test_ui.files_archive(app, 'prod', 2 * 3600, {'modules/ps_shoppingcart/translations/lt.php': (lt.replace('Krepšelis', 'Pirkinių krepšelis') + "$_MODULE['<{ps_shoppingcart}prestashop>cart_2'] = 'Tuščias';\n").encode(),
+                                                   'modules/ps_contact/translations/lt.php': b'<?php\n$_MODULE = array();\n',
+                                                   'modules/ps_banner/translations/lt.php': b'<?php\n$_MODULE = array();\n',
+                                                   'themes/classic/lang/flag.png': b'\x89PNG\r\n\x1a\n\0\0'})
     # More projects, most with prod and stage, as a worker with many shops has them.
     for shop in ('biofitus', 'joldija', 'nespresso', 'papildai', 'forsena', 'vaistai', 'zoo-shop', 'baldai', 'knygos', 'geles'):
         case.tree.project(shop, 'prod', 'stage')
