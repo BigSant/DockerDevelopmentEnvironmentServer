@@ -36,6 +36,15 @@ if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
 fi
 fail() { echo "$1" >&2; exit "${2:-65}"; }
 as_account() { if [ "$(id -u)" = 0 ]; then (cd / && sudo -u "$ACCOUNT" -H "$@"); else "$@"; fi; }
+# The account's make processes outside containers: a pipeline step. A project's cron container runs its jobs' make
+# under the same UID (APP_UID); those are no step.
+pipeline_makes() {
+    local pid cgroup
+    for pid in $(pgrep -u "$ACCOUNT" -x make 2>/dev/null || true); do
+        cgroup=$(cat "${SETUP_SERVER_PROC:-/proc}/$pid/cgroup" 2>/dev/null) || continue
+        grep -qE 'docker[-/]|containerd|libpod' <<<"$cgroup" || printf '%s ' "$pid"
+    done
+}
 git_setup() { as_account git -C "$SETUP" "$@"; }
 
 as_account test -d "$SETUP/.git" || fail "No setup checkout at $SETUP (run bin/prepare-host first)"
@@ -68,7 +77,7 @@ if [ "$check" = 1 ]; then
     echo "==> Check finished; nothing was changed (only fetched)."
     exit 0
 fi
-busy=$(pgrep -u "$ACCOUNT" -x make 2>/dev/null | tr '\n' ' ' || true)
+busy=$(pipeline_makes)
 [ -z "$busy" ] || fail "A pipeline step of $ACCOUNT is running (make, PID ${busy% }); update when it has finished" 75
 if ! git_setup checkout -q --detach "$ref" || [ "$(git_setup rev-parse HEAD)" != "$target" ] \
         || [ -n "$(git_setup status --porcelain --untracked-files=no)" ]; then

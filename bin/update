@@ -49,6 +49,15 @@ fail() { echo "$1" >&2; exit "${2:-65}"; }
 # The setup account owns the shared checkout; others reach it through sudo. Run from / so that git
 # does not start in a directory the account cannot read (a caller's 0750 home breaks git).
 as_account() { if [ "$(id -un)" = "$ACCOUNT" ]; then "$@"; else (cd / && "${SUDO[@]}" -u "$ACCOUNT" -H "$@"); fi; }
+# The account's make processes outside containers: a pipeline step. A project's cron container runs its jobs' make
+# under the same UID (APP_UID); those are no step.
+pipeline_makes() {
+    local pid cgroup
+    for pid in $(pgrep -u "$ACCOUNT" -x make 2>/dev/null || true); do
+        cgroup=$(cat "${SETUP_SERVER_PROC:-/proc}/$pid/cgroup" 2>/dev/null) || continue
+        grep -qE 'docker[-/]|containerd|libpod' <<<"$cgroup" || printf '%s ' "$pid"
+    done
+}
 git_in() {  # git_in server|setup ARGS — git in that checkout, as its owner
     local side=$1; shift
     if [ "$side" = setup ]; then as_account git -C "$SETUP" "$@"; else git -C "$CHECKOUT" "$@"; fi
@@ -285,7 +294,7 @@ main() {
         [ -z "$changes" ] || fail "$(name_of "$side") has local changes; commit, stash or discard them first:
 $changes"
     done
-    local busy; busy=$(pgrep -u "$ACCOUNT" -x make 2>/dev/null | tr '\n' ' ' || true)
+    local busy; busy=$(pipeline_makes)
     if [ -n "$busy" ]; then
         [ "$check" = 1 ] || fail "A pipeline step of $ACCOUNT is running (make, PID ${busy% }); update when it has finished" 75
         say "Note: a pipeline step of $ACCOUNT is running (make, PID ${busy% }); an update now would be refused"

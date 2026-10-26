@@ -428,7 +428,7 @@ class ServerUnitTest(Worker):
     def setUp(self):
         super().setUp()
         self.stub("systemctl", UNIT_SYSTEMCTL_STUB)
-        self.stub("pgrep", '[ -n "${FAKE_MAKE:-}" ] && echo 777\n')
+        self.stub("pgrep", 'echo ${FAKE_MAKE:-}\n')
 
     def unit(self, *arguments, root=False, **env):
         path = f"{self.fake_root()}:{self.bin}" if root else str(self.bin)
@@ -440,7 +440,7 @@ class ServerUnitTest(Worker):
         return [call for call in self.calls("systemctl") if not call.startswith("show ")]
 
     def test_check_shows_the_unit_and_changes_nothing(self):
-        result = self.unit("--check", "restart", "runner", FAKE_MAKE="1")
+        result = self.unit("--check", "restart", "runner", FAKE_MAKE="777")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("==> setup-server-runner.service: loaded active running", result.stdout)
         self.assertIn("a pipeline step of", result.stdout)

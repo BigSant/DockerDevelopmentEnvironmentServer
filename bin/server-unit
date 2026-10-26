@@ -39,6 +39,15 @@ done
 action=${positional[0]}
 name=${positional[1]}
 refuse() { echo "$1" >&2; exit 65; }
+# The account's make processes outside containers: a pipeline step. A project's cron container runs its jobs' make
+# under the same UID (APP_UID); those are no step.
+pipeline_makes() {
+    local pid cgroup
+    for pid in $(pgrep -u "$ACCOUNT" -x make 2>/dev/null || true); do
+        cgroup=$(cat "${SETUP_SERVER_PROC:-/proc}/$pid/cgroup" 2>/dev/null) || continue
+        grep -qE 'docker[-/]|containerd|libpod' <<<"$cgroup" || printf '%s ' "$pid"
+    done
+}
 
 case "$name" in
     runner) unit=setup-server-runner.service; allowed="start stop restart" ;;
@@ -70,8 +79,8 @@ load=$(systemctl show --property=LoadState --value "$unit" 2>/dev/null || true)
 echo "==> $unit: $(state)"
 case "$name:$action" in
     runner:stop|runner:restart|github-runner@*:stop|github-runner@*:restart)
-        busy=$(pgrep -u "$ACCOUNT" -x make 2>/dev/null | paste -sd ' ' || true)
-        [ -z "$busy" ] || echo "    note: a pipeline step of $ACCOUNT is running (make, PID $busy): $action stops it" ;;
+        busy=$(pipeline_makes)
+        [ -z "$busy" ] || echo "    note: a pipeline step of $ACCOUNT is running (make, PID ${busy% }): $action stops it" ;;
     ui:restart)
         echo "    note: the page loses its preview forms; an action that is running goes on" ;;
 esac

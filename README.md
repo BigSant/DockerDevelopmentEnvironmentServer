@@ -622,7 +622,8 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
   skaičių pirmyn/atgal, pakeistų failų suvestinę ir commit'ų sąrašą (`+` – atsiras, `-` – dings).
   Checkout'ų nekeičia.
 - Atsisako, jei checkout'e yra vietinių pakeitimų, ref'as nežinomas (parodo naujausius tag'us) arba vyksta
-  pipeline žingsnis (paskyros `setup` `make` procesas) – tada palauk, kol jis baigsis.
+  pipeline žingsnis (paskyros `setup` `make` procesas ne konteineryje; projekto cron konteinerio darbų `make` su
+  ta pačia UID neskaičiuojamas) – tada palauk, kol jis baigsis.
 - Tag'ai parsiunčiami be `--force`: jei `origin` tag'as perkeltas į kitą commit'ą (perrašytas), vietinis
   lieka, kur buvo, o `bin/update` (ir `--check`) baigiasi klaida, parodydamas tag'ą ir abu commit'us.
   Release tag'as neturi judėti – išsiaiškink, kas ir kodėl jį perkėlė.
@@ -658,7 +659,7 @@ sudo bin/update-setup                  # perjungia į jį
 sudo bin/update-setup v2.6.0           # arba į nurodytą release tag'ą
 ```
 
-- Tik release tag'ai (`vX.Y.Z`), tik švarus checkout'as, ne pipeline žingsnio metu (`make` paskyros `setup`).
+- Tik release tag'ai (`vX.Y.Z`), tik švarus checkout'as, ne pipeline žingsnio metu (`make` paskyros `setup` ne konteineryje).
   Nepavykus perjungti checkout'as grįžta. Git darbą atlieka paskyra `setup`.
 - **Naujausias release'as yra `master`:** setup kiekvieną sujungimą į `master` po sėkmingo CI išleidžia pats
   (`Release X.Y.Z`, tag'as `vX.Y.Z`), todėl „į naujausią“ – tai, ką turi `master`, o prod deploy'ai veikia (setup

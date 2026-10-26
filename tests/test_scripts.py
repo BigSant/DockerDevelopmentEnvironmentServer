@@ -48,6 +48,14 @@ class ScriptTest(unittest.TestCase):
         self.addCleanup(stand_ins.stop)
         self.bin = self.root / "bin"
         self.bin.mkdir()
+        # The processes a pgrep stub names (FAKE_MAKE): 777 a pipeline step's make, 778 a cron container job's.
+        for pid, cgroup in (("777", "0::/system.slice/setup-server-runner.service"),
+                            ("778", "0::/system.slice/docker-e86bc6cb5b9b.scope")):
+            (self.root / "proc" / pid).mkdir(parents=True)
+            (self.root / "proc" / pid / "cgroup").write_text(cgroup + "\n")
+        processes = patch.dict(os.environ, {"SETUP_SERVER_PROC": str(self.root / "proc")})
+        processes.start()
+        self.addCleanup(processes.stop)
         self.os_release('ubuntu', '24.04')
         self.meminfo(16)
 
@@ -605,13 +613,21 @@ class AddProjectTargetTest(ScriptTest):
             self.assertIn(line + "\n", text)
 
 
+class PipelineMakesTest(unittest.TestCase):
+    def test_the_scripts_that_wait_for_a_pipeline_step_tell_it_the_same_way(self):
+        pattern = re.compile(r"^# The account's make processes.*?^}\n", re.M | re.S)
+        copies = {name: pattern.findall((ROOT / "bin" / name).read_text()) for name in ("update", "update-setup", "server-unit")}
+        self.assertTrue(all(len(found) == 1 for found in copies.values()), copies)
+        self.assertEqual(len({found[0] for found in copies.values()}), 1, "pipeline_makes drifted apart")
+
+
 class UpdateSetupTest(ScriptTest):
     """bin/update-setup: the shared setup checkout to a release tag, as the setup account, without a password."""
 
     def setUp(self):
         super().setUp()
         self.root_bin = self.fake_root()
-        self.stub("pgrep", '[ -n "${FAKE_MAKE:-}" ] && echo 777\n')
+        self.stub("pgrep", 'echo ${FAKE_MAKE:-}\n')
         work, remote = self.root / "setup-work", self.root / "setup.git"
         git = lambda *arguments: subprocess.run(["git", *arguments], env=GIT_ENV, check=True, capture_output=True, text=True)
         git("init", "-q", "-b", "master", str(work))
@@ -659,9 +675,14 @@ class UpdateSetupTest(ScriptTest):
         unknown = self.update("v2.9.9")
         self.assertEqual(unknown.returncode, 65)
         self.assertIn("Unknown setup release v2.9.9", unknown.stderr)
-        busy = self.update(FAKE_MAKE="1")
+        busy = self.update(FAKE_MAKE="777")
         self.assertEqual(busy.returncode, 75)
         self.assertIn("pipeline step", busy.stderr)
+        self.assertNotIn("778", busy.stderr)
+        # A project's cron job runs make under the same UID, in its container: no step.
+        moved = self.update(FAKE_MAKE="778")
+        self.assertEqual(moved.returncode, 0, moved.stderr)
+        self.assertIn("setup at v2.7.0", moved.stdout)
         (self.setup / "VERSION").write_text("edited\n")
         dirty = self.update()
         self.assertEqual(dirty.returncode, 65)
@@ -818,7 +839,7 @@ class UpdateTest(ScriptTest):
                                f'  show) n=$(grep -c "^show" {self.calls}); '
                                '[ -n "${FAKE_RESTARTED:-}" ] && [ "$n" -gt 1 ] && echo 5151 || echo 4242;;\n'
                                'esac\n')
-        self.stub("pgrep", '[ -n "${FAKE_MAKE:-}" ] && echo 777\n')
+        self.stub("pgrep", 'echo ${FAKE_MAKE:-}\n')
         self.server_remote = self.remote("server", [("v0.1.0", {"tests/test_health.py": PASSING_TESTS, "bin/x": "1"})])
         self.setup_remote = self.remote("setup", [("v1.0.0", {"Makefile": "VERSION=1.0.0\n"})])
         self.server = self.root / "home/setup-server"
@@ -1106,7 +1127,7 @@ class UpdateTest(ScriptTest):
         self.assertEqual(dirty.returncode, 65)
         self.assertIn("local changes", dirty.stderr)
         (self.server / "bin/x").write_text("1")
-        busy = self.update("--setup-ref", "v1.1.0", FAKE_MAKE="1")
+        busy = self.update("--setup-ref", "v1.1.0", FAKE_MAKE="777")
         self.assertEqual(busy.returncode, 75)
         self.assertIn("pipeline", busy.stderr)
         self.assertEqual((self.head(self.server), self.head(self.setup)), ("v0.1.0", "v1.0.0"))
