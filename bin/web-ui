@@ -588,8 +588,33 @@ def plan_tool_access(form, status):
         if not match or chosen not in ('', 'tools'):
             raise Invalid('„Įrankiai“: netinkamas projektas ar aplinka.')
         (after.add if chosen else after.discard)(f'{match[1]}:{match[2]}')
+    return tool_plan(name, user, before, after, f'{name}: įrankiai')
+
+
+def plan_tool_bulk(form, status):
+    """Tools for every prod, every stage, the other or all environments of a key's user at once."""
+    name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
+    if stored_key(status, name) is None:
+        raise Invalid(f'Rakto vardu {name} nėra.')
+    scope, level = form.get('scope', ''), form.get('level', '')
+    if scope not in ('prod', 'stage', 'other', 'all') or level not in ('', 'tools'):
+        raise Invalid('Pasirink aplinką (prod, stage, kitos, visos) ir lygį.')
+    user = tool_user(status, name)
+    before = set(user.get('projects', []))
+    after = set(before)
+    for project, environment in access_columns(status):
+        # local and test never run on a target: no tools there to open.
+        if environment in ('local', 'test'):
+            continue
+        if scope == 'all' or environment == scope or (scope == 'other' and environment not in ('prod', 'stage')):
+            (after.add if level else after.discard)(f'{project}:{environment}')
+    what = {'prod': 'visos prod', 'stage': 'visos stage', 'other': 'kitos aplinkos', 'all': 'visos aplinkos'}[scope]
+    return tool_plan(name, user, before, after, f'{name}: įrankiai, {what} → {LEVEL_LABELS["tools"] if level else "be leidimo"}')
+
+
+def tool_plan(name, user, before, after, title):
     arguments = ['--name', name] + ([word for item in sorted(after) for word in ('--tools', item)] or ['--no-tools'])
-    plan = Plan('tool-access', f'{name}: įrankiai', *command('tool-access', arguments), timeout=3600)
+    plan = Plan('tool-access', title, *command('tool-access', arguments), timeout=3600)
     plan.changes = ([('bad', f'− {item.replace(":", " ")}: įrankiai nebeįleis') for item in sorted(before - after)] +
                     [('ok', f'+ {item.replace(":", " ")}: įrankiai įleis') for item in sorted(after - before)])
     if not plan.changes:
@@ -715,7 +740,7 @@ ACTIONS = {'add-project': plan_add_project, 'remove-project': plan_remove_projec
            'prepare-host': plan_prepare_host, 'update': plan_update, 'update-setup': plan_update_setup,
            'pipeline': plan_pipeline, 'backup-local': plan_backup_local, 'unit': plan_unit, 'install-ssh': plan_install_ssh,
            'move-bitbucket-ssh': plan_move_bitbucket_ssh, 'tool-access': plan_tool_access,
-           'tool-password': plan_tool_password, 'tool-ips': plan_tool_ips, 'tool-apply': plan_tool_apply}
+           'tool-bulk': plan_tool_bulk, 'tool-password': plan_tool_password, 'tool-ips': plan_tool_ips, 'tool-apply': plan_tool_apply}
 
 
 # --- Running commands ----------------------------------------------------------------------------
@@ -1616,6 +1641,7 @@ box-shadow:inset 0 2px 0 var(--amber)}
 .tabs a:hover{text-decoration:none;color:var(--ink)}
 form.bulk.everything{grid-template-columns:9.5em auto minmax(0,1fr) auto;background:var(--panel-2);border:1px solid var(--rule);
 border-top:none;padding:10px 16px;margin:0 0 12px}
+form.bulk.tools{grid-template-columns:5.5em auto auto;justify-content:start}
 .tabs+.bulkbox,.tabs+form+.bulkbox,.tabs+form+.callout+.bulkbox{border-top:none;border-radius:0 0 4px 4px}
 .foot{margin-top:28px;color:var(--faint);font-size:11px}
 """ + ''.join(f'.unit:nth-child({index}),.board tbody tr:nth-child({index}),.step:nth-child({index}){{animation-delay:{(index - 1) * 45}ms}}'
@@ -1625,7 +1651,7 @@ border-top:none;padding:10px 16px;margin:0 0 12px}
 .split{grid-template-columns:1fr;gap:6px}.index{position:static;flex-direction:row;flex-wrap:wrap;gap:6px}.index .block-label,.index .note{display:none}
 .index a{border:1px solid var(--rule);border-radius:3px}.ramp{grid-template-columns:1fr 1fr}.ramp li:nth-child(3){border-left:none}
 .ramp li:not(:last-child)::after{display:none}
-.keyhead{grid-template-columns:1fr 1fr}form.bulk{grid-template-columns:1fr}.search input[type=text]{width:100%}
+.keyhead{grid-template-columns:1fr 1fr}form.bulk,form.bulk.tools{grid-template-columns:1fr}.search input[type=text]{width:100%}
 label{grid-template-columns:1fr;gap:4px}.board thead{display:none}.board,.board tbody,.board tr,.board td{display:block;width:100%}
 .board tr{margin-bottom:10px}.board td{border-radius:0!important;border-top:none;border-bottom:none;padding:6px 14px}
 .board td:first-child{padding-top:12px}.runs li{grid-template-columns:18px 1fr 100px}.runs li .hide{display:none}}
@@ -2757,8 +2783,20 @@ class Page:
         body += '<div class="deck">' + self.form(
             'tool-password', 'Įrankių slaptažodis', fields, note='Slaptažodį sugalvoja ir perduoda administratorius; serveryje '
             'lieka tik jo hash\'as.', command=f'bin/tool-access --name {name} --password -') + '</div>'
-        wanted = query.strip().lower()
+        # Every prod, every stage or every environment at once.
         columns = access_columns(data)
+        others = sorted({environment for _, environment in columns if environment not in ('prod', 'stage', 'local', 'test')})
+        scopes = [('prod', '<span class="sign prod">prod</span>'), ('stage', '<span class="sign stage">stage</span>')]
+        if others:
+            scopes.append(('other', f'<span class="sign" title="{e(", ".join(others))}">kitos</span>'))
+        bulk = ''.join(f'<form class="bulk tools" method="post" action="/preview">'
+                       f'{self.hidden("tool-bulk", [("key_name", name), ("scope", scope)])}'
+                       f'<span class="bulk-scope">{label}</span>{self.seg("level", "", ("tools",))}<button>Peržiūrėti</button></form>'
+                       for scope, label in scopes + [('all', '<span class="chip muted">visos</span>')])
+        body += ('<div class="bulkbox"><p class="block-label">Visoms iš karto</p>' + bulk +
+                 '<p class="note">„—“ atima. Peržiūra parodo kiekvieną pasikeisiančią aplinką; nieko nekeičia, kol nespaudi '
+                 '„Vykdyti“.</p></div>')
+        wanted = query.strip().lower()
         rows = [(project, environments) for project, environments in project_rows(columns)
                 if (not wanted or wanted in project) and
                 (not only_granted or any(f'{project}:{one}' in granted for one in environments))]
@@ -3359,7 +3397,7 @@ def handler(user, stored):
                 return self.reply(400, page.invalid('Nežinomas veiksmas.'))
             try:
                 plan = builder(form, status()[0] if form.get('action') in ('pipeline', 'add-backup-key', 'key-bulk', 'tool-access',
-                                                                           'tool-password') else None)
+                                                                           'tool-bulk', 'tool-password') else None)
             except Invalid as error:
                 return self.reply(400, page.invalid(str(error)))
             if plan.kind == 'pipeline':
