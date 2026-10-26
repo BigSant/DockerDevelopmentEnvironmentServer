@@ -891,7 +891,8 @@ commit'as, raudonas, kai setup ne ant release tag'o.
   Visi pakeitimai – ta pati `add-backup-key` komanda su visu rakto leidimų sąrašu; peržiūra virš komandos parodo, kas
   pasikeis (`+` nauja, `~` kitas lygis, `−` atimama). Projekto puslapyje – kas pasiekia to projekto aplinkas.
   Trečias skirtukas *Įrankiai* – `bin/tool-access`: rakto įrankių slaptažodis (įvedamas, nerodomas, nustatymo data) ir
-  projektų aplinkos, kurių įrankius jis atidaro (nepavykęs siuntimas pažymimas). Sąraše – stulpelis *Įrankiai*, puslapio
+  projektų aplinkos, kurių įrankius jis atidaro (nepavykęs siuntimas pažymimas), su tuo pačiu *Visoms iš karto*
+  (įrankiai arba „—“ visoms prod, stage, kitoms ar visoms aplinkoms; local ir test – niekada). Sąraše – stulpelis *Įrankiai*, puslapio
   apačioje „Įrankių prieiga“ – šio serverio adresai ir „Siųsti iš naujo“ (žr. „Įrankių prieiga“).
 - *Failai* – failų kopijos (`BACKUP_FILE_PATHS`, žr. „Failų kopijos“): kiekviena aplinka su keliais ir naujausia kopija;
   aplinkos puslapyje – visos jos kopijos ir „Failų kopija dabar“; kopijos puslapyje – failai su paieška, kas nauja, pakeista

@@ -965,6 +965,18 @@ class WebUiTest(Worker):
                          f"{library} --name tomas --tools forsena_docker:stage --tools shop-two:prod")
         self.assertIn("− asana_tracker prod: įrankiai nebeįleis", body)
         self.assertIn("+ shop-two prod: įrankiai įleis", body)
+        # Every prod (or stage, the others, all) at once, as the other tabs; local and test never.
+        self.assertIn('name="action" value="tool-bulk"', key)
+        status, _, body = self.preview("tool-bulk", key_name="tomas", scope="prod", level="tools")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.sudo_calls("tool-access")[-1],
+                         f"{library} --name tomas --tools asana_tracker:prod --tools forsena_docker:stage "
+                         "--tools shop-two:prod")
+        self.assertIn("+ shop-two prod: įrankiai įleis", body)
+        self.preview("tool-bulk", key_name="tomas", scope="stage", level="")
+        self.assertEqual(self.sudo_calls("tool-access")[-1], f"{library} --name tomas --tools asana_tracker:prod")
+        self.preview("tool-bulk", key_name="tomas", scope="all", level="")
+        self.assertEqual(self.sudo_calls("tool-access")[-1], f"{library} --name tomas --no-tools")
         # The password: on stdin only, never in a page, a log or the job's files.
         password = "Typed-By-Admin-2026"
         status, _, body = self.preview("tool-password", key_name="tomas", tool_password=password)
@@ -988,6 +1000,9 @@ class WebUiTest(Worker):
                                         ("tool-password", {"key_name": "nobody", "tool_password": password}, "nėra"),
                                         ("tool-access", {"key_name": "tomas", "tool:x:local": "tools"}, "netinkamas"),
                                         ("tool-access", {"key_name": "tomas", "tool:asana_tracker:prod": "full"}, "netinkamas"),
+                                        ("tool-bulk", {"key_name": "tomas", "scope": "dev", "level": "tools"}, "Pasirink"),
+                                        ("tool-bulk", {"key_name": "tomas", "scope": "prod", "level": "full"}, "Pasirink"),
+                                        ("tool-bulk", {"key_name": "nobody", "scope": "prod", "level": "tools"}, "nėra"),
                                         ("tool-ips", {"allowed_ips": "0.0.0.0/0"}, "konkretų tinklą")):
             with self.subTest(action=action, fields=fields):
                 status, _, body = self.preview(action, **fields)
