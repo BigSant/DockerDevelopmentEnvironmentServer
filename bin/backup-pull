@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hand a developer the newest database backup of one project environment, over SSH.
+"""Hand a developer the newest database or files backup of one project environment, over SSH.
 
 The forced command of a developer key in the setup account's authorized_keys (bin/add-backup-key writes
 `from="<VPN>",command="setup-server-backup-pull --key <name> --pull-all none|db|fresh [--pull PROJECT:ENV=db|fresh …]",
@@ -7,16 +7,18 @@ restrict <key>`, or setup-server-access passes the same words on): the key runs 
 project environments it is granted: db downloads their backups, fresh also asks for a new one; --pull-all is every
 project's (new ones too), a --pull raises one environment above it. A key written before these grants (no --pull
 and no --pull-all) keeps what it had: every project, fresh with --allow-fresh. SSH_ORIGINAL_COMMAND is one of
-  latest PROJECT ENV [full]   print the file name of the newest backup of ENV (stage, prod or a STAGE_ENVIRONMENTS one)
-  info PROJECT ENV [full]     print "<file name> <size in bytes>" of that backup
-  get PROJECT ENV FILE        write that backup to stdout
-  fresh PROJECT ENV [full]    make a new backup now (keys granted fresh only), streaming its progress on
-                              stderr ("progress backup BYTES EXPECTED"), then print "<file name> <size>"
+  latest PROJECT ENV [full|files]  print the file name of the newest backup of ENV (stage, prod or a STAGE_ENVIRONMENTS one)
+  info PROJECT ENV [full|files]    print "<file name> <size in bytes>" of that backup
+  get PROJECT ENV FILE             write that backup to stdout
+  fresh PROJECT ENV [full|files]   make a new backup now (keys granted fresh only), streaming its progress on
+                                   stderr ("progress backup BYTES EXPECTED"), then print "<file name> <size>"
 Without `full` a backup is setup's registry backup (structure of every table, the import tables' data): the
 nightly ones (worker-<env>-…Z.sql.gz), "fresh" ones (fresh-<env>-…Z) and the pre-deploy ones
 (<project>-<env>-<time>.sql.gz). With `full` every table's data: the weekly ones (full-<env>-…Z) and fresh
-full ones (fresh-full-<env>-…Z). A fresh backup runs /usr/local/sbin/setup-server-backup (bin/backup-projects)
-as this account; one younger than 30 minutes with the same content is handed out instead of a new one.
+full ones (fresh-full-<env>-…Z). With `files` the files BACKUP_FILE_PATHS lists (files-<env>-…Z.tar.gz, setup's
+make files-pull); the same grants: db downloads them, fresh asks for new ones. A fresh backup runs
+/usr/local/sbin/setup-server-backup (bin/backup-projects) as this account; one younger than 30 minutes with the
+same content is handed out instead of a new one.
 Every answer is logged with the key's name.
 """
 
@@ -35,9 +37,10 @@ LOG = ROOT / 'backup-pulls.log'
 BACKUP_COMMAND = os.environ.get('SETUP_SERVER_BACKUP_COMMAND', '/usr/local/sbin/setup-server-backup')
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
 KEY = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
-# The series of bin/backup-projects and the pre-deploy backups of setup's make db-backup.
+# The series of bin/backup-projects, the pre-deploy backups of setup's make db-backup and the files backups.
 BACKUP = re.compile(r'(?:(worker|full|fresh|fresh-full)-([a-z][a-z0-9]{1,15})-\d{8}T\d{6}Z'
-                    r'|[a-z0-9][a-z0-9_-]*-([a-z][a-z0-9]{1,15})-\d{8}T\d{6}\d*)\.sql\.gz')
+                    r'|[a-z0-9][a-z0-9_-]*-([a-z][a-z0-9]{1,15})-\d{8}T\d{6}\d*)\.sql\.gz'
+                    r'|(files)-([a-z][a-z0-9]{1,15})-\d{8}T\d{6}Z\.tar\.gz')
 FULL = ('full', 'fresh-full')
 # The fresh backup bin/backup-projects hands out instead of a new one (its FRESH_REUSE), and how long it may run.
 FRESH_REUSE, FRESH_TIMEOUT = 30 * 60, 8 * 3600
@@ -91,7 +94,7 @@ def project_directory(project, environment):
 
 
 def backups(project, environment, content=None):
-    """The backups of one project environment, newest first; content 'registry' or 'full' narrows them."""
+    """The backups of one project environment, newest first; content 'registry', 'full' or 'files' narrows them."""
     folder = project_directory(project, environment) / '.generated/backups'
     if folder.is_symlink():
         raise Refused('the backup directory is a symlink')
@@ -100,19 +103,19 @@ def backups(project, environment, content=None):
         match = BACKUP.fullmatch(path.name)
         if not match or environment not in match.groups() or not path.is_file() or path.is_symlink():
             continue
-        if content and (match[1] in FULL) != (content == 'full'):
+        if content and content != ('files' if match[4] else 'full' if match[1] in FULL else 'registry'):
             continue
         found.append(path)
     return sorted(found, key=lambda path: (path.stat().st_mtime, path.name), reverse=True)
 
 
 def content(words):
-    """The optional last word of latest/info/fresh: nothing (the registry backups) or full."""
+    """The optional last word of latest/info/fresh: nothing (the registry backups), full or files."""
     if len(words) == 3:
         return 'registry'
-    if words[3:] == ['full']:
-        return 'full'
-    raise Refused('the last word may only be full')
+    if words[3:] in (['full'], ['files']):
+        return words[3]
+    raise Refused('the last word may only be full or files')
 
 
 class Grants:
@@ -160,7 +163,8 @@ def fresh(project, environment, kind):
     if not os.access(BACKUP_COMMAND, os.X_OK):
         raise Refused('fresh backups need the backup command on this server (bin/install-backups)')
     requested = time.time()
-    command = [BACKUP_COMMAND, '--fresh', *(['--full'] if kind == 'full' else []), '--progress', project, environment]
+    command = [BACKUP_COMMAND, '--fresh', *({'full': ['--full'], 'files': ['--files']}.get(kind, [])), '--progress',
+               project, environment]
     # Everything it says goes to the developer's terminal; stdout stays for the answer.
     result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=sys.stderr, stderr=sys.stderr,
                             timeout=FRESH_TIMEOUT)
@@ -191,7 +195,7 @@ def answer(key, request, grants):
         kind = content(words)
         found = backups(words[1], words[2], kind)
         if not found:
-            raise Refused(f'no {words[2]} {"full " if kind == "full" else ""}backup of {words[1]} yet')
+            raise Refused(f'no {words[2]} {"" if kind == "registry" else kind + " "}backup of {words[1]} yet')
         size = found[0].stat().st_size
         print(found[0].name if words[0] == 'latest' else f'{found[0].name} {size}', flush=True)
         return found[0].name
@@ -207,7 +211,7 @@ def answer(key, request, grants):
             shutil.copyfileobj(source, sys.stdout.buffer, 1024 * 1024)
         sys.stdout.buffer.flush()
         return f'sent {found[words[3]].stat().st_size} bytes'
-    raise Refused('expected: latest|info PROJECT ENV [full] | get PROJECT ENV FILE | fresh PROJECT ENV [full]')
+    raise Refused('expected: latest|info PROJECT ENV [full|files] | get PROJECT ENV FILE | fresh PROJECT ENV [full|files]')
 
 
 def main(arguments):

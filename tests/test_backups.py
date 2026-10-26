@@ -334,9 +334,19 @@ class BackupProjectsTest(ScriptTest):
         refused = self.run_script("backup-projects", "--files", "other")
         self.assertEqual(refused.returncode, 65)
         self.assertIn("other sets no BACKUP_FILE_PATHS", refused.stderr)
-        for arguments in (["--files", "--full"], ["--files", "--fresh"]):
-            with self.subTest(arguments=arguments):
-                self.assertEqual(self.run_script("backup-projects", *arguments).returncode, 64)
+        self.assertEqual(self.run_script("backup-projects", "--files", "--full").returncode, 64)
+        # A developer's fresh one (bin/backup-pull fresh … files) joins the series; a recent one is handed out.
+        os.environ["SETUP_SERVER_BACKUP_TIME"] = "20261009T120000"
+        hour_ago = datetime.now().timestamp() - 3600  # older than the 30 minutes a fresh one reuses
+        for path in backups.glob("files-prod-*"):
+            os.utime(path, (hour_ago, hour_ago))
+        fresh = self.run_script("backup-projects", "--files", "--fresh", "--progress", "shop", "prod")
+        self.assertEqual(fresh.returncode, 0, fresh.stdout + fresh.stderr)
+        self.assertTrue((backups / "files-prod-20261009T120000Z.tar.gz").is_file())
+        self.assertEqual(fresh.stdout, "", "with --progress everything goes to stderr")
+        again = self.run_script("backup-projects", "--files", "--fresh", "shop", "prod")
+        self.assertIn("used instead of a new fresh-files backup", again.stdout)
+        self.assertEqual(self.make_log.read_text().count("files-backup"), 2)
 
     def test_a_setup_without_make_files_backup_is_named_and_nothing_runs(self):
         self.setup_checkout(files=False)

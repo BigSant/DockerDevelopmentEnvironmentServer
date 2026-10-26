@@ -386,12 +386,13 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 
    | Prašymas | Atsakymas |
    | --- | --- |
-   | `latest <projektas> <stage\|prod> [full]` | naujausios kopijos vardas: be `full` – registro kopija (naktinė, „fresh“, prieš deploy'ų), su `full` – pilna (savaitinė ar „fresh“ pilna) |
-   | `info <projektas> <stage\|prod> [full]` | tas pats ir dydis baitais: `<failas> <dydis>` (atsisiuntimo progresui) |
+   | `latest <projektas> <stage\|prod> [full\|files]` | naujausios kopijos vardas: be `full` – registro kopija (naktinė, „fresh“, prieš deploy'ų), su `full` – pilna (savaitinė ar „fresh“ pilna), su `files` – failų kopija (`files-<env>-…Z.tar.gz`, „Failų kopijos“) |
+   | `info <projektas> <stage\|prod> [full\|files]` | tas pats ir dydis baitais: `<failas> <dydis>` (atsisiuntimo progresui) |
    | `get <projektas> <stage\|prod> <failas>` | tos kopijos turinys |
-   | `fresh <projektas> <stage\|prod> [full]` | tik tos aplinkos `fresh` leidimą turinčiam raktui: paleidžia `setup-server-backup --fresh [--full]` paskyra `setup`, eigą siunčia į stderr (`progress backup BAITAI TIKĖTINA`), pabaigoje – `<failas> <dydis>` |
+   | `fresh <projektas> <stage\|prod> [full\|files]` | tik tos aplinkos `fresh` leidimą turinčiam raktui: paleidžia `setup-server-backup --fresh [--full\|--files]` paskyra `setup`, eigą siunčia į stderr (`progress backup BAITAI TIKĖTINA`), pabaigoje – `<failas> <dydis>` |
 
-   „Fresh“ apkrauna projekto DB, todėl jo nedaro du kartus: jei tos pačios rūšies (registro ar pilna) kopija
+   Failų kopijas (setup `make files-pull`) saugo tie patys leidimai: `db` – parsisiųsti, `fresh` – užsakyti naują.
+   „Fresh“ apkrauna projekto DB, todėl jo nedaro du kartus: jei tos pačios rūšies (registro, pilna ar failų) kopija
    jaunesnė nei 30 min., atiduodama ji; jei kopija tuo metu daroma, laukiama jos pabaigos (užraktas). Reikia
    įdiegtos `/usr/local/sbin/setup-server-backup` (`sudo bin/install-backups`). Kiekvienas prašymas (ir atmestas)
    įrašomas į `/srv/setup-server/backup-pulls.log`: laikas, rakto vardas, adresas, prašymas, rezultatas. Projekto
@@ -488,6 +489,9 @@ sudo setup-server-backup --files shop prod        # vienos aplinkos kopija dabar
   sėkmingos naujos. DB kopijų ji neliečia, o DB kopijos – jos. Savas užraktas (`.lock-files-<env>`): DB kopijos nelaukia.
 - **Slaptažodžių nereikia** (secret store neskaitomas). Klaidos – kaip DB kopijų: vienos aplinkos klaida kitų nestabdo,
   paslauga baigiasi `failed`, `journalctl -u setup-server-backup-files.service`.
+- **Programuotojams** – setup `make files-pull [from=prod] [fresh=1] [extract=1]` parsiunčia naujausią (su `fresh=1` – ką tik
+  padarytą) failų kopiją per tą patį raktą ir leidimus, kaip `make db-pull` (žr. „Eiga“, 7 žingsnį): `db` – parsisiųsti,
+  `fresh` – užsakyti naują (jaunesnė nei 30 min. atiduodama ta pati).
 - **Peržiūra** – sąsajos *Failai*: aplinkos su `BACKUP_FILE_PATHS`, jų kopijos, kopijos failai (nauji, pakeisti ir dingę
   nuo ankstesnės kopijos), failo turinys, skirtumai nuo ankstesnės kopijos ir atsisiuntimas (iki 2 MiB). Tik skaitoma.
 - **Metrikos** – `setup_worker_files_backup*` (žr. „Worker'io metrikos“). Atnaujinus setup-server, `bin/update` parodo, kad

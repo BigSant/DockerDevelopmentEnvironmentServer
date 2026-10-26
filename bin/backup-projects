@@ -27,7 +27,8 @@ Kinds (one series each, rotated on its own; anything else in .generated/backups 
   files       files-<env>-…Z.tar.gz       the code-tree files BACKUP_FILE_PATHS lists (env/common.env or env/<env>.env,
                                           e.g. modules/*/translations/), which git does not carry: setup's
                                           `make files-backup` reads them from the deploy target (--files, the files
-                                          timer); 7 daily + 4 weekly kept
+                                          timer); 7 daily + 4 weekly kept. A developer's fresh one (--files --fresh,
+                                          bin/backup-pull fresh … files) joins the same series
 One database backup per project and ENV runs at a time (a lock in .generated/backups); the others wait for it, and
 so does a second files backup. A fresh backup is not made again when one with the same content (registry or full)
 is younger than 30 minutes. A files backup needs no secret store, only the target the deploy reaches.
@@ -56,7 +57,7 @@ JOB_TIMEOUT, FULL_TIMEOUT = 4 * 3600, 8 * 3600
 # kind: (file name prefix, make target and arguments, how many rotation keeps; None = daily + weekly)
 KINDS = {'daily': ('worker', ['db-backup'], None), 'full': ('full', ['db-backup', 'full=1'], KEEP_FULL),
          'fresh': ('fresh', ['db-backup'], KEEP_FRESH), 'fresh-full': ('fresh-full', ['db-backup', 'full=1'], KEEP_FRESH),
-         'files': ('files', ['files-backup'], None)}
+         'files': ('files', ['files-backup'], None), 'fresh-files': ('files', ['files-backup'], None)}
 # NAME, SERIES and environment_directory are identical in bin/worker-metrics (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
 # The database series are .sql.gz, the files series .tar.gz (the lookahead pairs them); groups: kind, ENV, time.
@@ -72,7 +73,8 @@ USAGE = f"""Usage: {Path(sys.argv[0]).name} [--check] [--full | --files] [--fres
   --fresh     the fresh-<env> series a developer asked for (bin/backup-pull); with --full fresh-full-<env>.
               Not made again while a backup with the same content is younger than {FRESH_REUSE // 60} minutes
   --files     not the database: the files BACKUP_FILE_PATHS lists (setup's make files-backup), the files-<env> series
-              (the files timer), of every environment that has the setting; 7 daily + 4 weekly kept
+              (the files timer), of every environment that has the setting; 7 daily + 4 weekly kept. With --fresh
+              (bin/backup-pull) not made again while one is younger than {FRESH_REUSE // 60} minutes
   --progress  machine-readable progress on stderr ("progress backup BYTES EXPECTED"); a terminal gets a bar
   --check     show what would be backed up and which old backups rotation would delete; change nothing
 The nightly series keeps the newest backup of each of the last {KEEP_DAILY} days that have one and of
@@ -140,9 +142,14 @@ def declared(build_root, kind='daily'):
     """(environment repository, [ENV deployed from here]); for files backups only the ENVs with BACKUP_FILE_PATHS."""
     directory = environment_directory(build_root)
     environments = [env for env in server_environments(directory) if directory and (directory / f'env/{env}.env').is_file()]
-    if kind == 'files':
+    if is_files(kind):
         environments = [env for env in environments if file_paths(directory, env)]
     return directory, environments
+
+
+def is_files(kind):
+    """The files kinds (files, fresh-files): one series, files-<env>-…Z.tar.gz."""
+    return KINDS[kind][0] == 'files'
 
 
 def file_paths(directory, environment):
@@ -189,13 +196,13 @@ def rotate(names, kind):
 
 def same_content(kind):
     """The kinds whose backups hold the same data: the registry ones, the full ones, or the files."""
-    if kind == 'files':
+    if is_files(kind):
         return ('files',)
     return ('full', 'fresh-full') if 'full=1' in KINDS[kind][1] else ('daily', 'fresh')
 
 
 def file_name(kind, environment, moment):
-    return f'{KINDS[kind][0]}-{environment}-{moment}Z.' + ('tar.gz' if kind == 'files' else 'sql.gz')
+    return f'{KINDS[kind][0]}-{environment}-{moment}Z.' + ('tar.gz' if is_files(kind) else 'sql.gz')
 
 
 def newest_backup(backups, environment, kind):
@@ -268,11 +275,11 @@ class Progress:
 def locked(backups, environment, kind='daily'):
     """An exclusive lock per project and ENV: one database backup at a time, a second one waits for it. Files
     backups have a lock of their own: they do not wait for a database backup."""
-    handle = open(backups / f'.lock-{"files-" if kind == "files" else ""}{environment}', 'a')
+    handle = open(backups / f'.lock-{"files-" if is_files(kind) else ""}{environment}', 'a')
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        say(f'    waiting for the {"files " if kind == "files" else ""}backup of {environment} that is running')
+        say(f'    waiting for the {"files " if is_files(kind) else ""}backup of {environment} that is running')
         fcntl.flock(handle, fcntl.LOCK_EX)
     return handle
 
@@ -381,7 +388,7 @@ def as_account():
 
 def store_refusal(name, environment, kind='daily'):
     """Why a backup cannot get its secrets, or None. A files backup needs none."""
-    if kind == 'files' or (os.environ.get('DATABASE_ROOT_PASSWORD') and os.geteuid() != 0):
+    if is_files(kind) or (os.environ.get('DATABASE_ROOT_PASSWORD') and os.geteuid() != 0):
         return None  # the caller's environment (a deployment step) has them
     container, state = secret_store(name, environment)
     if state == 'missing':
@@ -412,7 +419,7 @@ def job(name, environment, kind='daily', progress=False):
         raise Refused(f'No environment repository in {PROJECTS / name}')
     backups = directory / '.generated/backups'
     backups.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if kind == 'files' and not setup_knows_files():
+    if is_files(kind) and not setup_knows_files():
         say(f'{name} {environment}: setup has no make files-backup; update it (bin/update-setup)', error=True)
         return 1
     requested = time.time()
@@ -470,7 +477,7 @@ def plan(arguments, kind='daily'):
             environments = rest[:1]
         if not environments:
             raise Refused(f'{project} has no env/<stage|prod|…>.env: nothing deployed from here yet')
-        if kind == 'files':
+        if is_files(kind):
             environments = [env for env in environments if file_paths(directory, env)]
             if not environments:
                 raise Refused(f'{project} sets no BACKUP_FILE_PATHS (env/common.env or env/<env>.env): no files to back up')
@@ -481,7 +488,7 @@ def plan(arguments, kind='daily'):
             continue
         _, environments = declared(build_root, kind)
         if not environments:
-            say(f'==> {build_root.name}: ' + ('no BACKUP_FILE_PATHS of a deployed environment; skipped' if kind == 'files'
+            say(f'==> {build_root.name}: ' + ('no BACKUP_FILE_PATHS of a deployed environment; skipped' if is_files(kind)
                                              else 'no env/<env>.env (not deployed from here); skipped'))
         jobs += [(build_root.name, env) for env in environments]
     return jobs
@@ -496,7 +503,7 @@ def check(jobs, kind='daily'):
         new = file_name(kind, environment, stamp())
         say(f'==> would back up {name} {environment} into {backups / new}')
         try:
-            if kind == 'files':
+            if is_files(kind):
                 say(f'    paths: {" ".join(file_paths(directory, environment))} (from the deploy target)')
                 if not setup_knows_files():
                     say('    setup has no make files-backup; update it (bin/update-setup)', error=True)
@@ -603,10 +610,13 @@ def main(arguments):
             pwd.getpwnam(ACCOUNT)
         except KeyError:
             raise Refused(f'No account {ACCOUNT}; run bin/prepare-host first') from None
-    if files and (full or fresh):
-        say('--files backs up files, not the database: no --full or --fresh with it', error=True)
+    if files and full:
+        say('--files backs up files, not the database: no --full with it', error=True)
         return 64
-    kind = 'files' if files else ('fresh-full' if full else 'fresh') if fresh else ('full' if full else 'daily')
+    if files:
+        kind = 'fresh-files' if fresh else 'files'
+    else:
+        kind = ('fresh-full' if full else 'fresh') if fresh else ('full' if full else 'daily')
     if progress:
         sys.stdout = sys.stderr  # bin/backup-pull keeps stdout for its answer
     jobs = plan(positional, kind)
