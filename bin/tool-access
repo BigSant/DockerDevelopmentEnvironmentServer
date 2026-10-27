@@ -7,7 +7,9 @@ $CONFIG/tool-access.json (root only):
   allowed_ips  this server's addresses the targets let in, e.g. the VPN server's public IP (a developer's traffic
                to the targets goes out through it)
   users        a developer key's name (bin/add-backup-key) -> the crypt hash of the tools password the administrator
-               set (openssl passwd -6; the password itself is never kept) and the PROJECT:ENV it may open
+               set (openssl passwd -6; the password itself is never kept), the PROJECT:ENV it may open, and the
+               person: full_name (the UI shows it) and login (the name the tools ask for: a name or an e-mail
+               address; without it the key's name)
   managed      every PROJECT:ENV a user was ever granted: it keeps its user file, so taking the last grant away lets
                nobody in instead of falling back to the IP rule alone
 For each managed project environment it writes $ROOT/projects/<name>/tool-access/<env>/users.htpasswd (the granted
@@ -38,6 +40,9 @@ SOURCE = 'tool-access'
 APPLY_TIMEOUT = 300
 # The key names of bin/add-backup-key; a project, as the build roots under projects/ are named.
 USER = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
+# What a browser sends the same way everywhere (ASCII) and htpasswd can hold (no colon): a name or an e-mail address.
+LOGIN = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}')
+FULL_NAME_LENGTH = 100
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
 TOOLS = re.compile(r'([a-z0-9][a-z0-9_-]{0,63})(?::([a-z][a-z0-9]{1,15}))?')
 ENVIRONMENTS = ('stage', 'prod')
@@ -101,7 +106,36 @@ def shown(state):
     """The state for the UI and --show: no hash."""
     return {'allowed_ips': state['allowed_ips'], 'managed': sorted(state['managed']), 'applied': state['applied'],
             'users': {name: {'password': bool(user.get('hash')), 'password_set': user.get('password_set'),
-                             'projects': sorted(user.get('projects', []))} for name, user in sorted(state['users'].items())}}
+                             'projects': sorted(user.get('projects', [])), 'full_name': user.get('full_name'),
+                             'login': login_of(name, user)} for name, user in sorted(state['users'].items())}}
+
+
+def login_of(name, user):
+    """The name the tools ask for: the one given, else the key's."""
+    return user.get('login') or name
+
+
+def full_name(value):
+    text = ' '.join(value.split())
+    if len(text) > FULL_NAME_LENGTH or any(ord(character) < 32 or ord(character) == 127 for character in value if character not in ' \t'):
+        raise Refused(f'--full-name: up to {FULL_NAME_LENGTH} characters, no control characters')
+    return text
+
+
+def login(value, name, state):
+    """A login no other key's user has, nor another key's name (a key without a login logs in with it; the logs name
+    the keys): the tools and a reader could not tell them apart. Case does not tell either: a person types it as they
+    remember it."""
+    text = value.strip()
+    if not text:
+        return ''
+    if not LOGIN.fullmatch(text):
+        raise Refused('--login: a name or an e-mail address: letters, digits, . _ @ + - (up to 128), no spaces')
+    taken = {other.lower(): other for other in key_names() | set(state['users']) if other != name}
+    taken.update({login_of(other, user).lower(): other for other, user in state['users'].items() if other != name})
+    if text.lower() in taken:
+        raise Refused(f'--login: {text} is taken by the key {taken[text.lower()]}')
+    return text
 
 
 def key_names():
@@ -180,7 +214,7 @@ def wanted(state):
     for item in sorted(set(state['managed'])):
         if not exists(item):
             continue
-        lines = [f'{name}:{user["hash"]}' for name, user in sorted(state['users'].items())
+        lines = [f'{login_of(name, user)}:{user["hash"]}' for name, user in sorted(state['users'].items())
                  if user.get('hash') and item in user.get('projects', [])]
         files[item] = {'users.htpasswd': ''.join(line + '\n' for line in lines),
                        'allowed-ips': ''.join(address + '\n' for address in state['allowed_ips'])}
@@ -281,6 +315,10 @@ def changes(before, after):
             lines.append(f'{name}: removed (and from {len(old.get("projects", []))} project environments)')
             continue
         old = old or {}
+        if old.get('full_name') != new.get('full_name'):
+            lines.append(f'{name}: full name {new["full_name"] if new.get("full_name") else "removed"}')
+        if login_of(name, old) != login_of(name, new):
+            lines.append(f'{name}: login {login_of(name, old)} -> {login_of(name, new)}')
         if old.get('hash') != new.get('hash'):
             lines.append(f'{name}: {"new password" if new.get("hash") else "password removed: no tool lets it in"}')
         for item in sorted(set(old.get('projects', [])) - set(new.get('projects', []))):
@@ -299,6 +337,9 @@ def main(argv=None):
                         help='the project environments whose tools the user may open (without :ENV stage and prod); '
                              'repeatable or comma-separated; replaces the user\'s list')
     parser.add_argument('--no-tools', action='store_true', help='take every project environment away from the user')
+    parser.add_argument('--full-name', metavar='TEXT', help='the person\'s full name the UI shows; \'\' removes it')
+    parser.add_argument('--login', metavar='LOGIN', help='the name the tools ask for instead of the key\'s: a name or an '
+                                                         'e-mail address; \'\' goes back to the key\'s name')
     parser.add_argument('--remove', metavar='NAME', help='forget this user (bin/add-backup-key --remove does it too)')
     parser.add_argument('--allowed-ips', metavar='LIST', help='this server\'s addresses the targets let in (IP or CIDR, '
                                                                'comma-separated), e.g. the VPN server\'s public IP')
@@ -313,11 +354,12 @@ def main(argv=None):
         return 0
     if not args.check and os.geteuid() != 0:
         raise SystemExit('Run with sudo (or use --check / --show)')
-    user_options = args.password or args.no_password or args.tools or args.no_tools
+    user_options = (args.password or args.no_password or args.tools or args.no_tools or args.full_name is not None or
+                    args.login is not None)
     if user_options and not args.name:
-        parser.error('--password, --no-password, --tools and --no-tools need --name')
+        parser.error('--password, --no-password, --tools, --no-tools, --full-name and --login need --name')
     if args.name and not user_options:
-        parser.error('--name: give --password -, --no-password, --tools or --no-tools')
+        parser.error('--name: give --password -, --no-password, --tools, --no-tools, --full-name or --login')
     if args.password and args.no_password or args.tools and args.no_tools or args.allowed_ips and args.no_allowed_ips:
         parser.error('an option and its --no- form exclude each other')
     if not (user_options or args.remove or args.allowed_ips is not None or args.no_allowed_ips or args.apply is not None):
@@ -344,6 +386,14 @@ def main(argv=None):
             user.pop('password_set', None)
         if args.tools or args.no_tools:
             user['projects'] = [] if args.no_tools else project_environments(args.tools)
+        for field, given in (('full_name', args.full_name is not None and full_name(args.full_name)),
+                             ('login', args.login is not None and login(args.login, args.name, state))):
+            if given is False:
+                continue
+            if given:
+                user[field] = given
+            else:
+                user.pop(field, None)
     if args.remove:
         if args.remove not in state['users'] and not (user_options or args.allowed_ips is not None or
                                                       args.no_allowed_ips or args.apply is not None):

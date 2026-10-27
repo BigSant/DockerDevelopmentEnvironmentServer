@@ -108,6 +108,10 @@ TOOL_FIELD = re.compile(r'tool:([a-z0-9][a-z0-9_-]{0,63}):((?!local$|test$)[a-z]
 LEVEL_LABELS['tools'] = 'įrankiai'
 LEVEL_NOTES['tools'] = 'pma, cron, mailpit… su savo slaptažodžiu (bin/tool-access)'
 TOOL_PASSWORD = (12, 128)
+# The person behind a key (bin/tool-access): the full name the pages show, and the login the tools ask for instead of
+# the key's name, a name or an e-mail address (ASCII, no colon: what htpasswd holds and every browser sends alike).
+TOOL_LOGIN = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}')
+FULL_NAME_LENGTH = 100
 PUBLIC_KEY = re.compile(r'(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521)|sk-ssh-ed25519@openssh\.com|'
                         r'sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+={0,3}(?: [^\s]{1,100})?')
 JOB_ID = re.compile(r'\d{8}T\d{6}Z-[0-9a-f]{6}')
@@ -573,6 +577,11 @@ def tool_user(status, name):
     return (tool_state(status).get('users') or {}).get(name) or {}
 
 
+def full_names(status):
+    """A key's name -> the person's full name, for the keys that have one (bin/tool-access --full-name)."""
+    return {name: user['full_name'] for name, user in (tool_state(status).get('users') or {}).items() if user.get('full_name')}
+
+
 def plan_tool_access(form, status):
     """The project environments whose tools a key's user opens: the cells the page shows change, the rest stays."""
     name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
@@ -642,6 +651,33 @@ def plan_tool_password(form, status):
         plan.changes = [('warn' if tool_user(status, name).get('password') else 'ok',
                          'slaptažodis pakeičiamas nauju' if tool_user(status, name).get('password') else 'naujas slaptažodis')]
     plan.back = (f'/access/{quote(name)}?tab=tools', 'access')
+    return plan
+
+
+def plan_tool_person(form, status):
+    """A key's person: the full name the pages show and the login the tools ask for (empty: the key's name)."""
+    name = value(form, 'key_name', KEY_NAME, 'Vardas', required=True)
+    if stored_key(status, name) is None:
+        raise Invalid(f'Rakto vardu {name} nėra.')
+    full = ' '.join(form.get('full_name', '').split())
+    if len(full) > FULL_NAME_LENGTH or any(ord(character) < 32 or ord(character) == 127 for character in full):
+        raise Invalid(f'Vardas ir pavardė: iki {FULL_NAME_LENGTH} simbolių.')
+    login = value(form, 'login', TOOL_LOGIN, 'Prisijungimo vardas', limit=128)
+    others = {other['name'] for other in (status or {}).get('keys', []) if other.get('name') != name}
+    taken = {other.lower(): other for other in others}
+    taken.update({(user.get('login') or other).lower(): other
+                  for other, user in (tool_state(status).get('users') or {}).items() if other != name})
+    if login and login.lower() in taken:
+        raise Invalid(f'Prisijungimo vardas {login} jau užimtas (raktas {taken[login.lower()]}).')
+    user = tool_user(status, name)
+    plan = Plan('tool-person', f'{name}: vardas ir prisijungimas',
+                *command('tool-access', ['--name', name, '--full-name', full, '--login', login]), timeout=3600)
+    before = user.get('login') or name
+    plan.changes = [('ok', f'vardas: {full}' if full else 'vardas nerodomas')] if full != (user.get('full_name') or '') else []
+    if (login or name) != before:
+        plan.changes.append(('warn', f'įrankiai klaus {login or name} vietoj {before}' +
+                             (': pakeitimas nusiunčiamas į taikinius iš karto' if user.get('projects') else '')))
+    plan.back = (f'/access/{quote(name)}', 'access')
     return plan
 
 
@@ -740,7 +776,8 @@ ACTIONS = {'add-project': plan_add_project, 'remove-project': plan_remove_projec
            'prepare-host': plan_prepare_host, 'update': plan_update, 'update-setup': plan_update_setup,
            'pipeline': plan_pipeline, 'backup-local': plan_backup_local, 'unit': plan_unit, 'install-ssh': plan_install_ssh,
            'move-bitbucket-ssh': plan_move_bitbucket_ssh, 'tool-access': plan_tool_access,
-           'tool-bulk': plan_tool_bulk, 'tool-password': plan_tool_password, 'tool-ips': plan_tool_ips, 'tool-apply': plan_tool_apply}
+           'tool-bulk': plan_tool_bulk, 'tool-password': plan_tool_password,
+           'tool-person': plan_tool_person, 'tool-ips': plan_tool_ips, 'tool-apply': plan_tool_apply}
 
 
 # --- Running commands ----------------------------------------------------------------------------
@@ -2528,7 +2565,11 @@ class Page:
         keys, columns = data.get('keys', []), access_columns(data)
         wanted = query.strip().lower()
         reaches = lambda key: {project for project, _ in [*key_grants(key), *key_grants(key, 'backups')]}
-        shown = [key for key in keys if not wanted or wanted in key['name'].lower() or
+        people = full_names(data)
+        # The key, its person and their tools login: who it is, by any name.
+        named = lambda key: wanted in ' '.join([key['name'], people.get(key['name'], ''),
+                                                tool_user(data, key['name']).get('login') or '']).lower()
+        shown = [key for key in keys if not wanted or named(key) or
                  any(wanted in project for project in reaches(key)) or key.get('pull_all', 'none') != 'none']
         with_access = sum(1 for key in keys if key.get('grants'))
         everything = sum(1 for key in keys if key.get('pull_all', 'none') != 'none')
@@ -2542,7 +2583,7 @@ class Page:
                                                        f'<span>{e(LEVEL_NOTES[level])}</span></li>' for level in PULL_LEVELS) +
                  '</ol>')
         body += ('<div class="toolbar"><form class="search" method="get" action="/access">'
-                 f'<input type="text" name="q" value="{e(query)}" placeholder="raktas ar projektas" autocomplete="off">'
+                 f'<input type="text" name="q" value="{e(query)}" placeholder="žmogus, raktas ar projektas" autocomplete="off">'
                  '<button>Ieškoti</button></form><a class="btn go" href="/access/new">+ Pridėti raktą</a></div>')
         if not keys:
             body += '<div class="empty">Raktų dar nėra. <a href="/access/new">Pridėti raktą</a></div>'
@@ -2552,12 +2593,12 @@ class Page:
             rows = []
             for key in shown:
                 granted, pulls = key_grants(key), key_grants(key, 'backups')
-                if wanted and wanted not in key['name'].lower():
+                if wanted and not named(key):
                     granted = {item: level for item, level in granted.items() if wanted in item[0]}
                     pulls = {item: level for item, level in pulls.items() if wanted in item[0]}
                 rows.append(f'<tr class="is-{"ok" if key.get("grants") or key.get("pulls") or key.get("pull_all", "none") != "none" else "idle"}">'
-                            f'<td class="keyname"><a href="/access/{e(quote(key["name"]))}">{e(key["name"])}</a>'
-                            f'<small>{e(key.get("fingerprint", ""))}</small></td>'
+                            f'<td class="keyname"><a href="/access/{e(quote(key["name"]))}">{e(people.get(key["name"]) or key["name"])}</a>'
+                            f'<small>{e(key["name"] + " · " if key["name"] in people else "")}{e(key.get("fingerprint", ""))}</small></td>'
                             f'<td>{self.summary(granted, lambda name: name == "prod")}</td>'
                             f'<td>{self.summary(granted, lambda name: name == "stage")}</td>'
                             f'<td>{self.summary(granted, lambda name: name not in ("prod", "stage"))}</td>'
@@ -2571,7 +2612,7 @@ class Page:
                 body += (f'<p class="note">Rodoma, kur raktai pasiekia „{e(query)}“ (ir raktai su visų projektų kopijomis). '
                          '<a href="/access">Visi raktai</a></p>')
         body += self.tools_section(data)
-        body += '<h2>Paskutinė veikla</h2>' + self.activity_table(self.recent, keys=True, limit=25)
+        body += '<h2>Paskutinė veikla</h2>' + self.activity_table(self.recent, keys=True, limit=25, people=people)
         body += '<p class="note"><a href="/logs#activity">Visa veikla – Žurnalai</a></p>'
         return self.layout('Prieiga', body, section='access')
 
@@ -2651,8 +2692,10 @@ class Page:
             return None
         tab = tab if tab in KINDS or tab == 'tools' else 'access'
         access = key_grants(key)
+        person = full_names(data).get(name)
         body = ('<p><a href="/access">← Prieiga</a></p><div class="keyhead">'
-                f'<div><p class="plate-name">raktas</p><p class="keytitle">{e(name)}</p>'
+                f'<div><p class="plate-name">{"žmogus · raktas " + e(name) if person else "raktas"}</p>'
+                f'<p class="keytitle">{e(person or name)}</p>'
                 f'<p class="plate-line">{e(key.get("type", ""))} <code>{e(key.get("fingerprint", ""))}</code></p></div>'
                 f'<div><p class="plate-name">iš kur</p><p>{" ".join(badge(source, "muted") for source in key.get("sources", []))}</p></div>'
                 f'<div><p class="plate-name">kopijos</p><p>{self.backups_summary(key)}</p></div>'
@@ -2670,8 +2713,8 @@ class Page:
             body += self.tools_tab(data, name, query, only_granted)
         else:
             body += self.grants_tab(data, key, name, tab, query, only_granted)
-        body += self.key_settings(key, name, events)
-        return self.layout(f'Raktas {name}', body, section='access')
+        body += self.key_settings(key, name, events, tool_user(data, name))
+        return self.layout(f'Raktas {name}' + (f' – {person}' if person else ''), body, section='access')
 
     def grants_tab(self, data, key, name, tab, query, only_granted):
         """A key's access (make ssh) or backups (make db-pull): every prod/stage at once, then one row per project."""
@@ -2739,8 +2782,8 @@ class Page:
             body += '<div class="empty">Nė vienas projektas neatitinka filtro.</div>'
         return body
 
-    def key_settings(self, key, name, events):
-        """The key itself (networks, a new public key, a project not on this server yet) and its activity."""
+    def key_settings(self, key, name, events, user=None):
+        """The key itself (networks, a new public key, a project not on this server yet), its person and its activity."""
         hidden = lambda fields: ''.join(f'<input type="hidden" name="{e(name_)}" value="{e(text)}">' for name_, text in fields)
         body = ''
         text = lambda field_, label, placeholder='', current='': (
@@ -2752,7 +2795,15 @@ class Page:
                     text('grants', 'Prieiga projektui, kurio čia dar nėra', 'shop:prod=phpfpm-readonly') +
                     '<label><span>Naujas viešasis raktas</span><textarea name="public_key" spellcheck="false" '
                     'placeholder="tuščia – lieka dabartinis"></textarea></label>')
-        body += ('<h2>Rakto nustatymai</h2><div class="deck">' +
+        user = user or {}
+        person = (hidden([('key_name', name)]) +
+                  text('full_name', 'Vardas ir pavardė (rodoma puslapiuose)', 'Vardenis Pavardenis', user.get('full_name') or '') +
+                  text('login', 'Prisijungimo vardas įrankiams', f'{name} arba vardas@imone.lt',
+                       user.get('login') if user.get('login') not in (None, name) else ''))
+        body += ('<h2 id="person">Rakto nustatymai</h2><div class="deck">' +
+                 self.form('tool-person', 'Žmogus', person, note='Prisijungimo vardas – vardas ar el. paštas, kurio klaus pma, '
+                           f'cron ir kiti įrankiai (didžiosios ir mažosios raidės skiriasi); tuščias – rakto vardas {name}. '
+                           'Žurnaluose raktas lieka raktu.', command=f'bin/tool-access --name {name} --full-name … --login …') +
                  self.form('add-backup-key', 'Tinklai, raktas', settings,
                            note='Naujas raktas galioja visoms šio rakto aplinkoms iš karto.', command=f'bin/add-backup-key --name {name}') +
                  self.form('remove-backup-key', f'Atimti raktą {name}', f'<input type="hidden" name="key_name" value="{e(name)}">',
@@ -2772,7 +2823,7 @@ class Page:
         state = (f'{badge("nustatytas", "ok")} <span class="muted">{e(user.get("password_set") or "")}</span>'
                  if user.get('password') else badge('nenustatytas', 'warn'))
         body = ('<div class="callout"><p>Pažymėtų aplinkų pma, cron, mailpit, backup, metrics ir projekto PROXY_TOOLS paklaus '
-                f'vardo <code>{e(name)}</code> ir šio slaptažodžio. Įleidžiama tik iš setup-server adresų '
+                f'vardo <code>{e(user.get("login") or name)}</code> (<a href="#person">keisti</a>) ir šio slaptažodžio. Įleidžiama tik iš setup-server adresų '
                 f'({e(", ".join(addresses)) if addresses else "nenurodyti – tik projekto ALLOWED_IPS"}; '
                 '<a href="/access#tools">keisti</a>). Pakeitimas galioja iš karto, be deploy\'aus.</p></div>')
         fields = (f'<input type="hidden" name="key_name" value="{e(name)}"><p>Slaptažodis: {state}</p>'
@@ -2832,7 +2883,7 @@ class Page:
         return body
 
     @staticmethod
-    def activity_table(events, keys=True, limit=100):
+    def activity_table(events, keys=True, limit=100, people=None):
         """Logins, downloads, shells and commands: newest first, a shell with how long it ran and its session."""
         if events is None:
             return '<div class="callout warn"><p>Veiklos nepavyko perskaityti.</p></div>'
@@ -2854,7 +2905,10 @@ class Page:
                 took = f'{seconds // 60} min.' if seconds >= 60 else f'{seconds} s'
             session = (f'<a class="btn" href="/access/{e(quote(event["key"]))}/session/{e(event["session"])}">Seansas</a>'
                        if event.get('session') else '')
-            who = (f'<td><a href="/access/{e(quote(event["key"]))}#activity">{e(event["key"])}</a></td>' if keys else '')
+            person = (people or {}).get(event['key'])
+            title = f' title="{e(event["key"])}"' if person else ''
+            who = (f'<td><a href="/access/{e(quote(event["key"]))}#activity"{title}>{e(person or event["key"])}</a></td>'
+                   if keys else '')
             rows.append(f'<tr class="is-{"bad" if event["state"] in ("failed", "refused") else "idle"}">'
                         f'<td class="when">{e(local_time(event["at"]))}<small>{e(ago(event["at"]))}</small></td>{who}'
                         f'<td class="what">{e(what)}{" " + level_chip(event["level"]) if event.get("level") else ""}</td>'
@@ -2930,12 +2984,12 @@ class Page:
         """Who reaches this project's environments through the worker."""
         environments = sorted({environment for project, environment in access_columns(data) if project == name},
                               key=environment_order)
-        rows = []
+        rows, people = [], full_names(data)
         for key in (data or {}).get('keys', []):
             granted = {environment: level for (project, environment), level in key_grants(key).items() if project == name}
             pulls = {environment: pull_level(key, name, environment) for environment in environments}
             if granted or any(level != 'none' for level in pulls.values()):
-                rows.append(f'<tr><td class="id"><a href="/access/{e(quote(key["name"]))}?q={e(quote(name))}#projects">{e(key["name"])}</a></td>' +
+                rows.append(f'<tr><td class="id"><a href="/access/{e(quote(key["name"]))}?q={e(quote(name))}#projects">{e(people.get(key["name"]) or key["name"])}</a></td>' +
                             ''.join(f'<td>{level_chip(granted.get(environment))} {level_chip(pulls[environment])}</td>'
                                     for environment in environments) + '</tr>')
         if not rows:
@@ -3121,7 +3175,8 @@ class Page:
                 for name, meta, state, kind in recent) + '</ul>'
         else:
             body += '<div class="empty">Veiksmų dar nebuvo.</div>'
-        body += '<h2 id="activity">Programuotojų veikla</h2>' + self.activity_table(self.recent, keys=True, limit=150)
+        body += '<h2 id="activity">Programuotojų veikla</h2>' + self.activity_table(self.recent, keys=True, limit=150,
+                                                                                      people=full_names(data))
         body += f'<h2>Žurnalai</h2><details open><summary>ui-actions.log</summary><div class="inner">{term(actions)}</div></details>'
         if data is None:
             body += f'<div class="callout bad"><p>{e(error)}</p></div>'
@@ -3397,7 +3452,7 @@ def handler(user, stored):
                 return self.reply(400, page.invalid('Nežinomas veiksmas.'))
             try:
                 plan = builder(form, status()[0] if form.get('action') in ('pipeline', 'add-backup-key', 'key-bulk', 'tool-access',
-                                                                           'tool-bulk', 'tool-password') else None)
+                                                                           'tool-bulk', 'tool-password', 'tool-person') else None)
             except Invalid as error:
                 return self.reply(400, page.invalid(str(error)))
             if plan.kind == 'pipeline':

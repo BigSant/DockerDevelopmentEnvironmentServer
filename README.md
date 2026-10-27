@@ -510,6 +510,12 @@ Dabar tai valdoma čia, vienoje vietoje (setup 3.6.0+):
 - **Vartotojai** – programuotojų raktų vardai (`bin/add-backup-key`). Kiekvienam administratorius nustato įrankių
   slaptažodį ir pažymi, kurių projektų aplinkų įrankius jis atidaro. Įrankis paklausia vardo ir slaptažodžio prie IP
   taisyklės; projekto savas `<ĮRANKIS>_HTPASSWD` laimi.
+- **Žmogus** – rakto savininko vardas ir pavardė (`--full-name`), kurį sąsaja rodo vietoj rakto vardo (sąraše,
+  rakto puslapyje, veikloje; paieška randa ir pagal jį), ir prisijungimo vardas įrankiams (`--login`): vardas ar el.
+  paštas, kurį žmogus pats renkasi, vietoj rakto vardo. Prisijungimo vardas – lotyniškos raidės, skaitmenys,
+  `. _ @ + -` (be tarpų ir dvitaškio: taip jį vienodai siunčia visos naršyklės), unikalus nepaisant didžiųjų raidžių
+  ir nesutampa su kito rakto vardu; įrankiai skiria didžiąsias raides. Tuščia reikšmė grąžina rakto vardą. Žurnaluose
+  ir `authorized_keys` raktas lieka raktu.
 - **Iš karto.** Po kiekvieno pakeitimo komanda įrašo `projects/<vardas>/tool-access/<env>/users.htpasswd` ir
   `allowed-ips` ir paleidžia ten `make tool-access ENV=<env>`: setup juos nukopijuoja į taikinio `data/<env>/tool-access/`
   ir perkrauna nginx-proxy. Leidimas ar jo atėmimas galioja per kelias sekundes, be deploy'aus; kiekvienas deploy'us juos
@@ -522,13 +528,15 @@ sudo bin/tool-access --allowed-ips 198.51.100.7                 # VPN serverio v
 sudo bin/tool-access --name tomas --password - < slaptazodis.txt # 12+ simbolių, per stdin; saugomas tik hash'as
 sudo bin/tool-access --name tomas --tools shop:prod,blog         # be :ENV – stage ir prod; sąrašas pakeičiamas
 sudo bin/tool-access --name tomas --no-tools                     # atima visas
+sudo bin/tool-access --name tomas --full-name 'Tomas Žarskis' --login tomas@imone.lt  # žmogus; '' – nėra / rakto vardas
 sudo bin/tool-access --apply                                     # siunčia visus failus dar kartą (pvz. po klaidos)
 sudo bin/tool-access --show                                      # būsena JSON, be hash'ų
 ```
 
 - Būsena – `/etc/setup-server/tool-access.json` (root, 0600): adresai, vartotojų slaptažodžių hash'ai (crypt SHA-512,
-  `openssl passwd -6`), leistos aplinkos ir paskutinio siuntimo rezultatas. Slaptažodis niekur neįrašomas.
-- `bin/add-backup-key --remove VARDAS` pašalina ir vartotoją: jo eilutės iškart dingsta iš visų taikinių.
+  `openssl passwd -6`), leistos aplinkos, vardai ir prisijungimo vardai, paskutinio siuntimo rezultatas. Slaptažodis niekur neįrašomas.
+- `bin/add-backup-key --remove VARDAS` pašalina ir vartotoją: jo eilutės iškart dingsta iš visų taikinių. Naujo rakto
+  vardas negali būti kito rakto prisijungimo vardas.
 - Atnaujinus setup-server sąsajai reikia naujos sudo taisyklės (`tool-access`): `sudo bin/install-ui`. Bendras setup
   turi būti 3.6.0+ (`sudo bin/update-setup`); kol jis senesnis, failai laukia build kataloguose – atnaujinus
   `sudo bin/tool-access --apply`.
@@ -884,8 +892,9 @@ commit'as, raudonas, kai setup ne ant release tag'o.
   - *Projektai* – po eilutę projektui, jo aplinkos (prod, stage, kitos) šalia, lygis – mygtukų juosta (kopijose „visi: db“
     – aplinka be savo leidimo, galioja visų projektų lygis); filtras pagal vardą ir „tik su leidimu“ (keičiamos tik
     rodomos aplinkos, paslėptos lieka);
-  - *Rakto nustatymai* – tinklai, naujas viešasis raktas (galioja visoms aplinkoms), dar nesančio projekto leidimai;
-    rakto atėmimas;
+  - *Rakto nustatymai* – „Žmogus“ (vardas ir pavardė, rodomi vietoj rakto vardo, ir prisijungimo vardas įrankiams –
+    `bin/tool-access --full-name … --login …`), tinklai, naujas viešasis raktas (galioja visoms aplinkoms), dar nesančio
+    projekto leidimai; rakto atėmimas;
   - *Veikla* – kas, kada, iš kur: prisijungimai, kopijos, shell'ai (lygis, trukmė, rezultatas, seanso įrašas), komandos,
     atmesti bandymai; seanso puslapyje – surinktos eilutės.
 
@@ -931,7 +940,7 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 | Paslaugos (ir Apžvalgoje) | `sudo -n L/server-unit start\|stop\|restart UNIT` (žr. žemiau) |
 | Worker'io metrikos | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |
 | Raktai (*Prieiga*) | `sudo -n L/add-backup-key [-] --name … [--from …] --pull-all … --pull …\|--no-pulls --grant …\|--no-grants` (visi sąrašai aiškiai; naujas raktas per stdin, esamam – be jo), `--remove VARDAS` |
-| Įrankių prieiga (rakto *Įrankiai*, *Prieiga*) | `sudo -n L/tool-access --name … --tools …\|--no-tools`, `--name … --password -` (slaptažodis per stdin, išvestyje – `<hidden>`) `\|--no-password`, `--allowed-ips …\|--no-allowed-ips`, `--apply` |
+| Įrankių prieiga (rakto *Įrankiai*, *Prieiga*) | `sudo -n L/tool-access --name … --tools …\|--no-tools`, `--name … --password -` (slaptažodis per stdin, išvestyje – `<hidden>`) `\|--no-password`, `--name … --full-name … --login …`, `--allowed-ips …\|--no-allowed-ips`, `--apply` |
 | Paruošti serverį | `sudo -n L/prepare-host [--setup-ref …]` (`--check` kodas 1 – „Needs attention“ – vykdyti leidžia) |
 | Atnaujinti setup (*Atnaujinimas*) | `sudo -n L/update-setup [vX.Y.Z]` (tik release tag'ai, be slaptažodžio) |
 | Atnaujinti setup-server (*Atnaujinimas*) | `sudo -n -H -u <klono savininkas> <klonas>/bin/update --server-ref origin/master` (ar kiti `--server-ref`/`--setup-ref`) |

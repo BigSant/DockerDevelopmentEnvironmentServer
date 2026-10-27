@@ -182,6 +182,53 @@ class ToolAccessTest(unittest.TestCase):
             keys.main(["--remove", "ona"])
         self.assertEqual(calls, [], "ona has no tool access: nothing to forget")
 
+    def test_a_login_of_their_own_replaces_the_keys_name_in_the_user_files(self):
+        self.run_as_root("--name", "tomas", "--password", "-", "--tools", "shop:prod", stdin=PASSWORD + "\n")
+        self.sent.clear()
+        code, output = self.run_as_root("--name", "tomas", "--full-name", " Tomas  Žarskis ", "--login", "tomas@example.lt")
+        self.assertEqual(code, 0, output)
+        self.assertIn("tomas: full name Tomas Žarskis", output)
+        self.assertIn("tomas: login tomas -> tomas@example.lt", output)
+        self.assertEqual(self.sent, ["shop:prod"], "the new login reaches the target at once")
+        self.assertRegex(self.files("shop", "prod")["users.htpasswd"], r"^tomas@example\.lt:\$6\$[^\n]+\n$")
+        shown = json.loads(self.run_as_root("--show")[1])["users"]["tomas"]
+        self.assertEqual((shown["full_name"], shown["login"]), ("Tomas Žarskis", "tomas@example.lt"))
+        status = load("server_status", ROOT / "bin/server-status").tool_access()["users"]["tomas"]
+        self.assertEqual((status["full_name"], status["login"]), ("Tomas Žarskis", "tomas@example.lt"))
+        # A full name alone changes no file: nothing is sent.
+        self.sent.clear()
+        self.assertEqual(self.run_as_root("--name", "tomas", "--full-name", "Tomas Ž.")[0], 0)
+        self.assertEqual(self.sent, [])
+        # Empty: no full name, the key's name again.
+        code, output = self.run_as_root("--name", "tomas", "--full-name", "", "--login", "")
+        self.assertIn("tomas: full name removed", output)
+        self.assertIn("tomas: login tomas@example.lt -> tomas", output)
+        self.assertTrue(self.files("shop", "prod")["users.htpasswd"].startswith("tomas:$6$"))
+        self.assertNotIn("login", self.state()["users"]["tomas"])
+        self.assertNotIn("full_name", self.state()["users"]["tomas"])
+        # A key without tool access yet may have a person too.
+        self.assertEqual(self.run_as_root("--name", "ona", "--full-name", "Ona Kairė")[0], 0)
+        self.assertEqual(self.state()["users"]["ona"], {"full_name": "Ona Kairė", "projects": []})
+
+    def test_a_login_two_keys_would_share_is_refused(self):
+        self.run_as_root("--name", "tomas", "--login", "Tomas@Example.lt")
+        cases = (("ona", "tomas@example.LT", "taken by the key tomas"),
+                 ("ona", "TOMAS", "taken by the key tomas"),
+                 ("tomas", "ona", "taken by the key ona"),
+                 ("ona", "ona k", "a name or an e-mail address"),
+                 ("ona", "ona:k", "a name or an e-mail address"))
+        for name, login, message in cases:
+            with self.subTest(login=login), self.assertRaisesRegex(self.module.Refused, message):
+                self.run_as_root("--name", name, "--login", login)
+        with self.assertRaisesRegex(self.module.Refused, "no control characters"):
+            self.run_as_root("--name", "ona", "--full-name", "Ona\x1b[31m")
+        self.assertEqual(self.run_as_root("--name", "tomas", "--login", "tomas@example.lt")[0], 0, "its own, in another case")
+        keys = load("add_backup_key", ROOT / "bin/add-backup-key")
+        public = self.root / "new.pub"
+        public.write_text(f"ssh-ed25519 {BLOB}z new\n")
+        with patch.object(keys.os, "geteuid", return_value=0), self.assertRaisesRegex(SystemExit, "tools login of the key tomas"):
+            keys.main([str(public), "--name", "Tomas@example.lt", "--from", "10.8.0.0/24"])
+
     def test_the_status_shows_the_state_without_hashes(self):
         self.run_as_root("--name", "tomas", "--password", "-", "--tools", "shop:prod", stdin=PASSWORD + "\n")
         self.run_as_root("--allowed-ips", "198.51.100.7")
