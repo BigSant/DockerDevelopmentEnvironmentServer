@@ -509,7 +509,8 @@ Dabar tai valdoma čia, vienoje vietoje (setup 3.6.0+):
   programuotojų srautas į taikinius). Jie pridedami prie kiekvieno įrankio IP sąrašo, bet ne prie svetainės.
 - **Vartotojai** – programuotojų raktų vardai (`bin/add-backup-key`). Kiekvienam administratorius nustato įrankių
   slaptažodį ir pažymi, kurių projektų aplinkų įrankius jis atidaro. Įrankis paklausia vardo ir slaptažodžio prie IP
-  taisyklės; projekto savas `<ĮRANKIS>_HTPASSWD` laimi.
+  taisyklės. Jei projektas įrankiui turi savo `<ĮRANKIS>_HTPASSWD`, įleidžia abu sąrašai (setup 3.8.0+; senesnis setup
+  tada naudoja tik projekto sąrašą); vardas, esantis abiejuose, tikrinamas pagal projekto slaptažodį.
 - **Žmogus** – rakto savininko vardas ir pavardė (`--full-name`), kurį sąsaja rodo vietoj rakto vardo (sąraše,
   rakto puslapyje, veikloje; paieška randa ir pagal jį), ir prisijungimo vardas įrankiams (`--login`): vardas ar el.
   paštas, kurį žmogus pats renkasi, vietoj rakto vardo. Prisijungimo vardas – lotyniškos raidės, skaitmenys,
