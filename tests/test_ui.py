@@ -6,6 +6,7 @@ stubbed); Bitbucket is a fake API on 127.0.0.1. No root, no network.
 """
 
 import base64
+from urllib.parse import quote
 import getpass
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1006,6 +1007,53 @@ class WebUiTest(Worker):
                                         ("tool-ips", {"allowed_ips": "0.0.0.0/0"}, "konkretų tinklą")):
             with self.subTest(action=action, fields=fields):
                 status, _, body = self.preview(action, **fields)
+                self.assertEqual(status, 400, body)
+                self.assertIn(message, body)
+
+    def test_a_keys_person_has_a_full_name_on_the_pages_and_a_login_of_their_own(self):
+        self.write_keys()
+        with (self.tree.root / ".ssh/authorized_keys").open("a") as keys:
+            keys.write('from="10.8.0.0/24",command="/usr/local/sbin/setup-server-backup-pull --key ona --pull-all none",restrict '
+                       'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e2 ona\n')
+        config = self.root / "config"
+        config.mkdir()
+        (config / "tool-access.json").write_text(json.dumps({"users": {
+            "tomas": {"full_name": "Tomas Žarskis", "login": "tomas@example.lt", "projects": ["asana_tracker:prod"]},
+            "ona": {"login": "ona.k", "projects": []}}}))
+        status, _, page = self.request("GET", "/access?fresh=1")
+        self.assertEqual(status, 200, page)
+        self.assertIn('<a href="/access/tomas">Tomas Žarskis</a><small>tomas · ', page)
+        self.assertIn('<a href="/access/ona">ona</a>', page, "a key without a full name shows its own")
+        for query in ("žarsk", "example.lt"):
+            with self.subTest(query=query):
+                found = self.request("GET", f"/access?q={quote(query)}")[2]
+                self.assertIn('href="/access/tomas"', found)
+                self.assertNotIn('href="/access/ona"', found)
+        status, _, key = self.request("GET", "/access/tomas?tab=tools")
+        self.assertIn('<p class="keytitle">Tomas Žarskis</p>', key)
+        self.assertIn("vardo <code>tomas@example.lt</code>", key, "the tools ask for the login")
+        self.assertIn('name="full_name" value="Tomas Žarskis"', key)
+        self.assertIn('name="login" value="tomas@example.lt"', key)
+        library = f"-n {self.library}/bin/tool-access --check"
+        status, _, body = self.preview("tool-person", key_name="tomas", full_name="  Tomas   Žarskis ", login="Tomas.Z")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.sudo_calls("tool-access")[-1],
+                         f"{library} --name tomas --full-name Tomas Žarskis --login Tomas.Z")
+        self.assertIn("įrankiai klaus Tomas.Z vietoj tomas@example.lt", body)
+        self.assertNotIn("vardas:", body, "the full name stays")
+        # Empty: no full name, the key's name again.
+        status, _, body = self.preview("tool-person", key_name="ona", full_name="Ona K", login="")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.sudo_calls("tool-access")[-1], f"{library} --name ona --full-name Ona K --login ")
+        self.assertIn("įrankiai klaus ona vietoj ona.k", body)
+        for fields, message in (({"key_name": "ona", "login": "Tomas@Example.lt"}, "užimtas (raktas tomas)"),
+                                ({"key_name": "ona", "login": "TOMAS"}, "užimtas (raktas tomas)"),
+                                ({"key_name": "ona", "login": "ona k"}, "Prisijungimo vardas"),
+                                ({"key_name": "ona", "login": "ona:k"}, "Prisijungimo vardas"),
+                                ({"key_name": "ona", "full_name": "x" * 101}, "iki 100"),
+                                ({"key_name": "nobody", "full_name": "X"}, "nėra")):
+            with self.subTest(fields=fields):
+                status, _, body = self.preview("tool-person", **fields)
                 self.assertEqual(status, 400, body)
                 self.assertIn(message, body)
 

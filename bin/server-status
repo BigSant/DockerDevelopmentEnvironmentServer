@@ -789,7 +789,8 @@ def deploy_key():
 
 
 def tool_access():
-    """bin/tool-access's state without the password hashes: who may open which project environment's tools."""
+    """bin/tool-access's state without the password hashes: who may open which project environment's tools, and the
+    person behind each key (full name, the login the tools ask for)."""
     text = read_text(CONFIG / 'tool-access.json')
     try:
         state = json.loads(text) if text else {}
@@ -801,7 +802,9 @@ def tool_access():
             'managed': [str(item) for item in state.get('managed') or []],
             'applied': state.get('applied') if isinstance(state.get('applied'), dict) else {},
             'users': {str(name): {'password': bool(user.get('hash')), 'password_set': user.get('password_set'),
-                                  'projects': [str(item) for item in user.get('projects') or []]}
+                                  'projects': [str(item) for item in user.get('projects') or []],
+                                  'full_name': str(user.get('full_name') or '') or None,
+                                  'login': str(user.get('login') or name)}
                       for name, user in users.items() if isinstance(user, dict)}}
 
 

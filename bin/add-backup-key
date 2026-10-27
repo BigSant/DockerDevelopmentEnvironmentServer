@@ -213,6 +213,15 @@ def write_keys(lines, check):
     print(f'==> wrote {KEYS}')
 
 
+def tool_users():
+    """bin/tool-access's users: a key's name -> its tools login, password and projects."""
+    try:
+        users = json.loads((CONFIG / 'tool-access.json').read_text()).get('users') or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return users if isinstance(users, dict) else {}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('key', nargs='?', help='the developer\'s public key file (.pub), or - for stdin')
@@ -259,11 +268,7 @@ def main(argv=None):
             raise SystemExit(f'No backup key named {args.remove}')
         write_keys(kept, args.check)
         # The tools password goes with the key (bin/tool-access): its user file lines leave every target now.
-        try:
-            users = json.loads((CONFIG / 'tool-access.json').read_text()).get('users') or {}
-        except (OSError, ValueError, AttributeError):
-            users = {}
-        if args.remove in users and (HERE / 'tool-access').is_file():
+        if args.remove in tool_users() and (HERE / 'tool-access').is_file():
             subprocess.run([sys.executable, str(HERE / 'tool-access'), '--remove', args.remove] + (['--check'] if args.check else []),
                            env={**os.environ, 'SETUP_SERVER_ROOT': str(ROOT), 'SETUP_SERVER_USER': ACCOUNT,
                                 'SETUP_SERVER_CONFIG': str(CONFIG)})
@@ -279,6 +284,11 @@ def main(argv=None):
         parser.error(f'no key named {args.name} yet: give its public key file (and --from)')
     if not args.sources and existing is None:
         parser.error('give --from: the networks the key may connect from')
+    if existing is None:
+        # Another key's user may log in to the tools under this name (bin/tool-access --login): two people, one login.
+        for other, user in tool_users().items():
+            if isinstance(user, dict) and other != args.name and str(user.get('login') or '').lower() == args.name.lower():
+                raise SystemExit(f'--name: {args.name} is the tools login of the key {other}; choose another name')
     if args.allow_fresh and args.pull_all and args.pull_all != 'fresh':
         parser.error('--allow-fresh is --pull-all fresh: give one of them')
     found = parsed(existing) if existing else Entry(args.name, [])
