@@ -15,7 +15,8 @@ $CONFIG/tool-access.json (root only):
 For each managed project environment it writes $ROOT/projects/<name>/tool-access/<env>/users.htpasswd (the granted
 users that have a password) and allowed-ips, and runs `make tool-access ENV=<env>` there as the setup account
 (setup 3.6.0+): the target's nginx-proxy takes them at once, and every deploy brings them again. The tools then ask
-for the user's name and password on top of their IP rule; a tool's own <TOOL>_HTPASSWD still wins.
+for the user's name and password on top of their IP rule; a tool with its own <TOOL>_HTPASSWD lets both lists in
+(setup 3.8.0+; an older setup keeps the tool's own alone).
 """
 
 import argparse
