@@ -118,6 +118,16 @@ class SharedHelpersTest(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(status.get(name), backups[name])
 
+    def test_backups_metrics_and_the_status_page_know_the_prestashop_paths_alike(self):
+        saved = self.SHARED
+        self.SHARED = ("PRESTASHOP_FILE_PATHS",)
+        try:
+            found = [self.definitions(name).get("PRESTASHOP_FILE_PATHS") for name in ("backup-projects", "worker-metrics", "server-status")]
+        finally:
+            self.SHARED = saved
+        self.assertTrue(found[0])
+        self.assertEqual(found, [found[0]] * 3)
+
     def test_the_access_command_reads_build_roots_and_env_files_as_the_others(self):
         saved = self.SHARED
         self.SHARED = self.ENV_HELPERS + ("environment_directory", "NAME")
@@ -330,6 +340,10 @@ class EndpointTest(ScriptTest):
         self.assertEqual(value(samples, "setup_worker_files_backups", project="forsena_docker", environment="stage"), 0)
         self.assertFalse([key for key in samples if key[0] == "setup_worker_files_backups" and ("project", "shop") in key[1]],
                          "an ENV without BACKUP_FILE_PATHS expects no files backups")
+        (self.tree.projects / "shop/app/env/common.env").write_text("PROFILE=prestashop\n")
+        samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
+        self.assertEqual(value(samples, "setup_worker_files_backups", project="shop", environment="prod"), 0,
+                         "a PrestaShop project expects its translations backed up without BACKUP_FILE_PATHS")
 
     def test_a_stage_class_environment_the_project_lists_has_its_backups_and_deploys(self):
         shop = self.tree.project("shop", "prod", "mdv", "old")

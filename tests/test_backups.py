@@ -308,7 +308,7 @@ class BackupProjectsTest(ScriptTest):
         shop = self.project("shop", "stage", "prod")
         (shop / "env/common.env").write_text('PROJECT_NAME=demo\nBACKUP_FILE_PATHS="modules/*/translations/ config/local.php"\n')
         (shop / "env/stage.env").write_text("DOMAIN=example.test\nBACKUP_FILE_PATHS=\n")  # an env file wins
-        self.project("other", "prod")
+        other = self.project("other", "prod")
         backups = shop / ".generated/backups"
         backups.mkdir(parents=True)
         for n in range(1, 41):
@@ -335,6 +335,12 @@ class BackupProjectsTest(ScriptTest):
         self.assertEqual(refused.returncode, 65)
         self.assertIn("other sets no BACKUP_FILE_PATHS", refused.stderr)
         self.assertEqual(self.run_script("backup-projects", "--files", "--full").returncode, 64)
+        # A PrestaShop project needs no BACKUP_FILE_PATHS: setup's profile backs its translations up.
+        (other / "env/common.env").write_text("PROJECT_NAME=other\nPROFILE=prestashop\n")
+        profile = self.run_script("backup-projects", "--check", "--files", "other")
+        self.assertEqual(profile.returncode, 0, profile.stdout + profile.stderr)
+        self.assertIn("would back up other prod", profile.stdout)
+        self.assertIn("paths: modules/*/translations/ themes/*/modules/*/translations/ translations/*-*/", profile.stdout)
         # A developer's fresh one (bin/backup-pull fresh … files) joins the series; a recent one is handed out.
         os.environ["SETUP_SERVER_BACKUP_TIME"] = "20261009T120000"
         hour_ago = datetime.now().timestamp() - 3600  # older than the 30 minutes a fresh one reuses

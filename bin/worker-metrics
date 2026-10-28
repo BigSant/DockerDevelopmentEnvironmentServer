@@ -185,19 +185,24 @@ def backups(metrics, found, now):
     return complete
 
 
+# The paths setup's PrestaShop profile always backs up (setup 4.0.0+), before a project's BACKUP_FILE_PATHS.
+PRESTASHOP_FILE_PATHS = ('modules/*/translations/', 'themes/*/modules/*/translations/', 'translations/*-*/')
+
+
 def files_declared(directory, environment):
-    """Whether env/<env>.env (or else env/common.env) sets a BACKUP_FILE_PATHS that is not empty (one line)."""
-    found = None
+    """Whether the ENV has files to back up: a PrestaShop project (PRESTASHOP_FILE_PATHS), or env/<env>.env (or else
+    env/common.env) sets a BACKUP_FILE_PATHS that is not empty (one line each)."""
+    found = {}
     for name in ('common.env', f'{environment}.env'):
         try:
             text = (directory / 'env' / name).read_text(errors='replace')
         except OSError:
             continue
         for line in text.splitlines():
-            match = re.fullmatch(r'\s*(?:export\s+)?BACKUP_FILE_PATHS\s*=\s*(["\']?)([^"\'#]*)\1\s*(?:#.*)?', line)
+            match = re.fullmatch(r'\s*(?:export\s+)?(BACKUP_FILE_PATHS|PROFILE)\s*=\s*(["\']?)([^"\'#]*)\2\s*(?:#.*)?', line)
             if match:
-                found = bool(match[2].strip())
-    return bool(found)
+                found[match[1]] = match[3].strip()
+    return found.get('PROFILE') == 'prestashop' or bool(found.get('BACKUP_FILE_PATHS'))
 
 
 def timestamp(text):

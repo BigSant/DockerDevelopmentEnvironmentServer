@@ -139,7 +139,7 @@ def environment_directory(build_root):
 
 
 def declared(build_root, kind='daily'):
-    """(environment repository, [ENV deployed from here]); for files backups only the ENVs with BACKUP_FILE_PATHS."""
+    """(environment repository, [ENV deployed from here]); for files backups only the ENVs with files to back up."""
     directory = environment_directory(build_root)
     environments = [env for env in server_environments(directory) if directory and (directory / f'env/{env}.env').is_file()]
     if is_files(kind):
@@ -152,10 +152,16 @@ def is_files(kind):
     return KINDS[kind][0] == 'files'
 
 
+# The paths setup's PrestaShop profile always backs up (setup 4.0.0+), before a project's BACKUP_FILE_PATHS.
+PRESTASHOP_FILE_PATHS = ('modules/*/translations/', 'themes/*/modules/*/translations/', 'translations/*-*/')
+
+
 def file_paths(directory, environment):
-    """The code-tree paths of BACKUP_FILE_PATHS (setup's setting; env/<env>.env wins over env/common.env)."""
+    """The code-tree paths a files backup takes: a PrestaShop project's translations, then BACKUP_FILE_PATHS (setup's
+    setting; env/<env>.env wins over env/common.env)."""
     values = {**read_env(directory / 'env/common.env'), **read_env(directory / f'env/{environment}.env')}
-    return (values.get('BACKUP_FILE_PATHS') or '').split()
+    profile = PRESTASHOP_FILE_PATHS if values.get('PROFILE') == 'prestashop' else ()
+    return list(dict.fromkeys([*profile, *(values.get('BACKUP_FILE_PATHS') or '').split()]))
 
 
 def setup_knows_files():
@@ -480,7 +486,8 @@ def plan(arguments, kind='daily'):
         if is_files(kind):
             environments = [env for env in environments if file_paths(directory, env)]
             if not environments:
-                raise Refused(f'{project} sets no BACKUP_FILE_PATHS (env/common.env or env/<env>.env): no files to back up')
+                raise Refused(f'{project} sets no BACKUP_FILE_PATHS (env/common.env or env/<env>.env) and is no PrestaShop '
+                              'project: no files to back up')
         return [(project, env) for env in environments]
     jobs = []
     for build_root in sorted(PROJECTS.iterdir()) if PROJECTS.is_dir() else []:
