@@ -976,7 +976,8 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 
 **Deploy'ai per Bitbucket.** Projekto puslapyje – „Deploy į stage“, „Deploy į prod“ ir kiekvienai papildomai aplinkai
 „Deploy į mdv“ (custom pipeline'ai `deploy-stage`, `deploy-<env>`,
-`deploy-production` su kintamaisiais `REF`, `IMAGES`, `BACKUP`, `ROLLBACK`), „Backup dabar“ (`backup-now`, pažymėjus
+`deploy-production` su kintamaisiais `REF`, `IMAGES`, `BACKUP`, `ROLLBACK`; pažymėjus CACHE – ir `CACHE=yes`, o
+nepažymėjus jis nesiunčiamas, ir setup 5.2.0+ pipeline'as cache išvalo tik kai deploy'us jį keičia), „Backup dabar“ (`backup-now`, pažymėjus
 FULL – su kintamuoju `FULL=yes`; nepažymėjus kintamasis nesiunčiamas) ir „Runner'io
 testas“ (`runner-test`). Sąsaja juos paleidžia per Bitbucket API, todėl istorija lieka Bitbucket'e (Pipelines,
 Deployments), o darbą atlieka runner'is šiame serveryje. Repo – build katalogo `app/` `origin` URL, šaka – jo

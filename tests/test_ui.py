@@ -1429,6 +1429,13 @@ class WebUiTest(Worker):
         self.assertRegex(self.log.read_text(), r"pipeline asana_tracker: POST /repositories/rsmaizys/asana_tracker/pipelines/ "
                                                r"deploy-production branch=main REF=v1\.2\.0 IMAGES=yes ROLLBACK=no BACKUP=yes "
                                                r"\(token BITBUCKET_ACCESS_TOKEN_ASANA_TRACKER\) -> HTTP 201 #42")
+        self.assertNotIn("CACHE", json.dumps(sent), "without the box the pipeline's CACHE=auto decides")
+        status, _, body = self.preview("pipeline", project="asana_tracker", pipeline="deploy-production",
+                                       ref="v1.2.0", cache="yes")
+        self.assertEqual(status, 200, body)
+        self.confirm(body)
+        sent = [request for request in self.api.requests if request[0] == "POST"][-1][3]
+        self.assertEqual(sent["variables"][-1], {"key": "CACHE", "value": "yes"}, "the box asks for a clear")
         written = self.everything_written() + body + page
         self.assertNotIn(PROJECT_TOKEN, written)
         self.assertNotIn(GENERAL_TOKEN, written)

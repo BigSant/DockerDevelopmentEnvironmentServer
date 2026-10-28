@@ -763,6 +763,10 @@ def plan_pipeline(form, status):
             variables.append(('REF', ref))
         for key in ('IMAGES', 'ROLLBACK', 'BACKUP'):
             variables.append((key, 'yes' if flag(form, key.lower()) else 'no'))
+        # Sent only when asked for: without it the pipeline's CACHE=auto clears the cache when the deploy needs it
+        # (setup 5.2.0+).
+        if flag(form, 'cache'):
+            variables.append(('CACHE', 'yes'))
     elif pipeline == 'backup-now' and flag(form, 'full'):
         # Sent only when asked for: a project whose backup-now predates FULL keeps working as it did.
         variables.append(('FULL', 'yes'))
@@ -2249,7 +2253,9 @@ class Page:
                                    '<label><span>REF (tag\'as ar commit\'as)</span><input type="text" name="ref" autocomplete="off"></label>'
                                    '<label class="check"><input type="checkbox" name="images" value="yes"> IMAGES – perkurti image\'us</label>'
                                    '<label class="check"><input type="checkbox" name="backup" value="yes" checked> BACKUP – kopija prieš deploy\'ų</label>'
-                                   '<label class="check"><input type="checkbox" name="rollback" value="yes"> ROLLBACK – grįžti į ankstesnį</label>',
+                                   '<label class="check"><input type="checkbox" name="rollback" value="yes"> ROLLBACK – grįžti į ankstesnį</label>'
+                                   '<label class="check"><input type="checkbox" name="cache" value="yes"> CACHE – išvalyti cache '
+                                   '(be varnelės – tik kai deploy\'us jį keičia)</label>',
                                    note='Istorija lieka Bitbucket Deployments.', command=f'custom pipeline {pipeline}'))
         forms.append(self.form('pipeline', PIPELINES['backup-now'],
                                hidden + '<input type="hidden" name="pipeline" value="backup-now">' + branch_field +
