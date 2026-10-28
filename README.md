@@ -465,7 +465,9 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 Kai kuriuos kodo medžio failus rašo pati parduotuvė taikinyje, o git'e jų nėra (pvz. modulių vertimai
 `modules/*/translations/`). Deploy'us jų netrina, bet ir niekur kitur jų nėra: sugedus taikiniui jie dingtų. Projektas juos
 išvardija setup kintamuoju `BACKUP_FILE_PATHS` (kaip `DEPLOY_PROTECTED_PATHS`: keliai nuo kodo šaknies, per tarpą, katalogas
-baigiasi `/`, leidžiamas `*`), o worker'is kas naktį juos parsisiunčia ir laiko kopijas:
+baigiasi `/`, leidžiamas `*`), o worker'is kas naktį juos parsisiunčia ir laiko kopijas. PrestaShop projektui (`PROFILE=prestashop`)
+nieko nustatyti nereikia: setup 4.0.0+ profilis visada kopijuoja vertimus (`modules/*/translations/`,
+`themes/*/modules/*/translations/` ir kalbų paketus `translations/*-*/`), o `BACKUP_FILE_PATHS` prideda projekto kelius:
 
 ```dotenv
 # env/common.env (env/<env>.env reikšmė laimi)
@@ -479,8 +481,9 @@ sudo setup-server-backup --check --files          # kurių projektų aplinkos ir
 sudo setup-server-backup --files shop prod        # vienos aplinkos kopija dabar (ar sąsajoje „Failų kopija dabar“)
 ```
 
-- **Kurios aplinkos** – tos pačios, kurių DB kopijuojama (`env/<env>.env` build kataloge), jei joms `BACKUP_FILE_PATHS`
-  netuščias. Kitų projektų naktinis paleidimas nekeičia.
+- **Kurios aplinkos** – tos pačios, kurių DB kopijuojama (`env/<env>.env` build kataloge), jei projektas yra PrestaShop arba
+  joms `BACKUP_FILE_PATHS` netuščias. Kitų projektų naktinis paleidimas nekeičia. PrestaShop projektui be `BACKUP_FILE_PATHS`
+  reikia setup 4.0.0+: senesnis setup tokio projekto kopijos nedaro (`BACKUP_FILE_PATHS is empty`).
 - **Kaip** – setup `make files-backup ENV=<env> file=…` (setup 3.1.0+; senesnis – „setup has no make files-backup“; iš 2.x – naujas MAJOR,
   `sudo bin/update-setup v3.1.0`), paskyra `setup`, tuo pačiu keliu kaip deploy'us (`DEPLOY_SSH` jos raktu arba vietinis katalogas). rsync
   parsiunčia tik išvardytus kelius į veidrodį `.generated/backups/.files-<env>/` (kitą naktį – tik pasikeitimus), iš jo
@@ -493,7 +496,7 @@ sudo setup-server-backup --files shop prod        # vienos aplinkos kopija dabar
 - **Programuotojams** – setup `make files-pull [from=prod] [fresh=1] [extract=1]` parsiunčia naujausią (su `fresh=1` – ką tik
   padarytą) failų kopiją per tą patį raktą ir leidimus, kaip `make db-pull` (žr. „Eiga“, 7 žingsnį): `db` – parsisiųsti,
   `fresh` – užsakyti naują (jaunesnė nei 30 min. atiduodama ta pati).
-- **Peržiūra** – sąsajos *Failai*: aplinkos su `BACKUP_FILE_PATHS`, jų kopijos, kopijos failai (nauji, pakeisti ir dingę
+- **Peržiūra** – sąsajos *Failai*: aplinkos su failų kopijomis (PrestaShop ar `BACKUP_FILE_PATHS`), jų kopijos, kopijos failai (nauji, pakeisti ir dingę
   nuo ankstesnės kopijos), failo turinys, skirtumai nuo ankstesnės kopijos ir atsisiuntimas (iki 2 MiB). Tik skaitoma.
 - **Metrikos** – `setup_worker_files_backup*` (žr. „Worker'io metrikos“). Atnaujinus setup-server, `bin/update` parodo, kad
   laikmačio dar nėra (`note: … differs`) – paleisk `sudo bin/install-backups`.
