@@ -105,8 +105,11 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    failo neturi, bet `java` procesui jas vis tiek perduoda komandų eilutėje, todėl tai nieko nepaslėptų –
    paliktas argumentų būdas. Dėl to į šį serverį neįleisk paskyrų, kurios neturi matyti šių duomenų.
 
-   Po minutės Bitbucket'e runner'is turi būti **ONLINE**. Kitas runner'is (pvz. workspace vietoj
-   repository) įdiegiamas paleidžiant tą patį scriptą su naujomis reikšmėmis.
+   Po minutės Bitbucket'e runner'is turi būti **ONLINE**. Worker'yje veikia **vienas** Bitbucket runner'is (paslauga
+   `setup-server-runner`): tas pats scriptas su kito runner'io reikšmėmis jį **pakeičia**. Todėl rinkis **workspace**
+   runner'į (*Workspace settings → Pipelines → Workspace runners → Add runner*, Linux Shell, žyma `setup.build`;
+   `repositoryUuid` – Enter): jį naudoja visi to workspace repo, o repository runner'is – tik savo. Pakeitus senasis lieka
+   OFFLINE – pašalink jį. Viešo API runner'iui sukurti Bitbucket neturi (tik vidinį, nepalaikomą).
 
    **GitHub Actions runner'is** (projektams GitHub'e; veikia greta Bitbucket runner'io, jo neliečia).
    GitHub: *organizacijos* (rekomenduojama: vienas runner'is visiems organizacijos repo) arba *repo
@@ -927,8 +930,12 @@ commit'as, raudonas, kai setup ne ant release tag'o.
   sunumeruotus žingsnius su komandomis: kaip taikinyje sužinoti OS ir architektūrą (`/etc/os-release`, `uname -m`),
   paketai, Docker, vartotojas ir `docker` grupė, katalogas, worker'io raktas (tikras, iš
   `/srv/setup-server/.ssh/id_ed25519.pub`), ugniasienė (DirectAdmin – ir CSF: po `csf -r` Docker'is atkuria savo
-  taisykles, `live-restore` palieka konteinerius veikti), portai, DirectAdmin domenas, sertifikatas ir proxy,
-  `env/<env>.env.example`, slaptažodžiai, registracija, host key palyginimas ir pirmas deploy'us. Kiekvienas žingsnis
+  taisykles, `live-restore` palieka konteinerius veikti), swap, portai, DirectAdmin domenas (katalogai
+  `/home/VARTOTOJAS/docker/<aplinka>`: stage ir prod gali būti vieno vartotojo), DNS (svetainė ir `*.` įrankiams;
+  Cloudflare – įrankių wildcard DNS only), sertifikatas ir proxy (įjungiamas po pirmo deploy'aus),
+  `env/<env>.env.example` (limitai – lubos, stage – mažas buffer pool), slaptažodžiai (PS raktų eksportas iš esamos
+  parduotuvės `parameters.php`), Access keys abiem repo, registracija, host key palyginimas, workspace runner'is ir
+  pirmas deploy'us. Kiekvienas žingsnis
   nurodo šaltinį; kur setup dar nieko neaprašo (DirectAdmin proxy, sertifikatas be skydelio, ne Debian OS), tai
   pažymėta įspėjimu. Puslapis nieko nevykdo; mygtukas atidaro „Pridėti projektą“ su įrašytu taikiniu.
   Šalia – *pavyzdys* (`/instructions/example`): visas projekto pridėjimas su išgalvotais vardais (PrestaShop su aplinkos
