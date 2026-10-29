@@ -47,7 +47,8 @@ Wants=network-online.target
 Type=oneshot
 User=$ACCOUNT
 Group=$group
-UMask=0077
+# Project/test artifacts use the normal readable modes; auto-update explicitly protects its journal.
+UMask=0022
 WorkingDirectory=$CHECKOUT
 ExecStart=/usr/bin/python3 $CHECKOUT/bin/auto-update --server-dir $CHECKOUT --setup-dir $SETUP --state-dir $STATE
 TimeoutStartSec=50min
