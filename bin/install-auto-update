@@ -20,6 +20,9 @@ case "${1:-}" in
     *) exit 64 ;;
 esac
 [ "$#" -le 1 ] || exit 64
+for tool in python3 git make docker php systemctl; do
+    command -v "$tool" >/dev/null || { echo "Required for local health checks: $tool" >&2; exit 65; }
+done
 for value in "$CHECKOUT" "$SETUP" "$ACCOUNT" "$ROOT" "$SYSTEMD"; do
     [[ "$value" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "Unexpected characters in $value" >&2; exit 65; }
 done

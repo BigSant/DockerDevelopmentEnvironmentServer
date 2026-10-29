@@ -217,6 +217,17 @@ class AutoUpdateTest(unittest.TestCase):
         self.assertIn('--setup-dir ' + str(self.paths['setup']), result.stdout)
         self.assertFalse(units.exists())
         self.assertFalse((self.root / 'runtime').exists())
+        tools = self.root / 'missing-php-bin'
+        tools.mkdir()
+        for name in ('python3', 'git', 'make', 'docker', 'systemctl'):
+            (tools / name).write_text('#!/bin/sh\nexit 0\n')
+            (tools / name).chmod(0o755)
+        environment['PATH'] = str(tools)
+        result = subprocess.run(['/bin/bash', str(ROOT / 'bin/install-auto-update'), '--check'], env=environment,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 65)
+        self.assertIn('Required for local health checks: php', result.stderr)
+        self.assertFalse(units.exists())
 
     def test_promotion_publishes_only_the_tested_master(self):
         source = self.sources['server']

@@ -676,6 +676,8 @@ GitHub Actions patikrina `master` ir paskelbia tik patikrintą versiją šakoje 
   ir pastumia `deploy/local`. PR, nesėkmingas CI ir pasenęs patikros rezultatas kanalo nepastumia.
 
 Vietinis `setup-server-auto-update.timer` tikrina abu kanalus kas minutę (iki 10 s papildomo atidėjimo).
+Vietinėms patikroms turi būti paruošti Python 3.10+, Git, Make, Docker su Compose ir PHP CLI; installer'is
+trūkstamų paketų nediegia. CachyOS PHP CLI paketas — `php`.
 Jam reikia tik esamos neinteraktyvios Git SSH prieigos. GitHub API token'o, self-hosted runner'io ar įeinančio
 tinklo prievado nereikia. Po išjungto PC jis patikrina vėl; veikia ir prieš grafinį prisijungimą.
 
