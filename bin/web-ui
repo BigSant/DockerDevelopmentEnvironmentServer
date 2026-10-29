@@ -1151,7 +1151,7 @@ GUIDE = (
          'setup dokumentacija reikalauja Debian/Ubuntu tipo serverio, o bin/prepare-host – Ubuntu 22.04+. Žemiau – bendri '
          'Docker žingsniai šiai OS; SELinux ir firewalld setup netikrina. Pirmą deploy\'ų daryk į stage.',
          when={'os': DNF}, source='setup doc/lt/02-pradzia.md:12; bin/prepare-host:46-51',
-         warning='CentOS 7 nebepalaikomas (EOL); rinkis Stream 9, AlmaLinux ar Rocky 9.'),
+         warning='CentOS 7 nebepalaikomas (EOL); tinka 9 ir 10 versijos (Stream, AlmaLinux, Rocky): Docker CE turi el9 ir el10 paketus.'),
     Step('Paketai, kurių reikia deploy\'ui', 'target',
          'Worker\'is per SSH naudoja `rsync`, `mkdir`, `ls`, `xargs` ir `ss` (portų patikrai).',
          blocks=((None, ('apt-get update', 'apt-get install -y rsync iproute2 openssh-server ca-certificates curl')),),
