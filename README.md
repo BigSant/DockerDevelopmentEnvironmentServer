@@ -17,6 +17,7 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<repo vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`. GitHub repo – su savo deploy key. |
 | `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
 | `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
+| `bin/install-auto-update` | Įdiegia vienos minutės systemd laikmatį dviem esamiems administratoriaus `master` klonams: tik po sėkmingo GitHub CI, neliečiant vietinio darbo. Veikia ir rankiniu būdu paruoštame CachyOS; `prepare-host` jam nereikia. |
 | `bin/install-backups` | DB kopijos: naktinė (`setup-server-backup.timer`, pagal lentelių registrą) ir savaitinė pilna (`setup-server-backup-full.timer`, visų lentelių duomenys); naktinė failų kopija (`setup-server-backup-files.timer`, projekto `BACKUP_FILE_PATHS` keliai iš taikinio); komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
 | `bin/install-ssh` | SSH iš VPN: `openssh-server` (Ubuntu Desktop jo neturi), paleistas ir startuojantis po perkrovimo, nustatymai `/etc/ssh/sshd_config.d/10-setup-server.conf` – iš už nurodytų tinklų ir šio serverio tik raktu, be slaptažodžio; įjungtam ufw – leidimas tiems tinklams. Reikia `make db-pull` ir valdymo sąsajos tuneliui. |
 | `bin/add-backup-key` | Programuotojo SSH raktas DB kopijoms atsisiųsti (`make db-pull`) – tik leistų projektų aplinkų (`--pull PROJEKTAS:ENV=db`, `=fresh` – ir naujai kopijai užsakyti, `make db-pull fresh=1`; `--pull-all` – visų projektų): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. Su `--grant PROJEKTAS:ENV=LYGIS` – ir prieiga prie to projekto taikinio per šį serverį (`make ssh`), per `/usr/local/sbin/setup-server-access` (kopija iš `bin/server-access`). |
@@ -604,8 +605,9 @@ sudo bin/install-ui                    # sudo taisyklė web sąsajai (veiksmas �
 ## Atnaujinimas
 
 Viena komanda atnaujina abu checkout'us: šį repo (`~/setup-server`, administratoriaus klonas, iš kurio
-paleista komanda) ir bendrą setup checkout'ą `/srv/setup-server/setup` (paskyros `setup`). Abu repo yra
-GitHub'e, todėl atnaujinama rankomis serveryje, ne per Pipelines.
+paleista komanda) ir bendrą setup checkout'ą `/srv/setup-server/setup` (paskyros `setup`). Žemiau aprašytas
+rankinis bendro serverio atnaujinimas. Dviem administratoriaus darbo klonams galima įjungti ir automatinį
+atnaujinimą po GitHub Actions patikrų (žr. „Automatinis vietinių klonų atnaujinimas“).
 
 ```bash
 cd ~/setup-server
@@ -663,6 +665,65 @@ neskaito).
 Nepavykus patikrai abu checkout'ai grąžinami į ankstesnius commit'us (ar šaką, jei checkout'as buvo ant
 jos), o įdiegtos komandų kopijos – į ankstesnes; išvedama, kuri patikra nepavyko, ir grąžinamas kodas 1. Kodas 2 reiškia, kad nepavyko ir grįžimas –
 išvedamos komandos rankiniam atstatymui.
+
+### Automatinis vietinių klonų atnaujinimas
+
+GitHub Actions patikrina `master` ir paskelbia tik patikrintą versiją šakoje `deploy/local`:
+
+- setup `Release` workflow po sėkmingo `Setup compatibility` vienu atominiu push paskelbia release commit'ą,
+  jo `vX.Y.Z` tag'ą ir `deploy/local`. Jei tuo metu `master` pasikeitė, visas push atmetamas.
+- setup-server `tests` workflow priklausomas `publish-local` job'as po sėkmingų testų patikrina push commit'ą
+  ir pastumia `deploy/local`. PR, nesėkmingas CI ir pasenęs patikros rezultatas kanalo nepastumia.
+
+Vietinis `setup-server-auto-update.timer` tikrina abu kanalus kas minutę (iki 10 s papildomo atidėjimo).
+Jam reikia tik esamos neinteraktyvios Git SSH prieigos. GitHub API token'o, self-hosted runner'io ar įeinančio
+tinklo prievado nereikia. Po išjungto PC jis patikrina vėl; veikia ir prieš grafinį prisijungimą.
+
+Pavyzdys dviem naudotojo `tomas` klonams; pradžioje peržiūra, paskui ta pati komanda be `--check`:
+
+```bash
+cd /home/tomas/Projects/setup-server
+sudo env SETUP_SERVER_USER=tomas SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server \
+  SETUP_DIRECTORY=/home/tomas/Projects/setup bin/install-auto-update --check
+sudo env SETUP_SERVER_USER=tomas SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server \
+  SETUP_DIRECTORY=/home/tomas/Projects/setup bin/install-auto-update
+```
+
+Numatytasis setup-server klonas yra tas, iš kurio leidžiamas installer'is, setup — jo kaimynas `setup`;
+kitą serverio kloną nurodo `SETUP_SERVER_CHECKOUT`. Abu turi priklausyti `SETUP_SERVER_USER` (numatytasis —
+serverio klono savininkas). `SETUP_SERVER_ROOT` čia parenka tik būsenos katalogą `auto-update/`, ne kitus klonus.
+Installer'is nereikalauja Ubuntu ir nekeičia `prepare-host`, paketų, projektų ar runner'ių. Kartojant esami
+unit'ai lyginami; veikiantis atnaujinimas nestabdomas. Keisti šiuos kelius reikia sustabdžius laikmatį ir palaukus
+veikiančios atnaujinimo paslaugos pabaigos.
+
+`bin/auto-update` abiejuose klonuose palieka `master` ir atlieka tik fast-forward. Jei yra pakeistų ar
+neįtrauktų failų, kita šaka, nebaigta Git operacija, nepublikuotų commit'ų arba to naudotojo `make` ne
+konteineryje, atnaujinimas atidedamas. Naujesnis vietinis `master`, kurio CI dar vyksta, negrąžinamas atgal.
+Setup atnaujinimo commit'as turi sutapti su jo `VERSION` atitinkančiu release tag'u. Leidžiami ir nauji MAJOR
+leidimai: tai du darbo klonai, ne produkcinio projekto versijos pasirinkimas.
+
+Po pakeitimo vykdomi abiejų repozitorijų vietiniai testai: setup-server unittest ir setup A lygis (`tests/run`,
+be pasirenkamų Docker integracijų). Nepavykus abu klonai grįžta į ankstesnius commit'us per `git reset --keep`.
+Jei patikros metu pradėjai redaguoti, automatika darbo netrina ir palieka aiškią rankinio atkūrimo klaidą.
+Nutrauktas atnaujinimas atkuriamas iš transakcijos žurnalo prieš kitą bandymą. Vienu metu veikia tik vienas
+atnaujinimas; tos pačios patikros neišlaikiusios versijos nebekartoja, kol neatsiranda nauja arba neduodi `--retry`.
+
+Šis režimas atnaujina **tik dviejų Git klonų kodą**. Root priklausančių įdiegtų komandų kopijų, sudo taisyklių,
+unit'ų ir konteinerių jis nekeičia. Joms lieka `bin/update` ir atitinkami `bin/install-*`; setup host pagalbinėms
+kopijoms — `setup/install-host` (CachyOS sistemoje jas atnaujink rankiniu būdu, nevykdyk Ubuntu paketų diegimo).
+
+```bash
+systemctl list-timers setup-server-auto-update.timer
+journalctl -u setup-server-auto-update.service -n 50
+cat /home/tomas/Projects/runtime/setup-server/auto-update/status.json
+bin/auto-update --check --state-dir /home/tomas/Projects/runtime/setup-server/auto-update
+sudo systemctl disable --now setup-server-auto-update.timer  # sustabdo būsimus bandymus
+```
+
+Laikmačio išjungimas nenutraukia jau vykstančio atnaujinimo. Prieš rankinį atkūrimą palauk jo pabaigos.
+`--check` tik parsiunčia ir parodo; darbo klonų nekeičia. Rankiniam pakartojimui pridėk `--retry` ir naudok
+tą patį `--state-dir` kaip paslauga. Sėkmingo darbo būsena — `updated` arba `up_to_date`; nesukurtas kanalas —
+`waiting_for_ci`; grąžinta versija — `rolled_back`; `updating` po proceso pabaigos reikalauja atkūrimo.
 
 ### Tik setup (be slaptažodžio)
 

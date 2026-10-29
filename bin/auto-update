@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Fast-forward two clean master checkouts to their CI-approved deploy/local branches.
+
+No GitHub API token or inbound connection is needed. A transaction journal makes an interrupted
+update recoverable; a failed health check returns both checkouts without discarding local work.
+"""
+
+import argparse
+from datetime import datetime, timezone
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+
+CHANNEL = 'refs/remotes/origin/deploy/local'
+
+
+def run(command, cwd=None, timeout=120):
+    environment = {key: value for key, value in os.environ.items() if not key.startswith('SETUP_SERVER_')}
+    environment.update(GIT_TERMINAL_PROMPT='0', GIT_SSH_COMMAND='ssh -o BatchMode=yes -o ConnectTimeout=15')
+    result = subprocess.run(command, cwd=cwd, env=environment, capture_output=True, text=True, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError('{}: {}'.format(' '.join(map(str, command)), (result.stderr or result.stdout)[-4000:].strip()))
+    return result.stdout.strip()
+
+
+def git(path, *arguments):
+    return run(['git', '-C', str(path), *arguments])
+
+
+def ancestor(path, before, after):
+    result = subprocess.run(['git', '-C', str(path), 'merge-base', '--is-ancestor', before, after], capture_output=True)
+    if result.returncode not in (0, 1):
+        raise RuntimeError('Cannot compare commits in {}'.format(path))
+    return result.returncode == 0
+
+
+def clean_master(path):
+    if Path(git(path, 'rev-parse', '--show-toplevel')).resolve() != path:
+        raise RuntimeError('{} is not the root of a checkout'.format(path))
+    if git(path, 'symbolic-ref', '--quiet', '--short', 'HEAD') != 'master':
+        raise RuntimeError('{}: selected branch is not master; left unchanged'.format(path))
+    if git(path, 'status', '--porcelain', '--untracked-files=normal'):
+        raise RuntimeError('{}: local changes or untracked files; left unchanged'.format(path))
+    for marker in ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'BISECT_LOG'):
+        if Path(git(path, 'rev-parse', '--path-format=absolute', '--git-path', marker)).exists():
+            raise RuntimeError('{}: unfinished Git operation; left unchanged'.format(path))
+    return git(path, 'rev-parse', 'HEAD')
+
+
+def pipeline_busy():
+    for process in Path('/proc').iterdir():
+        if not process.name.isdigit():
+            continue
+        try:
+            if process.stat().st_uid == os.getuid() and (process / 'comm').read_text().strip() == 'make':
+                if not re.search(r'docker[-/]|containerd|libpod', (process / 'cgroup').read_text()):
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def save(path, state):
+    state['checked_at'] = datetime.now(timezone.utc).isoformat()
+    temporary = path.with_suffix('.tmp')
+    with temporary.open('w') as handle:
+        os.chmod(temporary, 0o600)
+        json.dump(state, handle, indent=2)
+        handle.write('\n')
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+    descriptor = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def rollback(paths, state):
+    # Check both first: a user edit during health checks must never be overwritten by a forced reset.
+    for name, path in paths.items():
+        head = clean_master(path)
+        if head not in (state['before'][name], state['targets'][name]):
+            raise RuntimeError('{} changed during the update; manual recovery needed'.format(path))
+    for name, path in reversed(list(paths.items())):
+        if git(path, 'rev-parse', 'HEAD') != state['before'][name]:
+            git(path, 'reset', '--keep', state['before'][name])
+
+
+def update(args, paths, journal, previous):
+    if pipeline_busy():
+        raise RuntimeError('A make/pipeline process is running; retry later')
+    if previous.get('result') == 'updating':
+        if previous.get('paths') != {name: str(path) for name, path in paths.items()}:
+            raise RuntimeError('Interrupted update belongs to other paths; manual recovery needed')
+        if args.check:
+            raise RuntimeError('An interrupted update needs recovery; run without --check')
+        rollback(paths, previous)
+        previous.update(result='rolled_back', error='Recovered an interrupted update', failed_targets=previous['targets'])
+        save(journal, previous)
+        print('Recovered the interrupted update; waiting for another approved version or --retry', flush=True)
+        return 1
+
+    before = {name: clean_master(path) for name, path in paths.items()}
+    targets = {}
+    for name, path in paths.items():
+        git(path, 'fetch', '--quiet', '--prune', '--tags', 'origin')
+        if not ancestor(path, before[name], 'refs/remotes/origin/master'):
+            raise RuntimeError('{}: local commits are not on origin/master; left unchanged'.format(path))
+        found = subprocess.run(['git', '-C', str(path), 'rev-parse', '--verify', CHANNEL + '^{commit}'],
+                               capture_output=True, text=True)
+        if found.returncode:
+            state = dict(previous, result='waiting_for_ci', message='{}: deploy/local is not published yet'.format(name))
+            save(journal, state)
+            print(state['message'], flush=True)
+            return 0
+        target = found.stdout.strip()
+        if not ancestor(path, target, 'refs/remotes/origin/master'):
+            raise RuntimeError('{}: approved commit is not on origin/master'.format(path))
+        if ancestor(path, target, before[name]):
+            targets[name] = before[name]  # Never roll back a newer working master while its CI is pending.
+        elif ancestor(path, before[name], target):
+            targets[name] = target
+        else:
+            raise RuntimeError('{}: master diverged from deploy/local; left unchanged'.format(path))
+    version = git(paths['setup'], 'show', '{}:VERSION'.format(targets['setup'])).strip()
+    if not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
+        raise RuntimeError('Approved setup VERSION is invalid')
+    # A working master ahead of its channel may not have a release tag yet; it is never moved here.
+    if targets['setup'] != before['setup']:
+        if git(paths['setup'], 'rev-parse', 'refs/tags/v{}^{{commit}}'.format(version)) != targets['setup']:
+            raise RuntimeError('Approved setup commit does not match its release tag')
+    if previous.get('failed_targets') == targets and not args.retry:
+        print('This version previously failed; waiting for another approved version or --retry', flush=True)
+        return 0
+    state = {'result': 'up_to_date', 'paths': {name: str(path) for name, path in paths.items()},
+             'before': before, 'targets': targets}
+    if targets == before:
+        save(journal, state)
+        print('Both master checkouts are up to date with their approved channels', flush=True)
+        return 0
+    for name in paths:
+        print('{}: {} -> {}'.format(name, before[name][:12], targets[name][:12]), flush=True)
+    if args.check:
+        print('Check finished; working checkouts were not changed', flush=True)
+        return 0
+    # Recheck after fetching; no checkout is moved if the user started editing or switched branches.
+    if pipeline_busy() or {name: clean_master(path) for name, path in paths.items()} != before:
+        raise RuntimeError('A checkout changed while fetching; retry later')
+    state['result'] = 'updating'
+    save(journal, state)
+    try:
+        for name, path in paths.items():
+            if targets[name] != before[name]:
+                git(path, 'merge', '--ff-only', '--no-edit', targets[name])
+        print('Checking setup-server and setup on this machine', flush=True)
+        run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests'], paths['server'], timeout=900)
+        run([sys.executable, 'tests/run'], paths['setup'], timeout=900)
+        if {name: clean_master(path) for name, path in paths.items()} != targets:
+            raise RuntimeError('A checkout changed during health checks')
+    except (Exception, KeyboardInterrupt) as error:
+        state['error'] = str(error) or 'Interrupted'
+        try:
+            rollback(paths, state)
+        except Exception as recovery_error:
+            state['recovery_error'] = str(recovery_error)
+            # Keep result=updating: the next invocation must recover before considering another update.
+            save(journal, state)
+            raise RuntimeError('Update failed; manual recovery needed: {}'.format(recovery_error)) from error
+        state.update(result='rolled_back', failed_targets=targets)
+        save(journal, state)
+        raise RuntimeError('Health check failed; both checkouts returned: {}'.format(error)) from error
+    state['result'] = 'updated'
+    save(journal, state)
+    print('Updated both master checkouts; health checks passed', flush=True)
+    return 0
+
+
+def main():
+    server = Path(__file__).resolve().parents[1]
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument('--setup-dir', type=Path, default=server.parent / 'setup')
+    parser.add_argument('--server-dir', type=Path, default=server)
+    parser.add_argument('--state-dir', type=Path, default=Path.home() / '.local/state/setup-server/auto-update')
+    parser.add_argument('--check', action='store_true', help='fetch and show; do not move either checkout')
+    parser.add_argument('--retry', action='store_true', help='retry a version that failed its health check')
+    args = parser.parse_args()
+    paths = {'server': args.server_dir.resolve(), 'setup': args.setup_dir.resolve()}
+    if paths['server'] == paths['setup']:
+        parser.error('The two checkouts must be different')
+    for path in paths.values():
+        if args.state_dir.resolve().is_relative_to(path):
+            parser.error('--state-dir must be outside both checkouts')
+    args.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    journal = args.state_dir / 'status.json'
+    with (args.state_dir / 'update.lock').open('a') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('Another update is already running', flush=True)
+            return 0
+        try:
+            previous = json.loads(journal.read_text()) if journal.exists() else {}
+            return update(args, paths, journal, previous)
+        except (Exception, KeyboardInterrupt) as error:
+            # Do not hide a transaction or its rollback record with a generic preflight error.
+            current = json.loads(journal.read_text()) if journal.exists() else {}
+            if current.get('result') not in ('updating', 'rolled_back'):
+                current.update(result='skipped', error=str(error))
+                save(journal, current)
+            print('auto-update: {}'.format(error), file=sys.stderr, flush=True)
+            return 1
+
+
+def interrupted(signum, frame):
+    raise InterruptedError('Interrupted by signal {}'.format(signum))
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, interrupted)
+    sys.exit(main())

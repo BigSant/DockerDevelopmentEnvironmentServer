@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Install a system timer for two existing administrator-owned checkouts; no runner or Ubuntu packages.
+set -euo pipefail
+
+CHECKOUT=${SETUP_SERVER_CHECKOUT:-$(cd "$(dirname "$0")/.." && pwd -P)}
+SETUP=${SETUP_DIRECTORY:-$(dirname "$CHECKOUT")/setup}
+ACCOUNT=${SETUP_SERVER_USER:-$(stat -c %U "$CHECKOUT")}
+ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
+SYSTEMD=${SETUP_SERVER_SYSTEMD:-/etc/systemd/system}
+STATE=$ROOT/auto-update
+NAME=setup-server-auto-update
+check=0
+case "${1:-}" in
+    --check) check=1 ;;
+    -h|--help)
+        echo "Usage: sudo [SETUP_SERVER_ROOT=... SETUP_SERVER_USER=... SETUP_DIRECTORY=...] $0 [--check]"
+        echo "Installs a one-minute system timer; existing clean master checkouts only. --check changes nothing."
+        exit 0 ;;
+    '') ;;
+    *) exit 64 ;;
+esac
+[ "$#" -le 1 ] || exit 64
+for value in "$CHECKOUT" "$SETUP" "$ACCOUNT" "$ROOT" "$SYSTEMD"; do
+    [[ "$value" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "Unexpected characters in $value" >&2; exit 65; }
+done
+for path in "$CHECKOUT" "$SETUP" "$ROOT" "$SYSTEMD"; do
+    [[ "$path" = /* ]] || { echo "An absolute path is required: $path" >&2; exit 65; }
+done
+for path in "$CHECKOUT" "$SETUP"; do
+    [ "$(stat -c %U "$path")" = "$ACCOUNT" ] || { echo "$ACCOUNT must own $path" >&2; exit 65; }
+    git -c safe.directory="$path" -C "$path" rev-parse --git-dir >/dev/null
+done
+[ -f "$CHECKOUT/bin/auto-update" ] && [ -f "$SETUP/tests/run" ] || { echo "Required updater/tests are missing" >&2; exit 65; }
+group=$(id -gn "$ACCOUNT")
+staging=$(mktemp -d)
+trap 'rm -rf "$staging"' EXIT
+cat > "$staging/service" <<EOF
+[Unit]
+Description=Update setup and setup-server from their successful CI channels
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=$ACCOUNT
+Group=$group
+UMask=0077
+WorkingDirectory=$CHECKOUT
+ExecStart=/usr/bin/python3 $CHECKOUT/bin/auto-update --server-dir $CHECKOUT --setup-dir $SETUP --state-dir $STATE
+TimeoutStartSec=35min
+TimeoutStopSec=2min
+KillMode=mixed
+EOF
+cat > "$staging/timer" <<EOF
+[Unit]
+Description=Check CI-approved setup updates every minute
+
+[Timer]
+OnBootSec=1min
+OnCalendar=*-*-* *:*:00
+RandomizedDelaySec=10s
+Persistent=true
+Unit=$NAME.service
+
+[Install]
+WantedBy=timers.target
+EOF
+if [ "$check" = 1 ]; then
+    echo "==> would install $NAME.service and $NAME.timer in $SYSTEMD"
+    echo "==> user $ACCOUNT; setup $SETUP; setup-server $CHECKOUT; state $STATE"
+    cat "$staging/service" "$staging/timer"
+    exit 0
+fi
+[ "$(id -u)" = 0 ] || { echo 'Run with sudo (or use --check)' >&2; exit 77; }
+install -d -o "$ACCOUNT" -g "$group" -m 0700 "$STATE"
+install -d -m 0755 "$SYSTEMD"
+changed=0
+for kind in service timer; do
+    if ! cmp -s "$staging/$kind" "$SYSTEMD/$NAME.$kind"; then
+        install -o root -g root -m 0644 "$staging/$kind" "$SYSTEMD/$NAME.$kind"
+        changed=1
+    fi
+done
+if [ "$changed" = 1 ]; then systemctl daemon-reload; fi
+systemctl enable --now "$NAME.timer"
+if [ "$changed" = 1 ]; then systemctl restart "$NAME.timer"; fi
+echo "==> $NAME.timer enabled; journalctl -u $NAME.service; status: $STATE/status.json"
