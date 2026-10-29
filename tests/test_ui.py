@@ -1321,10 +1321,14 @@ class WebUiTest(Worker):
         default = self.instructions()
         for text in ("Ubuntu 22.04 / 24.04", "apt-get install -y rsync", "download.docker.com/linux/ubuntu", "Domenas DirectAdmin",
                      "Custom HTTPD Configurations", "ProxyPass / http://127.0.0.1:8081/", "LOCALHOST_PORT_SSL=8082",
-                     "PMA_ALLOWED_IPS=&quot;BIURO_IP&quot;", "Deployments → <code>Production</code>", "žingsnių",
+                     "PMA_ALLOWED_IPS=&quot;BIURO_IP&quot;", "Deployments → <code>Production</code>", " žingsni",
                      "Kokia OS ir architektūra", ". /etc/os-release &amp;&amp; echo", "uname -m",
                      "CSF ugniasienė (DirectAdmin)", "csf -a WORKER_IP &quot;setup-server worker&quot;",
-                     "systemctl is-active --quiet docker &amp;&amp; systemctl restart docker"):
+                     "systemctl is-active --quiet docker &amp;&amp; systemctl restart docker", "dd if=/dev/zero of=/swapfile",
+                     "Prieiga prie repo", "sudo -u setup -H git ls-remote APLINKOS_REPO_URL HEAD",
+                     "Workspace runners → Add runner", "sudo bin/install-runner --check",
+                     "make deploy-variables ENV=prod names=1", "str_replace(&quot;%%&quot;, &quot;%&quot;",
+                     "APLINKOS_REPO_URL [KODO_REPO_URL]", "ServerAlias *.DOMENAS"):
             with self.subTest(text=text):
                 self.assertIn(text, default)
         self.assertNotRegex(default, r"\nALLOWED_IPS=", "prod: per-tool lists, not the site-wide one")
@@ -1340,6 +1344,7 @@ class WebUiTest(Worker):
                      "certbot certonly --standalone -d shop.example.lt",
                      "/etc/letsencrypt/live/shop.example.lt/privkey.pem /home/shop/site/data/stage/ssl/domain.key",
                      "LOCALHOST_PORT=80", "LOCALHOST_PORT_SSL=443", "\nALLOWED_IPS=&quot;BIURO_IP&quot;", "Deployments → <code>Staging</code>",
+                     "DATABASE_BUFFER_POOL=512M\nDATABASE_CPUS=…", "shop.example.lt   A  TAIKINIO_IP",
                      "--target stage=ssh://shop@shop.example.lt/home/shop/site",
                      "/actions?target=stage%3Dssh%3A%2F%2Fshop%40shop.example.lt%2Fhome%2Fshop%2Fsite#add-project"):
             with self.subTest(text=text):
@@ -1356,9 +1361,11 @@ class WebUiTest(Worker):
     def test_the_form_asks_only_for_what_the_choice_needs(self):
         body = self.instructions(host="shop.example.lt", domain="shop.example.lt", da_user="shopda", address="ignored", worker="10.8.0.14")
         steps = body.split('class="steps"')[1]
-        self.assertIn("install -d -o shopda -g shopda -m 0750 /home/shopda/shop.example.lt", steps,
-                      "with DirectAdmin the directory comes from its user and the domain")
-        self.assertIn("--target prod=ssh://shopda@shop.example.lt/home/shopda/shop.example.lt", steps)
+        self.assertIn("sudo -u shopda -H mkdir -p /home/shopda/docker/prod", steps,
+                      "with DirectAdmin the directory comes from its user and the environment")
+        self.assertIn("--target prod=ssh://shopda@shop.example.lt/home/shopda/docker/prod", steps)
+        self.assertIn("*.shop.example.lt   A  TAIKINIO_IP", steps, "DNS: the site and its tools by one wildcard")
+        self.assertNotIn("DATABASE_BUFFER_POOL", steps, "prod keeps setup's buffer pool")
         self.assertIn("Atidaryti formą su šiuo taikiniu", steps)
         self.assertIn("PUBLISH_ADDRESS=127.0.0.1", steps)
         css = self.request("GET", "/ui.css")[2]
@@ -1377,13 +1384,14 @@ class WebUiTest(Worker):
         self.assertEqual(status, 200, body)
         self.assertIn('class="btn on" href="/instructions"', body, "the example belongs to the instructions section")
         for text in ("bin/update --check --server-ref origin/master --setup-ref vX.Y.Z", "df -h /home",
-                     "usermod -aG docker shopuser", "sudo -u shopuser -H mkdir -p /home/shopuser/docker/shop",
+                     "usermod -aG docker shopuser", "sudo -u shopuser -H mkdir -p /home/shopuser/docker/stage /home/shopuser/docker/prod",
                      "Access keys", "Host key verification failed", "ssh-keyscan -t ed25519 server.example.lt",
-                     "--target stage=ssh://shopuser@server.example.lt/home/shopuser/docker/shop",
+                     "--target stage=ssh://shopuser@server.example.lt/home/shopuser/docker/stage",
                      "git@ssh.bitbucket.org:imone/shop_docker.git git@ssh.bitbucket.org:imone/shop.git",
                      "Alias /shop /var/www/html", "ProxyPass /shop/ http://127.0.0.1:3045/shop/",
                      "sudo bin/remove-project --check shop_docker", "Kokia OS ir architektūra",
-                     "17 žingsnių"):
+                     "Swap ir CSF", "*.server.example.lt   A  SERVERIO_IP", "Workspace runners → Add runner",
+                     "19 žingsnių"):
             with self.subTest(text=text):
                 self.assertIn(text, body)
         self.assertIn(f"{self.tree.root}/.ssh/id_ed25519.pub", body, "the worker's own root, not a fixed path")

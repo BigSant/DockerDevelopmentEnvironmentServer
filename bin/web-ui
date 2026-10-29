@@ -1087,12 +1087,13 @@ GUIDE_FIELDS = (
     Field('domain', 'Domenas', NAME_PATTERN, 'svetainės domenas (DOMAIN)'),
     Field('da_user', 'DirectAdmin vartotojas', ACCOUNT_PATTERN, 'domeno savininkas DirectAdmin\'e', when=(DIRECTADMIN,)),
     Field('vpn_address', 'Taikinio VPN IP', ADDRESS_PATTERN, 'taikinyje: ip -4 addr show tun0', when=(VPN,), address=True),
-    Field('public_address', 'Taikinio viešas IP', ADDRESS_PATTERN, 'taikinyje: hostname -I', when=(PUBLIC,), address=True),
+    Field('public_address', 'Taikinio viešas IP', ADDRESS_PATTERN, 'taikinyje: curl -4 -s https://ifconfig.me/ip; DNS įrašams',
+          when=(PUBLIC, DIRECTADMIN), address=True),
     Field('worker', 'Worker\'io IP', ADDRESS_PATTERN, 'ugniasienei: per VPN – worker\'io VPN adresas; internetu – '
           'curl -4 -s https://ifconfig.me worker\'yje', address=True),
     Field('user', 'SSH vartotojas', ACCOUNT_PATTERN, 'numatyta deploy', when=({'panel': ('none',)},), more=True),
     Field('path', 'Projekto katalogas', re.compile(r'/[A-Za-z0-9._/-]{1,200}'),
-          'numatyta /home/VARTOTOJAS/DOMENAS', more=True),
+          'numatyta /home/VARTOTOJAS/docker/APLINKA', more=True),
     Field('port', 'Projekto port\'as', re.compile(r'[0-9]{2,5}'), 'numatyta 8081; stage ir prod viename serveryje – skirtingi',
           when=(DIRECTADMIN, VPN), more=True),
 )
@@ -1117,7 +1118,8 @@ def guide_css():
     return (','.join(rules) + '{display:none}') if rules else ''
 
 
-WHERE = {'target': 'taikinyje (root)', 'panel': 'DirectAdmin', 'repo': 'env repo ir Bitbucket', 'worker': 'worker\'yje (šiame serveryje)'}
+WHERE = {'target': 'taikinyje (root)', 'panel': 'DirectAdmin', 'dns': 'DNS', 'repo': 'env repo ir Bitbucket',
+         'worker': 'worker\'yje (šiame serveryje)'}
 DOCKER_APT = ('install -m 0755 -d /etc/apt/keyrings',
               'curl -fsSL https://download.docker.com/linux/{distribution}/gpg -o /etc/apt/keyrings/docker.asc',
               'chmod a+r /etc/apt/keyrings/docker.asc',
@@ -1175,7 +1177,10 @@ GUIDE = (
                          'systemctl enable --now docker')),),
          when={'os': DNF}, source='docs.docker.com (setup šios OS neaprašo)'),
     Step('Domenas DirectAdmin\'e', 'panel',
-         'Vartotojas `{user}` (Admin level → Create New User, jei jo dar nėra) → User level → Domain Setup → Add Another Domain: `{domain}` . Jo vardas – SSH vartotojas kitame žingsnyje.',
+         'Vartotojas `{user}` (Admin level → Create New User, jei jo dar nėra) → User level → Domain Setup → Add Another '
+         'Domain: `{domain}`. Jo vardas – SSH vartotojas kitame žingsnyje. Atskiras domenas, ne subdomenas: tada jis yra '
+         'Custom HTTPD Configurations sąraše. Licencija riboja paskyras, ne domenus: stage ir prod gali būti vieno '
+         'vartotojo (katalogai `docker/stage` ir `docker/prod`, skirtingi portai).',
          when={'panel': ('directadmin',)}),
     Step('SSH vartotojas', 'target',
          'Naudok domeno DirectAdmin vartotoją: konteineriai veikia jo UID/GID, todėl failų savininkas lieka vienas. '
@@ -1190,10 +1195,11 @@ GUIDE = (
          warning='docker grupė prilygsta root teisėms. root vartotojo taikiniui nenaudok.'),
     Step('Projekto katalogas', 'target',
          'Absoliutus kelias, jau sukurtas ir rašomas vartotojo; nesibaigia `/app` – jame atsiras `app/` (kodas) ir `data/` '
-         '(duomenys, sertifikatai). bin/add-project nutolusio katalogo nekuria. Su DirectAdmin tai ne jo '
-         '`domains/{domain}/public_html` (tą aptarnauja pats DirectAdmin), o atskiras katalogas vartotojo namuose, kaip '
-         'setup pavyzdyje `/home/VARTOTOJAS/demo`.',
-         blocks=((None, ('install -d -o {user} -g {user} -m 0750 {path}',)),),
+         '(MySQL failai, sertifikatai). bin/add-project nutolusio katalogo nekuria. Su DirectAdmin tai ne jo '
+         '`domains/{domain}/public_html`: ten esantį DirectAdmin atiduotų internetui ir vykdytų pats. Kiekvienai aplinkai '
+         'savas katalogas, pavadintas kaip setup aplinka (`docker/stage`, `docker/prod`): taip jis atitinka konteinerių '
+         'vardus ir kopijas.',
+         blocks=((None, ('sudo -u {user} -H mkdir -p {path}', 'chmod 0750 {path}')),),
          source='bin/add-project:159-162,182; setup docker/project_release.py:56-57; doc/lt/09-aplinkos.md:55,88'),
     Step('Worker\'io raktas', 'target',
          'Worker\'is jungiasi kaip `setup` paskyra savo raktu (tas pats, kuriuo skaito git). Įrašyk jį vartotojui:',
@@ -1233,6 +1239,17 @@ GUIDE = (
                          'curl -sI http://127.0.0.1:8099 | head -1; docker exec csftest wget -qO- -T5 https://ifconfig.me/ip; echo',
                          'docker rm -f csftest; docker network rm csftest'))),
          when={'panel': ('directadmin',)}, source='išbandyta 2026-10-29: AlmaLinux 10.2, DirectAdmin, CSF, Docker 29'),
+    Step('Swap', 'target',
+         'Limitai – lubos, ne rezervacija, todėl stage ir prod jų suma gali viršyti RAM. Be swap, jei abu pasiektų lubas '
+         'kartu, OOM killer nutrauktų didžiausią procesą – dažnai duomenų bazę. Swap tik sulėtina piką; `vm.swappiness=10` '
+         'jį naudoja tik pritrūkus RAM. Jei `swapon --show` jau rodo swap, žingsnis nereikalingas. `dd`, ne `fallocate`: '
+         'XFS (AlmaLinux, Rocky) ne visada priima `fallocate` swap failą.',
+         blocks=((None, ('swapon --show; free -g',
+                         'dd if=/dev/zero of=/swapfile bs=1M count=4096 status=progress',
+                         'chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile',
+                         "echo '/swapfile none swap sw 0 0' >> /etc/fstab",
+                         "echo 'vm.swappiness=10' > /etc/sysctl.d/90-swappiness.conf && sysctl -p /etc/sysctl.d/90-swappiness.conf")),),
+         source='išbandyta 2026-10-29: AlmaLinux 10.2, DirectAdmin'),
     Step('SELinux', 'target',
          'setup katalogams SELinux žymių nededa ir su SELinux netestuotas. Jei `getenforce` rodo Enforcing, po pirmo '
          'deploy\'aus peržiūrėk atmetimus.',
@@ -1262,6 +1279,15 @@ GUIDE = (
          'adresas – `http://{domain}:{port}`. Viešų portų nėra. Patikrink, kad portas laisvas:',
          blocks=((None, ("ss -ltn 'sport = :{port}'",)),),
          when={'panel': ('none',), 'ssl': ('none',)}, source='setup doc/lt/09-aplinkos.md:46; spec setup-server „Prieiga“'),
+    Step('DNS', 'dns',
+         'Du įrašai: svetainė ir jos įrankiai (`pma.`, `mailpit.`, `cron.`, `backup.{domain}`) vienu wildcard įrašu. Su '
+         'Cloudflare `{domain}` gali būti Proxied, jei jis vieno lygio po zona (nemokamas sertifikatas dengia `*.zona`): SSL '
+         'režimas Full, kol serveris neturi sertifikato, paskui Full (strict); tikrą lankytojo IP serveris gauna tik iš '
+         '`CF-Connecting-IP`. `*.{domain}` – DNS only: antro lygio vardų nemokamas sertifikatas nedengia, o įrankių IP '
+         'sąrašai per Cloudflare matytų jo adresus.',
+         blocks=((None, ('{domain}     A  {public}', '*.{domain}   A  {public}   (Cloudflare: DNS only)')),
+                 ('patikra', ('dig +short A {domain} @1.1.1.1', 'dig +short A pma.{domain} @1.1.1.1'))),
+         when={'ssl': ('letsencrypt', 'own')}, source='išbandyta 2026-10-29: Cloudflare, DirectAdmin; README „Įrankių prieiga“'),
     Step('Let\'s Encrypt DirectAdmin\'e', 'panel',
          'User level → SSL Certificates → „Free & automatic certificate from Let\'s Encrypt“ domenui `{domain}` (ir www, jei '
          'naudojamas). TLS baigiasi DirectAdmin\'e; kiekvienas DOMAIN vardas gauna savo sertifikatą.',
@@ -1271,8 +1297,10 @@ GUIDE = (
          when={'panel': ('directadmin',), 'ssl': ('own',)}, source='setup doc/lt/09-aplinkos.md:45'),
     Step('Proxy į projektą', 'panel',
          'Admin level → Custom HTTPD Configurations → `{domain}`: DirectAdmin perduoda užklausas projektui, '
-         '`/.well-known` palieka sau (Let\'s Encrypt atnaujinimui). nginx-proxy pasitiki `X-Forwarded-*` tik iš loopback.',
-         blocks=(('Apache (DirectAdmin numatytas)', ('ProxyPreserveHost On', 'ProxyPass /.well-known !',
+         '`/.well-known` palieka sau (Let\'s Encrypt atnaujinimui). nginx-proxy pasitiki `X-Forwarded-*` tik iš loopback. '
+         'Įjunk po pirmo deploy\'aus: kol konteineriai neveikia, svetainė atsakytų 503. Įrankiams – `ServerAlias '
+         '*.{domain}` ir sertifikatas jų vardams (išvardytiems; wildcard – tik per DNS patikrą).',
+         blocks=(('Apache (DirectAdmin numatytas)', ('ProxyPreserveHost On', 'ServerAlias *.{domain}', 'ProxyPass /.well-known !',
                                                       'ProxyPass / http://127.0.0.1:{port}/',
                                                       'ProxyPassReverse / http://127.0.0.1:{port}/',
                                                       'RequestHeader set X-Forwarded-Proto expr=%{REQUEST_SCHEME}')),
@@ -1300,20 +1328,42 @@ GUIDE = (
     Step('env/{env}.env.example aplinkos repo', 'repo',
          'Adresas, portai, limitai ir IP sąrašai – aplinkos repo `env/{env}.env.example`. `DEPLOY_*`, `APP_UID` ir `APP_GID` '
          'nerašyk: juos įrašo bin/add-project į `target.{env}.env`, o toks example atmetamas. Limitai privalomi; serveriui su '
-         'vienu projektu setup siūlo ~30 % RAM PHP ir ~45 % duomenų bazei (dalink, jei serveris bendras).',
+         'vienu projektu setup siūlo ~30 % RAM PHP ir ~45 % duomenų bazei (dalink, jei serveris bendras). Jie – lubos, ne '
+         'rezervacija: nedirbanti aplinka užima tik MySQL buffer pool (setup – 60 % `DATABASE_MEMORY`), kurį MySQL, kartą '
+         'užpildęs, laiko. {buffer_text}',
          blocks=((None, ('DOMAIN={domain}', 'PUBLISH_ADDRESS={address}', 'LOCALHOST_PORT={port}', 'LOCALHOST_PORT_SSL={port_ssl}',
-                         '{https_line}', 'PHP_MEMORY=…', 'PHP_CPUS=…', 'DATABASE_MEMORY=…', 'DATABASE_CPUS=…', 'WEBSERVER_MEMORY=…',
-                         'WEBSERVER_CPUS=…', 'PROXY_MEMORY=…', 'PROXY_CPUS=…', '{allow_lines}')),),
+                         '{https_line}', 'PHP_MEMORY=…', 'PHP_CPUS=…', 'DATABASE_MEMORY=…', '{buffer_line}DATABASE_CPUS=…',
+                         'WEBSERVER_MEMORY=…', 'WEBSERVER_CPUS=…', 'PROXY_MEMORY=…', 'PROXY_CPUS=…', '{allow_lines}')),),
          source='setup doc/lt/09-aplinkos.md:20,62-81; doc/lt/05-servisai.md:218-249; templates/grouped/env/prod.env.example'),
     Step('Slaptažodžiai Bitbucket\'e', 'repo',
-         'Repository settings → Deployments → `{deployment}`: `DATABASE_PASSWORD`, `DATABASE_ROOT_PASSWORD` ir kiti projekto '
-         'slaptažodžiai kaip Secured kintamieji (GitHub – environment secrets). Patikra iš kompiuterio:',
-         blocks=((None, ('make deploy-variables ENV={env} token=…',)),), source='setup doc/lt/09-aplinkos.md:208-244'),
+         'Aplinkos repo (ne kodo) Repository settings → Deployments → `{deployment}`: vardai iš `make deploy-variables '
+         'ENV={env} names=1`, kiekvienas Secured (GitHub – environment secrets). DB slaptažodžiai – nauji, šios aplinkos '
+         'konteineriui. PrestaShop raktai – tie patys, kaip parduotuvės, kurios DB keliausi (kitaip užšifruotos reikšmės ir '
+         'seni slaptažodžių hash\'ai neveiks): setup juos ima iš `parameters.php` – `%%` tampa `%`, API raktai base64.',
+         blocks=(('vardai ir patikra (kompiuteryje, aplinkos repo)', ('make deploy-variables ENV={env} names=1',
+                                                                      'make deploy-variables ENV={env} token=…')),
+                 ('DB slaptažodis', ("openssl rand -base64 24 | tr -d '/+='",)),
+                 ('PS raktai iš esamos parduotuvės (PS 1.7+; failas 0600, į terminalą nespausdinamas)', (
+                     'umask 077; php -r \'$p = (require "KELIAS/app/config/parameters.php")["parameters"];',
+                     'foreach (["PS_COOKIE_KEY"=>"cookie_key", "PS_COOKIE_IV"=>"cookie_iv", "PS_NEW_COOKIE_KEY"=>"new_cookie_key",',
+                     '          "PS_SECRET"=>"secret", "PS_API_PRIVATE_KEY"=>"api_private_key", "PS_API_PUBLIC_KEY"=>"api_public_key"] as $e => $k) {',
+                     '    $v = str_replace("%%", "%", $p[$k] ?? ""); if ($v === "") continue;',
+                     '    if (strpos($e, "PS_API_") === 0) { $v = base64_encode($v); }',
+                     '    echo $e, "=\\x27", $v, "\\x27\\n"; }\' > /root/keys.env   # suvedus: shred -u /root/keys.env'))),
+         source='setup doc/lt/09-aplinkos.md „Deployment variables“; docker/project_prestashop.py existing_keys'),
+    Step('Prieiga prie repo', 'repo',
+         'Worker\'io raktas (`sudo cat {root}/.ssh/id_ed25519.pub`) – Bitbucket aplinkos repo ir kodo repo (jei atskiras) '
+         'Repository settings → Security → Access keys → Add key: visada tik skaitymui. Ne į asmeninę paskyrą (Personal '
+         'settings → SSH keys): worker\'is gautų tavo teises. Patikra worker\'yje:',
+         blocks=((None, ('sudo -u setup -H git ls-remote APLINKOS_REPO_URL HEAD', 'sudo -u setup -H git ls-remote KODO_REPO_URL HEAD')),),
+         source='README „Eiga“, 2 žingsnis'),
     Step('Užregistruoti taikinį', 'worker',
          'Worker\'is prisijungia kaip `{user}`, įrašo jo UID/GID į `target.{env}.env` ir sukuria Docker context '
-         '`setup-<vardas>-{env}`. Esamam projektui – ta pati komanda su jo vardu ir aplinkos repo; arba forma „Pridėti projektą“.',
-         blocks=((None, ('sudo bin/add-project --check --target {env}=ssh://{user}@{host}{path} [VARDAS] APLINKOS_REPO_URL',
-                         'sudo bin/add-project --target {env}=ssh://{user}@{host}{path} [VARDAS] APLINKOS_REPO_URL')),),
+         '`setup-<vardas>-{env}`. Atskiras kodo repo (PrestaShop) – antras URL, klonuojamas į `app/public`. Esamam projektui – ta '
+         'pati komanda; arba forma „Pridėti projektą“. Vietoj vardo tinka IPv4; SSH ne per 22 portą – tik per '
+         '`{root}/.ssh/config` (`Host`, `Port`).',
+         blocks=((None, ('sudo bin/add-project --check --target {env}=ssh://{user}@{host}{path} APLINKOS_REPO_URL [KODO_REPO_URL]',
+                         'sudo bin/add-project --target {env}=ssh://{user}@{host}{path} APLINKOS_REPO_URL [KODO_REPO_URL]')),),
          source='bin/add-project:159-210; README „Eiga“', link=True),
     Step('Palygink host key', 'worker',
          'Pirmą kartą worker\'is serverio raktą priima be patikros (accept-new), o bin/add-project parodo tik jo tipą. '
@@ -1321,6 +1371,15 @@ GUIDE = (
          blocks=(('taikinyje', ('ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub',)),
                  ('worker\'yje', ('sudo -u setup ssh-keygen -lF {host} -f {root}/.ssh/known_hosts',))),
          source='bin/add-project:170-171,188'),
+    Step('Runner\'is', 'repo',
+         'Worker\'yje veikia vienas Bitbucket runner\'is (`setup-server-runner`): `sudo bin/install-runner` su kito runner\'io '
+         'reikšmėmis jį pakeičia. Todėl – vienas workspace runner\'is visiems workspace repo: Workspace settings → Pipelines → '
+         'Workspace runners → Add runner → Linux Shell, žyma `setup.build`; dialogo komandos nevykdyk (`OAuthClientSecret` '
+         'rodomas tik ten), `repositoryUuid` – Enter. Jei worker\'is jau turi workspace runner\'į, žingsnis nereikalingas; '
+         'senas repository runner\'is lieka OFFLINE – Remove.',
+         blocks=((None, ('sudo bin/install-runner --check', 'sudo bin/install-runner', 'systemctl status setup-server-runner')),),
+         source='bin/install-runner:21; README „Eiga“, 3 žingsnis',
+         warning='Workspace runner\'is vykdo bet kurio workspace repo pipeline\'ą kaip setup (Docker = root worker\'yje).'),
     Step('Pirmas deploy\'us', 'worker',
          'Projekto puslapyje „Deploy į {env}“ su IMAGES (pirmą kartą ir pakeitus serverio env – privaloma). {release}',
          source='setup doc/lt/09-aplinkos.md:44,127,186'),
@@ -1360,6 +1419,11 @@ EXAMPLE = (
                  ('atnaujinti', ('apt-get update', 'apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io '
                                  'docker-buildx-plugin docker-compose-plugin'))),
          source='bin/prepare-host MIN_COMPOSE; setup doc/lt/02-pradzia.md:12'),
+    Step('Swap ir CSF', 'target',
+         'Serveris buvo be swap, o stage limitai su kitomis svetainėmis viršija RAM: 4 GB swap su `vm.swappiness=10`. '
+         'Ugniasienę valdė CSF: Docker\'is atkuria savo taisykles po kiekvieno `csf -r`, `live-restore` palieka konteinerius '
+         'veikti. Komandos ir patikra – vedlio žingsniuose „Swap“ ir „CSF ugniasienė (DirectAdmin)“.',
+         source='išbandyta 2026-10-29: AlmaLinux 10.2, DirectAdmin, CSF, Docker 29'),
     Step('DirectAdmin vartotojas docker grupėje', 'target',
          'Worker\'is jungiasi domeno savininku `shopuser`: konteineriai veiks jo UID/GID, failai lieka vieno savininko. '
          'Grupė galioja naujiems prisijungimams, todėl tikrink jo vardu:',
@@ -1369,9 +1433,10 @@ EXAMPLE = (
     Step('Projekto katalogas – ne public_html', 'target',
          'Jame bus `app/` (aplinkos repo ir kodas) ir `data/` (MySQL failai, sertifikatai). `public_html` juos atiduotų '
          'internetui, DirectAdmin PHP vykdytų kodą pro konteinerį, o senos svetainės nebebūtų kur grąžinti. bin/add-project '
-         'nutolusio katalogo nekuria.',
-         blocks=((None, ('sudo -u shopuser -H mkdir -p /home/shopuser/docker/shop',
-                         'sudo -u shopuser -H test -w /home/shopuser/docker/shop && echo rasomas')),),
+         'nutolusio katalogo nekuria. Katalogas pavadintas kaip setup aplinka: DirectAdmin licencija leido tik dvi paskyras, '
+         'todėl stage ir vėliau prod – to paties vartotojo, `docker/stage` ir `docker/prod`.',
+         blocks=((None, ('sudo -u shopuser -H mkdir -p /home/shopuser/docker/stage /home/shopuser/docker/prod',
+                         'sudo -u shopuser -H test -w /home/shopuser/docker/stage && echo rasomas')),),
          source='bin/add-project:195'),
     Step('Worker\'io raktas taikinyje', 'target',
          'Raktas – viena eilutė iš worker\'io: `sudo cat {root}/.ssh/id_ed25519.pub` (viešas, juo worker\'is ir skaito git).',
@@ -1398,16 +1463,19 @@ EXAMPLE = (
     Step('Registracija', 'worker',
          'Pirma aplinkos repo, po jo kodo repo (klonuojamas į `app/public`). Build katalogas – aplinkos repo vardas '
          '(`projects/shop_docker`), todėl pipeline\'as jį randa be `BUILD_ROOT`. Tik stage taikinys: prod nėra.',
-         blocks=((None, ('sudo bin/add-project --check --target stage=ssh://shopuser@server.example.lt/home/shopuser/docker/shop \\',
+         blocks=((None, ('sudo bin/add-project --check --target stage=ssh://shopuser@server.example.lt/home/shopuser/docker/stage \\',
                          '    git@ssh.bitbucket.org:imone/shop_docker.git git@ssh.bitbucket.org:imone/shop.git',
-                         'sudo bin/add-project --target stage=ssh://shopuser@server.example.lt/home/shopuser/docker/shop \\',
+                         'sudo bin/add-project --target stage=ssh://shopuser@server.example.lt/home/shopuser/docker/stage \\',
                          '    git@ssh.bitbucket.org:imone/shop_docker.git git@ssh.bitbucket.org:imone/shop.git')),),
          source='README „Eiga“, 4 žingsnis'),
     Step('Runner\'is', 'repo',
-         'Workspace settings → Runners: worker\'io runner\'is su žyma `setup.build` turi būti workspace (`imone`) lygio – '
-         'repository runner\'is tarnauja tik savo repo. Jei jo nėra, `sudo bin/install-runner` su naujomis reikšmėmis '
-         '(esamas lieka). Seni OFFLINE runner\'iai – Remove.',
-         source='README „Eiga“, 3 žingsnis'),
+         'Worker\'is turėjo repository runner\'į kitam repo, o worker\'yje veikia tik vienas Bitbucket runner\'is: '
+         '`sudo bin/install-runner` su naujomis reikšmėmis jį pakeičia. Todėl – workspace (`imone`) runner\'is visiems repo: '
+         'Workspace settings → Pipelines → Workspace runners → Add runner → Linux Shell, žyma `setup.build`, '
+         '`repositoryUuid` – Enter. Senas repository runner\'is – OFFLINE, Remove. Viešo API runner\'iui sukurti Bitbucket '
+         'neturi.',
+         blocks=((None, ('sudo bin/install-runner --check', 'sudo bin/install-runner')),),
+         source='bin/install-runner:21; README „Eiga“, 3 žingsnis'),
     Step('Aplinkos repo failai', 'repo',
          '`bitbucket-pipelines.yml` – setup šablonas (`deploy-stage` ir `backup-now`). `env/stage.env.example` – be '
          '`DEPLOY_*`, `APP_UID`, `APP_GID` ir slaptažodžių. Limitai pagal serverį (`nproc; free -g`) ir jo kaimynus; PHP '
@@ -1427,6 +1495,12 @@ EXAMPLE = (
                      "UPDATE `${DB_PREFIX}shop_url` SET `domain` = '${DOMAIN}', `domain_ssl` = '${DOMAIN}', "
                      "`physical_uri` = '/shop/', `virtual_uri` = '' WHERE `id_shop` = 1 AND `main` = 1;",))),
          source='setup docker/docker/apache/conf/sites.conf; doc/lt/07-duomenu-baze.md „After-import SQL“'),
+    Step('DNS: įrankių wildcard', 'dns',
+         'Svetainės vardas jau buvo; įrankiams (`pma.`, `mailpit.server.example.lt`) – vienas wildcard įrašas. DNS valdė '
+         'Cloudflare: wildcard – DNS only (antro lygio vardų nemokamas sertifikatas nedengia, IP sąrašai matytų Cloudflare '
+         'adresus); pagrindinis vardas gali likti Proxied.',
+         blocks=((None, ('*.server.example.lt   A  SERVERIO_IP   (Cloudflare: DNS only)', 'dig +short A pma.server.example.lt @1.1.1.1')),),
+         source='išbandyta 2026-10-29: Cloudflare'),
     Step('DirectAdmin proxy tik /shop/', 'panel',
          'Priešdėlis neatmetamas, `Host` išlaikomas (nginx-proxy svetainę randa pagal jį), `X-Forwarded-For` Apache prideda '
          'pats – pagal jį veikia ir svetainės `.htaccess` IP taisyklės.',
@@ -1438,7 +1512,8 @@ EXAMPLE = (
     Step('Slaptažodžiai Bitbucket\'e', 'repo',
          'Repository settings → Deployments → Staging, Secured: `DATABASE_PASSWORD`, `DATABASE_ROOT_PASSWORD` ir PS raktai iš '
          'esamos svetainės `app/config/parameters.php` (`cookie_key`, `cookie_iv`, `new_cookie_key`, `secret`, '
-         '`api_private_key`, `api_public_key`) – kitaip DB kopijoje užšifruotos reikšmės nebeveiks.',
+         '`api_private_key`, `api_public_key`; `%%` tampa `%`, API raktai base64 – eksporto komanda vedlio žingsnyje '
+         '„Slaptažodžiai Bitbucket\'e“) – kitaip DB kopijoje užšifruotos reikšmės nebeveiks. Aplinkos repo, ne kodo.',
          blocks=((None, ('make deploy-variables ENV=stage names=1',)),),
          source='setup doc/lt/09-aplinkos.md „Deployment variables“'),
     Step('Pirmas deploy\'us ir turinys', 'worker',
@@ -1484,7 +1559,7 @@ def guide_values(query, status_data):
     pick = lambda key: given[key] if applies(key) else ''
     user = (pick('da_user') or 'DA_VARTOTOJAS') if directadmin else (pick('user') or 'deploy')
     domain = pick('domain') or 'DOMENAS'
-    path = (pick('path') or f'/home/{user}/{domain}').rstrip('/')
+    path = (pick('path') or f'/home/{user}/docker/{choice["env"]}').rstrip('/')
     if path.endswith('/app'):
         errors.append('Projekto katalogas negali baigtis /app: jame bus app/ ir data/.')
     port = '80' if public else pick('port') or '8081'
@@ -1503,7 +1578,10 @@ def guide_values(query, status_data):
               'certbot_install': 'dnf install -y epel-release && dnf install -y certbot' if choice['os'] == 'centos'
               else 'apt-get install -y certbot',
               'https_line': 'HTTP_FORCE_HTTPS=off' if choice['ssl'] == 'none' else '# HTTP_FORCE_HTTPS=on (numatyta stage/prod)',
-              'allow_lines': allow,
+              'allow_lines': allow, 'public': pick('public_address') or 'TAIKINIO_IP',
+              'buffer_text': 'Stage bendrame serveryje – mažas buffer pool, kad nedirbdamas neužimtų RAM.'
+              if choice['env'] == 'stage' else '',
+              'buffer_line': 'DATABASE_BUFFER_POOL=512M\n' if choice['env'] == 'stage' else '',
               'release': 'prod – iš release tag\'o (REF = vX.Y.Z, setup ant vX.Y.Z tag\'o); vėlesni – su BACKUP.' if choice['env'] == 'prod'
               else 'stage tinka bet kuris commit\'as.'}
     return choice, values, errors, given, key is not None, complete
