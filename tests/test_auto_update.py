@@ -112,8 +112,13 @@ class AutoUpdateTest(unittest.TestCase):
     def test_missing_channel_waits_without_changing_either_checkout(self):
         self.git(self.sources['setup'], 'push', 'origin', ':refs/heads/deploy/local')
         self.advance('server')
+        self.state.mkdir()
+        (self.state / 'status.json').write_text(json.dumps({'result': 'skipped', 'error': 'old local changes',
+                                                           'failed_targets': self.before}))
         self.assertEqual(self.invoke().returncode, 0)
         self.assertEqual(self.status()['result'], 'waiting_for_ci')
+        self.assertNotIn('error', self.status(), 'waiting for CI must clear an obsolete preflight error')
+        self.assertEqual(self.status()['failed_targets'], self.before, 'a failed version stays blocked while CI is pending')
         self.assertEqual(self.heads(), self.before)
 
     def test_untracked_files_dirty_work_and_other_branches_are_preserved(self):

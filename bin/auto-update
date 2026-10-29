@@ -116,7 +116,9 @@ def update(args, paths, journal, previous):
         found = subprocess.run(['git', '-C', str(path), 'rev-parse', '--verify', CHANNEL + '^{commit}'],
                                capture_output=True, text=True)
         if found.returncode:
-            state = dict(previous, result='waiting_for_ci', message='{}: deploy/local is not published yet'.format(name))
+            state = {'result': 'waiting_for_ci', 'message': '{}: deploy/local is not published yet'.format(name)}
+            if previous.get('failed_targets'):
+                state['failed_targets'] = previous['failed_targets']
             save(journal, state)
             print(state['message'], flush=True)
             return 0
