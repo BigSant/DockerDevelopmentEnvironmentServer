@@ -1322,7 +1322,9 @@ class WebUiTest(Worker):
         for text in ("Ubuntu 22.04 / 24.04", "apt-get install -y rsync", "download.docker.com/linux/ubuntu", "Domenas DirectAdmin",
                      "Custom HTTPD Configurations", "ProxyPass / http://127.0.0.1:8081/", "LOCALHOST_PORT_SSL=8082",
                      "PMA_ALLOWED_IPS=&quot;BIURO_IP&quot;", "Deployments → <code>Production</code>", "žingsnių",
-                     "Kokia OS ir architektūra", ". /etc/os-release &amp;&amp; echo", "uname -m"):
+                     "Kokia OS ir architektūra", ". /etc/os-release &amp;&amp; echo", "uname -m",
+                     "CSF ugniasienė (DirectAdmin)", "csf -a WORKER_IP &quot;setup-server worker&quot;",
+                     "systemctl is-active --quiet docker &amp;&amp; systemctl restart docker"):
             with self.subTest(text=text):
                 self.assertIn(text, default)
         self.assertNotRegex(default, r"\nALLOWED_IPS=", "prod: per-tool lists, not the site-wide one")
@@ -1346,6 +1348,7 @@ class WebUiTest(Worker):
         vpn = self.instructions(panel="none", ssl="none", vpn_address="10.8.0.14", public_address="192.0.2.1")
         for text in ("Tik VPN", "PUBLISH_ADDRESS=10.8.0.14", "HTTP_FORCE_HTTPS=off"):
             self.assertIn(text, vpn)
+        self.assertNotIn("CSF ugniasienė", vpn, "CSF is a DirectAdmin server's firewall")
         self.assertNotIn("certbot", vpn)
         self.assertNotIn("192.0.2.1", vpn.split('class="steps"')[1], "a field this choice does not ask for is ignored")
         self.assertNotIn("Atidaryti formą", vpn, "no form link without the server, user and path")

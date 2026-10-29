@@ -1211,6 +1211,28 @@ GUIDE = (
          blocks=((None, ('firewall-cmd --permanent --add-rich-rule=\'rule family="ipv4" source address="{worker}" '
                          'port port="22" protocol="tcp" accept\'', 'firewall-cmd --reload')),),
          when={'os': DNF}, source='bin/add-project:159'),
+    Step('CSF ugniasienė (DirectAdmin)', 'target',
+         'DirectAdmin serveriuose ugniasienę dažnai valdo CSF/LFD (`systemctl is-active csf`; tada ufw ir firewalld žingsniai '
+         'nereikalingi). Kiekvienas `csf -r` ištrina visas iptables taisykles, ir Docker\'io, o CSF `DOCKER = "1"` grąžina tik '
+         '`docker0`: projektų tinklai liktų be ryšio. Todėl po CSF taisyklių Docker\'is perkraunamas ir atkuria savąsias, o '
+         '`live-restore` palieka konteinerius veikti. Worker\'į įleidžia `csf.allow`, LFD jo neblokuoja dėl `csf.ignore`. Jei '
+         '`/etc/docker/daemon.json` jau yra, `live-restore` įrašyk į jį.',
+         blocks=((None, ('sed -i -e \'s/^DOCKER = "0"/DOCKER = "1"/\' '
+                         '-e \'s|^DOCKER_NETWORK4 = .*|DOCKER_NETWORK4 = "172.16.0.0/12"|\' /etc/csf/csf.conf',
+                         'csf -a {worker} "setup-server worker"',
+                         'echo "{worker} # setup-server worker" >> /etc/csf/csf.ignore',
+                         '[ -f /etc/docker/daemon.json ] || printf \'{\\n  "live-restore": true\\n}\\n\' > /etc/docker/daemon.json',
+                         '[ -f /etc/csf/csfpost.sh ] || printf \'#!/bin/sh\\n\' > /etc/csf/csfpost.sh',
+                         'echo \'systemctl is-active --quiet docker && systemctl restart docker\' >> /etc/csf/csfpost.sh',
+                         'chmod 700 /etc/csf/csfpost.sh', 'systemctl restart docker && csf -r && systemctl restart lfd')),
+                 ('patikra: abu kartus 200 ir išeinantis ryšys, konteineris neperkrautas', (
+                         'docker network create csftest',
+                         'docker run -d --name csftest --network csftest -p 127.0.0.1:8099:80 nginx:alpine',
+                         'curl -sI http://127.0.0.1:8099 | head -1; docker exec csftest wget -qO- -T5 https://ifconfig.me/ip; echo',
+                         'csf -r > /dev/null; sleep 5; docker ps --filter name=csftest --format \'{{.Status}}\'',
+                         'curl -sI http://127.0.0.1:8099 | head -1; docker exec csftest wget -qO- -T5 https://ifconfig.me/ip; echo',
+                         'docker rm -f csftest; docker network rm csftest'))),
+         when={'panel': ('directadmin',)}, source='išbandyta 2026-10-29: AlmaLinux 10.2, DirectAdmin, CSF, Docker 29'),
     Step('SELinux', 'target',
          'setup katalogams SELinux žymių nededa ir su SELinux netestuotas. Jei `getenforce` rodo Enforcing, po pirmo '
          'deploy\'aus peržiūrėk atmetimus.',

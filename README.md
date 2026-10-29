@@ -925,7 +925,9 @@ commit'as, raudonas, kai setup ne ant release tag'o.
   (Ubuntu, Debian; CentOS/AlmaLinux/Rocky – netestuota), valdymo skydelį (DirectAdmin ar jokio), aplinką (prod, stage) ir
   SSL (Let's Encrypt, savas, be SSL – tik VPN), įrašai serverį, vartotoją, katalogą, domeną, port'ą ir gauni
   sunumeruotus žingsnius su komandomis: kaip taikinyje sužinoti OS ir architektūrą (`/etc/os-release`, `uname -m`),
-  paketai, Docker, vartotojas ir `docker` grupė, katalogas, worker'io raktas (tikras, iš `/srv/setup-server/.ssh/id_ed25519.pub`), ugniasienė, portai, DirectAdmin domenas, sertifikatas ir proxy,
+  paketai, Docker, vartotojas ir `docker` grupė, katalogas, worker'io raktas (tikras, iš
+  `/srv/setup-server/.ssh/id_ed25519.pub`), ugniasienė (DirectAdmin – ir CSF: po `csf -r` Docker'is atkuria savo
+  taisykles, `live-restore` palieka konteinerius veikti), portai, DirectAdmin domenas, sertifikatas ir proxy,
   `env/<env>.env.example`, slaptažodžiai, registracija, host key palyginimas ir pirmas deploy'us. Kiekvienas žingsnis
   nurodo šaltinį; kur setup dar nieko neaprašo (DirectAdmin proxy, sertifikatas be skydelio, ne Debian OS), tai
   pažymėta įspėjimu. Puslapis nieko nevykdo; mygtukas atidaro „Pridėti projektą“ su įrašytu taikiniu.
