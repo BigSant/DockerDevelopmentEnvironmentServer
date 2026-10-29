@@ -928,6 +928,10 @@ commit'as, raudonas, kai setup ne ant release tag'o.
   `env/<env>.env.example`, slaptažodžiai, registracija, host key palyginimas ir pirmas deploy'us. Kiekvienas žingsnis
   nurodo šaltinį; kur setup dar nieko neaprašo (DirectAdmin proxy, sertifikatas be skydelio, ne Debian OS), tai
   pažymėta įspėjimu. Puslapis nieko nevykdo; mygtukas atidaro „Pridėti projektą“ su įrašytu taikiniu.
+  Šalia – *pavyzdys* (`/instructions/example`): visas projekto pridėjimas su išgalvotais vardais (PrestaShop su aplinkos
+  ir atskiru kodo repo, stage DirectAdmin serveryje, svetainė bendro hostname poaplankyje) ir tai, kas tikrame
+  pridėjime užkliūva: versijos ir vieta diske, Docker vartotojui, Access keys abiem repo, host key prieš `BatchMode`,
+  runner'io lygis, `Alias` ir proxy poaplankiui, atšaukimas.
 
 **Veiksmai.** Kiekvienas pirmiausia paleidžiamas su `--check`: puslapis parodo komandą ir jos išvestį. Tik tada
 „Vykdyti“ paleidžia **tą pačią** komandą be `--check` (peržiūra galioja 15 min. ir vieną kartą; jei `--check` baigėsi

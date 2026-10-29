@@ -1298,6 +1298,127 @@ GUIDE = (
          source='setup doc/lt/09-aplinkos.md:44,127,186'),
 )
 
+# --- Instructions: a worked example of adding a project -------------------------------------------
+# A whole project added end to end with made-up names: a PrestaShop shop with an environment repository and a
+# separate code repository, a stage on a DirectAdmin server, the shop under a path of a shared hostname. It adds
+# to the guide what a real run ran into (versions, disk, keys, the host key, the runner, a path prefix).
+EXAMPLE_INTRO = ('Pavyzdys: PrestaShop parduotuvė su aplinkos repo `imone/shop_docker` ir atskiru kodo repo `imone/shop`, '
+                 'stage aplinka DirectAdmin serveryje `server.example.lt` (domeno savininkas `shopuser`), parduotuvė '
+                 'poaplankyje `/shop/`, laiškai – į Mailpit. Savam projektui pakeisk vardus; žingsniai pagal OS, skydelį ir '
+                 'sertifikatą – vedlyje „Serverio paruošimas“.')
+EXAMPLE = (
+    Step('setup-server ir setup versijos', 'worker',
+         'Projektas nurodo seniausią tinkamą setup (`SETUP_MIN_VERSION` faile `env/common.env`). Atnaujink abu checkout\'us '
+         'prieš registruodamas; tą patį daro puslapis „Atnaujinimas“.',
+         blocks=((None, ('bin/update --check --server-ref origin/master --setup-ref vX.Y.Z',
+                         'bin/update --server-ref origin/master --setup-ref vX.Y.Z')),),
+         source='README „Atnaujinimas“; setup doc/lt/09-aplinkos.md „Bitbucket Pipelines“'),
+    Step('Vieta diske', 'target',
+         'Taikinyje atsiras projekto DB (importo metu – dar daugiau, nei užima galutinė), kodas ir image\'ai (~3–5 GB). '
+         'Palygink su esamos DB ir kodo dydžiu ir palik atsargą.',
+         blocks=((None, ('df -h /home', 'du -xh --max-depth=2 /home 2>/dev/null | sort -h | tail -15', 'docker system df')),),
+         warning='Tame pačiame diske veikia kitos svetainės ir DirectAdmin MySQL: pilnas diskas sustabdo ir jas.'),
+    Step('Docker ir Compose versijos', 'target',
+         'Compose turi būti 2.24.4+. Senas Engine verta atnaujinti, kol projekto konteinerių dar nėra: tai perkrauna dockerd, '
+         'todėl pirmiau pažiūrėk, kas veikia. Docker 29 nepriima klientų, senesnių nei Docker 25 (API 1.44): worker\'yje '
+         '`docker version --format \'{{.Client.Version}}\'` turi būti ≥ 25.',
+         blocks=((None, ("docker version --format '{{.Server.Version}}'", 'docker compose version', 'docker ps -a')),
+                 ('atnaujinti', ('apt-get update', 'apt-get install --only-upgrade docker-ce docker-ce-cli containerd.io '
+                                 'docker-buildx-plugin docker-compose-plugin'))),
+         source='bin/prepare-host MIN_COMPOSE; setup doc/lt/02-pradzia.md:12'),
+    Step('DirectAdmin vartotojas docker grupėje', 'target',
+         'Worker\'is jungiasi domeno savininku `shopuser`: konteineriai veiks jo UID/GID, failai lieka vieno savininko. '
+         'Grupė galioja naujiems prisijungimams, todėl tikrink jo vardu:',
+         blocks=((None, ('id shopuser', 'usermod -aG docker shopuser',
+                         "sudo -u shopuser -H docker version --format 'docker {{.Server.Version}}'")),),
+         source='bin/add-project:184-194', warning='docker grupė prilygsta root teisėms.'),
+    Step('Projekto katalogas – ne public_html', 'target',
+         'Jame bus `app/` (aplinkos repo ir kodas) ir `data/` (MySQL failai, sertifikatai). `public_html` juos atiduotų '
+         'internetui, DirectAdmin PHP vykdytų kodą pro konteinerį, o senos svetainės nebebūtų kur grąžinti. bin/add-project '
+         'nutolusio katalogo nekuria.',
+         blocks=((None, ('sudo -u shopuser -H mkdir -p /home/shopuser/docker/shop',
+                         'sudo -u shopuser -H test -w /home/shopuser/docker/shop && echo rasomas')),),
+         source='bin/add-project:195'),
+    Step('Worker\'io raktas taikinyje', 'target',
+         'Raktas – viena eilutė iš worker\'io: `sudo cat {root}/.ssh/id_ed25519.pub` (viešas, juo worker\'is ir skaito git).',
+         blocks=((None, ('install -d -m 0700 -o shopuser -g shopuser ~shopuser/.ssh',
+                         "echo 'SETUP_RAKTAS' >> ~shopuser/.ssh/authorized_keys",
+                         'chown shopuser: ~shopuser/.ssh/authorized_keys', 'chmod 0600 ~shopuser/.ssh/authorized_keys')),),
+         source='bin/add-project:184-190'),
+    Step('Tas pats raktas abiem repo', 'repo',
+         'Bitbucket → Repository settings → Access keys → Add key, ir aplinkos (`imone/shop_docker`), ir kodo repo '
+         '(`imone/shop`). Access key visada tik skaitymui. Ne į asmeninę paskyrą (Personal settings → SSH keys): '
+         'worker\'is gautų tavo teises, o Bitbucket to paties rakto nebeleistų kaip Access key. Patikra worker\'yje:',
+         blocks=((None, ('sudo -u setup -H git ls-remote git@ssh.bitbucket.org:imone/shop_docker.git HEAD',
+                         'sudo -u setup -H git ls-remote git@ssh.bitbucket.org:imone/shop.git HEAD')),),
+         source='README „Eiga“, 2 žingsnis'),
+    Step('Host key ir ryšys', 'worker',
+         '`Host key verification failed` reiškia, kad paskyra `setup` šio serverio dar nematė, o `BatchMode` nepaklausia. '
+         'Palygink atspaudus ir tik tada priimk. Vietoj vardo tinka IPv4 adresas; SSH ne per 22 portą – tik per '
+         '`{root}/.ssh/config` (`Host` ir `Port`).',
+         blocks=(('taikinyje', ('ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub',)),
+                 ('worker\'yje', ('ssh-keyscan -t ed25519 server.example.lt 2>/dev/null | ssh-keygen -lf -',
+                                  'sudo -u setup -H ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new '
+                                  "shopuser@server.example.lt 'id -u; docker version --format {{.Server.Version}}'"))),
+         source='bin/add-project:172,184'),
+    Step('Registracija', 'worker',
+         'Pirma aplinkos repo, po jo kodo repo (klonuojamas į `app/public`). Build katalogas – aplinkos repo vardas '
+         '(`projects/shop_docker`), todėl pipeline\'as jį randa be `BUILD_ROOT`. Tik stage taikinys: prod nėra.',
+         blocks=((None, ('sudo bin/add-project --check --target stage=ssh://shopuser@server.example.lt/home/shopuser/docker/shop \\',
+                         '    git@ssh.bitbucket.org:imone/shop_docker.git git@ssh.bitbucket.org:imone/shop.git',
+                         'sudo bin/add-project --target stage=ssh://shopuser@server.example.lt/home/shopuser/docker/shop \\',
+                         '    git@ssh.bitbucket.org:imone/shop_docker.git git@ssh.bitbucket.org:imone/shop.git')),),
+         source='README „Eiga“, 4 žingsnis'),
+    Step('Runner\'is', 'repo',
+         'Workspace settings → Runners: worker\'io runner\'is su žyma `setup.build` turi būti workspace (`imone`) lygio – '
+         'repository runner\'is tarnauja tik savo repo. Jei jo nėra, `sudo bin/install-runner` su naujomis reikšmėmis '
+         '(esamas lieka). Seni OFFLINE runner\'iai – Remove.',
+         source='README „Eiga“, 3 žingsnis'),
+    Step('Aplinkos repo failai', 'repo',
+         '`bitbucket-pipelines.yml` – setup šablonas (`deploy-stage` ir `backup-now`). `env/stage.env.example` – be '
+         '`DEPLOY_*`, `APP_UID`, `APP_GID` ir slaptažodžių. Limitai pagal serverį (`nproc; free -g`) ir jo kaimynus; PHP '
+         'limitas – didesnis už didžiausią cron užduoties `memory_limit`. IP sąrašų nereikia: įrankius atidaro įrankių prieiga.',
+         blocks=(('env/stage.env.example', ('DOMAIN=server.example.lt', 'LOCALHOST_PORT=3045', 'LOCALHOST_PORT_SSL=3046',
+                                            'DATABASE_NAME=shop', 'DATABASE_USER=shop',
+                                            'PHP_MEMORY=4g', 'PHP_CPUS=2', 'DATABASE_MEMORY=3g', 'DATABASE_CPUS=2',
+                                            'WEBSERVER_MEMORY=256m', 'WEBSERVER_CPUS=0.5', 'PROXY_MEMORY=128m', 'PROXY_CPUS=0.5',
+                                            'SERVICES="pma cron backup mailpit"')),),
+         source='setup templates/pipelines/bitbucket-pipelines.yml; doc/lt/09-aplinkos.md „Paruošimas vieną kartą“'),
+    Step('Svetainė poaplankyje', 'repo',
+         'Kai parduotuvė lieka bendro hostname poaplankyje (`server.example.lt/shop/`, multishop – `virtual_uri`, pvz. '
+         '`lv/`): stack\'as aptarnauja `/`, todėl Apache drop-in rodo kodą ir po `/shop`, o after-import SQL palieka '
+         '`physical_uri=/shop/`. Savame domene šio žingsnio nereikia.',
+         blocks=(('config/apache/stage/vhost.d/shop-path.conf', ('Alias /shop /var/www/html',)),
+                 ('database/after-import/stage/010-urls.sql', (
+                     "UPDATE `${DB_PREFIX}shop_url` SET `domain` = '${DOMAIN}', `domain_ssl` = '${DOMAIN}', "
+                     "`physical_uri` = '/shop/', `virtual_uri` = '' WHERE `id_shop` = 1 AND `main` = 1;",))),
+         source='setup docker/docker/apache/conf/sites.conf; doc/lt/07-duomenu-baze.md „After-import SQL“'),
+    Step('DirectAdmin proxy tik /shop/', 'panel',
+         'Priešdėlis neatmetamas, `Host` išlaikomas (nginx-proxy svetainę randa pagal jį), `X-Forwarded-For` Apache prideda '
+         'pats – pagal jį veikia ir svetainės `.htaccess` IP taisyklės.',
+         blocks=((None, ('ProxyPreserveHost On', 'ProxyPass /shop/ http://127.0.0.1:3045/shop/',
+                         'ProxyPassReverse /shop/ http://127.0.0.1:3045/shop/',
+                         'RequestHeader set X-Forwarded-Proto expr=%{REQUEST_SCHEME}')),),
+         source='setup doc/lt/09-aplinkos.md:73',
+         warning='setup proxy poaplankiui neaprašo: pirmiau išbandyk stage\'e.'),
+    Step('Slaptažodžiai Bitbucket\'e', 'repo',
+         'Repository settings → Deployments → Staging, Secured: `DATABASE_PASSWORD`, `DATABASE_ROOT_PASSWORD` ir PS raktai iš '
+         'esamos svetainės `app/config/parameters.php` (`cookie_key`, `cookie_iv`, `new_cookie_key`, `secret`, '
+         '`api_private_key`, `api_public_key`) – kitaip DB kopijoje užšifruotos reikšmės nebeveiks.',
+         blocks=((None, ('make deploy-variables ENV=stage names=1',)),),
+         source='setup doc/lt/09-aplinkos.md „Deployment variables“'),
+    Step('Pirmas deploy\'us ir turinys', 'worker',
+         'Pipelines → Run pipeline → `deploy-stage` (arba projekto puslapis): `REF` – kodo repo commit\'as, `IMAGES=yes`. '
+         'Tada DB ir turinys iš esamos svetainės: `img/`, kalbų paketai, modulių vertimai, `.htaccess` (deploy\'us jų niekada '
+         'nerašo).',
+         source='setup doc/lt/09-aplinkos.md „Kodo deploy\'us“'),
+    Step('Jei reikia atšaukti', 'worker',
+         'Pašalina build katalogą su `target.stage.env` ir Docker context\'ą. Neliečia: rakto taikinio `authorized_keys`, '
+         '`docker` grupės, katalogo taikinyje, host key (`sudo -u setup -H ssh-keygen -R server.example.lt`) ir Access keys.',
+         blocks=((None, ('sudo bin/remove-project --check shop_docker', 'sudo bin/remove-project shop_docker')),),
+         source='README „Eiga“, 5 žingsnis'),
+)
+
 
 def guide_values(query, status_data):
     """(choice, values, errors, given, key known): the chosen options, the values steps fill in, what was not accepted
@@ -1365,6 +1486,17 @@ def guide_fill(text, values):
     for key, value in values.items():
         text = text.replace('{' + key + '}', value)
     return text
+
+
+def guide_step(step, values, link=''):
+    """One numbered step of the guide or the example: title and where, warning tape, text, commands and source."""
+    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', e(guide_fill(step.text, values)))
+    blocks = ''.join((f'<p class="block-label">{e(label)}</p>' if label else '') +
+                     f'<pre class="cmd">{e(guide_fill(chr(10).join(lines), values))}</pre>' for label, lines in step.blocks)
+    warning = f'<div class="tape"><span>{e(step.warning)}</span></div>' if step.warning else ''
+    source = f'<p class="source">Šaltinis: {e(step.source)}</p>' if step.source else ''
+    return (f'<li class="step{" is-warn" if step.warning else ""}"><h3>{e(guide_fill(step.title, values))}'
+            f'{badge(WHERE[step.where], "muted")}</h3>{warning}<p>{text}</p>{blocks}{link}{source}</li>')
 
 
 # --- HTML ----------------------------------------------------------------------------------------
@@ -2477,9 +2609,7 @@ class Page:
 
     # --- Instructions ---
     def instructions(self, choice, values, errors, given, key_known, complete):
-        def text(markup):
-            return re.sub(r'`([^`]+)`', r'<code>\1</code>', e(guide_fill(markup, values)))
-        selects = ''.join(
+        selects =''.join(
             f'<label><span>{e(label)}</span><select name="{key}">' +
             ''.join(f'<option value="{value}"{" selected" if choice[key] == value else ""}>{e(title)}</option>'
                     for value, title in options) + '</select></label>' for key, label, options in GUIDE_OPTIONS)
@@ -2491,7 +2621,8 @@ class Page:
         opened = ' open' if any(given[item.key] for item in GUIDE_FIELDS if item.more) else ''
         body = ('<p class="note">Ką padaryti serveryje, kad jis taptų projekto taikiniu (bin/add-project --target '
                 'ENV=ssh://VARTOTOJAS@SERVERIS/KELIAS). Rodomi tik tam pasirinkimui reikalingi laukai; užpildyti įrašomi '
-                'į komandas, tušti lieka DIDŽIOSIOMIS.</p>'
+                'į komandas, tušti lieka DIDŽIOSIOMIS. Viso projekto pridėjimas su tikrais vardais – '
+                '<a href="/instructions/example">pavyzdys</a>.</p>'
                 f'<form class="action guide-form" method="get" action="/instructions"><div class="guide">{selects}{required}</div>'
                 f'<details class="more"{opened}><summary>Nebūtina: pakeisti numatytas reikšmes</summary>'
                 f'<div class="inner guide">{optional}</div></details>'
@@ -2507,19 +2638,22 @@ class Page:
                                                   for key, label in labels.items()) +
                  f'<span class="note">{len(steps)} {steps_word(len(steps))}</span></div><ol class="steps">')
         for step in steps:
-            blocks = ''.join((f'<p class="block-label">{e(label)}</p>' if label else '') +
-                             f'<pre class="cmd">{e(guide_fill(chr(10).join(lines), values))}</pre>' for label, lines in step.blocks)
             link = ''
             if step.link and complete:
                 target = f'{choice["env"]}=ssh://{values["user"]}@{values["host"]}{values["path"]}'
                 if TARGET.fullmatch(target):
                     link = (f'<p><a class="btn" href="/actions?target={e(quote(target, safe=""))}#add-project">'
                             'Atidaryti formą su šiuo taikiniu</a></p>')
-            warning = f'<div class="tape"><span>{e(step.warning)}</span></div>' if step.warning else ''
-            source = f'<p class="source">Šaltinis: {e(step.source)}</p>' if step.source else ''
-            body += (f'<li class="step{" is-warn" if step.warning else ""}"><h3>{e(guide_fill(step.title, values))}'
-                     f'{badge(WHERE[step.where], "muted")}</h3>{warning}<p>{text(step.text)}</p>{blocks}{link}{source}</li>')
+            body += guide_step(step, values, link)
         return self.layout('Instrukcijos: serverio paruošimas', body + '</ol>', section='instructions')
+
+    def instructions_example(self):
+        values = {'root': str(ROOT)}
+        intro = re.sub(r'`([^`]+)`', r'<code>\1</code>', e(EXAMPLE_INTRO))
+        body = (f'<p class="note">{intro}</p><p><a class="btn" href="/instructions">← Serverio paruošimas</a></p>'
+                f'<div class="chosen"><span class="note">{len(EXAMPLE)} {steps_word(len(EXAMPLE))}</span></div>'
+                '<ol class="steps">' + ''.join(guide_step(step, values) for step in EXAMPLE) + '</ol>')
+        return self.layout('Instrukcijos: projekto pridėjimo pavyzdys', body, section='instructions')
 
     # --- Access: developer keys and what each may reach ---
     @staticmethod
@@ -3405,6 +3539,8 @@ def handler(user, stored):
             if path == '/instructions':
                 data, _ = status()
                 return self.reply(200, page.instructions(*guide_values(query, data)))
+            if path == '/instructions/example':
+                return self.reply(200, page.instructions_example())
             if path == '/logs':
                 recent = []
                 for directory in jobs(20):

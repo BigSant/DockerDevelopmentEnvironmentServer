@@ -1366,6 +1366,23 @@ class WebUiTest(Worker):
         self.assertIn("LOCALHOST_PORT=80", public, "a public site without a panel takes 80/443, whatever the port field says")
         self.assertIn("Netinkama reikšmė lauke „Projekto port&#x27;as“", self.instructions(port="70000"))
 
+    def test_the_example_walks_through_adding_a_project(self):
+        self.assertIn('href="/instructions/example"', self.instructions())
+        status, _, body = self.request("GET", "/instructions/example")
+        self.assertEqual(status, 200, body)
+        self.assertIn('class="btn on" href="/instructions"', body, "the example belongs to the instructions section")
+        for text in ("bin/update --check --server-ref origin/master --setup-ref vX.Y.Z", "df -h /home",
+                     "usermod -aG docker shopuser", "sudo -u shopuser -H mkdir -p /home/shopuser/docker/shop",
+                     "Access keys", "Host key verification failed", "ssh-keyscan -t ed25519 server.example.lt",
+                     "--target stage=ssh://shopuser@server.example.lt/home/shopuser/docker/shop",
+                     "git@ssh.bitbucket.org:imone/shop_docker.git git@ssh.bitbucket.org:imone/shop.git",
+                     "Alias /shop /var/www/html", "ProxyPass /shop/ http://127.0.0.1:3045/shop/",
+                     "sudo bin/remove-project --check shop_docker", "16 žingsnių"):
+            with self.subTest(text=text):
+                self.assertIn(text, body)
+        self.assertIn(f"{self.tree.root}/.ssh/id_ed25519.pub", body, "the worker's own root, not a fixed path")
+        self.assertNotIn("{root}", body)
+
     def test_the_instructions_refuse_bad_values_and_show_the_workers_key(self):
         ssh = self.tree.root / ".ssh"
         ssh.mkdir()
