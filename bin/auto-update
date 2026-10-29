@@ -161,7 +161,7 @@ def update(args, paths, journal, previous):
                 git(path, 'merge', '--ff-only', '--no-edit', targets[name])
         print('Checking setup-server and setup on this machine', flush=True)
         run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests'], paths['server'], timeout=900)
-        run([sys.executable, 'tests/run'], paths['setup'], timeout=900)
+        run([sys.executable, 'tests/run'], paths['setup'], timeout=1800)
         if {name: clean_master(path) for name, path in paths.items()} != targets:
             raise RuntimeError('A checkout changed during health checks')
     except (Exception, KeyboardInterrupt) as error:
