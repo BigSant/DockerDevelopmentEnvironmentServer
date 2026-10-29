@@ -467,7 +467,8 @@ Kai kuriuos kodo medžio failus rašo pati parduotuvė taikinyje, o git'e jų n�
 išvardija setup kintamuoju `BACKUP_FILE_PATHS` (kaip `DEPLOY_PROTECTED_PATHS`: keliai nuo kodo šaknies, per tarpą, katalogas
 baigiasi `/`, leidžiamas `*`), o worker'is kas naktį juos parsisiunčia ir laiko kopijas. PrestaShop projektui (`PROFILE=prestashop`)
 nieko nustatyti nereikia: setup 4.0.0+ profilis visada kopijuoja vertimus (`modules/*/translations/`,
-`themes/*/modules/*/translations/` ir kalbų paketus `translations/*-*/`), o `BACKUP_FILE_PATHS` prideda projekto kelius:
+`themes/*/modules/*/translations/` ir kalbų paketus `translations/*-*/`; setup 5.3.0+ – ir laiškų temas `mails/*/lang.php`,
+`themes/*/mails/*/lang.php`), o `BACKUP_FILE_PATHS` prideda projekto kelius:
 
 ```dotenv
 # env/common.env (env/<env>.env reikšmė laimi)

@@ -332,8 +332,9 @@ class ServerStatusTest(Worker):
         (asana / "env/prod.env").write_text("PROFILE=prestashop\n")
         data = json.loads(self.status().stdout)
         prod = next(item for item in data["projects"] if item["name"] == "asana_tracker")["environments"]["prod"]
-        self.assertEqual(prod["file_paths"], ["modules/*/translations/", "themes/*/modules/*/translations/", "translations/*-*/",
-                                              "config/local.php"], "the PrestaShop profile's first, each path once")
+        self.assertEqual(prod["file_paths"], ["modules/*/translations/", "themes/*/modules/*/translations/", "mails/*/lang.php",
+                                              "themes/*/mails/*/lang.php", "translations/*-*/", "config/local.php"],
+                         "the PrestaShop profile's first, each path once")
         self.assertEqual(prod["files_backups"]["count"], 2)
         self.assertEqual(prod["files_backups"]["newest"]["name"], newest)
         self.assertEqual([item["name"] for item in prod["backup_files"] if item["kind"] == "files"], [newest, older])

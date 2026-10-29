@@ -340,7 +340,8 @@ class BackupProjectsTest(ScriptTest):
         profile = self.run_script("backup-projects", "--check", "--files", "other")
         self.assertEqual(profile.returncode, 0, profile.stdout + profile.stderr)
         self.assertIn("would back up other prod", profile.stdout)
-        self.assertIn("paths: modules/*/translations/ themes/*/modules/*/translations/ translations/*-*/", profile.stdout)
+        self.assertIn("paths: modules/*/translations/ themes/*/modules/*/translations/ mails/*/lang.php "
+                      "themes/*/mails/*/lang.php translations/*-*/", profile.stdout)
         # A developer's fresh one (bin/backup-pull fresh … files) joins the series; a recent one is handed out.
         os.environ["SETUP_SERVER_BACKUP_TIME"] = "20261009T120000"
         hour_ago = datetime.now().timestamp() - 3600  # older than the 30 minutes a fresh one reuses

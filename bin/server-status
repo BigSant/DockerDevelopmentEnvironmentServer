@@ -89,7 +89,8 @@ MEMBER = re.compile(r'[^\x00-\x1f\x7f]{1,1024}')
 # A BACKUP_FILE_PATHS entry as setup accepts it (a code-tree path, `*` allowed); only such entries are shown.
 FILE_PATH = re.compile(r'/?[A-Za-z0-9._*-]+(/[A-Za-z0-9._*-]+)*/?')
 # The paths setup's PrestaShop profile always backs up (setup 4.0.0+), before a project's BACKUP_FILE_PATHS.
-PRESTASHOP_FILE_PATHS = ('modules/*/translations/', 'themes/*/modules/*/translations/', 'translations/*-*/')
+PRESTASHOP_FILE_PATHS = ('modules/*/translations/', 'themes/*/modules/*/translations/', 'mails/*/lang.php',
+                         'themes/*/mails/*/lang.php', 'translations/*-*/')
 PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 
 

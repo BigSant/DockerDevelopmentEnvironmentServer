@@ -186,7 +186,8 @@ def backups(metrics, found, now):
 
 
 # The paths setup's PrestaShop profile always backs up (setup 4.0.0+), before a project's BACKUP_FILE_PATHS.
-PRESTASHOP_FILE_PATHS = ('modules/*/translations/', 'themes/*/modules/*/translations/', 'translations/*-*/')
+PRESTASHOP_FILE_PATHS = ('modules/*/translations/', 'themes/*/modules/*/translations/', 'mails/*/lang.php',
+                         'themes/*/mails/*/lang.php', 'translations/*-*/')
 
 
 def files_declared(directory, environment):
