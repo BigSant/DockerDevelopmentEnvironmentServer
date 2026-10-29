@@ -1321,7 +1321,8 @@ class WebUiTest(Worker):
         default = self.instructions()
         for text in ("Ubuntu 22.04 / 24.04", "apt-get install -y rsync", "download.docker.com/linux/ubuntu", "Domenas DirectAdmin",
                      "Custom HTTPD Configurations", "ProxyPass / http://127.0.0.1:8081/", "LOCALHOST_PORT_SSL=8082",
-                     "PMA_ALLOWED_IPS=&quot;BIURO_IP&quot;", "Deployments → <code>Production</code>", "žingsnių"):
+                     "PMA_ALLOWED_IPS=&quot;BIURO_IP&quot;", "Deployments → <code>Production</code>", "žingsnių",
+                     "Kokia OS ir architektūra", ". /etc/os-release &amp;&amp; echo", "uname -m"):
             with self.subTest(text=text):
                 self.assertIn(text, default)
         self.assertNotRegex(default, r"\nALLOWED_IPS=", "prod: per-tool lists, not the site-wide one")
@@ -1378,7 +1379,8 @@ class WebUiTest(Worker):
                      "--target stage=ssh://shopuser@server.example.lt/home/shopuser/docker/shop",
                      "git@ssh.bitbucket.org:imone/shop_docker.git git@ssh.bitbucket.org:imone/shop.git",
                      "Alias /shop /var/www/html", "ProxyPass /shop/ http://127.0.0.1:3045/shop/",
-                     "sudo bin/remove-project --check shop_docker", "16 žingsnių"):
+                     "sudo bin/remove-project --check shop_docker", "Kokia OS ir architektūra",
+                     "17 žingsnių"):
             with self.subTest(text=text):
                 self.assertIn(text, body)
         self.assertIn(f"{self.tree.root}/.ssh/id_ed25519.pub", body, "the worker's own root, not a fixed path")

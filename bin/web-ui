@@ -1141,6 +1141,12 @@ class Step:
 
 APT, DNF = ('ubuntu', 'debian'), ('centos',)
 GUIDE = (
+    Step('Kokia OS ir architektūra', 'target',
+         'Pagal `ID` ir `VERSION_ID` pasirink OS formoje: `ubuntu` 22.04 ar 24.04, `debian` 12, `centos`, `almalinux` ar '
+         '`rocky` – trečias variantas. `uname -m` turi sutapti su worker\'io (`x86_64`): image\'ai kuriami worker\'yje ir '
+         'perduodami per SSH (`docker save | docker load`), kitos architektūros taikinys jų nepaleis.',
+         blocks=((None, ('. /etc/os-release && echo "$PRETTY_NAME (ID=$ID VERSION_ID=$VERSION_ID)"', 'uname -m')),),
+         source='bin/prepare-host:11,50; setup doc/lt/09-aplinkos.md „D modelis“'),
     Step('Ši OS setup\'e netestuota', 'target',
          'setup dokumentacija reikalauja Debian/Ubuntu tipo serverio, o bin/prepare-host – Ubuntu 22.04+. Žemiau – bendri '
          'Docker žingsniai šiai OS; SELinux ir firewalld setup netikrina. Pirmą deploy\'ų daryk į stage.',
@@ -1307,6 +1313,12 @@ EXAMPLE_INTRO = ('Pavyzdys: PrestaShop parduotuvė su aplinkos repo `imone/shop_
                  'poaplankyje `/shop/`, laiškai – į Mailpit. Savam projektui pakeisk vardus; žingsniai pagal OS, skydelį ir '
                  'sertifikatą – vedlyje „Serverio paruošimas“.')
 EXAMPLE = (
+    Step('Kokia OS ir architektūra', 'target',
+         'Pagal `ID` ir `VERSION_ID` pasirink OS formoje: `ubuntu` 22.04 ar 24.04, `debian` 12, `centos`, `almalinux` ar '
+         '`rocky` – trečias variantas. `uname -m` turi sutapti su worker\'io (`x86_64`): image\'ai kuriami worker\'yje ir '
+         'perduodami per SSH (`docker save | docker load`), kitos architektūros taikinys jų nepaleis.',
+         blocks=((None, ('. /etc/os-release && echo "$PRETTY_NAME (ID=$ID VERSION_ID=$VERSION_ID)"', 'uname -m')),),
+         source='bin/prepare-host:11,50; setup doc/lt/09-aplinkos.md „D modelis“'),
     Step('setup-server ir setup versijos', 'worker',
          'Projektas nurodo seniausią tinkamą setup (`SETUP_MIN_VERSION` faile `env/common.env`). Atnaujink abu checkout\'us '
          'prieš registruodamas; tą patį daro puslapis „Atnaujinimas“.',
