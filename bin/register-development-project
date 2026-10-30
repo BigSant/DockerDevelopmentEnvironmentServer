@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Register an existing DDE monorepo without cloning, moving it or changing its private configuration."""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+
+
+def register(root, name, checkout):
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', name):
+        raise ValueError('Invalid project name')
+    checkout = checkout.resolve(strict=True)
+    app = checkout / 'app'
+    if not (checkout / '.git').is_dir() or not (app / 'Makefile').is_file() or not (app / 'env/local.env').is_file():
+        raise ValueError('Expected an existing Git checkout with app/Makefile and private app/env/local.env')
+    subprocess.run(['git', '-C', str(checkout), 'rev-parse', '--verify', 'origin/master'], check=True, stdout=subprocess.DEVNULL)
+    build = root / 'projects' / name
+    build.mkdir(parents=True, exist_ok=True, mode=0o750)
+    if build.is_symlink():
+        raise ValueError('Build root must not be a symlink')
+    link = build / 'app'
+    if link.exists() or link.is_symlink():
+        if not link.is_symlink() or link.resolve() != app:
+            raise ValueError('Refusing to replace existing project')
+    else:
+        link.symlink_to(app, target_is_directory=True)
+    descriptor = build / 'development.json'
+    content = json.dumps({'version': 1, 'checkout': str(checkout)}, indent=2) + '\n'
+    if descriptor.exists() and descriptor.read_text() != content:
+        raise ValueError('Conflicting development registration')
+    descriptor.write_text(content)
+    descriptor.chmod(0o640)
+    return build
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('name')
+    parser.add_argument('checkout', type=Path)
+    args = parser.parse_args()
+    try:
+        print(register(Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server')), args.name, args.checkout))
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        parser.exit(1, str(error) + '\n')

@@ -999,6 +999,15 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 OPENER = urllib.request.build_opener(NoRedirect)
 
 
+def github_actions_link(entry):
+    match = re.fullmatch(r'(?:git@github\.com:|https://github\.com/)([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)',
+                         entry.get('repository') or '')
+    if not match:
+        return None
+    repository = match[2].removesuffix('.git')
+    return f'https://github.com/{quote(match[1])}/{quote(repository)}/actions'
+
+
 def bitbucket_repository(url):
     match = BITBUCKET_URL.fullmatch(url.strip())
     return (match[1], match[2]) if match else None
@@ -2033,7 +2042,7 @@ def environment_kind(state):
     newest = (state.get('backups') or {}).get('newest')
     unhealthy = any(item.get('health') == 'unhealthy' for item in state.get('containers', []))
     if (deploys.get('last') or {}).get('failed') or state.get('secrets') == 'stopped' or unhealthy or \
-            (state.get('declared') and (not newest or time.time() - newest['time'] >= 26 * 3600)):
+            (state.get('declared') and not state.get('development') and (not newest or time.time() - newest['time'] >= 26 * 3600)):
         return 'bad'
     return 'ok' if state.get('declared') else 'idle'
 
@@ -2052,7 +2061,7 @@ def environment_order(name):
 def access_columns(data):
     """[(project, env)] a key may be granted: every environment the status shows, and any a key already has."""
     found = {(entry['name'], environment) for entry in (data or {}).get('projects', [])
-             for environment in entry.get('environments', {})}
+             for environment, state in entry.get('environments', {}).items() if not state.get('development')}
     found |= {(grant['project'], grant['environment']) for key in (data or {}).get('keys', [])
               for grant in key.get('grants', []) + key.get('pulls', [])}
     return sorted(found, key=lambda item: (item[0], environment_order(item[1])))
@@ -2278,7 +2287,7 @@ class Page:
                 if unhealthy:
                     items.append(('bad', f'{where}: nesveiki {e(", ".join(unhealthy))}', link))
                 newest = (state.get('backups') or {}).get('newest')
-                if state.get('declared') and (not newest or time.time() - newest['time'] >= 26 * 3600):
+                if state.get('declared') and not state.get('development') and (not newest or time.time() - newest['time'] >= 26 * 3600):
                     items.append(('bad', f'{where}: naujausia kopija ' + (e(ago(newest['time'])) if newest else 'nėra'), link))
                 newest = (state.get('files_backups') or {}).get('newest')
                 if state.get('declared') and state.get('file_paths') and installed(units, 'setup-server-backup-files.timer') and \
@@ -2303,7 +2312,8 @@ class Page:
                 found, error = pipeline_runs(entry['name'], repository)
                 runs = self.run_cell(found[0], repository) if found else e(error) if error else 'dar nebuvo'
             elif entry.get('repository'):
-                runs = '<span class="muted">GitHub: dar nepalaikoma</span>'
+                link = github_actions_link(entry)
+                runs = f'<a href="{e(link)}">GitHub Actions</a>' if link else '—'
             for index, (environment, state) in enumerate(environments.items()):
                 first = index == 0
                 cells = (f'<td class="project"><a href="/project/{e(entry["name"])}">{e(entry["name"])}</a>'
@@ -2329,6 +2339,8 @@ class Page:
 
     @staticmethod
     def target(entry, environment):
+        if entry.get('environments', {}).get(environment, {}).get('development'):
+            return 'šis serveris · kūrimo aplinka'
         targets = entry.get('targets', {})
         values = {**targets.get('all', {}), **targets.get(environment, {})}
         if not values:
@@ -2354,6 +2366,8 @@ class Page:
 
     @staticmethod
     def backup_cell(state):
+        if state.get('development'):
+            return '<span class="muted">programos recovery kopijos</span>'
         backups = state.get('backups') or {}
         newest = backups.get('newest')
         if not newest:
@@ -2383,6 +2397,8 @@ class Page:
 
     @staticmethod
     def secrets_cell(state):
+        if state.get('development'):
+            return '<span class="muted">vietinė konfigūracija</span>'
         return {'running': badge('veikia', 'ok'), 'stopped': badge('sustojęs', 'bad')}.get(
             state.get('secrets'), badge('nėra', 'warn' if state.get('declared') else 'muted'))
 
@@ -2442,6 +2458,9 @@ class Page:
                              f'<td class="muted">{e(item["status"])}</td>'
                              f'<td><a class="btn" href="/project/{e(name)}/logs?env={e(quote(environment))}&amp;container={e(quote(item["name"]))}">'
                              'Rodyti</a></td></tr>' for item in state['containers']) + '</tbody></table>')
+            if state.get('development'):
+                body += '<p class="note">Kūrimo aplinkos kopijas valdo programa; serverio DB kopijavimo rolės čia netaikomos.</p>'
+                continue
             body += self.backup_list(state)
             body += '<div class="deck">' + self.form(
                 'backup-local', 'Kopija dabar serveryje',
@@ -2473,6 +2492,9 @@ class Page:
                 '</table><p class="note">Parsisiųsti: make db-pull (raktas – bin/add-backup-key).</p></div></details>')
 
     def pipelines(self, entry):
+        link = github_actions_link(entry)
+        if link:
+            return f'<p><a class="btn" href="{e(link)}">GitHub Actions: paleidimai ir žurnalai</a></p>'
         repository = bitbucket_repository(entry.get('repository') or '')
         if repository is None:
             return ('<div class="callout warn"><p>Pipeline\'ų paleidimas – tik Bitbucket projektams; GitHub dar nepalaikomas. '
@@ -3565,7 +3587,7 @@ def handler(user, stored):
             if match:
                 environment, container = query.get('env', [''])[0], query.get('container', [''])[0]
                 lines = query.get('lines', [CONTAINER_LINES[0]])[0]
-                if not ENVIRONMENT.fullmatch(environment) or not CONTAINER.fullmatch(container) or lines not in CONTAINER_LINES:
+                if not (ENVIRONMENT.fullmatch(environment) or environment == 'local') or not CONTAINER.fullmatch(container) or lines not in CONTAINER_LINES:
                     return self.reply(400, page.invalid('Netinkama aplinka, konteineris ar eilučių skaičius.'))
                 data, error = helper('--container-logs', match[1], environment, container, lines)
                 return self.reply(200, page.container_logs(match[1], environment, container, lines, data, error))

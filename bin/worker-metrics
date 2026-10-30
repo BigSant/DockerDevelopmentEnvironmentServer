@@ -119,6 +119,24 @@ def server_environments(directory):
     return ENVIRONMENTS + tuple(dict.fromkeys(extra))
 
 
+def development_checkout(build_root):
+    """An explicitly registered monorepo; never infer local access from an arbitrary symlink."""
+    try:
+        registration = json.loads((build_root / 'development.json').read_text())
+        checkout = Path(registration['checkout'])
+        if registration.get('version') != 1 or not checkout.is_absolute() or not (checkout / '.git').is_dir():
+            return None
+        if (build_root / 'app').resolve() != (checkout / 'app').resolve():
+            return None
+        return checkout
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def registered_environments(build_root, directory):
+    return ('local',) if development_checkout(build_root) else server_environments(directory)
+
+
 def environment_directory(build_root):
     """The environment repository of a build root: app/, or app/docker/ in older layouts."""
     for directory in (build_root / 'app', build_root / 'app/docker'):
@@ -219,7 +237,7 @@ def deploys(metrics, found, now):
     at, rollback, and "failed": "after-rsync" when the code reached the target but the deploy stopped)."""
     complete = True
     for name, directory in found:
-        for environment in server_environments(directory):
+        for environment in registered_environments(PROJECTS / name, directory):
             path = directory / f'.generated/release/{environment}/deployments.json'
             try:
                 if not path.is_file():

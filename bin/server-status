@@ -116,6 +116,24 @@ def server_environments(directory):
     return ENVIRONMENTS + tuple(dict.fromkeys(extra))
 
 
+def development_checkout(build_root):
+    """An explicitly registered monorepo; never infer local access from an arbitrary symlink."""
+    try:
+        registration = json.loads((build_root / 'development.json').read_text())
+        checkout = Path(registration['checkout'])
+        if registration.get('version') != 1 or not checkout.is_absolute() or not (checkout / '.git').is_dir():
+            return None
+        if (build_root / 'app').resolve() != (checkout / 'app').resolve():
+            return None
+        return checkout
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def registered_environments(build_root, directory):
+    return ('local',) if development_checkout(build_root) else server_environments(directory)
+
+
 def environment_directory(build_root):
     """The environment repository of a build root: app/, or app/docker/ in older layouts."""
     for directory in (build_root / 'app', build_root / 'app/docker'):
@@ -345,14 +363,14 @@ def project(build_root, errors):
         errors.append(f'{name}: no environment repository (app/ with a Makefile and env/)')
         return entry
     entry['layout'] = str(directory.relative_to(build_root))
-    checkout = build_root / 'app'
+    checkout = development_checkout(build_root) or build_root / 'app'
     entry['repository'] = origin(checkout)
     entry['branch'] = default_branch(checkout)
     entry['code_repository'] = origin(checkout / 'public') if (checkout / 'public/.git').exists() else None
     common = {**parse_env(read_text(directory / 'env/common.env'))}
     entry['project_name'] = common.get('PROJECT_NAME') if NAME.fullmatch(common.get('PROJECT_NAME', '')) else name
     # The deploy target bin/add-project registered: target.env for both, target.<env>.env for one.
-    environments = server_environments(directory)
+    environments = registered_environments(build_root, directory)
     targets = {'': parse_env(read_text(build_root / 'target.env'))}
     for environment in environments:
         targets[environment] = parse_env(read_text(build_root / f'target.{environment}.env'))
@@ -365,6 +383,7 @@ def project(build_root, errors):
         state = {'declared': declared, 'compose_project': f"{entry['project_name']}-{environment}",
                  'context': values.get('DEPLOY_CONTEXT') or 'default', 'deploys': None, 'backups': None,
                  'full_backups': None, 'fresh_backups': None, 'files_backups': None, 'backup_files': [],
+                 'development': development_checkout(build_root) is not None,
                  'file_paths': list(dict.fromkeys([*(PRESTASHOP_FILE_PATHS if values.get('PROFILE') == 'prestashop' else ()),
                                                    *(item for item in (values.get('BACKUP_FILE_PATHS') or '').split()
                                                      if FILE_PATH.fullmatch(item))]))[:50],
@@ -852,7 +871,7 @@ def main(arguments):
     elif arguments[:1] == ['--container-logs'] and len(arguments) in (4, 5):
         name, environment, container = arguments[1:4]
         count = arguments[4] if len(arguments) == 5 else str(CONTAINER_LINES)
-        if not NAME.fullmatch(name) or not ENVIRONMENT.fullmatch(environment) or \
+        if not NAME.fullmatch(name) or not (ENVIRONMENT.fullmatch(environment) or environment == 'local') or \
                 not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', container) or \
                 not count.isdigit() or not 1 <= int(count) <= MAXIMUM_CONTAINER_LINES:
             print(f'Expected PROJECT ENV CONTAINER [LINES 1 to {MAXIMUM_CONTAINER_LINES}]', file=sys.stderr)
