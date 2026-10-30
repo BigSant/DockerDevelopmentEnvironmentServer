@@ -2033,7 +2033,7 @@ def environment_kind(state):
     newest = (state.get('backups') or {}).get('newest')
     unhealthy = any(item.get('health') == 'unhealthy' for item in state.get('containers', []))
     if (deploys.get('last') or {}).get('failed') or state.get('secrets') == 'stopped' or unhealthy or \
-            (state.get('declared') and (not newest or time.time() - newest['time'] >= 26 * 3600)):
+            (state.get('declared') and not state.get('development') and (not newest or time.time() - newest['time'] >= 26 * 3600)):
         return 'bad'
     return 'ok' if state.get('declared') else 'idle'
 
@@ -2052,7 +2052,7 @@ def environment_order(name):
 def access_columns(data):
     """[(project, env)] a key may be granted: every environment the status shows, and any a key already has."""
     found = {(entry['name'], environment) for entry in (data or {}).get('projects', [])
-             for environment in entry.get('environments', {})}
+             for environment, state in entry.get('environments', {}).items() if not state.get('development')}
     found |= {(grant['project'], grant['environment']) for key in (data or {}).get('keys', [])
               for grant in key.get('grants', []) + key.get('pulls', [])}
     return sorted(found, key=lambda item: (item[0], environment_order(item[1])))

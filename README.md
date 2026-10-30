@@ -1214,3 +1214,13 @@ python3 -m unittest discover -s tests                                    # be ro
 SETUP_SERVER_UBUNTU_IMAGE=ubuntu:24.04 python3 -m unittest discover -s tests   # + tikras Ubuntu konteineris
 SETUP_PROMTOOL_IMAGE=prom/prometheus:latest python3 -m unittest discover -s tests  # + metrikų formato patikra (be promtool)
 ```
+
+### Esama vietinė monorepo kūrimo aplinka
+
+Kai DDE failai yra monorepo `app/`, o kodas `app/public/`, nenaudok `add-project` klonavimui į jau veikiantį katalogą. Vykdyk kaip jo savininkas:
+
+```sh
+SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server bin/register-development-project ai-os /home/tomas/Projects/ai-os
+```
+
+Registracija sukuria `projects/ai-os/app` nuorodą ir `development.json`; kodas, privatūs env ir DB neperkeliami. Web apžvalga rodo `local` konteinerius, jų žurnalus ir DDE formato diegimų istoriją; deployment metrikos taip pat skaitomos. Tai nesuteikia serverinių SSH, DB kopijavimo ar atsarginių kopijų teisių `local` aplinkai. AI OS naudoja savo šifruotas recovery kopijas. CI/CD vykdo šio repo atskiras GitHub runner (`bin/install-runner --provider github`); konkretaus produkto diegimą aprašo produkto pipeline ir jo DDE komandos.

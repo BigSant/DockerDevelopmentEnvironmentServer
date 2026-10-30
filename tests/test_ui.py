@@ -171,6 +171,31 @@ class ServerStatusTest(Worker):
                                      "SETUP_SERVER_ROOT": str(self.tree.root), "SETUP_SERVER_LIBRARY": str(self.library)})
         return result
 
+    def test_registered_monorepo_is_visible_as_local_without_server_access(self):
+        checkout = self.tree.root / "development-checkout"
+        app = checkout / "app"
+        (app / "env").mkdir(parents=True)
+        (app / "Makefile").write_text("include $(SETUP_DIRECTORY)/docker/project.mk\n")
+        (app / "env/common.env").write_text("PROJECT_NAME=ai-os-dev\n")
+        (app / "env/local.env").write_text("DOMAIN=localhost\nPASSWORD=never-export-this\n")
+        (checkout / ".git").mkdir()
+        (checkout / ".git/config").write_text('[remote "origin"]\n url = git@github.com:BigSant/ai-os.git\n')
+        build = self.tree.projects / "ai-os"
+        build.mkdir()
+        (build / "app").symlink_to(app, target_is_directory=True)
+        (build / "development.json").write_text(json.dumps({"version": 1, "checkout": str(checkout)}))
+        result = self.status()
+        self.assertNotIn("never-export-this", result.stdout)
+        project = next(p for p in json.loads(result.stdout)["projects"] if p["name"] == "ai-os")
+        self.assertEqual(project["repository"], "git@github.com:BigSant/ai-os.git")
+        self.assertEqual(list(project["environments"]), ["local"])
+        self.assertTrue(project["environments"]["local"]["development"])
+        self.assertEqual(project["environments"]["local"]["compose_project"], "ai-os-dev-local")
+        # An invalid descriptor must not turn an unrelated checkout into a local project.
+        (build / "development.json").write_text(json.dumps({"version": 1, "checkout": str(checkout.parent)}))
+        project = next(p for p in json.loads(self.status().stdout)["projects"] if p["name"] == "ai-os")
+        self.assertNotIn("local", project["environments"])
+
     def test_the_overview_comes_from_the_build_roots_docker_and_systemd(self):
         self.library.mkdir()
         (self.library / "install.env").write_text(f"VERSION=v0.4.0\nCHECKOUT={ROOT}\nADMIN={getpass.getuser()}\n")
