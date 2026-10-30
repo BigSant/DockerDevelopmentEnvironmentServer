@@ -9,7 +9,7 @@ import subprocess
 
 
 def register(root, name, checkout):
-    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]*', name):
+    if not re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', name):
         raise ValueError('Invalid project name')
     checkout = checkout.resolve(strict=True)
     app = checkout / 'app'

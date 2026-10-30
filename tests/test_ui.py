@@ -191,6 +191,11 @@ class ServerStatusTest(Worker):
         self.assertEqual(list(project["environments"]), ["local"])
         self.assertTrue(project["environments"]["local"]["development"])
         self.assertEqual(project["environments"]["local"]["compose_project"], "ai-os-dev-local")
+        view = load_web_ui()
+        self.assertEqual(view.Page.target(project, 'local'), 'šis serveris · kūrimo aplinka')
+        self.assertEqual(view.github_actions_link(project), 'https://github.com/BigSant/ai-os/actions')
+        self.assertIsNone(view.github_actions_link({'repository': 'https://example.invalid/steal'}))
+        self.assertNotIn(('ai-os', 'local'), view.access_columns({'projects': [project]}))
         # An invalid descriptor must not turn an unrelated checkout into a local project.
         (build / "development.json").write_text(json.dumps({"version": 1, "checkout": str(checkout.parent)}))
         project = next(p for p in json.loads(self.status().stdout)["projects"] if p["name"] == "ai-os")

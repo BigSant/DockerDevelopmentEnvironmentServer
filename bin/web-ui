@@ -2339,6 +2339,8 @@ class Page:
 
     @staticmethod
     def target(entry, environment):
+        if entry.get('environments', {}).get(environment, {}).get('development'):
+            return 'šis serveris · kūrimo aplinka'
         targets = entry.get('targets', {})
         values = {**targets.get('all', {}), **targets.get(environment, {})}
         if not values:
