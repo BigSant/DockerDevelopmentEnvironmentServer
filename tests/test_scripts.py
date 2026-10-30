@@ -9,6 +9,7 @@ import getpass
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -462,6 +463,17 @@ class InstallGitHubRunnerRootTest(ScriptTest):
         self.assertEqual((self.root / "dependencies.calls").read_text(), "installed\n")
         self.assertIn("take a new one and run this again", result.stderr)
         self.assertFalse(self.template.exists(), "no service without a registration")
+
+    def test_large_library_cache_does_not_misdiagnose_installed_icu(self):
+        (self.root / "systemd").mkdir()
+        # grep -q exits at the first match; a real ldconfig can then get SIGPIPE.
+        # Under the installer's pipefail that incorrectly selects dependency installation.
+        writer = shlex.join([shutil.which('python3'), '-c',
+                             "import sys; sys.stdout.write('libother.so => /lib/libother.so\\n' * 100000)"])
+        self.stub("ldconfig", 'echo "libicuuc.so.74 => /lib/libicuuc.so.74"\nexec ' + writer + '\n')
+        result = self.install("--sha256", self.sha256)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((self.root / "dependencies.calls").exists(), "installed ICU must not trigger package installation")
 
 
 class AddProjectTest(ScriptTest):

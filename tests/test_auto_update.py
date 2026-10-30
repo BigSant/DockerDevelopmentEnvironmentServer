@@ -239,7 +239,13 @@ class AutoUpdateTest(unittest.TestCase):
         tested = self.advance('server', publish=False)
         workflow = (ROOT / '.github/workflows/tests.yml').read_text()
         step = workflow.split('      - name: Publish only the tested master commit\n', 1)[1]
-        script = textwrap.dedent(step.split('        run: |\n', 1)[1])
+        body = step.split('        run: |\n', 1)[1].splitlines(keepends=True)
+        lines = []
+        for line in body:
+            if line.strip() and not line.startswith('          '):
+                break
+            lines.append(line)
+        script = textwrap.dedent(''.join(lines))
         environment = {**os.environ, 'TESTED': self.before['server']}
         result = subprocess.run(['bash', '-c', script], cwd=source, env=environment, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)

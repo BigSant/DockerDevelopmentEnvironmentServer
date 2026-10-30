@@ -676,6 +676,15 @@ GitHub Actions patikrina `master` ir paskelbia tik patikrintą versiją šakoje 
   ir pastumia `deploy/local`. PR, nesėkmingas CI ir pasenęs patikros rezultatas kanalo nepastumia.
 
 Vietinis `setup-server-auto-update.timer` tikrina abu kanalus kas minutę (iki 10 s papildomo atidėjimo).
+
+Workflow taip pat turi priklausomą `local-update` job'ą: po `publish-local` jis vykdomas šios
+repozitorijos registruotame GitHub runner'yje su žymomis `[self-hosted, linux, setup.build]`.
+Jis paleidžia esamą `setup-server-auto-update.service`, palaukia jo pabaigos ir patikrina, kad abu vietiniai
+klonai švarūs, sutampa su CI patvirtintais kanalais ir turi workflow patikrintą commit'ą. Runner'io systemd
+paslauga perduoda `SETUP_SERVER_ROOT`; jo paskyrai turi būti leidžiama neinteraktyviai paleisti atnaujinimo
+paslaugą. Job'as nepaleidžiamas PR kodui. Neprijungus šios repozitorijos runner'io jis lauks eilėje;
+nepriklausomas timer'is lieka veikti ir tada, kai GitHub job'as negali pasiekti PC.
+
 Vietinėms patikroms turi būti paruošti Python 3.10+, Git, Make, Docker su Compose ir PHP CLI; installer'is
 trūkstamų paketų nediegia. CachyOS PHP CLI paketas — `php`.
 Jam reikia tik esamos neinteraktyvios Git SSH prieigos. GitHub API token'o, self-hosted runner'io ar įeinančio

@@ -198,7 +198,9 @@ github() {
         chown -R "$ACCOUNT:$ACCOUNT" "$directory"
         chmod 0750 "$directory"  # the archive's ./ entry (0755) replaced the mode
         # config.sh stops without ICU (and a few other libraries); the runner's own script installs them.
-        if ! ldconfig -p 2>/dev/null | grep -q 'libicu'; then
+        # Consume ldconfig's entire output: grep -q can SIGPIPE a large cache and,
+        # with pipefail, report missing ICU even though its line matched.
+        if ! ldconfig -p 2>/dev/null | grep 'libicu' >/dev/null; then
             echo "==> installing the runner's dependencies (its bin/installdependencies.sh)"
             "$directory/bin/installdependencies.sh"
         fi
