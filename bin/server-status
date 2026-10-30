@@ -871,7 +871,7 @@ def main(arguments):
     elif arguments[:1] == ['--container-logs'] and len(arguments) in (4, 5):
         name, environment, container = arguments[1:4]
         count = arguments[4] if len(arguments) == 5 else str(CONTAINER_LINES)
-        if not NAME.fullmatch(name) or not ENVIRONMENT.fullmatch(environment) or \
+        if not NAME.fullmatch(name) or not (ENVIRONMENT.fullmatch(environment) or environment == 'local') or \
                 not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', container) or \
                 not count.isdigit() or not 1 <= int(count) <= MAXIMUM_CONTAINER_LINES:
             print(f'Expected PROJECT ENV CONTAINER [LINES 1 to {MAXIMUM_CONTAINER_LINES}]', file=sys.stderr)

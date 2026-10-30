@@ -815,7 +815,7 @@ class WebUiTest(Worker):
         self.assertEqual(status, 200, body)
         for text in ("asana_tracker", "git@bitbucket.org:rsmaizys/asana_tracker.git", "v1.0.0", "rollback",
                      "laikoma 3", "2/3 veikia", "šis serveris", "deploy@shop.example:/home/deploy/shop",
-                     "GitHub: dar nepalaikoma", "v0.4.0", "nepavyko (exit-code)", "Tue 2026-10-13 00:30:00 UTC",
+                     "GitHub Actions", "v0.4.0", "nepavyko (exit-code)", "Tue 2026-10-13 00:30:00 UTC",
                      "GitHub runner&#x27;is bigsant", "#41"):
             self.assertIn(text, body)
         self.assertNotIn("never-shown-password", body)
@@ -824,7 +824,7 @@ class WebUiTest(Worker):
         self.assertEqual(status, 200)
         for text in ("asana-prod-php-fpm", "healthy", "asana-prod-cron", "asana-prod-secrets", "Deploy į prod", "Backup dabar"):
             self.assertIn(text, project)
-        self.assertIn("GitHub dar nepalaikomas", self.request("GET", "/project/forsena_docker")[2])
+        self.assertIn("https://github.com/BigSant/forsena_docker/actions", self.request("GET", "/project/forsena_docker")[2])
         self.assertEqual(self.request("GET", "/project/missing")[0], 404)
         self.assertEqual(self.request("GET", "/project/..%2Fetc")[0], 404)
         logs = self.request("GET", "/logs")[2]
