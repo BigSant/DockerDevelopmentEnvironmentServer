@@ -85,6 +85,25 @@ class AutoUpdateTest(unittest.TestCase):
     def status(self):
         return json.loads((self.state / 'status.json').read_text())
 
+    def test_service_waits_for_ci_lock_then_applies_the_approved_commits(self):
+        targets = {name: self.advance(name) for name in self.paths}
+        self.state.mkdir()
+        with (self.state / 'update.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            process = subprocess.Popen([sys.executable, str(ROOT / 'bin/auto-update'),
+                '--server-dir', str(self.paths['server']), '--setup-dir', str(self.paths['setup']),
+                '--state-dir', str(self.state), '--wait-lock'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    process.wait(timeout=0.2)
+                self.assertEqual(self.heads(), self.before)
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                output, error = process.communicate(timeout=45)
+        self.assertEqual(process.returncode, 0, output + error)
+        self.assertEqual(self.heads(), targets)
+        self.assertEqual(self.status()['result'], 'updated')
+
     def test_success_fast_forwards_both_master_branches_and_is_idempotent(self):
         targets = {name: self.advance(name) for name in self.paths}
         result = self.invoke()
@@ -218,6 +237,7 @@ class AutoUpdateTest(unittest.TestCase):
                                 capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Persistent=true', result.stdout)
+        self.assertIn('--wait-lock', result.stdout)
         self.assertIn('User=' + getpass.getuser(), result.stdout)
         self.assertIn('--setup-dir ' + str(self.paths['setup']), result.stdout)
         self.assertFalse(units.exists())

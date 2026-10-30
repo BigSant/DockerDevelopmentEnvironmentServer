@@ -50,7 +50,7 @@ Group=$group
 # Project/test artifacts use the normal readable modes; auto-update explicitly protects its journal.
 UMask=0022
 WorkingDirectory=$CHECKOUT
-ExecStart=/usr/bin/python3 $CHECKOUT/bin/auto-update --server-dir $CHECKOUT --setup-dir $SETUP --state-dir $STATE
+ExecStart=/usr/bin/python3 $CHECKOUT/bin/auto-update --server-dir $CHECKOUT --setup-dir $SETUP --state-dir $STATE --wait-lock
 TimeoutStartSec=50min
 TimeoutStopSec=2min
 KillMode=mixed
