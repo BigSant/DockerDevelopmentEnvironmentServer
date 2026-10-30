@@ -668,6 +668,13 @@ išvedamos komandos rankiniam atstatymui.
 
 ### Automatinis vietinių klonų atnaujinimas
 
+Visi `tests` workflow job'ai vykdomi šios repozitorijos vietiniame runner'yje
+`[self-hosted, linux, setup.build]`: testai, kanalo publikavimas ir vietinis atnaujinimas. Testai išlaiko
+Ubuntu 22.04 / Python 3.10 aplinką iš `tests/fixtures/ci.Dockerfile`, vykdomą Docker konteineryje šiame PC.
+Konteineris dirba su runner'io UID/GID; prijungiamas tik checkout, be Docker socket ar naudotojo namų katalogo.
+CI paleidžiamas kiekvienos repo šakos push ir rankiniu workflow_dispatch; PR patikros ateina iš šakos push.
+Išorinių fork PR workflow automatiškai nepaleidžia. Tik `master` push po testų gali skelbti kanalą ar atnaujinti aplinką.
+
 GitHub Actions patikrina `master` ir paskelbia tik patikrintą versiją šakoje `deploy/local`:
 
 - setup `Release` workflow po sėkmingo `Setup compatibility` vienu atominiu push paskelbia release commit'ą,
