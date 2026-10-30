@@ -191,6 +191,7 @@ def main():
     parser.add_argument('--server-dir', type=Path, default=server)
     parser.add_argument('--state-dir', type=Path, default=Path.home() / '.local/state/setup-server/auto-update')
     parser.add_argument('--check', action='store_true', help='fetch and show; do not move either checkout')
+    parser.add_argument('--wait-lock', action='store_true', help='wait for an active DDE CI/deployment before updating')
     parser.add_argument('--retry', action='store_true', help='retry a version that failed its health check')
     args = parser.parse_args()
     paths = {'server': args.server_dir.resolve(), 'setup': args.setup_dir.resolve()}
@@ -203,7 +204,7 @@ def main():
     journal = args.state_dir / 'status.json'
     with (args.state_dir / 'update.lock').open('a') as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_EX | (0 if args.wait_lock else fcntl.LOCK_NB))
         except BlockingIOError:
             print('Another update is already running', flush=True)
             return 0

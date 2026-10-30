@@ -1224,3 +1224,5 @@ SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server bin/register-develop
 ```
 
 Registracija sukuria `projects/ai-os/app` nuorodą ir `development.json`; kodas, privatūs env ir DB neperkeliami. Web apžvalga rodo `local` konteinerius, jų žurnalus, DDE formato diegimų istoriją ir nuorodą į GitHub Actions; deployment metrikos taip pat skaitomos. Tai nesuteikia serverinių SSH, DB kopijavimo ar atsarginių kopijų teisių `local` aplinkai. AI OS naudoja savo šifruotas recovery kopijas. CI/CD vykdo šio repo atskiras GitHub runner (`bin/install-runner --provider github`); konkretaus produkto diegimą aprašo produkto pipeline ir jo DDE komandos.
+
+Automatinio atnaujinimo systemd tarnyba naudoja `--wait-lock`: aktyvaus DDE CI ar diegimo užraktas atideda atnaujinimą, kol darbai baigiasi. Įprastas `bin/auto-update` be šios parinkties išlieka neblokuojantis. Jei naudojamas vietinis `ExecStartPost` įdiegtų kopijų atnaujinimui, jo `flock` taip pat turi laukti užrakto, o ne naudoti `-n`.
