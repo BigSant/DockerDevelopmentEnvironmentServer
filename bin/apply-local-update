@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Apply the CI-approved local versions, including a publish that arrived during another update."""
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+
+
+def git(directory, *arguments):
+    return subprocess.run(['git', '-C', str(directory), *arguments], capture_output=True, text=True, check=False)
+
+
+def apply(root, component, expected):
+    if component not in ('server', 'setup') or not re.fullmatch(r'[a-f0-9]{40}', expected):
+        raise ValueError('Expected setup/server and its full tested commit')
+    for attempt in range(3):
+        # start waits for the existing oneshot too; that invocation may predate this publish.
+        subprocess.run(['sudo', '-n', 'systemctl', 'start', 'setup-server-auto-update.service'], check=True)
+        state = json.loads((root / 'auto-update/status.json').read_text())
+        if state.get('result') not in ('updated', 'up_to_date'):
+            raise RuntimeError('Local update did not succeed; inspect the service journal')
+        heads = {}
+        for side, directory in state['paths'].items():
+            def value(*args):
+                result = git(directory, *args)
+                result.check_returncode()
+                return result.stdout.strip()
+            head = value('rev-parse', 'HEAD')
+            if head != state['targets'][side] or head != value('rev-parse', 'refs/remotes/origin/deploy/local'):
+                raise RuntimeError(side + ': checkout is not its recorded CI-approved version')
+            if value('status', '--porcelain', '--untracked-files=normal'):
+                raise RuntimeError(side + ': local edits appeared; verification stopped')
+            heads[side] = head
+        if git(state['paths'][component], 'cat-file', '-e', expected + '^{commit}').returncode:
+            print('The earlier update has not fetched this commit; starting the next update.', flush=True)
+            continue
+        result = git(state['paths'][component], 'merge-base', '--is-ancestor', expected, heads[component])
+        if result.returncode == 0:
+            print('Local checkouts, health checks and installed refresh succeeded:', heads)
+            return heads
+        if result.returncode != 1:
+            result.check_returncode()
+        print('An earlier update completed before this publish; applying the current approved versions.', flush=True)
+    raise RuntimeError('The tested commit was not applied after three completed update attempts')
+
+
+if __name__ == '__main__':
+    apply(Path(os.environ['SETUP_SERVER_ROOT']), os.environ['EXPECTED_COMPONENT'], os.environ['EXPECTED_COMMIT'])
