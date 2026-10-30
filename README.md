@@ -1230,3 +1230,5 @@ Automatinio atnaujinimo systemd tarnyba naudoja `--wait-lock`: aktyvaus DDE CI a
 Po `bin/auto-update` atnaujinimo pakartok `bin/install-auto-update` su tais pačiais `SETUP_SERVER_ROOT`, `SETUP_SERVER_USER`, `SETUP_DIRECTORY` ir `SETUP_SERVER_CHECKOUT`: vien Git pull nepakeičia jau įdiegtos systemd komandos. `systemctl cat setup-server-auto-update.service` turi rodyti `--wait-lock`; vietiniam įdiegtų kopijų `ExecStartPost` naudok `flock --wait 1800`, ne `flock -n`.
 
 CI žingsnis `bin/apply-local-update` palaukia tarnybos ir patikrina savo ištestuotą commit. Jei pasibaigęs atnaujinimas pradėtas dar prieš šį publikavimą, jis paleidžia kitą atnaujinimą (iki trijų bandymų, be aklo laukimo). Tikros sveikatos patikrų klaidos, vietiniai pakeitimai ar nepatvirtinta versija iškart sustabdo žingsnį. Tai apsaugo nuo klaidingai žalio seno diegimo ir nuo klaidos vien todėl, kad tarnyba jau vykdė ankstesnį darbą.
+
+Vietinės versijos tikrinimas ima bendrą skaitymo užraktą: kitas laikmačio atnaujinimas negali tarp būsenos failo ir Git HEAD/ref nuskaitymų pakeisti tikrinamos versijos.
