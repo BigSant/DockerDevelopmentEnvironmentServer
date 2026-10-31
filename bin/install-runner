@@ -26,10 +26,11 @@ tarball=
 provider=bitbucket
 sha256=
 runner_name=
+instance=
 usage() {
     cat <<EOF
 Usage: sudo $0 [--provider bitbucket] [--tarball URL|FILE] [--check] < dialog.txt
-       sudo $0 --provider github [--name NAME] [--tarball URL|FILE --sha256 HASH] [--check] < dialog.txt
+       sudo $0 --provider github [--name NAME] [--instance N] [--tarball URL|FILE --sha256 HASH] [--check] < dialog.txt
   --provider  bitbucket (default): the Bitbucket Pipelines Linux Shell runner, service setup-server-runner;
               github: a GitHub Actions runner of one organization or repository, service
               setup-server-github-runner@<scope> (one per organization or repository)
@@ -37,6 +38,8 @@ Usage: sudo $0 [--provider bitbucket] [--tarball URL|FILE] [--check] < dialog.tx
               GitHub: by default the pinned release from github.com/actions/runner
   --sha256    GitHub: the archive's SHA-256 when it is not the pinned release (it is always verified)
   --name      GitHub: the runner's name in GitHub (default: this host's name)
+  --instance  GitHub: a further runner (2-9) of the same organization or repository, so its jobs run in
+              parallel: scope <scope>.<N>, its own directory and service; it needs a --name of its own
   --check     validate the pasted text and show what would be installed; change nothing
 In a terminal it asks for the dialog's values one by one (secrets are not shown). Piped, it reads the
 whole dialog text: Bitbucket's (the curl download line and the ./start.sh … --runtime linux-shell
@@ -49,6 +52,7 @@ while [ $# -gt 0 ]; do
         --tarball) tarball=${2:?--tarball needs a URL or file}; shift ;;
         --sha256) sha256=${2:?--sha256 needs a hash}; shift ;;
         --name) runner_name=${2:?--name needs a name}; shift ;;
+        --instance) instance=${2:?--instance needs a number}; shift ;;
         --check) check=1 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 64 ;;
@@ -56,7 +60,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 case "$provider" in
-    bitbucket) [ -z "$sha256$runner_name" ] || { echo "--sha256 and --name are for --provider github" >&2; exit 64; } ;;
+    bitbucket) [ -z "$sha256$runner_name$instance" ] || { echo "--sha256, --name and --instance are for --provider github" >&2; exit 64; } ;;
     github) ;;
     *) usage >&2; exit 64 ;;
 esac
@@ -129,6 +133,13 @@ github() {
         || { echo "Not a github.com organization or repository URL: $url" >&2; exit 65; }
     local owner=${BASH_REMATCH[1]} repository=${BASH_REMATCH[3]} scope kind
     scope=$(printf '%s' "$owner${repository:+.$repository}" | tr '[:upper:]' '[:lower:]')
+    if [ -n "$instance" ]; then
+        # GitHub hands each queued job to any idle runner with the labels: more runners, more parallel jobs.
+        [[ "$instance" =~ ^[2-9]$ ]] || { echo "--instance needs a number from 2 to 9" >&2; exit 64; }
+        # config.sh --replace would take over the first runner's registration under the same name.
+        [ -n "$runner_name" ] || { echo "--instance needs a --name of its own" >&2; exit 64; }
+        scope="$scope.$instance"
+    fi
     if [ -n "$repository" ]; then kind="repository $owner/$repository"; else kind="organization $owner"; fi
     local directory="$ROOT/github-runner/$scope" unit="$GITHUB_UNIT@$scope.service" configured=0
     [ ! -f "$directory/.runner" ] || configured=1
@@ -142,6 +153,17 @@ github() {
     fi
     local name=${runner_name:-$(hostname -s)}
     [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "Unexpected runner name: $name" >&2; exit 65; }
+    if [ "$configured" = 0 ]; then
+        local other
+        for other in "$ROOT"/github-runner/*/.runner; do
+            [ -f "$other" ] || continue
+            # The .runner file is UTF-8 JSON with a byte order mark; the name is its agentName.
+            if tr -d '\r' < "$other" | grep -qE "\"agentName\": *\"$name\""; then
+                echo "$(dirname "$other") is registered as $name already: give this runner another --name" >&2
+                exit 65
+            fi
+        done
+    fi
 
     local machine arch
     machine=$(uname -m)

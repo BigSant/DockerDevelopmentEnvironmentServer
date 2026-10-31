@@ -141,6 +141,12 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
      (`bigsant`, `bigsant.<repo>`) ir atskira paslauga `setup-server-github-runner@<scope>` (vienas systemd šablonas
      `setup-server-github-runner@.service`). Kitai organizacijai ar repo – tas pats scriptas su kitu URL.
      Paslauga veikia paskyra `setup` su tais pačiais `SETUP_SERVER_ROOT` ir `SETUP_DIRECTORY`, kaip Bitbucket'o.
+   - **Keli runner'iai vienam scope.** Vienas runner'is vykdo vieną job'ą vienu metu; GitHub eilėje laukiantį job'ą
+     atiduoda bet kuriam laisvam runner'iui su tomis žymomis. Lygiagrečiam darbui –
+     `--instance N --name <kitas vardas>` (N nuo 2 iki 9): scope `<scope>.N`, katalogas
+     `github-runner/<scope>.N`, paslauga `setup-server-github-runner@<scope>.N`. Vardas privalomas ir turi skirtis:
+     su tuo pačiu vardu `--replace` perimtų pirmojo runner'io registraciją, todėl čia jau užregistruotas vardas
+     atmetamas. Metrikos, būsena ir UI naujus katalogus mato patys.
    - **Pakartotinai** paleistas su jau užregistruotu scope (`.runner` yra) – nei atsisiunčia, nei registruoja,
      token'o neklausia: įrašo unit'ą ir paleidžia paslaugą, jei ji neveikia. Veikiančios neperkrauna; pasikeitus
      unit'ui parodo `sudo systemctl restart …` – paleisk, kai nevyksta job'as.

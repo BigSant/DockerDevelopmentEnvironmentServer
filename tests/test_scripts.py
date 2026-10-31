@@ -312,6 +312,33 @@ class InstallGitHubRunnerTest(ScriptTest):
         self.assertIn(f"{self.root}/srv/github-runner/bigsant.forsena_docker", result.stdout)
         self.assertIn("setup-server-github-runner@bigsant.forsena_docker.service", result.stdout)
 
+    def test_a_further_instance_has_its_own_scope_and_needs_its_own_name(self):
+        page = f"./config.sh --url https://github.com/BigSant/ai-os --token {GITHUB_TOKEN}\n"
+        result = self.github("--check", "--instance", "2", "--name", "worker1-2", stdin=page)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("runner worker1-2: labels", result.stdout)
+        self.assertIn(f"{self.root}/srv/github-runner/bigsant.ai-os.2", result.stdout)
+        self.assertIn("setup-server-github-runner@bigsant.ai-os.2.service", result.stdout)
+        for arguments, message in ((("--instance", "2"), "needs a --name of its own"),
+                                   (("--instance", "1", "--name", "x"), "from 2 to 9"),
+                                   (("--instance", "10", "--name", "x"), "from 2 to 9")):
+            with self.subTest(arguments=arguments):
+                refused = self.github("--check", *arguments, stdin=page)
+                self.assertEqual(refused.returncode, 64, refused.stdout + refused.stderr)
+                self.assertIn(message, refused.stderr)
+        bitbucket = self.run_script("install-runner", "--check", "--instance", "2", stdin=RUN_COMMAND)
+        self.assertEqual(bitbucket.returncode, 64)
+
+    def test_a_name_registered_here_already_is_refused(self):
+        first = self.root / "srv/github-runner/bigsant.ai-os"
+        first.mkdir(parents=True)
+        (first / ".runner").write_text('﻿{\r\n  "agentId": 2,\r\n  "agentName": "worker1",\r\n  "poolId": 1\r\n}')
+        page = f"./config.sh --url https://github.com/BigSant/ai-os --token {GITHUB_TOKEN}\n"
+        refused = self.github("--check", "--instance", "2", "--name", "worker1", stdin=page)
+        self.assertEqual(refused.returncode, 65, refused.stdout + refused.stderr)
+        self.assertIn("registered as worker1 already", refused.stderr)
+        self.assertEqual(self.github("--check", "--instance", "2", "--name", "worker1-2", stdin=page).returncode, 0)
+
     def test_a_newer_version_on_the_page_is_noted_and_the_pinned_one_kept(self):
         result = self.github("--check", stdin=GITHUB_PAGE.replace("2.338.0", "2.340.1"))
         self.assertEqual(result.returncode, 0, result.stderr)
