@@ -203,7 +203,8 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    - **Taikinys nurodomas visada:** naujas projektas be `--target` nesukuriamas (nieko neklonuoja).
    - **`local`** – šis serveris (`DEPLOY_CONTEXT=default`), projekto šaknis yra build katalogas,
      konteineriai veikia paskyra `setup` (jos `APP_UID`/`APP_GID`).
-   - **`local:/KELIAS`** – šis serveris, bet projekto šaknis kitame kataloge (pvz. `local:/home/vardas/Projects/asana`).
+   - **`local:/KELIAS`** – šis serveris, bet projekto šaknis kitame kataloge (pvz. `local:/home/vardas/Projects/asana`),
+     ne `SETUP_SERVER_ROOT` viduje (tikrinama išskleidus symlink'us).
      Nesantį katalogą scriptas sukuria paskyrai `setup` (0750); esamas turi būti jai rašomas. Failai ir konteineriai –
      paskyros `setup`. Deploy'us ten kopijuoja kodą, o setup 2.7.0+ ir konteinerių prijungiamus aplinkos failus
      (`config/` ir kt.). Jei failai turi priklausyti katalogo savininkui, naudok `ssh://SAVININKAS@localhost/KELIAS`
@@ -264,9 +265,18 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
      `app/public/`. `--check` parodo klonavimą ir taikinius, nieko nekeisdamas.
    - **Taikinys – kiekvienai aplinkai savas `local:/KELIAS` (arba `ssh://`).** `local` (pats build katalogas) su
      `--monorepo` atmetamas: build katalogas yra repo klonas, kurį kiekvienas deploy'us perjungia į savo commit'ą.
-     Katalogai turi būti už `SETUP_SERVER_ROOT` ribų; nesančius scriptas sukuria paskyrai `SETUP_SERVER_USER` (0750).
+     Todėl su `--monorepo`:
+     - kiekvienas `--target` turi aplinką priekyje (`stage=`, `prod=`); bendras `target.env` nepriimamas;
+     - keliai lyginami taip, kaip juos pasieks deploy'us: symlink'ai išskleidžiami (dar nesanti kelio dalis – nuo
+       artimiausio esamo tėvinio katalogo). Katalogas build kataloge ar `SETUP_SERVER_ROOT` viduje (ir per symlink'ą)
+       atmetamas;
+     - dvi aplinkos negali deploy'inti į tą pačią vietą ar viena kitos viduje – tikrinama ir su jau įrašytais
+       `target.<env>.env`.
+
+     Nesančius katalogus scriptas sukuria paskyrai `SETUP_SERVER_USER` (0750), tik patikrinęs visus taikinius.
    - `target.stage.env` ir `target.prod.env` guli klono šaknyje; jie įrašomi į klono `.git/info/exclude`, todėl
-     `git status` lieka švarus.
+     `git status` lieka švarus. Repo, kurio šaknyje sekami (`git`) `target.env` ar `target.*.env`, atmetamas: checkout'as
+     juos perrašytų registruotais repo failais.
    - Pakartotinai paleistas klonas paliekamas (tikrinamas tas pats `origin` ir `app/Makefile`). Build katalogo su
      atskirais repo (`app/.git`) į monorepo nepaverčia (pirma `bin/remove-project`), o monorepo klono be `--monorepo`
      nepriima.
