@@ -357,6 +357,18 @@ class EndpointTest(ScriptTest):
         self.assertNotIn(("setup_worker_backups", (("environment", "old"), ("project", "shop"))), samples, "not listed")
         self.assertEqual(value(samples, "setup_worker_deploy_last_success", project="shop", environment="mdv"), 1)
 
+    def test_a_monorepo_build_root_has_its_backups_and_deploys(self):
+        # bin/add-project --monorepo: the repository is the build root; app/ is the environment as in any other.
+        zarskis = self.tree.project("zarskis", "stage", "prod")
+        (zarskis.parent / ".git").mkdir()
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - 3600))
+        self.tree.backup(zarskis, f"worker-prod-{stamp}Z.sql.gz", 3600, 512)
+        self.tree.deployments(zarskis, "stage", [entry("master", "d" * 40, "2026-11-05T10:00:00+00:00")])
+        samples = parse(self.scrape())
+        self.assertEqual(value(samples, "setup_worker_backup_newest_size_bytes", project="zarskis", environment="prod"), 512)
+        self.assertEqual(value(samples, "setup_worker_backups", project="zarskis", environment="stage"), 0)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_success", project="zarskis", environment="stage"), 1)
+
     def test_the_last_deploy_tells_a_rollback_and_a_failed_deploy_apart(self):
         self.fixtures()
         samples = parse(self.scrape())

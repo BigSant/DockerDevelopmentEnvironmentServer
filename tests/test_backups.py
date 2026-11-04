@@ -162,6 +162,19 @@ class BackupProjectsTest(ScriptTest):
         self.assertIn("removed 30", result.stdout)
         self.assertIn("Backups: 3 ok, 0 failed", result.stdout)
 
+    def test_a_monorepo_build_root_is_backed_up_from_its_app(self):
+        # bin/add-project --monorepo: the repository is the build root, a target of its own per environment.
+        zarskis = self.project("zarskis", "stage", "prod")
+        (self.projects / "zarskis/.git").mkdir()
+        for environment in ("stage", "prod"):
+            (self.projects / f"zarskis/target.{environment}.env").write_text(
+                f"DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH=/home/tomas/Projects/runtime/zarskis/{environment}\n")
+        result = self.run_script("backup-projects")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for environment in ("stage", "prod"):
+            self.assertTrue((zarskis / f".generated/backups/worker-{environment}-20261009T013000Z.sql.gz").is_file())
+        self.assertIn("Backups: 2 ok, 0 failed", result.stdout)
+
     def test_an_environment_the_project_lists_in_stage_environments_is_backed_up_like_stage(self):
         os.environ["STORES"] += " demo-mdv-secrets"
         shop = self.project("shop", "prod", "mdv", "old")

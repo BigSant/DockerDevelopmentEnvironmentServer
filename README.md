@@ -14,7 +14,7 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | --- | --- |
 | `bin/prepare-host` | Paketai (`git`, `make`, `rsync`, `python3`, OpenJDK 25 runner'iui), Docker su Compose (jei jo nėra – iš download.docker.com; esamas Docker nekeičiamas), paskyra `setup` su Docker grupe, katalogai `/srv/setup-server`, git raktas, bendras setup checkout'as. |
 | `bin/install-runner` | Bitbucket Linux Shell runner'is kaip systemd paslauga `setup-server-runner` (paskyra `setup`); su `--provider github` – GitHub Actions runner'is, paslauga `setup-server-github-runner@<scope>` (po vieną organizacijai ar repo). |
-| `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<repo vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`. GitHub repo – su savo deploy key. |
+| `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<repo vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`; monorepo (`--monorepo`) – pats repo yra build katalogas. GitHub repo – su savo deploy key. |
 | `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
 | `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
 | `bin/install-auto-update` | Įdiegia vienos minutės systemd laikmatį dviem esamiems administratoriaus `master` klonams: tik po sėkmingo GitHub CI, neliečiant vietinio darbo. Veikia ir rankiniu būdu paruoštame CachyOS; `prepare-host` jam nereikia. |
@@ -215,8 +215,12 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
      pirmo prisijungimo metu (parodomas).
    - **`stage=…` / `prod=…` / `mdv=…`** – tik viena aplinka (`target.<env>.env`, laimi prieš bendrą `target.env`),
      kai stage ir prod skirtinguose serveriuose, ar papildomai aplinkai (žr. „Papildomos aplinkos“). `--target` galima kartoti.
-   - Pakartotinai paleistas be `--target` taikinio nekeičia; su `--target` – perrašo. `remove-project`
-     pašalina ir build katalogą (su `target*.env`), ir projekto Docker context'us.
+   - **Stage ir prod tame pačiame serveryje – po savo katalogą:** `--target stage=local:/KELIAS/stage --target
+     prod=local:/KELIAS/prod`. Su vienu `local` abi aplinkos naudoja build katalogą, o jo konteineriai prijungia aplinkos
+     failus (`config/` ir kt.) tiesiai iš jo: kiekvienas stage deploy'us perjungia build katalogą į savo commit'ą, todėl
+     prod'as imtų stage commit'o failus. Su atskirais katalogais kiekviena aplinka gauna savo deploy'into commit'o kopiją.
+   - Pakartotinai paleistas be `--target` taikinio nekeičia (nei `target.env`, nei `target.<env>.env`); su `--target` –
+     perrašo. `remove-project` pašalina ir build katalogą (su `target*.env`), ir projekto Docker context'us.
 
    **GitHub projektas:**
 
@@ -237,6 +241,46 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    `repository=${GITHUB_REPOSITORY#*/}` ir `${repository,,}`; `SETUP_SERVER_ROOT` perduoda runner'io paslauga).
    Kitu vardu – Actions variable `BUILD_ROOT`. Slaptažodžiai – GitHub environment secrets. Job'as turi turėti
    `runs-on: [self-hosted, linux, setup.build]`. `unset DOCKER_HOST` nereikia: GitHub jo nenustato.
+
+   **Repo vardas su tašku** (`zarskis.lt`) nėra tinkamas NAME (tik `a-z`, `0-9`, `_`, `-`): scriptas sustoja ir
+   pasiūlo vardą. Nurodyk jį `--name zarskis` (arba `zarskis` prieš URL). Build katalogas tada nesutampa su repo
+   vardu: workflow jį įrašo pats (`${SETUP_SERVER_ROOT}/projects/zarskis`) arba gauna per Actions variable `BUILD_ROOT`.
+
+   **Monorepo GitHub projektas** – vienas repo, kuriame ir DDE aplinka `app/`, ir kodas `app/public/` (pvz.
+   `BigSant/zarskis.lt`). Šiame serveryje (`SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server`, paskyra
+   `tomas`):
+
+   ```bash
+   sudo SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server SETUP_SERVER_USER=tomas \
+       bin/add-project --check --monorepo \
+       --target stage=local:/home/tomas/Projects/runtime/zarskis/stage \
+       --target prod=local:/home/tomas/Projects/runtime/zarskis/prod \
+       --name zarskis git@github.com:BigSant/zarskis.lt.git
+   # tada tas pats be --check: pirmą kartą sustoja ties deploy key (žr. aukščiau), jį pridėjus – dar kartą
+   ```
+
+   - `--monorepo` klonuoja repo **kaip build katalogą** (`projects/zarskis/`), ne į `app/` (kitaip būtų `app/app/`).
+     Repo turi turėti `app/Makefile`; kitoks repo atmetamas ir nieko nepaliekama. Kodo repo URL neduodamas – kodas jau
+     `app/public/`. `--check` parodo klonavimą ir taikinius, nieko nekeisdamas.
+   - **Taikinys – kiekvienai aplinkai savas `local:/KELIAS` (arba `ssh://`).** `local` (pats build katalogas) su
+     `--monorepo` atmetamas: build katalogas yra repo klonas, kurį kiekvienas deploy'us perjungia į savo commit'ą.
+     Katalogai turi būti už `SETUP_SERVER_ROOT` ribų; nesančius scriptas sukuria paskyrai `SETUP_SERVER_USER` (0750).
+   - `target.stage.env` ir `target.prod.env` guli klono šaknyje; jie įrašomi į klono `.git/info/exclude`, todėl
+     `git status` lieka švarus.
+   - Pakartotinai paleistas klonas paliekamas (tikrinamas tas pats `origin` ir `app/Makefile`). Build katalogo su
+     atskirais repo (`app/.git`) į monorepo nepaverčia (pirma `bin/remove-project`), o monorepo klono be `--monorepo`
+     nepriima.
+   - Paskui projekte: `app/env/stage.env.example`, `app/env/prod.env.example` (be `DEPLOY_*`), GitHub environments
+     `staging`/`production` su secrets ir runner'is šiam repo (`bin/install-runner --provider github`, scope
+     `bigsant.zarskis.lt`). Kopijos, metrikos, apžvalga ir `remove-project` monorepo build katalogą skaito kaip bet kurį
+     kitą (aplinka – `app/`).
+
+   **AI OS diegimai** (AI OS `docs/development-delivery-contract.md`) eina tik per GitHub: AI OS paleidžia projekto
+   `deploy.yml` (`workflow_dispatch` su `operation` `deploy|status`, `environment` `stage|prod`, `sha`, `attempt_id`,
+   `request_id`, `expected_live`, `health_paths`; vardas `aios <operation> <environment> <request_id>`), job'as šio
+   serverio runner'yje vykdo `make -C <build katalogas>/app pipeline-deploy`, o būseną grąžina artifact'u
+   `aios-<request_id>` (`dde-deploy-status/v1`, setup'o `make deploy-status`). setup-server tam duoda tik build
+   katalogą, taikinius ir runner'į; AI OS serverio, SSH ar Docker prieigos negauna.
 
 5. **Projekto pašalinimas:**
 
@@ -1223,7 +1267,7 @@ SETUP_PROMTOOL_IMAGE=prom/prometheus:latest python3 -m unittest discover -s test
 
 ### Esama vietinė monorepo kūrimo aplinka
 
-Kai DDE failai yra monorepo `app/`, o kodas `app/public/`, nenaudok `add-project` klonavimui į jau veikiantį katalogą. Vykdyk kaip jo savininkas:
+Kai DDE failai yra monorepo `app/`, o kodas `app/public/`, nenaudok `add-project` klonavimui į jau veikiantį katalogą (serverio stage/prod build katalogui monorepo – `add-project --monorepo`, žr. „GitHub projektas“). Vykdyk kaip jo savininkas:
 
 ```sh
 SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server bin/register-development-project ai-os /home/tomas/Projects/ai-os
