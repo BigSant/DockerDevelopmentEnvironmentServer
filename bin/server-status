@@ -363,7 +363,9 @@ def project(build_root, errors):
         errors.append(f'{name}: no environment repository (app/ with a Makefile and env/)')
         return entry
     entry['layout'] = str(directory.relative_to(build_root))
-    checkout = development_checkout(build_root) or build_root / 'app'
+    # The environment repository's clone: app/, or the build root itself for bin/add-project --monorepo.
+    monorepo = (build_root / '.git').is_dir() and not (build_root / 'app/.git').exists()
+    checkout = development_checkout(build_root) or (build_root if monorepo else build_root / 'app')
     entry['repository'] = origin(checkout)
     entry['branch'] = default_branch(checkout)
     entry['code_repository'] = origin(checkout / 'public') if (checkout / 'public/.git').exists() else None

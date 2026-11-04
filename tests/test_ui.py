@@ -201,6 +201,23 @@ class ServerStatusTest(Worker):
         project = next(p for p in json.loads(self.status().stdout)["projects"] if p["name"] == "ai-os")
         self.assertNotIn("local", project["environments"])
 
+    def test_a_monorepo_build_root_names_its_own_repository(self):
+        # bin/add-project --monorepo: the build root is the clone, app/ its environment, app/public/ no clone of its own.
+        app = self.tree.project("zarskis", "stage", "prod")
+        self.origin(app.parent, "git@github.com-bigsant.zarskis.lt:BigSant/zarskis.lt.git")
+        (app / "public").mkdir()
+        for environment in ("stage", "prod"):
+            (app.parent / f"target.{environment}.env").write_text(
+                f"DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH=/home/tomas/Projects/runtime/zarskis/{environment}\n")
+        result = self.status()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        project = next(p for p in json.loads(result.stdout)["projects"] if p["name"] == "zarskis")
+        self.assertEqual((project["repository"], project["branch"], project["code_repository"], project["layout"]),
+                         ("git@github.com-bigsant.zarskis.lt:BigSant/zarskis.lt.git", "main", None, "app"))
+        self.assertEqual(project["targets"]["prod"]["DEPLOY_PATH"], "/home/tomas/Projects/runtime/zarskis/prod")
+        self.assertEqual(project["targets"]["stage"]["DEPLOY_PATH"], "/home/tomas/Projects/runtime/zarskis/stage")
+        self.assertNotIn("all", project["targets"])
+
     def test_the_overview_comes_from_the_build_roots_docker_and_systemd(self):
         self.library.mkdir()
         (self.library / "install.env").write_text(f"VERSION=v0.4.0\nCHECKOUT={ROOT}\nADMIN={getpass.getuser()}\n")

@@ -13,6 +13,8 @@
 # --target local is this host, the build root itself and the account's ids; ssh://USER@HOST/PATH a remote server (a Docker
 # context setup-<name> of the account), ENV=... one environment only (target.<env>.env). A rerun keeps
 # the clones and the registered target unless --target is given.
+# --monorepo: one repository holds both, app/ (the environment) and app/public/ (the code); it is cloned as the
+# build root itself, so $ROOT/projects/<name>/app is still the environment directory setup expects.
 set -euo pipefail
 
 ROOT=${SETUP_SERVER_ROOT:-/srv/setup-server}
@@ -20,16 +22,22 @@ ACCOUNT=${SETUP_SERVER_USER:-setup}
 
 check=0
 shared_key=0
+monorepo=0
+given_name=
 targets=()
 usage() {
     cat <<EOF
-Usage: sudo $0 [--check] [--shared-key] [--target [ENV=]local|ssh://USER@HOST/PATH] [NAME] ENV_REPO_URL [CODE_REPO_URL]
+Usage: sudo $0 [--check] [--shared-key] [--monorepo] [--target [ENV=]local|ssh://USER@HOST/PATH] [--name NAME|NAME] ENV_REPO_URL [CODE_REPO_URL]
   NAME           directory under $ROOT/projects; defaults to the repository slug of ENV_REPO_URL,
                  which is what pipelines use (BITBUCKET_REPO_SLUG; on GitHub the repository name in
-                 lower case) — give it only to deviate
+                 lower case) — give it only to deviate, or when the slug is no NAME (zarskis.lt: --name zarskis)
+  --name NAME    the same as NAME in front of the URL
   ENV_REPO_URL   git URL of the environment repository (cloned into app/)
   CODE_REPO_URL  git URL of a separate code repository (cloned into app/public/); omit when the
                  environment repository already contains public/
+  --monorepo     ENV_REPO_URL holds the environment in app/ and the code in app/public/: it is cloned as the
+                 build root itself (no CODE_REPO_URL; app/Makefile required). Each environment needs a target
+                 of its own outside the checkout (stage=local:/PATH, prod=local:/PATH or ssh://), not local
   --shared-key   GitHub: clone with the account's own key (a machine user that reads every repository)
                  instead of a deploy key per repository
   --target       where stage/prod deploy (target.env), required for a new project: local = this host, the build root, the
@@ -46,6 +54,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --check) check=1 ;;
         --shared-key) shared_key=1 ;;
+        --monorepo) monorepo=1 ;;
+        --name) given_name=${2:?--name needs NAME}; shift ;;
         --target) targets+=("${2:?--target needs local or ssh://USER@HOST/PATH}"); shift ;;
         -h|--help) usage; exit 0 ;;
         -*) usage >&2; exit 64 ;;
@@ -56,10 +66,15 @@ done
 is_url() { [[ "$1" == *:* || "$1" == */* ]]; }
 if [ ${#args[@]} -ge 1 ] && ! is_url "${args[0]}"; then
     name=${args[0]}; args=("${args[@]:1}")
+    [ -z "$given_name" ] || [ "$given_name" = "$name" ] || { echo "--name $given_name and NAME $name differ: give one" >&2; exit 64; }
 else
-    name=
+    name=$given_name
 fi
 [ ${#args[@]} -ge 1 ] && [ ${#args[@]} -le 2 ] || { usage >&2; exit 64; }
+if [ "$monorepo" = 1 ] && [ ${#args[@]} -gt 1 ]; then
+    echo "--monorepo: the repository holds the code in app/public/ itself; no CODE_REPO_URL (${args[1]})" >&2
+    exit 64
+fi
 # Bitbucket serves git over SSH at ssh.bitbucket.org from 2026-11-12 (bitbucket.org then refuses SSH): an
 # old-host URL is cloned through the new name - the same repository, the same host keys (bin/prepare-host).
 bitbucket_ssh() { sed -E 's#^git@bitbucket\.org:#git@ssh.bitbucket.org:#; s#^ssh://git@bitbucket\.org/#ssh://git@ssh.bitbucket.org/#' <<<"$1"; }
@@ -68,6 +83,11 @@ for given in "${args[@]}"; do
     [ "$(bitbucket_ssh "$given")" = "$given" ] || echo "==> note: $given is cloned as $(bitbucket_ssh "$given") (Bitbucket's SSH host from 2026-11-12)"
 done
 slug=$(basename "${env_repo%/}" .git | tr '[:upper:]' '[:lower:]')
+if [ -z "$name" ] && ! [[ "$slug" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    suggestion=$(sed -E 's/\..*//; s/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//' <<<"$slug")
+    echo "The repository name '$slug' is no NAME (lowercase letters, digits, _ or -): give one${suggestion:+, e.g. --name $suggestion}" >&2
+    exit 65
+fi
 name=${name:-$slug}
 [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || { echo "NAME must be lowercase letters, digits, _ or -" >&2; exit 65; }
 if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
@@ -139,20 +159,103 @@ clone() {  # clone URL DIRECTORY — an existing checkout of the same remote is 
     echo "==> $([ "$check" = 1 ] && echo would clone || echo cloning) $clone_url into $2"
     [ "$check" = 1 ] || as_account git clone -q "$clone_url" "$2"
 }
+tracked_targets() {  # the target.env / target.<env>.env files the monorepo clone's commit has in its top directory
+    as_account git -C "$build_root" ls-tree --name-only HEAD 2>/dev/null | grep -E '^target(\..+)?\.env$' || true
+}
+clone_monorepo() {  # clone_monorepo URL — the repository as the build root; an existing clone of it is kept
+    if [ -e "$build_root" ] && [ ! -d "$build_root/.git" ] && [ -n "$(ls -A "$build_root" 2>/dev/null)" ]; then
+        if [ -d "$build_root/app/.git" ]; then
+            echo "$build_root holds a project of separate repositories (app/ is a clone of its own); preserved." >&2
+            echo "Run without --monorepo, or remove it first (bin/remove-project $name)." >&2
+        else
+            echo "$build_root exists and is not a git checkout; preserved" >&2
+        fi
+        exit 65
+    fi
+    if [ -d "$build_root/.git" ]; then
+        clone "$1" "$build_root"
+    else
+        deploy_key "$1"
+        echo "==> $([ "$check" = 1 ] && echo would clone || echo cloning) $(clone_url "$1") into $build_root (--monorepo: the repository is the build root, its app/ the environment)"
+        if [ "$check" = 1 ]; then
+            echo "==> would require app/Makefile and no tracked target*.env in it"
+            return
+        fi
+        [ -d "$build_root" ] || install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$build_root"
+        as_account git clone -q --no-checkout "$(clone_url "$1")" "$build_root"
+        # Checked before any file is checked out: a repository of another layout leaves nothing behind.
+        if ! as_account git -C "$build_root" cat-file -e HEAD:app/Makefile 2>/dev/null; then
+            rm -rf -- "$build_root"
+            echo "$1 has no app/Makefile: --monorepo needs the environment in app/ (and the code in app/public/); nothing was kept" >&2
+            exit 65
+        fi
+        if [ -n "$(tracked_targets)" ]; then
+            echo "$1 tracks $(tracked_targets | tr '\n' ' ')in its top directory, where setup-server keeps the deploy targets" >&2
+            echo "(a checkout would put them back over the registered ones): remove them from the repository; nothing was kept" >&2
+            rm -rf -- "$build_root"
+            exit 65
+        fi
+        as_account git -C "$build_root" reset -q --hard
+    fi
+    [ "$check" = 1 ] && [ ! -d "$build_root/.git" ] && return
+    [ -f "$build_root/app/Makefile" ] || { echo "$build_root/app/Makefile is missing: --monorepo needs the environment in app/" >&2; exit 65; }
+    if [ -n "$(tracked_targets)" ]; then
+        echo "$build_root tracks $(tracked_targets | tr '\n' ' ')in its top directory, where setup-server keeps the deploy targets:" >&2
+        echo "remove them from the repository first; nothing was changed" >&2
+        exit 65
+    fi
+    # target*.env lie in the checkout's top directory; git status there stays clean.
+    local exclude="$build_root/.git/info/exclude"
+    if ! as_account grep -qx '/target\*.env' "$exclude" 2>/dev/null; then
+        if [ "$check" = 1 ]; then
+            echo "==> would add /target*.env to $exclude"
+        else
+            as_account mkdir -p "${exclude%/*}"
+            printf '# bin/add-project: deploy targets of this server\n/target*.env\n' | as_account tee -a "$exclude" >/dev/null
+        fi
+    fi
+}
 
+# A path with its symlinks resolved; a tail that does not exist yet is kept as written below its nearest existing parent.
+canonical() { realpath -m -- "$1"; }
+inside() { [ "$1" = "$2" ] || [[ "$1" == "$2/"* ]]; }  # inside PATH DIRECTORY (or the directory itself)
+monorepo_refusal() {  # monorepo_refusal TARGET WHY
+    echo "--target $1: $2" >&2
+    echo "With --monorepo the build root is the repository's checkout, which every deploy moves to its commit:" >&2
+    echo "give each environment its own directory outside it, e.g. --target stage=local:/PATH/stage --target prod=local:/PATH/prod" >&2
+    exit 64
+}
+local_path() {  # local_path ENV SPEC — the project root of a local target, checked; nothing is created
+    local environment=$1 spec=$2 path real
+    # --monorepo: a project root in the checkout would mount the files of whichever commit was deployed last.
+    [ "$monorepo" = 0 ] || [ "$spec" != local ] || monorepo_refusal "${environment:+$environment=}$spec" "the build root itself"
+    if [ "$spec" = local ]; then
+        echo "$build_root"
+        return
+    fi
+    path=${spec#local:}
+    path=${path%/}
+    [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ && "/$path/" != */../* && "/$path/" != */./* ]] \
+        || { echo "--target $spec: expected local:/ABSOLUTE/PATH" >&2; exit 64; }
+    [ "${path##*/}" != app ] || { echo "--target $spec: PATH is the project root, which holds app/ and data/; give ${path%/app}" >&2; exit 64; }
+    # Compared as the deploy will reach them: a symlink into the build root or $ROOT is inside it.
+    real=$(canonical "$path")
+    if [ "$monorepo" = 1 ] && inside "$real" "$(canonical "$build_root")"; then
+        monorepo_refusal "${environment:+$environment=}$spec" "inside the build root $build_root$([ "$real" = "$path" ] || echo " (it resolves to $real)")"
+    fi
+    if inside "$real" "$(canonical "$ROOT")" && [ "$real" != "$(canonical "$build_root")" ]; then
+        echo "--target $spec: inside $ROOT, which belongs to setup-server$([ "$real" = "$path" ] || echo " (it resolves to $real)")" >&2
+        exit 64
+    fi
+    echo "$path"
+}
 target_lines() {  # target_lines ENV SPEC — the target.env lines of one target (reaches a remote server once)
     local environment=$1 spec=$2 user host path ssh context ids
     if [ "$spec" = local ] || [[ "$spec" == local:* ]]; then
         # This host. local: the build root is the project root; local:/PATH another directory, which the
         # deploys fill (code, data and the environment files, setup 2.7.0+) as $ACCOUNT, owner of the files.
-        path=$build_root
+        path=$(local_path "$environment" "$spec") || exit  # a refusal ends the script (errexit is off in $(...))
         if [ "$spec" != local ]; then
-            path=${spec#local:}
-            path=${path%/}
-            [[ "$path" =~ ^/[A-Za-z0-9._/-]+$ && "/$path/" != */../* && "/$path/" != */./* ]] \
-                || { echo "--target $spec: expected local:/ABSOLUTE/PATH" >&2; exit 64; }
-            [ "${path##*/}" != app ] || { echo "--target $spec: PATH is the project root, which holds app/ and data/; give ${path%/app}" >&2; exit 64; }
-            case "$path/" in "$ROOT/"*) [ "$path" = "$build_root" ] || { echo "--target $spec: inside $ROOT, which belongs to setup-server" >&2; exit 64; } ;; esac
             if [ "$check" = 1 ]; then
                 [ -e "$path" ] || echo "==> would create $path ($ACCOUNT, 0750)" >&2
             elif [ ! -e "$path" ]; then
@@ -201,14 +304,60 @@ target_lines() {  # target_lines ENV SPEC — the target.env lines of one target
     echo "==> Docker context $context: ssh://$ssh (Docker ${ids[2]}; host key $(as_account ssh-keygen -F "$host" 2>/dev/null | awk '!/^#/ {print $2; exit}'))" >&2
     printf 'DEPLOY_CONTEXT=%s\nDEPLOY_SSH=%s\nDEPLOY_PATH=%s\nAPP_UID=%s\nAPP_GID=%s\n' "$context" "$ssh" "$path" "${ids[0]}" "${ids[1]}"
 }
-planned_files=() planned_environments=() planned_lines=()
-prepare_target() {  # prepare_target [ENV=]SPEC — check a target and work out its lines before any clone
-    local environment= spec=$1 lines
+split_target() {  # split_target [ENV=]SPEC — sets environment (empty: every environment) and spec of the caller
+    environment= spec=$1
     # ENV= in front: stage, prod or a stage-class environment the project lists (setup's STAGE_ENVIRONMENTS, e.g. mdv).
     if [[ "$spec" =~ ^([a-z][a-z0-9]{1,15})=(.*)$ ]]; then
         environment=${BASH_REMATCH[1]} spec=${BASH_REMATCH[2]}
         case "$environment" in local|test) echo "--target $1: $environment is not a deploy environment" >&2; exit 64 ;; esac
     fi
+}
+place_of() {  # place_of ENV SPEC — where a target deploys, comparable between environments: this host's directories resolved
+    local spec=$2 path
+    if [ "$spec" = local ] || [[ "$spec" == local:* ]]; then
+        path=$(local_path "$1" "$spec") || exit
+        echo "local $(canonical "$path")"
+    elif [[ "$spec" =~ ^ssh://([a-z_][a-z0-9_.-]*@)?(localhost|127\.0\.0\.1)(/.*)$ ]]; then
+        echo "local $(canonical "${BASH_REMATCH[3]%/}")"
+    else
+        echo "remote ${spec%/}"
+    fi
+}
+check_monorepo_targets() {  # with --monorepo: each environment its own place, the given targets and the registered ones
+    local target environment spec file place envs=() places=() i j a b
+    for target in "${targets[@]}"; do
+        split_target "$target"
+        [ -n "$environment" ] || monorepo_refusal "$target" "no environment in front (stage=, prod=): one place for every environment"
+        place=$(place_of "$environment" "$spec") || exit
+        envs+=("$environment") places+=("$place")
+    done
+    [ ! -f "$build_root/target.env" ] || { echo "$build_root/target.env is one target for every environment; with --monorepo each has its own (target.<env>.env): remove it" >&2; exit 65; }
+    for file in "$build_root"/target.*.env; do
+        [ -f "$file" ] || continue
+        environment=${file##*/target.} environment=${environment%.env}
+        [[ " ${envs[*]} " != *" $environment "* ]] || continue  # given again: replaced
+        spec=$(sed -n 's/^DEPLOY_PATH=//p' "$file" 2>/dev/null | tail -n 1)
+        [ -n "$spec" ] || continue
+        a=$(sed -n 's/^DEPLOY_SSH=//p' "$file" 2>/dev/null | tail -n 1)
+        if [ -n "$a" ]; then spec="ssh://$a$spec"; else spec="local:$spec"; fi
+        place=$(place_of "$environment" "$spec") || exit
+        envs+=("$environment") places+=("$place")
+    done
+    for i in "${!places[@]}"; do
+        for j in "${!places[@]}"; do
+            [ "$i" -lt "$j" ] || continue
+            a=${places[$i]} b=${places[$j]}
+            if [ "$a" = "$b" ] || { [ "${a%% *}" = local ] && [ "${b%% *}" = local ] && { inside "${a#local }" "${b#local }" || inside "${b#local }" "${a#local }"; }; }; then
+                echo "--monorepo: ${envs[$i]} and ${envs[$j]} would deploy to the same place (${a#* }, ${b#* }); give each its own directory" >&2
+                exit 64
+            fi
+        done
+    done
+}
+planned_files=() planned_environments=() planned_lines=()
+prepare_target() {  # prepare_target [ENV=]SPEC — check a target and work out its lines before any clone
+    local environment spec lines
+    split_target "$1"
     lines=$(target_lines "$environment" "$spec")
     planned_files+=("$build_root/target${environment:+.$environment}.env")
     planned_environments+=("$environment")
@@ -229,30 +378,44 @@ write_target() {  # write_target INDEX — target.env or target.<env>.env of one
     echo "$lines" | sed 's/^/    /'
 }
 
-# The target is always named: nothing is created for a project without one.
-if [ ${#targets[@]} -eq 0 ] && [ ! -f "$build_root/target.env" ]; then
+# The target is always named: nothing is created for a project without one (target.env, or target.<env>.env
+# for each environment it deploys).
+registered=
+for file in "$build_root/target.env" "$build_root"/target.*.env; do
+    if [ -f "$file" ]; then registered+="$file "; fi
+done
+if [ ${#targets[@]} -eq 0 ] && [ -z "$registered" ]; then
     echo "Name the deploy target: --target local (this host, the build root $build_root) or" >&2
     echo "--target ssh://USER@HOST/PATH (another server); stage=/prod=/mdv= in front for one environment." >&2
     exit 64
 fi
+if [ "$monorepo" = 0 ] && [ -d "$build_root/.git" ]; then
+    echo "$build_root is a monorepo clone (the repository is the build root): add --monorepo" >&2
+    exit 65
+fi
 # Every target is checked (and a remote one reached) before anything of the project is created.
+[ "$monorepo" = 0 ] || check_monorepo_targets
 for target in "${targets[@]}"; do prepare_target "$target"; done
-[ "$check" = 1 ] || [ -d "$build_root" ] || install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$build_root"
-clone "$env_repo" "$build_root/app"
-[ -z "$code_repo" ] || clone "$code_repo" "$build_root/app/public"
+if [ "$monorepo" = 1 ]; then
+    clone_monorepo "$env_repo"
+else
+    [ "$check" = 1 ] || [ -d "$build_root" ] || install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$build_root"
+    clone "$env_repo" "$build_root/app"
+    [ -z "$code_repo" ] || clone "$code_repo" "$build_root/app/public"
+fi
 if [ ${#targets[@]} -gt 0 ]; then
     for index in "${!planned_files[@]}"; do write_target "$index"; done
 else
-    echo "==> deploy target kept: $build_root/target.env (change it with --target)"
+    echo "==> deploy target kept: $registered(change it with --target)"
 fi
-echo "==> Build root: $build_root"
+echo "==> Build root: $build_root$([ "$monorepo" = 0 ] || echo " (monorepo: environment app/, code app/public/)")"
 if [[ "$env_repo" == *github.com[:/]* ]]; then
     if [ "$name" = "$slug" ]; then
         echo "    Workflows of '$slug' find it themselves (\$SETUP_SERVER_ROOT/projects/<repository name in lower case>)."
     else
         echo "    The name differs from the repository name '$slug': set the Actions variable BUILD_ROOT=$build_root."
     fi
-    echo "    Fill env/<stage|prod>.env.example (no secrets, no DEPLOY_*/APP_UID/APP_GID: the target is in target.env)"
+    echo "    Fill $([ "$monorepo" = 0 ] || echo app/)env/<stage|prod>.env.example (no secrets, no DEPLOY_*/APP_UID/APP_GID: the target is in target.env)"
     echo "    and add the secrets as GitHub environment secrets."
 else
     if [ "$name" = "$slug" ]; then
