@@ -775,13 +775,17 @@ class WebUiTest(Worker):
 
     # --- Access ----------------------------------------------------------------------------------
     def test_every_request_needs_the_login(self):
-        for login in (None, ("admin", "wrong-password"), ("root", PASSWORD), ("admin", "")):
+        # A browser without a session goes to the login page; no WWW-Authenticate, so no browser login dialog.
+        status, headers, body = self.request("GET", "/access?q=x", login=None)
+        self.assertEqual((status, headers.get("Location")), (303, "/login?next=/access%3Fq%3Dx"))
+        self.assertNotIn("WWW-Authenticate", headers)
+        for login in (("admin", "wrong-password"), ("root", PASSWORD), ("admin", "")):
             with self.subTest(login=login):
                 status, headers, body = self.request("GET", "/", login=login)
                 self.assertEqual(status, 401)
-                self.assertEqual(headers.get("WWW-Authenticate"), 'Basic realm="Server OPS", charset="UTF-8"')
+                self.assertNotIn("WWW-Authenticate", headers)
                 self.assertNotIn("asana_tracker", body)
-        self.assertEqual(self.request("GET", "/ui.css", login=None)[0], 401)
+        self.assertEqual(self.request("GET", "/ui.css", login=None)[0], 200)  # the login page's look; nothing secret
         self.assertEqual(self.request("POST", "/preview", {"action": "add-project"}, login=None)[0], 401)
         self.assertEqual(self.request("GET", "/")[0], 200)
         # A name rebound to 127.0.0.1 is not this UI's: refused before the login is even looked at.
@@ -789,6 +793,175 @@ class WebUiTest(Worker):
         self.assertEqual(self.request("GET", "/", headers={"Host": f"localhost:{self.port}"})[0], 200)
         self.assertNotIn(PASSWORD, self.everything_written())
         self.assertIn("wrong login (401)", self.stderr.read_text())
+
+    # --- Users, groups and sessions --------------------------------------------------------------
+    def login(self, user, password, target="/"):
+        """The session cookie of a login on the login page (the reply's headers too)."""
+        status, headers, body = self.request("POST", "/login", {"user": user, "password": password, "next": target}, login=None)
+        self.assertEqual(status, 303, body)
+        return re.match(r"ops_session=([^;]+);", headers["Set-Cookie"])[1], headers
+
+    def as_session(self, method, path, cookie, form=None):
+        return self.request(method, path, form, login=None, headers={"Cookie": f"ops_session={cookie}"})
+
+    def token_of(self, cookie):
+        return re.search(r'name="csrf" value="([0-9a-f]+)"', self.as_session("GET", "/account", cookie)[2])[1]
+
+    def add_user(self, name, password, groups, **fields):
+        form = {"csrf": self.csrf(), "new": "1", "name": name, "password": password, "repeat": password,
+                **{f"group:{group}": "1" for group in groups}, **fields}
+        return self.request("POST", "/users/save", form)
+
+    def test_the_login_page_opens_a_session_and_logout_ends_it(self):
+        status, _, page = self.request("GET", "/login?next=/files", login=None)
+        self.assertEqual(status, 200)
+        self.assertIn('action="/login"', page)
+        self.assertIn('name="next" value="/files"', page)
+        status, _, page = self.request("POST", "/login", {"user": "admin", "password": "wrong-password"}, login=None)
+        self.assertEqual(status, 401)
+        self.assertIn("Neteisingas vardas arba slaptažodis", page)
+        cookie, headers = self.login("admin", PASSWORD, "/files")
+        self.assertEqual(headers["Location"], "/files")
+        self.assertIn("HttpOnly", headers["Set-Cookie"])
+        self.assertIn("SameSite=Lax", headers["Set-Cookie"])
+        self.assertNotIn("Secure", headers["Set-Cookie"])  # plain http on 127.0.0.1 (an SSH tunnel)
+        self.assertIn("Secure", self.request("POST", "/login", {"user": "admin", "password": PASSWORD}, login=None,
+                                             headers={"X-Forwarded-Proto": "https"})[1]["Set-Cookie"])
+        status, _, page = self.as_session("GET", "/", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn('href="/account">admin</a>', page)
+        self.assertIn('action="/logout"', page)
+        # Only the cookie's sha256 is kept; the password never.
+        self.assertNotIn(cookie, self.everything_written())
+        self.assertNotIn(PASSWORD, self.everything_written())
+        self.assertEqual(self.as_session("GET", "/login", cookie)[1].get("Location"), "/")
+        # A login leads only to a page of this UI.
+        for target in ("//attacker.example/", "https://attacker.example/", "/login", "/\\attacker.example"):
+            with self.subTest(target=target):
+                self.assertEqual(self.login("admin", PASSWORD, target)[1]["Location"], "/")
+        status, headers, _ = self.as_session("POST", "/logout", cookie, {"csrf": self.token_of(cookie)})
+        self.assertEqual((status, headers["Location"]), (303, "/login"))
+        self.assertIn("Max-Age=0", headers["Set-Cookie"])
+        self.assertEqual(self.as_session("GET", "/", cookie)[0], 303)
+        self.assertIn("user=admin client=127.0.0.1 users login", self.log.read_text())
+        self.assertIn("users logout", self.log.read_text())
+
+    def test_wrong_logins_from_one_client_must_wait(self):
+        for _ in range(10):
+            self.assertEqual(self.request("POST", "/login", {"user": "admin", "password": "wrong-password"}, login=None)[0], 401)
+        status, headers, _ = self.request("POST", "/login", {"user": "admin", "password": PASSWORD}, login=None)
+        self.assertEqual(status, 429)
+        self.assertIn("Retry-After", headers)
+        self.assertEqual(self.request("GET", "/", login=("admin", "wrong-password"))[0], 429)
+        self.assertIn("too many wrong logins (429)", self.stderr.read_text())
+
+    def test_the_first_start_makes_the_groups_and_the_ui_env_login_an_administrator(self):
+        status, _, page = self.request("GET", "/users")
+        self.assertEqual(status, 200)
+        for title in ("Administratoriai", "Operatoriai", "Stebėtojai"):
+            self.assertIn(title, page)
+        self.assertIn('href="/users/admin"', page)
+        stored = json.loads((self.state / "accounts.json").read_text())
+        self.assertEqual(stored["users"]["admin"]["groups"], ["administratoriai"])
+        self.assertEqual(stored["users"]["admin"]["password"], PASSWORD_HASH)
+        self.assertEqual(oct((self.state / "accounts.json").stat().st_mode & 0o777), "0o600")
+
+    def test_groups_decide_what_a_user_sees_and_runs(self):
+        form = {"csrf": self.csrf(), "group": "", "title": "Žiūrovai", "level:overview": "view", "level:logs": "view"}
+        status, headers, body = self.request("POST", "/groups/save", form)
+        self.assertEqual((status, headers.get("Location")), (303, "/groups/ziurovai?saved=1"), body)
+        self.assertEqual(self.add_user("jonas", "jono-slaptazodis-1", ["ziurovai"], full_name="Jonas Jonaitis")[0], 303)
+        jonas = ("jonas", "jono-slaptazodis-1")
+        status, _, page = self.request("GET", "/", login=jonas)
+        self.assertEqual(status, 200)
+        self.assertIn('href="/logs"', page)
+        self.assertNotIn('href="/access"', page)
+        self.assertNotIn('action="/preview"', page)  # view only: no action forms
+        self.assertIn("Tik peržiūra", page)
+        for path in ("/access", "/files", "/update", "/actions", "/users", "/users/admin", "/worker-metrics"):
+            with self.subTest(path=path):
+                self.assertEqual(self.request("GET", path, login=jonas)[0], 403)
+        token = re.search(r'name="csrf" value="([0-9a-f]+)"', page)[1]
+        status, _, body = self.request("POST", "/preview", {"csrf": token, "action": "unit", "unit": "runner",
+                                                            "operation": "restart"}, login=jonas)
+        self.assertEqual(status, 403, body)
+        self.assertEqual(self.request("POST", "/users/save", {"csrf": token, "new": "1", "name": "x"}, login=jonas)[0], 403)
+        self.assertEqual(self.sudo_calls("server-unit"), [])
+        # "valdo" on the overview: its actions run; a group the user gains counts at once.
+        form = {"csrf": self.csrf(), "group": "ziurovai", "title": "Žiūrovai", "level:overview": "manage", "level:logs": "view"}
+        self.assertEqual(self.request("POST", "/groups/save", form)[0], 303)
+        status, _, body = self.request("POST", "/preview", {"csrf": token, "action": "unit", "unit": "runner",
+                                                            "operation": "restart"}, login=jonas)
+        self.assertEqual(status, 200, body)
+        self.assertIn("user=admin client=127.0.0.1 users group ziurovai: created overview=view logs=view", self.log.read_text())
+        self.assertNotIn("jono-slaptazodis-1", self.everything_written())
+
+    def test_an_administrator_always_remains(self):
+        self.assertEqual(self.request("POST", "/users/save", {"csrf": self.csrf(), "name": "admin", "disabled": "1",
+                                                              "group:administratoriai": "1"})[0], 400)
+        status, _, body = self.request("POST", "/users/save", {"csrf": self.csrf(), "name": "admin", "group:operatoriai": "1"})
+        self.assertEqual(status, 400)
+        self.assertIn("bent vienas įjungtas", body)
+        self.assertEqual(self.request("POST", "/users/delete", {"csrf": self.csrf(), "name": "admin"})[0], 400)
+        self.assertEqual(self.request("POST", "/groups/delete", {"csrf": self.csrf(), "group": "administratoriai"})[0], 400)
+        self.assertEqual(self.request("POST", "/groups/save", {"csrf": self.csrf(), "group": "administratoriai",
+                                                               "title": "Visi"})[0], 400)
+        self.assertEqual(self.request("GET", "/")[0], 200)
+        self.assertIn("users user admin: refused (", self.log.read_text())
+        # With a second administrator the first may go; a disabled user's sessions end at once.
+        self.assertEqual(self.add_user("ona", "onos-slaptazodis-1", ["administratoriai"])[0], 303)
+        cookie, _ = self.login("ona", "onos-slaptazodis-1")
+        self.assertEqual(self.request("POST", "/users/save", {"csrf": self.csrf(), "name": "ona", "disabled": "1",
+                                                              "group:administratoriai": "1"})[0], 303)
+        self.assertEqual(self.as_session("GET", "/", cookie)[0], 303)
+        self.assertEqual(self.request("GET", "/", login=("ona", "onos-slaptazodis-1"))[0], 401)
+
+    def test_a_user_changes_their_own_password(self):
+        self.assertEqual(self.add_user("petras", "petro-slaptazodis-1", ["stebetojai"])[0], 303)
+        cookie, _ = self.login("petras", "petro-slaptazodis-1")
+        other, _ = self.login("petras", "petro-slaptazodis-1")
+        form = {"csrf": self.token_of(cookie), "current": "wrong-password", "password": "naujas-slaptazodis", "repeat": "naujas-slaptazodis"}
+        self.assertEqual(self.as_session("POST", "/account/password", cookie, form)[0], 400)
+        form["current"] = "petro-slaptazodis-1"
+        self.assertEqual(self.as_session("POST", "/account/password", cookie, form)[1].get("Location"), "/account?saved=1")
+        self.assertEqual(self.as_session("GET", "/account", cookie)[0], 200)
+        self.assertEqual(self.as_session("GET", "/", other)[0], 303)  # the other session ended
+        self.assertEqual(self.request("GET", "/", login=("petras", "naujas-slaptazodis"))[0], 200)
+        self.assertEqual(self.request("GET", "/", login=("petras", "petro-slaptazodis-1"))[0], 401)
+
+    def test_a_user_links_to_a_prieiga_person(self):
+        self.write_keys()
+        self.assertEqual(self.add_user("rimas", "rimo-slaptazodis-1", ["stebetojai"], person="no-such-key")[0], 400)
+        status, _, page = self.request("GET", "/users/new")
+        self.assertEqual(status, 200)
+        self.assertEqual(re.findall(r'<option value="([^"]+)"', page), ["tomas"])
+        self.assertEqual(self.add_user("rimas", "rimo-slaptazodis-1", ["stebetojai"], person="tomas")[0], 303)
+        self.assertIn('href="/access/tomas"', self.request("GET", "/users")[2])
+
+    def test_every_action_belongs_to_a_section(self):
+        web_ui = load_web_ui()
+        self.assertEqual(set(web_ui.ACTION_SECTIONS), set(web_ui.ACTIONS))
+        for sections in web_ui.ACTION_SECTIONS.values():
+            self.assertTrue(set(sections) <= set(web_ui.MANAGED_SECTIONS))
+
+    def test_a_new_ui_env_password_gives_the_first_administrator_back(self):
+        web_ui = load_web_ui()
+        state = self.root / "accounts-state"
+        accounts = web_ui.Accounts(state, "admin", PASSWORD_HASH)
+        accounts.save_user("ona", True, "", ["administratoriai"], "", False, PASSWORD_HASH)
+        accounts.save_user("admin", False, "", [], "", True, None)
+        self.assertEqual(accounts.permissions("admin"), {})
+        self.assertFalse(web_ui.Accounts(state, "admin", PASSWORD_HASH).recovered)  # the same ui.env: nothing changes
+        renewed = web_ui.password_hash("a-new-ui-env-password", iterations=10000)
+        accounts = web_ui.Accounts(state, "admin", renewed)
+        self.assertTrue(accounts.recovered)
+        self.assertTrue(accounts.authenticate("admin", "a-new-ui-env-password"))
+        self.assertEqual(accounts.permissions("admin")["users"], "manage")
+        broken = self.root / "broken-state"
+        broken.mkdir()
+        (broken / "accounts.json").write_text("{not json")
+        with self.assertRaises(web_ui.Refused):
+            web_ui.Accounts(broken, "admin", PASSWORD_HASH)
 
     def test_every_post_needs_the_csrf_token_of_its_form(self):
         form = {"action": "add-project", "env_repo": "git@bitbucket.org:ws/shop.git"}

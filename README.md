@@ -52,7 +52,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
 └── .ssh/github-<savininkas>.<repo>   GitHub projekto deploy key (tik skaitymui); host alias'ai – .ssh/config
 /etc/setup-server/runner.env    Bitbucket runner'io OAuth duomenys (root, 0600)
 /etc/setup-server/metrics.env   worker'io /metrics adresas, leidžiami adresai ir neprivalomas token'as (root, 0600)
-/etc/setup-server/ui.env        valdymo sąsajos prisijungimas (slaptažodžio hash'as) ir Bitbucket token'ai (root, 0600)
+/etc/setup-server/ui.env        valdymo sąsajos pirmojo administratoriaus prisijungimas (slaptažodžio hash'as) ir Bitbucket token'ai (root, 0600)
 /usr/local/lib/setup-server/bin/   komandų kopijos, kurias valdymo sąsaja vykdo per sudo (root)
 ```
 
@@ -1003,7 +1003,8 @@ sudo bin/install-ui                # įdiegia, paleidžia ir vieną kartą parod
 
 - `--port` – kitas port'as (1024–65535). Kito adreso nėra: `--address` priima tik `127.0.0.1`, pati paslauga kitu
   adresu nepasileidžia.
-- `--user` – prisijungimo vardas (numatytas `admin`), `--new-password` – naujas slaptažodis (senasis nebetinka).
+- `--user` – pirmojo administratoriaus vardas (numatytas `admin`), `--new-password` – naujas jo slaptažodis (senasis
+  nebetinka; žr. „Vartotojai ir grupės“ – taip root'as visada grąžina prieigą).
 - Pakartotinai paleistas palieka vardą, port'ą, slaptažodį ir token'us; paslaugą perkrauna tik pasikeitus failui.
   Įdiegtas kopijas atnaujina `bin/update` (žr. „Atnaujinimas“).
 
@@ -1015,8 +1016,35 @@ ssh -L 9102:127.0.0.1:9102 <serveris>    # kol tunelis atidarytas, sąsaja pasie
 
 Tunelis eina per serverio SSH; jei jis neatsako, žr. `bin/install-ssh` („Eiga“, 7 žingsnis).
 
-Naršyklė paklaus vardo ir slaptažodžio (Basic auth; srautą šifruoja SSH). Slaptažodis rodomas tik įdiegus, serveryje
-laikomas tik jo PBKDF2 hash'as `/etc/setup-server/ui.env` (root, 0600). Pamiršus – `sudo bin/install-ui --new-password`.
+Atsidaro prisijungimo puslapis (vardas ir slaptažodis; srautą šifruoja SSH). Pirmą kartą – `install-ui` parodytas
+`admin` slaptažodis; serveryje laikomas tik jo PBKDF2 hash'as `/etc/setup-server/ui.env` (root, 0600). Pamiršus –
+`sudo bin/install-ui --new-password`. Skriptams (`curl -u vardas:slaptažodis`) tinka ir Basic auth bet kurio įjungto
+vartotojo vardu; naršyklės iššokančio langelio nebėra.
+
+**Vartotojai ir grupės.** Skiltis *Vartotojai* (`/users`): kas prisijungia prie sąsajos ir ką joje gali.
+
+- **Grupė** kiekvienai skilčiai (Apžvalga, Prieiga, Failai, Atnaujinimas, Veiksmai, Instrukcijos, Žurnalai, Metrikos,
+  Vartotojai) duoda „nėra“, „mato“ (skiltis rodoma) arba „valdo“ (dar ir jos veiksmai: peržiūra ir vykdymas; Instrukcijos,
+  Žurnalai ir Metrikos tik rodomos). Veiksmas leidžiamas, jei vartotojas valdo bent vieną skiltį, kurioje yra jo forma
+  (pvz. „Backup dabar“ – Apžvalga, Failai ar Veiksmai). Kur vartotojas tik mato, mygtukų nėra, o tiesioginis POST – `403`.
+- **Vartotojas** priklauso vienai ar kelioms grupėms; jo teisė skilčiai – didžiausia iš jų. Jį galima (nebūtina) susieti
+  su *Prieigos* žmogumi (SSH raktu ir įrankiais): tai tik nuoroda, prisijungimas nuo rakto nepriklauso. Išjungtas
+  vartotojas prisijungti negali, jo sesijos baigiamos iš karto; naujas slaptažodis baigia kitas jo sesijas.
+- **Pradinės grupės:** *Administratoriai* (valdo viską, keisti ar ištrinti negalima), *Operatoriai* (valdo Apžvalgą, Failus
+  ir Veiksmus, mato kitas skiltis, išskyrus Vartotojus), *Stebėtojai* (mato viską, išskyrus Vartotojus). Turi likti bent
+  vienas įjungtas administratorius: paskutinio išjungti, iš grupės išimti ar ištrinti sąsaja neleidžia.
+- **Pirmasis administratorius.** Pirmą kartą pasileidusi sąsaja `ui.env` vardą (`admin`) padaro grupės
+  *Administratoriai* nariu. Pakeitus `ui.env` slaptažodį (`sudo bin/install-ui --new-password`) tas vartotojas vėl
+  įjungiamas, grąžinamas į *Administratorius* su nauju slaptažodžiu, jo sesijos baigiamos – root'o kelias atgal, jei
+  visi užsirakino.
+- **Mano paskyra** (`/account`, vardas viršuje dešinėje) – savo grupės, teisės ir slaptažodžio keitimas (12–128 simbolių).
+- **Kur laikoma:** `/var/lib/setup-server-ui/accounts.json` (`setup-ui`, 0600; slaptažodžiai – PBKDF2 hash'ai) ir
+  `sessions.json` (tik sesijų slapukų sha256). Sesija – slapukas `ops_session` (HttpOnly, SameSite=Lax; per HTTPS proxy –
+  ir Secure), baigiasi po 12 val. nenaudojimo ir ne vėliau kaip po 14 d.; mygtukas „Atsijungti“ ją baigia. 10 nepavykusių
+  prisijungimų iš vieno adreso per 15 min. – toliau `429`, kol praeis laikas. Sugadintas `accounts.json` – sąsaja
+  nepasileidžia (journal pasako kodėl); jį pašalinus, `ui.env` vartotojas vėl tampa pirmuoju administratoriumi.
+- Kiekvienas pakeitimas (prisijungimas, atsijungimas, vartotojo ar grupės išsaugojimas, ištrynimas, atsisakymas) įrašomas į
+  `ui-actions.log` (`users …`); slaptažodžiai – niekada. Neįrašius eilutės, pakeitimas nedaromas.
 
 **Ką rodo.** Navigacijoje prie *Prieigos* – raktų skaičius, prie *Atnaujinimo* – taškas: geltonas, kai yra naujesnis
 commit'as, raudonas, kai setup ne ant release tag'o.
@@ -1064,6 +1092,7 @@ commit'as, raudonas, kai setup ne ant release tag'o.
   „Atnaujinti į naujausią“ – Server OPS į `origin/master` (`bin/update`, žr. „Atnaujinimas“), setup – į naujausią
   to paties MAJOR release'ą (`bin/update-setup`; setup release'ą daro kiekvienas sujungimas į master); konkreti versija
   ar naujas MAJOR – „Konkreti versija ar ref'as“.
+- *Vartotojai* – sąsajos vartotojai ir grupės (žr. „Vartotojai ir grupės“); be teisės „mato“ skiltis nerodoma.
 - *Metrikos* – worker'io `/metrics`, kaip jį mato Prometheus (`setup-server-metrics --once`, be token'o), ir kurios
   grupės surinktos.
 - *Žurnalai* – programuotojų veikla (visų raktų), `ui-actions.log`, `backup-pulls.log`, `access.log`, Server OPS paslaugų journal (po 50 eilučių) ir paskutiniai
@@ -1168,7 +1197,8 @@ neperduodamas, puslapiuose nerodomas, į žurnalus nerašomas (žurnale – tik 
   `server-status`, `server-unit`, `update-setup`), niekada
   administratoriaus klonas, kurį gali keisti jo savininkas. `bin/update` – tik klono savininko teisėmis (root'u jis nevyksta).
 - Argumentų sudo neriboja: ribą nustato sąsajos patikra ir pačios komandos. Todėl `setup-ui` per šias komandas
-  (pvz. `install-runner`, `prepare-host`) turi administratoriaus galią; ją saugo `127.0.0.1`, slaptažodis ir CSRF token'as.
+  (pvz. `install-runner`, `prepare-host`) turi administratoriaus galią; ją saugo `127.0.0.1`, prisijungimas, grupių teisės
+  ir CSRF token'as.
 - Būseną skaito viena tik skaitanti komanda `server-status` (JSON): `systemctl show`, `journalctl`, versijas ir diską –
   root teisėmis, o build katalogus, Docker konteinerius ir secret store – paskyros `setup` teisėmis. Pipeline'o pakištas
   simlink'as todėl nieko daugiau neatskleidžia, o iš env failų išeina tik taikinio reikšmės. Konteinerio log'ai –
@@ -1182,7 +1212,7 @@ neperduodamas, puslapiuose nerodomas, į žurnalus nerašomas (žurnale – tik 
   (`bin/update`) ir `/tmp` (ankstesnės kopijos rankiniam grąžinimui). Palikta, kas netrukdo: `ProtectKernelModules`,
   `ProtectControlGroups`, `LockPersonality`, `RestrictRealtime`. `KillMode=process`: perkraunama tik sąsaja, vykdomas
   veiksmas tęsiasi.
-- **CSRF.** Kiekviena forma turi token'ą – vartotojo vardo HMAC su raktu, kurį paslauga sukuria pasileisdama
+- **CSRF.** Kiekviena forma (ir atsijungimas) turi token'ą – vartotojo vardo HMAC su raktu, kurį paslauga sukuria pasileisdama
   (persikrovus atidarytos formos nebetinka: atnaujink puslapį). POST be jo ar su svetimu `Origin` – `403`. `Host` turi būti
   `127.0.0.1` ar `localhost` (apsauga nuo DNS rebinding), kitaip – `400`. Vardas, slaptažodis ir token'ai lyginami
   pastovaus laiko palyginimu.

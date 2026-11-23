@@ -5,10 +5,15 @@ bin/install-ui installs this as /usr/local/sbin/setup-server-ui and runs it as t
 setup-server-ui of its own account, setup-ui (not setup: pipeline steps run as setup and must not reach
 it). It listens on 127.0.0.1 only (UI_PORT, default 9102); from a laptop: ssh -L 9102:127.0.0.1:9102 server.
 
-Access. Every request needs the Basic-auth login of /etc/setup-server/ui.env (UI_USER, UI_PASSWORD_HASH: PBKDF2,
-compared in constant time) and a Host of 127.0.0.1/localhost (a DNS-rebound name is refused). Every POST also
-needs the CSRF token of its form: an HMAC of the user with a key made at start (a restart invalidates the open
-forms) and, when the browser sends one, an Origin of 127.0.0.1/localhost.
+Access. Users and groups live in $STATE_DIRECTORY/accounts.json (class Accounts): a user belongs to groups, a
+group gives each section "mato" (view) or "valdo" (manage: its actions too). The first start makes the ui.env
+login (UI_USER, UI_PASSWORD_HASH) the first administrator; a new ui.env password (sudo bin/install-ui
+--new-password) gives it back later. A browser logs in on /login and gets a session cookie (HttpOnly,
+SameSite=Lax; only its sha256 is stored, sessions.json); a script may send Basic auth of any enabled user.
+Passwords are PBKDF2, compared in constant time; wrong logins from one client are rate-limited. Every request
+needs a Host of 127.0.0.1/localhost (a DNS-rebound name is refused). Every POST also needs the CSRF token of its
+form: an HMAC of the user with a key made at start (a restart invalidates the open forms) and, when the browser
+sends one, an Origin of 127.0.0.1/localhost.
 
 What it runs. Status: `sudo -n $LIBRARY/bin/server-status` (read-only, JSON: the overview, the logs, a project
 container's docker logs and the worker's /metrics). Actions: the root-owned copies
@@ -221,6 +226,273 @@ def installation():
     if not re.fullmatch(r'/[A-Za-z0-9._/-]+', checkout) or not re.fullmatch(r'[a-z_][a-z0-9_.-]*', admin):
         checkout = admin = None
     return {'version': values.get('VERSION'), 'checkout': checkout, 'admin': admin}
+
+
+# --- Users, groups and sessions ------------------------------------------------------------------
+# The UI's sections, and whether one has anything to manage (a view-only section has no actions).
+SECTIONS = (('overview', 'Apžvalga', True), ('access', 'Prieiga', True), ('files', 'Failai', True),
+            ('update', 'Atnaujinimas', True), ('actions', 'Veiksmai', True), ('instructions', 'Instrukcijos', False),
+            ('logs', 'Žurnalai', False), ('metrics', 'Metrikos', False), ('users', 'Vartotojai', True))
+SECTION_TITLES = {key: title for key, title, _ in SECTIONS}
+MANAGED_SECTIONS = tuple(key for key, _, manage in SECTIONS if manage)
+PERMISSION_LEVELS = ('', 'view', 'manage')
+PERMISSION_LABELS = {'': 'nėra', 'view': 'mato', 'manage': 'valdo'}
+# An action runs for a user who manages any one of its sections: the pages its form is on.
+ACTION_SECTIONS = {'pipeline': ('overview',), 'unit': ('overview',), 'remove-project': ('overview', 'actions'),
+                   'backup-local': ('overview', 'files', 'actions'), 'add-project': ('actions',),
+                   'install-runner': ('actions',), 'install-backups': ('actions',), 'install-metrics': ('actions',),
+                   'prepare-host': ('actions',), 'install-ssh': ('actions',), 'move-bitbucket-ssh': ('actions',),
+                   'update': ('update',), 'update-setup': ('update',), 'add-backup-key': ('access',),
+                   'key-bulk': ('access',), 'remove-backup-key': ('access',), 'list-backup-keys': ('access',),
+                   'tool-access': ('access',), 'tool-bulk': ('access',), 'tool-password': ('access',),
+                   'tool-person': ('access',), 'tool-ips': ('access',), 'tool-apply': ('access',)}
+ADMINISTRATORS = 'administratoriai'
+VIEW_ALL = {key: 'view' for key, _, _ in SECTIONS if key != 'users'}
+DEFAULT_GROUPS = {
+    ADMINISTRATORS: {'title': 'Administratoriai', 'sections': {key: 'manage' if manage else 'view' for key, _, manage in SECTIONS}},
+    'operatoriai': {'title': 'Operatoriai', 'sections': {**VIEW_ALL, 'overview': 'manage', 'files': 'manage', 'actions': 'manage'}},
+    'stebetojai': {'title': 'Stebėtojai', 'sections': dict(VIEW_ALL)}}
+USER_NAME = re.compile(r'[A-Za-z0-9._-]{1,32}')
+GROUP_ID = re.compile(r'[a-z0-9][a-z0-9_-]{0,31}')
+GROUP_TITLE = 40
+LOGIN_PASSWORD = (12, 128)
+SESSION_COOKIE = 'ops_session'
+SESSION_IDLE = 12 * 3600       # a session unused this long ends
+SESSION_LIFETIME = 14 * 86400  # and none lasts longer
+LOGIN_FAILURES = (10, 900)     # this many wrong logins from one client within this many seconds: it waits
+
+
+def group_id(title):
+    """A new group's id from its title: Lithuanian letters as ASCII, anything else as -."""
+    ascii_title = title.lower().translate(str.maketrans('ąčęėįšųūž', 'aceeisuuz'))
+    return re.sub(r'[^a-z0-9]+', '-', ascii_title).strip('-')[:32]
+
+
+def login_password(form, key, label):
+    password = form.get(key, '')
+    if not LOGIN_PASSWORD[0] <= len(password) <= LOGIN_PASSWORD[1] or any(ord(character) < 32 for character in password):
+        raise Invalid(f'{label}: {LOGIN_PASSWORD[0]}–{LOGIN_PASSWORD[1]} simbolių, be valdymo ženklų.')
+    return password
+
+
+class Accounts:
+    """The UI's users and groups ($STATE_DIRECTORY/accounts.json) and its sessions (sessions.json, which keeps only
+    the sha256 of each session cookie). One lock; every change is written at once, atomically, 0600.
+
+    The first start makes the default groups and the ui.env login (UI_USER, UI_PASSWORD_HASH) the first
+    administrator. A new ui.env password later (sudo bin/install-ui --new-password: root's way back in) gives
+    that login back: enabled, an administrator, with that password, its sessions closed."""
+
+    def __init__(self, directory, env_user, env_hash):
+        self.directory = directory
+        self.path, self.sessions_path = directory / 'accounts.json', directory / 'sessions.json'
+        self.lock = threading.RLock()
+        # An unknown or disabled user is checked against this: the time does not tell which names exist.
+        self.dummy = password_hash(secrets.token_urlsafe(18), iterations=int(env_hash.split(':')[1]))
+        try:
+            self.data = json.loads(self.path.read_text())
+            if not isinstance(self.data, dict) or not isinstance(self.data.get('users', {}), dict):
+                raise ValueError('not a JSON object of users and groups')
+        except FileNotFoundError:
+            self.data = {}
+        except (OSError, ValueError) as error:
+            raise Refused(f'{self.path}: unreadable ({error}); fix it, or move it away and the ui.env login '
+                          'becomes the first administrator again') from error
+        try:
+            sessions = json.loads(self.sessions_path.read_text())
+            self.sessions = sessions if isinstance(sessions, dict) else {}
+        except (OSError, ValueError):
+            self.sessions = {}
+        self.recovered = self.sync(env_user, env_hash)
+
+    def sync(self, env_user, env_hash):
+        """The groups and the ui.env login, as the class says; True when that login was (re)set."""
+        with self.lock:
+            data, before = self.data, json.dumps(self.data, sort_keys=True)
+            data.setdefault('groups', json.loads(json.dumps(DEFAULT_GROUPS)))
+            data.setdefault('users', {})
+            # Administrators always manage everything, sections added later too: nobody can lock everyone out.
+            data['groups'][ADMINISTRATORS] = json.loads(json.dumps(DEFAULT_GROUPS[ADMINISTRATORS]))
+            recovered = data.get('env_hash') != env_hash
+            if recovered:
+                now = int(time.time())
+                user = data['users'].setdefault(env_user, {'full_name': '', 'created': now, 'groups': []})
+                user.update(password=env_hash, disabled=False, password_changed=now)
+                user['groups'] = sorted({*user.get('groups', []), ADMINISTRATORS})
+                data['env_hash'] = env_hash
+                self.drop_sessions(env_user)
+            if json.dumps(data, sort_keys=True) != before:
+                self.write(self.path, data)
+            return recovered
+
+    def write(self, path, data):
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = path.with_name(path.name + '.tmp')
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(descriptor, 'w') as handle:
+            json.dump(data, handle, indent=1, sort_keys=True)
+            handle.write('\n')
+        os.replace(temporary, path)
+
+    def write_sessions(self):
+        try:
+            self.write(self.sessions_path, self.sessions)
+        except OSError as error:  # the sessions still work; a restart would end them
+            log(f'{self.sessions_path}: {error}')
+
+    # --- Reading ---
+    def snapshot(self):
+        """A copy of the users and groups (no lock needed by the caller)."""
+        with self.lock:
+            return json.loads(json.dumps({'users': self.data['users'], 'groups': self.data['groups']}))
+
+    def password_of(self, name):
+        """The stored hash of an enabled user, or None."""
+        with self.lock:
+            user = self.data['users'].get(name)
+            return user['password'] if user and not user.get('disabled') else None
+
+    def authenticate(self, name, password):
+        stored = self.password_of(name)
+        matched = password_matches(password, stored or self.dummy)  # outside the lock: PBKDF2 is slow on purpose
+        return matched and stored is not None and self.password_of(name) == stored
+
+    def permissions(self, name):
+        """section -> 'view' or 'manage': the highest level any of the user's groups gives."""
+        with self.lock:
+            user = self.data['users'].get(name)
+            if not user or user.get('disabled'):
+                return {}
+            levels = {}
+            for group in user.get('groups', []):
+                for section, level in ((self.data['groups'].get(group) or {}).get('sections') or {}).items():
+                    if level in PERMISSION_LEVELS and PERMISSION_LEVELS.index(level) > PERMISSION_LEVELS.index(levels.get(section, '')):
+                        levels[section] = level
+            return levels
+
+    # --- Sessions ---
+    @staticmethod
+    def digest(token):
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    def open_session(self, name, client):
+        token, now = secrets.token_urlsafe(32), int(time.time())
+        with self.lock:
+            self.sessions = {key: entry for key, entry in self.sessions.items()
+                             if now - entry.get('seen', 0) <= SESSION_IDLE and now - entry.get('created', 0) <= SESSION_LIFETIME}
+            self.sessions[self.digest(token)] = {'user': name, 'client': client, 'created': now, 'seen': now}
+            self.data['users'][name]['last_login'] = now
+            self.write_sessions()
+            self.write(self.path, self.data)
+        return token
+
+    def session_user(self, token):
+        if not token or len(token) > 100:
+            return None
+        key, now = self.digest(token), int(time.time())
+        with self.lock:
+            entry = self.sessions.get(key)
+            if entry is None:
+                return None
+            user = self.data['users'].get(entry.get('user'))
+            if (not user or user.get('disabled') or now - entry.get('seen', 0) > SESSION_IDLE or
+                    now - entry.get('created', 0) > SESSION_LIFETIME):
+                del self.sessions[key]
+                self.write_sessions()
+                return None
+            if now - entry['seen'] > 300:  # a write every few minutes of use, not every request
+                entry['seen'] = now
+                self.write_sessions()
+            return entry['user']
+
+    def close_session(self, token):
+        with self.lock:
+            if token and self.sessions.pop(self.digest(token), None) is not None:
+                self.write_sessions()
+
+    def drop_sessions(self, name, keep=None):
+        """End a user's sessions (a new password, disabled, deleted), all but `keep` (a cookie)."""
+        with self.lock:
+            kept = self.digest(keep) if keep else None
+            remaining = {key: entry for key, entry in self.sessions.items() if entry.get('user') != name or key == kept}
+            if len(remaining) != len(self.sessions):
+                self.sessions = remaining
+                self.write_sessions()
+
+    def session_count(self, name):
+        with self.lock:
+            return sum(1 for entry in self.sessions.values() if entry.get('user') == name)
+
+    # --- Changes: each checks that an enabled administrator remains, then writes ---
+    def commit(self, users, groups):
+        if not any(ADMINISTRATORS in user.get('groups', []) and not user.get('disabled') for user in users.values()):
+            raise Invalid('Turi likti bent vienas įjungtas vartotojas grupėje „Administratoriai“.')
+        self.data['users'], self.data['groups'] = users, groups
+        self.write(self.path, self.data)
+
+    def save_user(self, name, new, full_name, groups, person, disabled, hashed):
+        with self.lock:
+            snapshot = self.snapshot()
+            users, known = snapshot['users'], snapshot['groups']
+            if new and name in users:
+                raise Invalid(f'Vartotojas {name} jau yra.')
+            if not new and name not in users:
+                raise Invalid(f'Vartotojo {name} nėra.')
+            unknown = [group for group in groups if group not in known]
+            if unknown:
+                raise Invalid(f'Nėra grupės {unknown[0]}.')
+            now = int(time.time())
+            user = users.setdefault(name, {'created': now})
+            user.update(full_name=full_name, groups=sorted(groups), person=person, disabled=disabled)
+            if hashed:
+                user.update(password=hashed, password_changed=now)
+            if 'password' not in user:
+                raise Invalid('Naujam vartotojui reikia slaptažodžio.')
+            self.commit(users, known)
+
+    def set_password(self, name, hashed):
+        with self.lock:
+            snapshot = self.snapshot()
+            snapshot['users'][name].update(password=hashed, password_changed=int(time.time()))
+            self.commit(snapshot['users'], snapshot['groups'])
+
+    def delete_user(self, name):
+        with self.lock:
+            snapshot = self.snapshot()
+            if snapshot['users'].pop(name, None) is None:
+                raise Invalid(f'Vartotojo {name} nėra.')
+            self.commit(snapshot['users'], snapshot['groups'])
+            self.drop_sessions(name)
+
+    def save_group(self, identifier, title, sections):
+        """A new group when `identifier` is None (its id from the title); the group's id."""
+        with self.lock:
+            snapshot = self.snapshot()
+            groups = snapshot['groups']
+            if identifier is None:
+                identifier = group_id(title)
+                if not GROUP_ID.fullmatch(identifier):
+                    raise Invalid('Grupės pavadinime reikia bent vienos raidės ar skaitmens.')
+                if identifier in groups:
+                    raise Invalid(f'Grupė „{groups[identifier]["title"]}“ jau yra.')
+            elif identifier not in groups:
+                raise Invalid('Tokios grupės nėra.')
+            if identifier == ADMINISTRATORS:
+                raise Invalid('„Administratoriai“ visada valdo viską: šios grupės keisti negalima.')
+            groups[identifier] = {'title': title, 'sections': {key: level for key, level in sections.items() if level}}
+            self.commit(snapshot['users'], groups)
+            return identifier
+
+    def delete_group(self, identifier):
+        with self.lock:
+            snapshot = self.snapshot()
+            if identifier == ADMINISTRATORS:
+                raise Invalid('Grupės „Administratoriai“ ištrinti negalima.')
+            if snapshot['groups'].pop(identifier, None) is None:
+                raise Invalid('Tokios grupės nėra.')
+            for user in snapshot['users'].values():
+                user['groups'] = [group for group in user.get('groups', []) if group != identifier]
+            self.commit(snapshot['users'], snapshot['groups'])
 
 
 # --- The action log ------------------------------------------------------------------------------
@@ -1751,9 +2023,9 @@ form.action.danger{border-top:7px solid transparent;
 background:linear-gradient(var(--panel),var(--panel)) padding-box,repeating-linear-gradient(-45deg,var(--hazard) 0 10px,#171717 10px 20px) border-box}
 label{display:grid;grid-template-columns:minmax(9em,14em) minmax(0,1fr);gap:10px;align-items:center;margin:0 0 8px;color:var(--dim);font-size:12px}
 label.check{display:flex;gap:9px;align-items:flex-start;color:var(--ink)}
-input[type=text],textarea,select{font:inherit;color:var(--ink);background:#0f120c;border:1px solid var(--rule);border-radius:3px;
+input[type=text],input[type=password],textarea,select{font:inherit;color:var(--ink);background:#0f120c;border:1px solid var(--rule);border-radius:3px;
 padding:6px 9px;width:100%;caret-color:var(--amber)}
-input[type=text]:focus,textarea:focus,select:focus{outline:none;border-color:var(--amber)}
+input[type=text]:focus,input[type=password]:focus,textarea:focus,select:focus{outline:none;border-color:var(--amber)}
 input::placeholder,textarea::placeholder{color:var(--faint)}
 textarea{min-height:7em;resize:vertical}
 input[type=checkbox]{accent-color:var(--amber);width:15px;height:15px;margin:1px 0 0}
@@ -1938,6 +2210,14 @@ border-top:none;padding:10px 16px;margin:0 0 12px}
 form.bulk.tools{grid-template-columns:5.5em auto auto;justify-content:start}
 .tabs+.bulkbox,.tabs+form+.bulkbox,.tabs+form+.callout+.bulkbox{border-top:none;border-radius:0 0 4px 4px}
 .foot{margin-top:28px;color:var(--faint);font-size:11px}
+.who a{color:var(--ink)}.who a:hover{color:var(--amber)}
+.who form.logout{display:inline;margin-left:10px}.who form.logout button{padding:3px 8px;font-size:10px}
+main.login{max-width:440px;margin:12vh auto 0;padding:0 16px}main.login .mark{display:block;margin:0 0 22px;text-align:center}
+main.login form.action{padding:20px 22px}main.login label{grid-template-columns:7em minmax(0,1fr)}
+.matrix td{vertical-align:middle}.matrix td:first-child{width:14em}
+.seg .pm-view input:checked+span{background:rgba(111,147,201,.3);color:#d6e4fa}
+.seg .pm-manage input:checked+span{background:rgba(255,178,46,.25);color:var(--amber)}
+.seg .pm-none input:checked+span{background:var(--panel-2);color:var(--ink)}
 """ + ''.join(f'.unit:nth-child({index}),.board tbody tr:nth-child({index}),.step:nth-child({index}){{animation-delay:{(index - 1) * 45}ms}}'
               for index in range(2, 21)) + """
 """ + guide_css() + """
@@ -1954,7 +2234,7 @@ label{grid-template-columns:1fr;gap:4px}.board thead{display:none}.board,.board 
 NAVIGATION = (('overview', '/', 'Apžvalga'), ('access', '/access', 'Prieiga'), ('files', '/files', 'Failai'),
               ('update', '/update', 'Atnaujinimas'),
               ('actions', '/actions', 'Veiksmai'), ('instructions', '/instructions', 'Instrukcijos'),
-              ('logs', '/logs', 'Žurnalai'), ('metrics', '/worker-metrics', 'Metrikos'))
+              ('logs', '/logs', 'Žurnalai'), ('metrics', '/worker-metrics', 'Metrikos'), ('users', '/users', 'Vartotojai'))
 
 
 def ago(moment, now=None):
@@ -2116,24 +2396,41 @@ def git_line(state, tag_word=True):
 
 
 class Page:
-    """Renders the pages; `token` is the CSRF token of the logged-in user."""
+    """Renders the pages; `token` is the CSRF token of the logged-in user, `permissions` what their groups give
+    (section -> 'view' or 'manage'): the navigation shows what they see, the forms what they may run."""
 
-    def __init__(self, user, token):
-        self.user, self.token = user, token
+    def __init__(self, user, token, permissions):
+        self.user, self.token, self.permissions = user, token, permissions
+
+    def can(self, section, level='view'):
+        return PERMISSION_LEVELS.index(self.permissions.get(section, '')) >= PERMISSION_LEVELS.index(level)
+
+    def may(self, action):
+        return any(self.can(section, 'manage') for section in ACTION_SECTIONS.get(action, ()))
+
+    def first_section(self):
+        return next((href for key, href, _ in NAVIGATION if self.can(key)), None)
+
+    def csrf_field(self):
+        return f'<input type="hidden" name="csrf" value="{e(self.token)}">'
 
     def layout(self, title, body, refresh=None, section=None):
         head = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ''
         marks = self.marks()
         navigation = ''.join(f'<a class="btn{" on" if key == section else ""}" href="{href}">{e(label)}{marks.get(key, "")}</a>'
-                             for key, href, label in NAVIGATION)
+                             for key, href, label in NAVIGATION if self.can(key))
         busy = running_job()
         busy = (f'<a class="busy" href="/job/{e(busy)}">{lamp("run")}veiksmas eina</a>') if busy else ''
+        if section in MANAGED_SECTIONS and self.can(section) and not self.can(section, 'manage'):
+            body = ('<div class="callout"><p>Tik peržiūra: šioje skiltyje jūsų grupės leidžia matyti, bet ne keisti, '
+                    'todėl veiksmų mygtukų nėra.</p></div>' + body)
         return (f'<!doctype html><html lang="lt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
                 f'{head}<title>{e(title)} · Server OPS</title><link rel="stylesheet" href="/ui.css"></head><body>'
                 f'<header class="top"><a class="mark" href="/">OPS<small>{e(socket.gethostname())}</small></a>'
                 f'<nav class="nav">{navigation}</nav><span class="spacer"></span>{busy}'
-                f'<div class="who"><b>{e(time.strftime("%H:%M"))}</b>{e(self.user)}</div></header>'
-                f'<main><h1>{e(title)}</h1>{body}</main></body></html>')
+                f'<div class="who"><b>{e(time.strftime("%H:%M"))}</b><a href="/account">{e(self.user)}</a>'
+                f'<form class="logout" method="post" action="/logout">{self.csrf_field()}<button>Atsijungti</button></form>'
+                f'</div></header><main><h1>{e(title)}</h1>{body}</main></body></html>')
 
     @staticmethod
     def marks():
@@ -2156,12 +2453,16 @@ class Page:
                 ''.join(f'<input type="hidden" name="{e(key)}" value="{e(text)}">' for key, text in fields))
 
     def form(self, action, title, fields, button='Peržiūrėti', note='', command='', danger=False):
+        if not self.may(action):
+            return ''
         return (f'<form id="form-{e(action)}" class="action{" danger" if danger else ""}" method="post" action="/preview">'
                 f'<h3>{e(title)}{f"<small>{e(command)}</small>" if command else ""}</h3>{self.hidden(action)}{fields}'
                 f'<div class="form-foot"><p class="note">{note}</p><button>{e(button)}</button></div></form>')
 
     def button(self, action, fields, label, kind=''):
         """A one-button form (a unit's start/stop/restart): it leads to the same preview as any action."""
+        if not self.may(action):
+            return ''
         return (f'<form method="post" action="/preview">{self.hidden(action, fields.items())}'
                 f'<button class="{kind}">{e(label)}</button></form>')
 
@@ -3366,6 +3667,179 @@ class Page:
         body = f'<div class="split">{index}<div class="sections">{body}</div></div>'
         return self.layout('Veiksmai', body, section='actions')
 
+    # --- Login, users and groups -----------------------------------------------------------------
+    @staticmethod
+    def login_page(error='', name='', target='/'):
+        message = f'<div class="callout bad"><p>{e(error)}</p></div>' if error else ''
+        return ('<!doctype html><html lang="lt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+                '<title>Prisijungimas · Server OPS</title><link rel="stylesheet" href="/ui.css"></head><body>'
+                f'<main class="login"><p class="mark">OPS<small>{e(socket.gethostname())}</small></p>{message}'
+                '<form class="action" method="post" action="/login">'
+                f'<input type="hidden" name="next" value="{e(target)}">'
+                f'<label><span>Vartotojas</span><input type="text" name="user" value="{e(name)}" autocomplete="username" '
+                f'{"" if name else "autofocus "}required></label>'
+                f'<label><span>Slaptažodis</span><input type="password" name="password" autocomplete="current-password" '
+                f'{"autofocus " if name else ""}required></label>'
+                '<div class="form-foot"><p class="note">Server OPS valdymas</p><button class="run">Prisijungti</button></div>'
+                '</form></main></body></html>')
+
+    @staticmethod
+    def group_titles(groups, names):
+        return ', '.join(groups.get(name, {}).get('title', name) for name in names) or '—'
+
+    @staticmethod
+    def permission_summary(sections):
+        shown = [f'{SECTION_TITLES[key]}{" ✎" if sections.get(key) == "manage" else ""}' for key, _, _ in SECTIONS if sections.get(key)]
+        return ', '.join(shown) or 'nieko'
+
+    @staticmethod
+    def person_link(person):
+        return f'<a href="/access/{quote(person)}">{e(person)}</a>' if person else '—'
+
+    def saved(self, query):
+        return '<div class="callout"><p>Išsaugota.</p></div>' if query.get('saved') == ['1'] else ''
+
+    def users_page(self, accounts, query):
+        users, groups = accounts['users'], accounts['groups']
+        manage = self.can('users', 'manage')
+        rows = ''.join(
+            f'<tr><td><a href="/users/{quote(name)}">{e(name)}</a></td><td>{e(user.get("full_name") or "")}</td>'
+            f'<td>{e(self.group_titles(groups, user.get("groups", [])))}</td><td>{self.person_link(user.get("person"))}</td>'
+            f'<td>{badge("išjungtas", "bad") if user.get("disabled") else badge("aktyvus", "ok")}</td>'
+            f'<td>{e(ago(user["last_login"])) if user.get("last_login") else "dar nesijungė"}</td></tr>'
+            for name, user in sorted(users.items()))
+        members = lambda group: sum(1 for user in users.values() if group in user.get('groups', []))
+        group_rows = ''.join(
+            f'<tr><td><a href="/groups/{quote(identifier)}">{e(group["title"])}</a></td><td>{members(identifier)}</td>'
+            f'<td>{e(self.permission_summary(group.get("sections") or {}))}</td></tr>'
+            for identifier, group in sorted(groups.items(), key=lambda item: (item[0] != ADMINISTRATORS, item[1]['title'])))
+        stats = [(len(users), 'vartotojai'), (sum(1 for user in users.values() if not user.get('disabled')), 'aktyvūs'),
+                 (len(groups), 'grupės')]
+        body = self.saved(query) + '<div class="stats">' + ''.join(
+            f'<div class="stat"><b>{number}</b><span>{e(label)}</span></div>' for number, label in stats) + '</div>'
+        body += ('<h2>Vartotojai</h2>' + ('<div class="toolbar"><a class="btn go" href="/users/new">+ Naujas vartotojas</a></div>' if manage else '') +
+                 '<table class="list"><tr><th>Vardas</th><th>Vardas ir pavardė</th><th>Grupės</th><th>Prieigos žmogus</th>'
+                 f'<th>Būsena</th><th>Prisijungė</th></tr>{rows}</table>')
+        body += ('<h2>Grupės</h2>' + ('<div class="toolbar"><a class="btn go" href="/groups/new">+ Nauja grupė</a></div>' if manage else '') +
+                 f'<table class="list"><tr><th>Grupė</th><th>Narių</th><th>Skiltys (✎ – valdo)</th></tr>{group_rows}</table>'
+                 '<p class="note">Vartotojas mato ir valdo tai, ką leidžia bent viena jo grupė. „Administratoriai“ visada valdo '
+                 'viską; turi likti bent vienas įjungtas jų narys.</p>')
+        return self.layout('Vartotojai', body, section='users')
+
+    def user_page(self, accounts, name, people, query, sessions=0):
+        """A user's settings (name None: a new user)."""
+        users, groups = accounts['users'], accounts['groups']
+        user = users.get(name, {}) if name else {}
+        manage = self.can('users', 'manage')
+        if not manage:
+            rows = [('Vardas', e(name)), ('Vardas ir pavardė', e(user.get('full_name') or '—')),
+                    ('Grupės', e(self.group_titles(groups, user.get('groups', [])))), ('Prieigos žmogus', self.person_link(user.get('person'))),
+                    ('Būsena', badge('išjungtas', 'bad') if user.get('disabled') else badge('aktyvus', 'ok'))]
+            return self.layout(f'Vartotojas {name}', facts(rows) + '<p><a href="/users">← Vartotojai</a></p>', section='users')
+        text = lambda key, label, current='', extra='': (
+            f'<label><span>{e(label)}</span><input type="text" name="{key}" value="{e(current)}" autocomplete="off" {extra}></label>')
+        secret = lambda key, label, hint: (
+            f'<label><span>{e(label)}</span><input type="password" name="{key}" placeholder="{e(hint)}" autocomplete="new-password"></label>')
+        chosen = set(user.get('groups', []))
+        checks = ''.join(f'<label class="check"><input type="checkbox" name="group:{e(identifier)}" value="1"'
+                         f'{" checked" if identifier in chosen else ""}><span>{e(group["title"])}'
+                         f'<small class="muted"> — {e(self.permission_summary(group.get("sections") or {}))}</small></span></label>'
+                         for identifier, group in sorted(groups.items(), key=lambda item: (item[0] != ADMINISTRATORS, item[1]['title'])))
+        person = user.get('person') or ''
+        options = ['<option value="">— nesusietas —</option>'] + [
+            f'<option value="{e(key)}"{" selected" if key == person else ""}>{e(key)}{f" ({e(full)})" if full else ""}</option>'
+            for key, full in sorted({**people, **({person: ''} if person and person not in people else {})}.items())]
+        hint = 'tuščia – lieka dabartinis' if name else f'{LOGIN_PASSWORD[0]}–{LOGIN_PASSWORD[1]} simbolių'
+        fields = (self.csrf_field() + f'<input type="hidden" name="new" value="{"" if name else "1"}">' +
+                  (f'<input type="hidden" name="name" value="{e(name)}">' if name else
+                   text('name', 'Vardas (prisijungimui)', '', 'required pattern="[A-Za-z0-9._\\-]{1,32}"')) +
+                  text('full_name', 'Vardas ir pavardė', user.get('full_name') or '') +
+                  secret('password', 'Slaptažodis' if not name else 'Naujas slaptažodis', hint) +
+                  secret('repeat', 'Pakartokite slaptažodį', '') +
+                  f'<label><span>Prieigos žmogus</span><select name="person">{"".join(options)}</select></label>'
+                  '<div class="block-label">Grupės</div>' + checks +
+                  f'<label class="check"><input type="checkbox" name="disabled" value="1"{" checked" if user.get("disabled") else ""}>'
+                  '<span>Išjungtas (prisijungti negali, jo sesijos baigiamos)</span></label>')
+        body = self.saved(query)
+        if name:
+            body += facts([('Sukurtas', e(local_time(user['created'])) if user.get('created') else '—'),
+                           ('Slaptažodis keistas', e(local_time(user['password_changed'])) if user.get('password_changed') else '—'),
+                           ('Prisijungė', e(local_time(user['last_login'])) if user.get('last_login') else 'dar nesijungė'),
+                           ('Atviros sesijos', str(sessions))])
+        body += ('<div class="deck">'
+                 f'<form class="action" method="post" action="/users/save"><h3>{"Nustatymai" if name else "Naujas vartotojas"}</h3>{fields}'
+                 '<div class="form-foot"><p class="note">Prieigos žmogus – kuris „Prieigos“ raktas (SSH, įrankiai) yra šis žmogus; '
+                 f'prisijungimas prie sąsajos nuo jo nepriklauso.</p><button class="run">Išsaugoti</button></div></form>')
+        if name:
+            body += (f'<form class="action danger" method="post" action="/users/delete"><h3>Ištrinti {e(name)}</h3>{self.csrf_field()}'
+                     f'<input type="hidden" name="name" value="{e(name)}"><div class="form-foot"><p class="note">Vartotojas nebegalės '
+                     'prisijungti; jo veiksmai žurnaluose lieka.</p><button class="stop">Ištrinti</button></div></form>')
+        body += '</div><p><a href="/users">← Vartotojai</a></p>'
+        return self.layout(f'Vartotojas {name}' if name else 'Naujas vartotojas', body, section='users')
+
+    def group_page(self, accounts, identifier, query):
+        """A group's sections (identifier None: a new group)."""
+        users, groups = accounts['users'], accounts['groups']
+        group = groups.get(identifier, {}) if identifier else {}
+        sections = group.get('sections') or {}
+        locked = identifier == ADMINISTRATORS or not self.can('users', 'manage')
+        members = [name for name, user in sorted(users.items()) if identifier and identifier in user.get('groups', [])]
+
+        def choice(key, manage):
+            levels = PERMISSION_LEVELS if manage else PERMISSION_LEVELS[:2]
+            current = sections.get(key, '')
+            if locked:
+                return badge(PERMISSION_LABELS[current], {'manage': 'warn', 'view': 'ok'}.get(current, ''))
+            return '<div class="seg">' + ''.join(
+                f'<label class="pm-{level or "none"}"><input type="radio" name="level:{key}" value="{level}"'
+                f'{" checked" if level == current else ""}><span>{PERMISSION_LABELS[level]}</span></label>' for level in levels) + '</div>'
+        matrix = ('<table class="list matrix"><tr><th>Skiltis</th><th>Teisė</th></tr>' + ''.join(
+            f'<tr><td>{e(title)}</td><td>{choice(key, manage)}</td></tr>' for key, title, manage in SECTIONS) + '</table>')
+        body = self.saved(query)
+        if identifier:
+            body += facts([('Nariai', ', '.join(f'<a href="/users/{quote(name)}">{e(name)}</a>' for name in members) or '—')])
+        if locked:
+            note = ('„Administratoriai“ visada valdo viską, todėl šios grupės keisti negalima.' if identifier == ADMINISTRATORS else '')
+            body += (f'<p class="note">{e(note)}</p>' if note else '') + matrix
+        else:
+            body += ('<div class="deck wide">'
+                     f'<form class="action" method="post" action="/groups/save"><h3>{"Teisės" if identifier else "Nauja grupė"}</h3>'
+                     f'{self.csrf_field()}<input type="hidden" name="group" value="{e(identifier or "")}">'
+                     f'<label><span>Pavadinimas</span><input type="text" name="title" value="{e(group.get("title", ""))}" '
+                     f'maxlength="{GROUP_TITLE}" required autocomplete="off"></label>{matrix}'
+                     '<div class="form-foot"><p class="note">Mato – skiltis rodoma; valdo – dar ir jos veiksmai (peržiūra, vykdymas). '
+                     'Vartotojai: valdo – kuria vartotojus ir grupes.</p><button class="run">Išsaugoti</button></div></form>')
+            if identifier:
+                body += (f'<form class="action danger" method="post" action="/groups/delete"><h3>Ištrinti grupę</h3>{self.csrf_field()}'
+                         f'<input type="hidden" name="group" value="{e(identifier)}"><div class="form-foot"><p class="note">Nariai '
+                         'netenka šios grupės teisių; patys vartotojai lieka.</p><button class="stop">Ištrinti</button></div></form>')
+            body += '</div>'
+        body += '<p><a href="/users">← Vartotojai</a></p>'
+        title = f'Grupė {group["title"]}' if identifier else 'Nauja grupė'
+        return self.layout(title, body, section='users')
+
+    def account_page(self, accounts, query, sessions=0):
+        user = accounts['users'].get(self.user, {})
+        rows = [('Vardas', e(self.user)), ('Vardas ir pavardė', e(user.get('full_name') or '—')),
+                ('Grupės', e(self.group_titles(accounts['groups'], user.get('groups', [])))),
+                ('Mato ir valdo', e(self.permission_summary(self.permissions))),
+                ('Prieigos žmogus', self.person_link(user.get('person')) if self.can('access') else e(user.get('person') or '—')),
+                ('Slaptažodis keistas', e(local_time(user['password_changed'])) if user.get('password_changed') else '—'),
+                ('Atviros sesijos', str(sessions))]
+        secret = lambda key, label, complete: (
+            f'<label><span>{e(label)}</span><input type="password" name="{key}" autocomplete="{complete}" required></label>')
+        body = ('<div class="callout"><p>Slaptažodis pakeistas; kitos jūsų sesijos baigtos.</p></div>' if query.get('saved') == ['1'] else '')
+        body += facts(rows) + ('<div class="deck"><form class="action" method="post" action="/account/password"><h3>Keisti slaptažodį</h3>'
+                               f'{self.csrf_field()}' + secret('current', 'Dabartinis', 'current-password') +
+                               secret('password', 'Naujas', 'new-password') + secret('repeat', 'Pakartokite naują', 'new-password') +
+                               f'<div class="form-foot"><p class="note">{LOGIN_PASSWORD[0]}–{LOGIN_PASSWORD[1]} simbolių. Kitur atviros '
+                               'jūsų sesijos baigiamos.</p><button class="run">Keisti</button></div></form></div>')
+        return self.layout('Mano paskyra', body)
+
+    def refused(self, message, back='/users', label='Vartotojai'):
+        return self.layout('Netinkami duomenys', f'<div class="callout bad"><p>{e(message)}</p></div>'
+                                                 f'<p><a href="{e(back)}">← {e(label)}</a></p>', section='users')
+
     def invalid(self, message):
         return self.layout('Netinkami duomenys', f'<div class="callout bad"><p>{e(message)}</p></div>'
                                                  '<p><a href="/actions">← Atgal į veiksmus</a></p>', section='actions')
@@ -3499,9 +3973,25 @@ def tail(path, limit=200):
         return f'({error.strerror})'
 
 
-def handler(user, stored):
+def path_section(path):
+    """The section a GET path belongs to (its "mato" is needed), or None (checked where it is served)."""
+    for prefix, section in (('/project/', 'overview'), ('/access', 'access'), ('/files', 'files'), ('/update', 'update'),
+                            ('/actions', 'actions'), ('/instructions', 'instructions'), ('/logs', 'logs'),
+                            ('/worker-metrics', 'metrics'), ('/users', 'users'), ('/groups', 'users')):
+        if path == prefix.rstrip('/') or path.startswith(prefix.rstrip('/') + '/'):
+            return section
+    return None
+
+
+def safe_target(target):
+    """Where a login leads: a path of this UI only (never //host or /login)."""
+    return target if re.fullmatch(r'/(?![/\\])[^\s]{0,500}', target or '') and not target.startswith('/login') else '/'
+
+
+def handler(accounts):
     csrf_key = secrets.token_bytes(32)
-    verified = set()  # sha256 of Authorization headers already checked: PBKDF2 runs once per login
+    verified = {}  # sha256 of an Authorization header -> (user, password hash): PBKDF2 runs once per login
+    failures = {}  # client -> times of its wrong logins
     pending = Pending()
     lock = threading.Lock()
 
@@ -3531,38 +4021,103 @@ def handler(user, stored):
         def client(self):
             return self.client_address[0]
 
-        def login(self):
-            """The user of a valid Basic-auth header, or None (the reply is sent)."""
+        def host_ok(self):
             host = self.headers.get('Host', '')
             if re.sub(r':[0-9]+$', '', host) not in LOOPBACK_HOSTS:
                 log(f'refused {self.client()}: Host {host[:60]!r} (400)')
                 self.reply(400, 'Unexpected Host\n', 'text/plain; charset=utf-8')
+                return False
+            return True
+
+        def cookie(self):
+            for part in self.headers.get('Cookie', '').split(';'):
+                key, _, text = part.strip().partition('=')
+                if key == SESSION_COOKIE:
+                    return text
+            return ''
+
+        def limited(self):
+            """True (and the reply sent) when this client has had too many wrong logins lately."""
+            now = time.time()
+            with lock:
+                recent = [moment for moment in failures.get(self.client(), []) if now - moment < LOGIN_FAILURES[1]]
+                failures[self.client()] = recent
+            if len(recent) < LOGIN_FAILURES[0]:
+                return False
+            log(f'refused {self.client()}: too many wrong logins (429)')
+            self.reply(429, Page.login_page('Per daug nepavykusių bandymų: palaukite kelias minutes.'),
+                       headers=[('Retry-After', str(LOGIN_FAILURES[1]))])
+            return True
+
+        def failed(self):
+            with lock:
+                failures.setdefault(self.client(), []).append(time.time())
+                if len(failures) > 1000:
+                    failures.clear()
+            log(f'refused {self.client()}: wrong login (401)')
+
+        def login(self):
+            """The logged-in user, or None (the reply is sent). A browser has a session cookie (the login page
+            gives it); a script may send Basic auth of any enabled user instead. Without either a page leads to
+            the login page; no WWW-Authenticate is sent, so no browser shows its own login dialog."""
+            if not self.host_ok():
                 return None
             header = self.headers.get('Authorization', '')
-            digest = hashlib.sha256(header.encode('utf-8', 'surrogateescape')).digest()
-            with lock:
-                known = digest in verified
-            if not known:
+            if header:
+                digest = hashlib.sha256(header.encode('utf-8', 'surrogateescape')).digest()
+                with lock:
+                    known = verified.get(digest)
+                if known and accounts.password_of(known[0]) == known[1]:  # same password, still enabled
+                    return known[0]
+                if self.limited():
+                    return None
                 given_user, given_password = '', ''
                 if header.startswith('Basic '):
                     try:
                         given_user, _, given_password = base64.b64decode(header[6:], validate=True).decode().partition(':')
                     except (ValueError, UnicodeDecodeError):
                         pass
-                # Both are compared, whatever the first gives: the time tells nothing about the user name.
-                user_ok = hmac.compare_digest(given_user.encode(), user.encode())
-                password_ok = password_matches(given_password, stored)
-                if not (user_ok and password_ok):
-                    if header:
-                        log(f'refused {self.client()}: wrong login (401)')
-                    self.reply(401, self.page_text('Reikia prisijungti.'),
-                               headers=[('WWW-Authenticate', 'Basic realm="Server OPS", charset="UTF-8"')])
-                    return None
-                with lock:
-                    if len(verified) > 64:
-                        verified.clear()
-                    verified.add(digest)
-            return user
+                if USER_NAME.fullmatch(given_user) and accounts.authenticate(given_user, given_password):
+                    with lock:
+                        if len(verified) > 64:
+                            verified.clear()
+                        verified[digest] = (given_user, accounts.password_of(given_user))
+                    return given_user
+                self.failed()
+                self.reply(401, self.page_text('Neteisingas vardas arba slaptažodis.'))
+                return None
+            name = accounts.session_user(self.cookie())
+            if name:
+                return name
+            if self.command in ('GET', 'HEAD'):
+                self.redirect('/login' + (f'?next={quote(self.path)}' if self.path not in ('/', '') else ''))
+            else:
+                self.reply(401, self.page_text('Reikia prisijungti.'))
+            return None
+
+        def redirect(self, location, headers=()):
+            self.send_response(303)
+            self.send_header('Location', location)
+            self.send_header('Content-Length', '0')
+            self.send_header('Cache-Control', 'no-store')
+            for header in headers:
+                self.send_header(*header)
+            self.end_headers()
+
+        def session_cookie(self, token, age):
+            secure = '; Secure' if self.headers.get('X-Forwarded-Proto') == 'https' else ''
+            return ('Set-Cookie', f'{SESSION_COOKIE}={token}; Path=/; Max-Age={age}; HttpOnly; SameSite=Lax{secure}')
+
+        def page_for(self, name):
+            return Page(name, self.token(name), accounts.permissions(name))
+
+        def allowed(self, page, section, level='view'):
+            """True when the user's groups give this; else the 403 page is sent."""
+            if page.can(section, level):
+                return True
+            self.reply(403, page.layout('Nėra teisės', f'<div class="callout bad"><p>Skilčiai „{e(SECTION_TITLES[section])}“ '
+                                                       f'reikia teisės „{PERMISSION_LABELS[level]}“. Ją duoda grupės (Vartotojai).</p></div>'))
+            return False
 
         @staticmethod
         def page_text(text):
@@ -3572,17 +4127,56 @@ def handler(user, stored):
             return hmac.new(csrf_key, b'csrf\0' + name.encode(), hashlib.sha256).hexdigest()
 
         def do_GET(self):
+            url = urlsplit(self.path)
+            path, query = url.path, parse_qs(url.query)
+            if path == '/ui.css':  # the login page needs it too; nothing in it is secret
+                return self.reply(200, STYLE, 'text/css; charset=utf-8')
+            if path == '/login':
+                if not self.host_ok():
+                    return
+                target = safe_target(query.get('next', ['/'])[0])
+                if accounts.session_user(self.cookie()):
+                    return self.redirect(target)
+                return self.reply(200, Page.login_page(target=target))
             name = self.login()
             if name is None:
                 return
-            page = Page(name, self.token(name))
-            url = urlsplit(self.path)
-            path, query = url.path, parse_qs(url.query)
-            if path == '/ui.css':
-                return self.reply(200, STYLE, 'text/css; charset=utf-8')
+            page = self.page_for(name)
+            section = path_section(path)
+            if section and not self.allowed(page, section):
+                return
             if path == '/':
+                if not page.can('overview'):
+                    first = page.first_section()
+                    return self.redirect(first) if first else self.reply(200, page.layout(
+                        'Server OPS', '<div class="callout warn"><p>Jūsų grupės dar neleidžia matyti nė vienos skilties. '
+                        'Kreipkitės į administratorių.</p></div><p><a href="/account">Mano paskyra</a></p>'))
                 data, error = status(fresh='fresh' in query)
                 return self.reply(200, page.overview(data, error))
+            if path == '/account':
+                return self.reply(200, page.account_page(accounts.snapshot(), query, accounts.session_count(name)))
+            if path == '/users':
+                return self.reply(200, page.users_page(accounts.snapshot(), query))
+            match = re.fullmatch(r'/users/(' + USER_NAME.pattern + ')', unquote(path))
+            if match:
+                snapshot = accounts.snapshot()
+                if match[1] == 'new':
+                    if not self.allowed(page, 'users', 'manage'):
+                        return
+                    return self.reply(200, page.user_page(snapshot, None, self.people(), query))
+                if match[1] not in snapshot['users']:
+                    return self.reply(404, page.refused(f'Vartotojo {match[1]} nėra.'))
+                return self.reply(200, page.user_page(snapshot, match[1], self.people(), query, accounts.session_count(match[1])))
+            match = re.fullmatch(r'/groups/(' + GROUP_ID.pattern + ')', path)
+            if match:
+                snapshot = accounts.snapshot()
+                if match[1] == 'new':
+                    if not self.allowed(page, 'users', 'manage'):
+                        return
+                    return self.reply(200, page.group_page(snapshot, None, query))
+                if match[1] not in snapshot['groups']:
+                    return self.reply(404, page.refused('Tokios grupės nėra.'))
+                return self.reply(200, page.group_page(snapshot, match[1], query))
             match = re.fullmatch(r'/project/([a-z0-9][a-z0-9_-]{0,63})/logs', path)
             if match:
                 environment, container = query.get('env', [''])[0], query.get('container', [''])[0]
@@ -3692,6 +4286,8 @@ def handler(user, stored):
             match = re.fullmatch(r'/job/(' + JOB_ID.pattern + ')', path)
             if match and (JOBS / match[1] / 'job.json').is_file():
                 meta, result, running = job_state(JOBS / match[1])
+                if not any(page.can(where) for where in ACTION_SECTIONS.get(meta.get('action'), ('actions',))):
+                    return self.allowed(page, ACTION_SECTIONS.get(meta.get('action'), ('actions',))[0])
                 output = JOBS / match[1] / 'output.log'
                 return self.reply(200, page.job(match[1], meta, result, running, tail(output, 3000) if output.exists() else ''))
             self.reply(404, page.layout('Nerasta', '<p><a href="/">← Į apžvalgą</a></p>'))
@@ -3699,33 +4295,171 @@ def handler(user, stored):
         do_HEAD = do_GET
 
         def do_POST(self):
-            name = self.login()
-            if name is None:
+            path = urlsplit(self.path).path
+            if not self.host_ok():
                 return
             origin = self.headers.get('Origin')
             if origin is not None and (urlsplit(origin).hostname or '') not in ('127.0.0.1', 'localhost', '::1'):
                 log(f'refused {self.client()}: POST from Origin {origin[:60]!r} (403)')
                 return self.reply(403, self.page_text('Užklausa ne iš šios sąsajos.'))
+            if path != '/login':
+                name = self.login()
+                if name is None:
+                    return
             length = self.headers.get('Content-Length', '')
             if not length.isdigit() or int(length) > BODY_LIMIT:
                 return self.reply(413, self.page_text('Per didelė užklausa.'))
             fields = parse_qs(self.rfile.read(int(length)).decode('utf-8', 'replace'), keep_blank_values=True)
             form = {key: values[0] for key, values in fields.items()}
+            if path == '/login':  # no session yet: Origin above (SameSite and the CSP's form-action do the rest)
+                return self.sign_in(form)
             if not hmac.compare_digest(form.get('csrf', '').encode(), self.token(name).encode()):
-                log(f'refused {self.client()}: POST {urlsplit(self.path).path} without a valid CSRF token (403)')
+                log(f'refused {self.client()}: POST {path} without a valid CSRF token (403)')
                 return self.reply(403, self.page_text('Pasenusi forma: atnaujink puslapį ir bandyk dar kartą.'))
-            page = Page(name, self.token(name))
-            path = urlsplit(self.path).path
+            page = self.page_for(name)
             if path == '/preview':
                 return self.preview(page, name, form)
             if path == '/run':
                 return self.run(page, name, form)
+            if path == '/logout':
+                accounts.close_session(self.cookie())
+                self.audit(name, 'logout')
+                return self.redirect('/login', [self.session_cookie('', 0)])
+            if path == '/account/password':
+                return self.change_password(page, name, form)
+            changes = {'/users/save': self.save_user, '/users/delete': self.delete_user,
+                       '/groups/save': self.save_group, '/groups/delete': self.delete_group}
+            if path in changes:
+                if not self.allowed(page, 'users', 'manage'):
+                    return
+                try:
+                    return changes[path](page, name, form)
+                except Invalid as error:
+                    return self.reply(400, page.refused(str(error)))
             self.reply(404, page.layout('Nerasta', ''))
+
+        # --- Login and accounts ---
+        def audit(self, name, text):
+            """A line in ui-actions.log; False when it could not be written (a change then does not happen)."""
+            try:
+                record(name, self.client(), 'users', text)
+                return True
+            except OSError as error:
+                log(f'ui-actions.log: {error}')
+                return False
+
+        def change(self, name, what, apply):
+            """A change of users or groups: its line in ui-actions.log first (none written: nothing changes), then
+            the change; a refused one gets its own line."""
+            if not self.audit(name, what):
+                raise Invalid('Veiksmų žurnalas neįrašomas: nieko nepakeista.')
+            try:
+                return apply()
+            except Invalid as error:
+                self.audit(name, f'{what.split(":")[0]}: refused ({error})')
+                raise
+
+        def people(self):
+            """The Prieiga keys a user may be linked to: key -> full name."""
+            data = status()[0] or {}
+            names = full_names(data)
+            return {key['name']: names.get(key['name'], '') for key in data.get('keys', []) if key.get('name')}
+
+        def sign_in(self, form):
+            target = safe_target(form.get('next', '/'))
+            if self.limited():
+                return
+            given, password = form.get('user', '').strip(), form.get('password', '')
+            if not (USER_NAME.fullmatch(given) and accounts.authenticate(given, password)):
+                self.failed()
+                return self.reply(401, Page.login_page('Neteisingas vardas arba slaptažodis.', given[:32], target))
+            token = accounts.open_session(given, self.client())
+            self.audit(given, 'login')
+            self.redirect(target, [self.session_cookie(token, SESSION_LIFETIME)])
+
+        def change_password(self, page, name, form):
+            try:
+                if not accounts.authenticate(name, form.get('current', '')):
+                    self.failed()
+                    raise Invalid('Dabartinis slaptažodis neteisingas.')
+                password = login_password(form, 'password', 'Naujas slaptažodis')
+                if form.get('repeat', '') != password:
+                    raise Invalid('Slaptažodžiai nesutampa.')
+                self.change(name, f'user {name}: password changed (own)', lambda: accounts.set_password(name, password_hash(password)))
+            except Invalid as error:
+                return self.reply(400, page.refused(str(error), '/account', 'Mano paskyra'))
+            accounts.drop_sessions(name, keep=self.cookie())
+            self.redirect('/account?saved=1')
+
+        def save_user(self, page, name, form):
+            new = form.get('new') == '1'
+            user = value(form, 'name', USER_NAME, 'Vardas', required=True)
+            if new and user == 'new':
+                raise Invalid('Vardas „new“ užimtas (naujo vartotojo puslapis).')
+            full_name = form.get('full_name', '').strip()
+            if len(full_name) > FULL_NAME_LENGTH or any(ord(character) < 32 for character in full_name):
+                raise Invalid(f'Vardas ir pavardė: iki {FULL_NAME_LENGTH} simbolių.')
+            hashed = None
+            if new or form.get('password'):
+                password = login_password(form, 'password', 'Slaptažodis')
+                if form.get('repeat', '') != password:
+                    raise Invalid('Slaptažodžiai nesutampa.')
+                hashed = password_hash(password)
+            groups = [key[6:] for key, chosen in form.items() if key.startswith('group:') and chosen == '1']
+            if any(not GROUP_ID.fullmatch(group) for group in groups):
+                raise Invalid('Netinkama grupė.')
+            person = form.get('person', '')
+            if person and (not KEY_NAME.fullmatch(person) or (status()[0] and person not in self.people() and
+                                                                person != accounts.snapshot()['users'].get(user, {}).get('person'))):
+                raise Invalid(f'Prieigoje rakto {person} nėra.')
+            disabled = form.get('disabled') == '1'
+            what = (f'user {user}: {"created" if new else "saved"} groups={",".join(sorted(groups)) or "-"} person={person or "-"} '
+                    f'disabled={"yes" if disabled else "no"} password={"set" if hashed else "kept"}')
+            self.change(name, what, lambda: accounts.save_user(user, new, full_name, groups, person, disabled, hashed))
+            if hashed or disabled:  # a new password or a disabled user ends their sessions (the admin's own stays)
+                accounts.drop_sessions(user, keep=self.cookie() if user == name else None)
+            self.redirect(f'/users/{quote(user)}?saved=1')
+
+        def delete_user(self, page, name, form):
+            user = value(form, 'name', USER_NAME, 'Vardas', required=True)
+            self.change(name, f'user {user}: deleted', lambda: accounts.delete_user(user))
+            if user == name:
+                return self.redirect('/login', [self.session_cookie('', 0)])
+            self.redirect('/users?saved=1')
+
+        def save_group(self, page, name, form):
+            identifier = form.get('group') or None
+            if identifier is not None and not GROUP_ID.fullmatch(identifier):
+                raise Invalid('Tokios grupės nėra.')
+            title = form.get('title', '').strip()
+            if not 1 <= len(title) <= GROUP_TITLE or any(ord(character) < 32 for character in title):
+                raise Invalid(f'Grupės pavadinimas: 1–{GROUP_TITLE} simbolių.')
+            if identifier is None and group_id(title) == 'new':
+                raise Invalid('Pavadinimas „new“ užimtas (naujos grupės puslapis).')
+            sections = {}
+            for key, _, manage in SECTIONS:
+                level = form.get(f'level:{key}', '')
+                if level not in (PERMISSION_LEVELS if manage else PERMISSION_LEVELS[:2]):
+                    raise Invalid(f'{SECTION_TITLES[key]}: netinkama teisė.')
+                sections[key] = level
+            what = f'group {identifier or group_id(title)}: {"saved" if identifier else "created"} ' + \
+                ' '.join(f'{key}={level}' for key, level in sections.items() if level)
+            identifier = self.change(name, what, lambda: accounts.save_group(identifier, title, sections))
+            self.redirect(f'/groups/{identifier}?saved=1')
+
+        def delete_group(self, page, name, form):
+            identifier = form.get('group', '')
+            if not GROUP_ID.fullmatch(identifier):
+                raise Invalid('Tokios grupės nėra.')
+            self.change(name, f'group {identifier}: deleted', lambda: accounts.delete_group(identifier))
+            self.redirect('/users?saved=1')
 
         def preview(self, page, name, form):
             builder = ACTIONS.get(form.get('action', ''))
             if builder is None:
                 return self.reply(400, page.invalid('Nežinomas veiksmas.'))
+            if not page.may(form['action']):
+                return self.reply(403, page.invalid('Šiam veiksmui jūsų grupės neduoda teisės „valdo“.'))
             try:
                 plan = builder(form, status()[0] if form.get('action') in ('pipeline', 'add-backup-key', 'key-bulk', 'tool-access',
                                                                            'tool-bulk', 'tool-password', 'tool-person') else None)
@@ -3749,6 +4483,8 @@ def handler(user, stored):
             plan = pending.take(form.get('pending', ''), name)
             if plan is None:
                 return self.reply(400, page.invalid('Peržiūra nebegalioja (pasibaigė, jau vykdyta ar sąsaja persikrovė): pradėk iš naujo.'))
+            if not page.may(plan.action):  # the groups may have changed since the preview
+                return self.reply(403, page.invalid('Šiam veiksmui jūsų grupės neduoda teisės „valdo“.'))
             if plan.kind == 'pipeline':
                 return self.pipeline(page, name, plan)
             busy = running_job()
@@ -3819,7 +4555,17 @@ def main(arguments):
         print(f'would listen on http://{ADDRESS}:{port}/ for {user} (Bitbucket tokens: {", ".join(tokens) or "none"})')
         return 0
     try:
-        server = Server((ADDRESS, port), handler(user, stored))
+        accounts = Accounts(STATE, user, stored)
+    except Refused as error:
+        log(str(error))
+        return CONFIGURATION_ERROR
+    except OSError as error:
+        log(f'{STATE}: {error}')
+        return 1
+    if accounts.recovered:
+        log(f'{user}: the ui.env login is an enabled administrator with the ui.env password')
+    try:
+        server = Server((ADDRESS, port), handler(accounts))
     except OSError as error:
         log(f'Cannot listen on {ADDRESS}:{port}: {error}')
         return 1
