@@ -391,7 +391,8 @@ class InstallGitHubRunnerRootTest(ScriptTest):
         self.calls = self.root / "systemctl.calls"
         self.stub("systemctl", f'echo "$*" >> {self.calls}\n'
                                'case "$1" in is-active) [ -n "${FAKE_ACTIVE:-}" ] || { [ "$2" = --quiet ] || echo inactive; exit 3; }; '
-                               '[ "$2" = --quiet ] || echo active;; esac\n')
+                               '[ "$2" = --quiet ] || echo active;; '
+                               'show) echo "/system.slice/$5";; esac\n')
         # The stand-in archive: config.sh records how it was called and registers (.runner).
         self.config_log = self.root / "config.calls"
         archive = self.root / "archive"
@@ -459,6 +460,89 @@ class InstallGitHubRunnerRootTest(ScriptTest):
         self.assertNotIn("restart", self.calls.read_text())
         self.assertFalse([call for call in calls if "setup-server-runner" in call], "the Bitbucket runner is not touched")
         self.assertFalse((self.root / "systemd/setup-server-runner.service").exists())
+
+    def remove(self, *arguments, stdin="", provider=("--provider", "github"), **env):
+        return self.run_script("install-runner", *provider, "--remove", *arguments, stdin=stdin,
+                               PATH=f"{self.root_bin}:{self.bin}:{os.environ['PATH']}", SETUP_SERVER_USER=getpass.getuser(),
+                               SETUP_SERVER_SYSTEMD=str(self.root / "systemd"), SETUP_SERVER_CGROUP=str(self.root / "cgroup"),
+                               SETUP_SERVER_UNIT=str(self.root / "systemd/setup-server-runner.service"), **env)
+
+    def registered(self):
+        (self.root / "systemd").mkdir()
+        self.assertEqual(self.install("--sha256", self.sha256).returncode, 0)
+        (self.directory / ".runner").write_text('\ufeff{"agentId": 7, "agentName": "worker1", "gitHubUrl": "https://github.com/BigSant"}',
+                                                encoding="utf-8")
+        self.config_log.unlink()
+        self.calls.unlink()
+
+    def test_remove_unregisters_with_the_pasted_token_and_deletes_the_directory(self):
+        self.registered()
+        removal = "./config.sh remove --token AREMOVALTOKEN0123456789\n"
+        check = self.remove("--scope", "bigsant", "--check", stdin=removal)
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn("GitHub runner worker1 of https://github.com/BigSant", check.stdout)
+        self.assertIn("would stop and disable", check.stdout)
+        self.assertTrue(self.directory.is_dir())
+        self.assertFalse(self.config_log.exists())
+        result = self.remove("--scope", "bigsant", stdin=removal)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        config = self.config_log.read_text()
+        self.assertIn("args: remove", config)
+        self.assertIn("token: AREMOVALTOKEN0123456789", config, "from its environment, not its command line")
+        self.assertIn(f"disable --now {GITHUB_UNIT}", self.calls.read_text())
+        self.assertFalse(self.directory.exists())
+        self.assertNotIn("AREMOVALTOKEN0123456789", result.stdout + result.stderr + self.sudo_log.read_text())
+
+    def test_remove_waits_for_a_running_job_and_without_a_token_points_to_github(self):
+        self.registered()
+        cgroup = self.root / f"cgroup/system.slice/{GITHUB_UNIT}"
+        cgroup.mkdir(parents=True)
+        (cgroup / "cgroup.procs").write_text("4242\n")
+        (self.root / "proc/4242").mkdir(parents=True)
+        (self.root / "proc/4242/comm").write_text("Runner.Worker\n")
+        busy = self.remove("--scope", "bigsant")
+        self.assertEqual(busy.returncode, 75, busy.stdout + busy.stderr)
+        self.assertIn("runs a job now", busy.stderr)
+        self.assertTrue(self.directory.is_dir())
+        self.assertNotIn("disable", self.calls.read_text())
+        (self.root / "proc/4242/comm").write_text("Runner.Listener\n")
+        result = self.remove("--scope", "bigsant")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("until it is removed there: https://github.com/organizations/BigSant/settings/actions/runners", result.stdout)
+        self.assertFalse(self.config_log.exists(), "no token: nothing unregistered")
+        self.assertFalse(self.directory.exists())
+
+    def test_a_refused_removal_in_github_deletes_nothing(self):
+        self.registered()
+        result = self.remove("--scope", "bigsant", stdin="./config.sh remove --token EXPIRED0123\n", FAKE_CONFIG_FAILS="1")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("nothing was deleted", result.stderr)
+        self.assertTrue(self.directory.is_dir())
+
+    def test_remove_takes_only_a_runner_directory(self):
+        for scope, code in (("../srv", 64), ("Big", 64), ("a/b", 64), ("a..b", 64), ("nope", 65)):
+            with self.subTest(scope=scope):
+                self.assertEqual(self.remove("--scope", scope, "--check").returncode, code)
+        self.assertEqual(self.remove("--check").returncode, 64, "GitHub needs --scope")
+        self.assertEqual(self.run_script("install-runner", "--scope", "bigsant", "--check").returncode, 64)
+
+    def test_remove_takes_the_bitbucket_runner_its_unit_and_credentials(self):
+        (self.root / "systemd").mkdir()
+        unit = self.root / "systemd/setup-server-runner.service"
+        unit.write_text("[Service]\n")
+        environment = Path(os.environ["SETUP_SERVER_CONFIG"]) / "runner.env"
+        environment.parent.mkdir(parents=True)
+        environment.write_text('RUNNER_ARGS="--OAuthClientSecret x"\n')
+        (self.root / "srv/runner/current").mkdir(parents=True)
+        result = self.remove(provider=())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(unit.exists())
+        self.assertFalse(environment.exists())
+        self.assertFalse((self.root / "srv/runner").exists())
+        calls = self.calls.read_text()
+        self.assertIn("disable --now setup-server-runner.service", calls)
+        self.assertIn("daemon-reload", calls)
+        self.assertEqual(self.remove(provider=()).returncode, 65, "nothing left to remove")
 
     def test_a_registered_scope_needs_no_token_and_is_not_registered_again(self):
         (self.root / "systemd").mkdir()

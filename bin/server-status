@@ -55,6 +55,8 @@ LIBRARY = Path(os.environ.get('SETUP_SERVER_LIBRARY', '/usr/local/lib/setup-serv
 SBIN = Path(os.environ.get('SETUP_SERVER_SBIN', '/usr/local/sbin'))
 PROJECTS = ROOT / 'projects'
 CONFIG = Path(os.environ.get('SETUP_SERVER_CONFIG', '/etc/setup-server'))
+PROC = Path(os.environ.get('SETUP_SERVER_PROC') or '/proc')
+CGROUP = Path(os.environ.get('SETUP_SERVER_CGROUP') or '/sys/fs/cgroup')
 GITHUB_RUNNERS = ROOT / 'github-runner'
 # NAME, SERIES and environment_directory are identical in bin/backup-projects (tests/test_metrics.py).
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]*')
@@ -74,7 +76,8 @@ JOURNAL_UNITS = ('setup-server-runner.service', 'setup-server-github-runner@*.se
                  'setup-server-backup-full.service', 'setup-server-backup-files.service', 'setup-server-metrics.service',
                  'setup-server-ui.service')
 PROPERTIES = ('Id', 'LoadState', 'ActiveState', 'SubState', 'Result', 'NRestarts', 'ActiveEnterTimestamp',
-              'ExecMainExitTimestamp', 'ExecMainStatus', 'LastTriggerUSec', 'NextElapseUSecRealtime')
+              'ExecMainExitTimestamp', 'ExecMainStatus', 'LastTriggerUSec', 'NextElapseUSecRealtime', 'UnitFileState',
+              'ControlGroup')
 CONTAINERS = '{{.Label "com.docker.compose.project"}}\t{{.Names}}\t{{.State}}\t{{.Status}}'
 READ_LIMIT = 4 * 1024 * 1024
 DEFAULT_LINES, MAXIMUM_LINES = 50, 500
@@ -630,7 +633,50 @@ def units(errors):
         unit = properties.pop('Id', None)
         if unit in names:
             found[unit] = {key: value for key, value in properties.items() if value not in ('', 'n/a')}
-    return found, scopes
+    groups = {unit: properties.pop('ControlGroup', '') for unit, properties in found.items()}
+    return found, scopes, groups
+
+
+def running_job(group):
+    """Whether a GitHub runner runs a job now: its Runner.Worker process is in the unit's cgroup."""
+    if not group or '..' in group.split('/'):
+        return False
+    try:
+        pids = (CGROUP / group.lstrip('/') / 'cgroup.procs').read_text().split()
+    except OSError:
+        return False
+    for pid in pids:
+        try:
+            if pid.isdigit() and (PROC / pid / 'comm').read_text().strip() == 'Runner.Worker':
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def runner_details(scopes, groups):
+    """Each registered GitHub runner: its name and organization or repository in GitHub (its .runner, never
+    through a symlink), the version it runs (bin/ links to bin.<version>) and whether it runs a job now."""
+    details = {}
+    for scope in scopes:
+        directory = GITHUB_RUNNERS / scope
+        text = read_text(directory / '.runner') or ''
+        try:
+            registration = json.loads(text.lstrip('\ufeff')) if text else {}
+        except ValueError:
+            registration = {}
+        registration = registration if isinstance(registration, dict) else {}
+        url, name, agent = str(registration.get('gitHubUrl') or ''), str(registration.get('agentName') or ''), registration.get('agentId')
+        try:
+            version = re.fullmatch(r'.*/bin\.([0-9][0-9.]{0,30})', os.readlink(directory / 'bin'))
+        except OSError:
+            version = None
+        details[scope] = {'name': name[:100] if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}', name) else None,
+                          'url': url if re.fullmatch(r'https://github\.com/[A-Za-z0-9-]+(/[A-Za-z0-9._-]+)?', url) else None,
+                          'agent_id': agent if isinstance(agent, int) and not isinstance(agent, bool) else None,
+                          'version': version[1] if version else None,
+                          'busy': running_job(groups.get(GITHUB_UNIT.format(scope), ''))}
+    return details
 
 
 def describe(checkout, owner=None):
@@ -836,10 +882,11 @@ def tool_access():
 
 def overview():
     errors = []
-    found, scopes = units(errors)
+    found, scopes, groups = units(errors)
     part = projects_as_account()
     shown = versions()
     return {'generated': int(time.time()), 'root': str(ROOT), 'versions': shown, 'units': found, 'github_runners': scopes,
+            'github_runner_details': runner_details(scopes, groups),
             'disk': disk(), 'deploy_key': deploy_key(), 'projects': part['projects'], 'keys': part.get('keys', []),
             'tool_access': tool_access(),
             'errors': list(dict.fromkeys(errors + part['errors'] + ERRORS))}

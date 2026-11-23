@@ -230,17 +230,21 @@ def installation():
 
 # --- Users, groups and sessions ------------------------------------------------------------------
 # The UI's sections, and whether one has anything to manage (a view-only section has no actions).
-SECTIONS = (('overview', 'Apžvalga', True), ('access', 'Prieiga', True), ('files', 'Failai', True),
+SECTIONS = (('overview', 'Apžvalga', True), ('runners', "Runner'iai", True), ('access', 'Prieiga', True), ('files', 'Failai', True),
             ('update', 'Atnaujinimas', True), ('actions', 'Veiksmai', True), ('instructions', 'Instrukcijos', False),
             ('logs', 'Žurnalai', False), ('metrics', 'Metrikos', False), ('users', 'Vartotojai', True))
 SECTION_TITLES = {key: title for key, title, _ in SECTIONS}
 MANAGED_SECTIONS = tuple(key for key, _, manage in SECTIONS if manage)
 PERMISSION_LEVELS = ('', 'view', 'manage')
 PERMISSION_LABELS = {'': 'nėra', 'view': 'mato', 'manage': 'valdo'}
-# An action runs for a user who manages any one of its sections: the pages its form is on.
+# A section added later starts, in each existing group, at the level that group has for this one.
+NEW_SECTIONS_FROM = {'runners': 'actions'}
+# An action runs for a user who manages any one of its sections: the pages its form is on. A runner's
+# start, stop and restart (unit runner, github-runner@SCOPE) also count for "Runner'iai" (unit_sections).
 ACTION_SECTIONS = {'pipeline': ('overview',), 'unit': ('overview',), 'remove-project': ('overview', 'actions'),
                    'backup-local': ('overview', 'files', 'actions'), 'add-project': ('actions',),
-                   'install-runner': ('actions',), 'install-backups': ('actions',), 'install-metrics': ('actions',),
+                   'install-runner': ('runners',), 'remove-runner': ('runners',), 'install-backups': ('actions',),
+                   'install-metrics': ('actions',),
                    'prepare-host': ('actions',), 'install-ssh': ('actions',), 'move-bitbucket-ssh': ('actions',),
                    'update': ('update',), 'update-setup': ('update',), 'add-backup-key': ('access',),
                    'key-bulk': ('access',), 'remove-backup-key': ('access',), 'list-backup-keys': ('access',),
@@ -250,7 +254,8 @@ ADMINISTRATORS = 'administratoriai'
 VIEW_ALL = {key: 'view' for key, _, _ in SECTIONS if key != 'users'}
 DEFAULT_GROUPS = {
     ADMINISTRATORS: {'title': 'Administratoriai', 'sections': {key: 'manage' if manage else 'view' for key, _, manage in SECTIONS}},
-    'operatoriai': {'title': 'Operatoriai', 'sections': {**VIEW_ALL, 'overview': 'manage', 'files': 'manage', 'actions': 'manage'}},
+    'operatoriai': {'title': 'Operatoriai', 'sections': {**VIEW_ALL, 'overview': 'manage', 'runners': 'manage', 'files': 'manage',
+                                                         'actions': 'manage'}},
     'stebetojai': {'title': 'Stebėtojai', 'sections': dict(VIEW_ALL)}}
 USER_NAME = re.compile(r'[A-Za-z0-9._-]{1,32}')
 GROUP_ID = re.compile(r'[a-z0-9][a-z0-9_-]{0,31}')
@@ -260,6 +265,17 @@ SESSION_COOKIE = 'ops_session'
 SESSION_IDLE = 12 * 3600       # a session unused this long ends
 SESSION_LIFETIME = 14 * 86400  # and none lasts longer
 LOGIN_FAILURES = (10, 900)     # this many wrong logins from one client within this many seconds: it waits
+
+
+def unit_sections(unit):
+    """The sections whose "valdo" lets a unit be started, stopped or restarted."""
+    return ('overview', 'runners') if unit == 'runner' or unit.startswith('github-runner@') else ('overview',)
+
+
+def action_sections(action, form=None):
+    if action == 'unit' and form is not None:
+        return unit_sections(form.get('unit', ''))
+    return ACTION_SECTIONS.get(action, ())
 
 
 def group_id(title):
@@ -311,6 +327,15 @@ class Accounts:
             data, before = self.data, json.dumps(self.data, sort_keys=True)
             data.setdefault('groups', json.loads(json.dumps(DEFAULT_GROUPS)))
             data.setdefault('users', {})
+            # A section added since: each existing group gets the level it has for the section it came from.
+            known = data.get('sections') or [key for key, _, _ in SECTIONS if key not in NEW_SECTIONS_FROM]
+            for section, origin in NEW_SECTIONS_FROM.items():
+                if section not in known:
+                    for group in data['groups'].values():
+                        level = (group.get('sections') or {}).get(origin)
+                        if level:
+                            group.setdefault('sections', {})[section] = level
+            data['sections'] = [key for key, _, _ in SECTIONS]
             # Administrators always manage everything, sections added later too: nobody can lock everyone out.
             data['groups'][ADMINISTRATORS] = json.loads(json.dumps(DEFAULT_GROUPS[ADMINISTRATORS]))
             recovered = data.get('env_hash') != env_hash
@@ -610,6 +635,9 @@ def plan_install_runner(form, status):
     if provider not in ('bitbucket', 'github'):
         raise Invalid('Runner\'is: bitbucket arba github.')
     name = value(form, 'runner_name', RUNNER_NAME, 'Vardas GitHub\'e') if provider == 'github' else ''
+    instance = value(form, 'instance', re.compile(r'[2-9]'), 'Egzempliorius') if provider == 'github' else ''
+    if instance and not name:
+        raise Invalid('Papildomam egzemplioriui reikia savo vardo GitHub\'e (kitaip jis perimtų pirmojo registraciją).')
     tarball = value(form, 'tarball', TARBALL, 'Archyvas', limit=420)
     if tarball and ('..' in tarball.split('/') or tarball.startswith('//')):
         raise Invalid(f'Netinkama reikšmė lauke „Archyvas“: {tarball[:80]}')
@@ -623,10 +651,35 @@ def plan_install_runner(form, status):
         raise Invalid('Įklijuok Bitbucket dialogo (GitHub puslapio) tekstą.')
     if len(text) > 64 * 1024:
         raise Invalid('Tekstas per ilgas.')
-    arguments = ['--provider', provider] + (['--name', name] if name else []) + \
+    arguments = ['--provider', provider] + (['--name', name] if name else []) + (['--instance', instance] if instance else []) + \
         (['--tarball', tarball] if tarball else []) + (['--sha256', sha256] if sha256 else [])
     title = 'Įdiegti GitHub runner\'į' if provider == 'github' else 'Įdiegti Bitbucket runner\'į'
-    return Plan('install-runner', title, *command('install-runner', arguments), stdin=text, timeout=1800)
+    plan = Plan('install-runner', title, *command('install-runner', arguments), stdin=text, timeout=1800)
+    plan.back = ('/runners', 'runners')
+    return plan
+
+
+def plan_remove_runner(form, status):
+    """Remove a runner: a registered GitHub runner (its scope) or the Bitbucket one; GitHub's Remove dialog
+    text, when pasted, also unregisters it there."""
+    provider = form.get('provider', '')
+    if provider == 'github':
+        scope = value(form, 'scope', SCOPE, 'Runner\'is', required=True)
+        if status is not None and scope not in status.get('github_runners', []):
+            raise Invalid(f'GitHub runner\'io {scope} šiame serveryje nėra.')
+        text = form.get('dialog', '')
+        if len(text) > 16 * 1024:
+            raise Invalid('Tekstas per ilgas.')
+        arguments, title = ['--provider', 'github', '--remove', '--scope', scope], f'Pašalinti GitHub runner\'į {scope}'
+    elif provider == 'bitbucket':
+        text, arguments, title = '', ['--remove'], 'Pašalinti Bitbucket runner\'į'
+    else:
+        raise Invalid('Runner\'is: bitbucket arba github.')
+    plan = Plan('remove-runner', title, *command('install-runner', arguments), stdin=text, timeout=900,
+                danger='Runner\'is sustabdomas ir jo katalogas ištrinamas; GitHub runner\'io, vykdančio job\'ą, '
+                       'komanda nešalina (peržiūra tai parodo).')
+    plan.back = ('/runners', 'runners')
+    return plan
 
 
 def plan_install_backups(form, status):
@@ -692,8 +745,12 @@ def plan_unit(form, status):
         danger = 'Vykdomas pipeline\'o žingsnis nutrūktų (peržiūra parodo, ar toks yra).'
     if operation == 'stop' and unit == 'metrics':
         danger = 'Prometheus nebegaus worker\'io metrikų, kol paslauga nebus paleista.'
-    return Plan('unit', title, *command('server-unit', [operation, unit]),
+    plan = Plan('unit', title, *command('server-unit', [operation, unit]),
                 timeout=12 * 3600 if unit.startswith('backup') else 600, danger=danger)
+    plan.fields = {'unit': unit}
+    if 'runners' in unit_sections(unit):
+        plan.back = ('/runners', 'runners')
+    return plan
 
 
 def plan_install_ssh(form, status):
@@ -1046,7 +1103,7 @@ def plan_pipeline(form, status):
 
 
 ACTIONS = {'add-project': plan_add_project, 'remove-project': plan_remove_project,
-           'install-runner': plan_install_runner, 'install-backups': plan_install_backups,
+           'install-runner': plan_install_runner, 'remove-runner': plan_remove_runner, 'install-backups': plan_install_backups,
            'install-metrics': plan_install_metrics, 'add-backup-key': plan_add_backup_key, 'key-bulk': plan_key_bulk,
            'remove-backup-key': plan_remove_backup_key, 'list-backup-keys': plan_list_backup_keys,
            'prepare-host': plan_prepare_host, 'update': plan_update, 'update-setup': plan_update_setup,
@@ -2214,6 +2271,10 @@ form.bulk.tools{grid-template-columns:5.5em auto auto;justify-content:start}
 .who form.logout{display:inline;margin-left:10px}.who form.logout button{padding:3px 8px;font-size:10px}
 main.login{max-width:440px;margin:12vh auto 0;padding:0 16px}main.login .mark{display:block;margin:0 0 22px;text-align:center}
 main.login form.action{padding:20px 22px}main.login label{grid-template-columns:7em minmax(0,1fr)}
+.list.runners{margin:0 0 18px}.list.runners td{word-break:normal;vertical-align:middle}
+.list.runners .controls{padding-top:0;margin:0;flex-wrap:nowrap}.list.runners .controls button{padding:4px 8px;font-size:10px}
+h3 a.muted{font-size:11px;font-weight:400;margin-left:8px}
+.steps-list{margin:0 0 14px;padding-left:22px;color:var(--dim)}.steps-list li{margin:0 0 4px}.steps-list b{color:var(--ink)}
 .matrix td{vertical-align:middle}.matrix td:first-child{width:14em}
 .seg .pm-view input:checked+span{background:rgba(111,147,201,.3);color:#d6e4fa}
 .seg .pm-manage input:checked+span{background:rgba(255,178,46,.25);color:var(--amber)}
@@ -2231,7 +2292,8 @@ label{grid-template-columns:1fr;gap:4px}.board thead{display:none}.board,.board 
 .board td:first-child{padding-top:12px}.runs li{grid-template-columns:18px 1fr 100px}.runs li .hide{display:none}}
 @media (prefers-reduced-motion:reduce){*{animation:none!important}}
 """
-NAVIGATION = (('overview', '/', 'Apžvalga'), ('access', '/access', 'Prieiga'), ('files', '/files', 'Failai'),
+NAVIGATION = (('overview', '/', 'Apžvalga'), ('runners', '/runners', "Runner'iai"), ('access', '/access', 'Prieiga'),
+              ('files', '/files', 'Failai'),
               ('update', '/update', 'Atnaujinimas'),
               ('actions', '/actions', 'Veiksmai'), ('instructions', '/instructions', 'Instrukcijos'),
               ('logs', '/logs', 'Žurnalai'), ('metrics', '/worker-metrics', 'Metrikos'), ('users', '/users', 'Vartotojai'))
@@ -2314,6 +2376,33 @@ def unit_state(units, name):
     text = {'active': 'veikia', 'inactive': 'neveikia', 'failed': 'klaida', 'activating': 'paleidžiama'}.get(active, active)
     return badge(text, unit_kind(units, name)) + (f' <span class="muted">nuo {e(unit["ActiveEnterTimestamp"])}</span>'
                                                   if active == 'active' and unit.get('ActiveEnterTimestamp') else '')
+
+
+GITHUB_URL = re.compile(r'https://github\.com/([A-Za-z0-9-]+)(?:/([A-Za-z0-9._-]+))?')
+
+
+def runner_base(url):
+    """The first runner's scope of an organization or repository (bin/install-runner names it so)."""
+    match = GITHUB_URL.fullmatch(url or '')
+    return (match[1] + (f'.{match[2]}' if match[2] else '')).lower() if match else None
+
+
+def runner_instance(scope, base):
+    """1 for the first runner of `base`, 2-9 for a further instance, None for another organization's."""
+    if not base:
+        return None
+    if scope == base:
+        return 1
+    return int(scope[-1]) if re.fullmatch(re.escape(base) + r'\.[2-9]', scope) else None
+
+
+def github_runners_page(url, tail=''):
+    """GitHub's runner settings of the organization or repository (tail: /new, /<id>)."""
+    match = GITHUB_URL.fullmatch(url or '')
+    if not match:
+        return None
+    base = f'https://github.com/{match[1]}/{match[2]}' if match[2] else f'https://github.com/organizations/{match[1]}'
+    return f'{base}/settings/actions/runners{tail}'
 
 
 def environment_kind(state):
@@ -2405,8 +2494,8 @@ class Page:
     def can(self, section, level='view'):
         return PERMISSION_LEVELS.index(self.permissions.get(section, '')) >= PERMISSION_LEVELS.index(level)
 
-    def may(self, action):
-        return any(self.can(section, 'manage') for section in ACTION_SECTIONS.get(action, ()))
+    def may(self, action, fields=None):
+        return any(self.can(section, 'manage') for section in action_sections(action, fields))
 
     def first_section(self):
         return next((href for key, href, _ in NAVIGATION if self.can(key)), None)
@@ -2461,7 +2550,7 @@ class Page:
 
     def button(self, action, fields, label, kind=''):
         """A one-button form (a unit's start/stop/restart): it leads to the same preview as any action."""
-        if not self.may(action):
+        if not self.may(action, fields):
             return ''
         return (f'<form method="post" action="/preview">{self.hidden(action, fields.items())}'
                 f'<button class="{kind}">{e(label)}</button></form>')
@@ -2504,13 +2593,16 @@ class Page:
                                e(versions.get('setup') or '?'), git_line(setup_git or None),
                                '<a class="btn" href="/update">Atnaujinti</a>'))
         runner = 'setup-server-runner.service'
-        tiles.append(self.tile("Bitbucket runner'is", unit_kind(units, runner), unit_state(units, runner),
-                               controls=self.unit_controls('runner', UNIT_OPERATIONS['runner']) if installed(units, runner)
-                               else '<a class="btn" href="/actions#form-install-runner">Įdiegti</a>'))
-        for scope in data.get('github_runners', []):
-            name = f'setup-server-github-runner@{scope}.service'
-            tiles.append(self.tile(f"GitHub runner'is {scope}", unit_kind(units, name), unit_state(units, name),
-                                   controls=self.unit_controls(f'github-runner@{scope}', ('start', 'stop', 'restart'))))
+        scopes = data.get('github_runners', [])
+        names = [runner] * installed(units, runner) + [f'setup-server-github-runner@{scope}.service' for scope in scopes]
+        kinds = [unit_kind(units, name) for name in names]
+        kind = 'bad' if 'bad' in kinds else 'warn' if 'warn' in kinds else 'ok' if names else 'muted'
+        working = sum(1 for name in names if (units.get(name) or {}).get('ActiveState') == 'active')
+        busy = sum(1 for item in (data.get('github_runner_details') or {}).values() if item.get('busy'))
+        tiles.append(self.tile("Runner'iai", kind, badge(f'{working} iš {len(names)} veikia', kind) if names else badge('nėra', 'muted'),
+                               f'GitHub: {len(scopes)}; Bitbucket: {"yra" if installed(units, runner) else "nėra"}; '
+                               f'vykdo job\'ą: {busy}',
+                               '<a class="btn" href="/runners">Valdyti</a>' if self.can('runners') else ''))
         for unit, label, operation in (('setup-server-backup', 'Naktinės DB kopijos', 'backup'),
                                        ('setup-server-backup-full', 'Savaitinės pilnos DB kopijos', 'backup-full'),
                                        ('setup-server-backup-files', 'Naktinės failų kopijos', 'backup-files')):
@@ -3584,7 +3676,7 @@ class Page:
                     ('access', 'SSH ir metrikos'), ('units', 'Paslaugos'), ('server', 'Serveris'))
         index = ('<nav class="index"><p class="block-label">Skyriai</p>' +
                  ''.join(f'<a href="#{key}">{e(label)}</a>' for key, label in sections) +
-                 '<p class="block-label">Kituose puslapiuose</p><a href="/access">Raktai ir prieiga →</a>'
+                 '<p class="block-label">Kituose puslapiuose</p><a href="/runners">Runner\'iai →</a><a href="/access">Raktai ir prieiga →</a>'
                  '<a href="/update">Atnaujinimas →</a><p class="note">Kiekvienas veiksmas pirmiausia paleidžiamas su --check: '
                  'matai, ką jis darytų, ir tik tada spaudi „Vykdyti“.</p></nav>')
         body = '<h2 id="add-project">Projektai</h2><div class="deck">' + self.form(
@@ -3597,17 +3689,9 @@ class Page:
             '<label class="check"><input type="checkbox" name="shared_key" value="yes"> GitHub: paskyros raktas (--shared-key)</label>',
             note='Naujam projektui taikinys privalomas (local – šis serveris). Esamam tuščias laukas taikinio nekeičia. '
                  'Pašalinimas – projekto puslapyje.', command='bin/add-project') + '</div>'
-        body += '<h2 id="runners">Runner\'iai</h2><div class="deck">' + self.form(
-            'install-runner', 'Įdiegti runner\'į',
-            '<label><span>Runner\'is</span><select name="provider"><option value="bitbucket">Bitbucket</option>'
-            '<option value="github">GitHub Actions</option></select></label>' +
-            text('runner_name', 'Vardas GitHub\'e (nebūtina)', 'numatyta – serverio vardas') +
-            text('tarball', 'Archyvas (nebūtina)', 'https://… arba /kelias/runner.tar.gz') +
-            text('sha256', 'Archyvo SHA-256 (GitHub)', 'būtina GitHub archyvui, kuris ne pin\'intas') +
-            '<label><span>Dialogo / puslapio tekstas</span><textarea name="dialog" autocomplete="off" spellcheck="false"></textarea></label>',
-            note='Įklijuok visą Bitbucket „Runner installation“ dialogo arba GitHub „New self-hosted runner“ puslapio tekstą. '
-                 'Jis perduodamas per stdin, niekur neįrašomas ir nerodomas. Archyvas: Bitbucket – numatyta nuoroda iš dialogo, '
-                 'GitHub – pin\'intas release\'as.', command='bin/install-runner') + '</div>'
+        body += ('<h2 id="runners">Runner\'iai</h2><div class="pointer"><h3>Runner\'iai – atskirame puslapyje</h3>'
+                 '<p class="note">GitHub ir Bitbucket runner\'ių sąrašas, pridėjimas, papildomi egzemplioriai, paleidimas, '
+                 'sustabdymas ir pašalinimas.</p><a class="btn go" href="/runners">Runner\'iai →</a></div>')
         body += '<h2 id="backups">Kopijos</h2><div class="deck">' + self.form(
             'backup-local', 'Kopija dabar serveryje',
             text('project', 'Projektas (nebūtina)', 'tuščia – visi projektai') +
@@ -3666,6 +3750,180 @@ class Page:
                  'su versijomis ir commit\'ų sąrašu.</p><a class="btn" href="/update">Atnaujinimas →</a></div></div>')
         body = f'<div class="split">{index}<div class="sections">{body}</div></div>'
         return self.layout('Veiksmai', body, section='actions')
+
+    # --- Runners --------------------------------------------------------------------------------
+    @staticmethod
+    def runner_facts(unit, busy=None):
+        """State, job, boot and restarts of a runner's unit (systemctl show)."""
+        boot = {'enabled': 'taip', 'disabled': 'ne'}.get(unit.get('UnitFileState'), unit.get('UnitFileState') or '—')
+        job = '—' if busy is None else badge('vykdo job\'ą', 'run') if busy else badge('laisvas', 'ok') \
+            if unit.get('ActiveState') == 'active' else '—'
+        return job, boot, unit.get('NRestarts', '0')
+
+    def runners(self, data, error):
+        if data is None:
+            return self.layout("Runner'iai", f'<div class="callout bad"><p>Būsenos nepavyko gauti: {e(error)}</p></div>', section='runners')
+        units, details = data.get('units') or {}, data.get('github_runner_details') or {}
+        scopes = data.get('github_runners', [])
+        groups = {}
+        for scope in scopes:
+            groups.setdefault((details.get(scope) or {}).get('url') or '', []).append(scope)
+        unit_of = lambda scope: units.get(f'setup-server-github-runner@{scope}.service') or {}
+        active = sum(1 for scope in scopes if unit_of(scope).get('ActiveState') == 'active')
+        busy = sum(1 for scope in scopes if (details.get(scope) or {}).get('busy'))
+        bitbucket = units.get('setup-server-runner.service') or {}
+        bitbucket_installed = installed(units, 'setup-server-runner.service')
+        stats = [(len(scopes), "GitHub runner'iai"), (active, 'veikia'), (busy, "vykdo job'ą"), (len(groups), 'repo ir organizacijos'),
+                 ('yra' if bitbucket_installed else 'nėra', "Bitbucket runner'is")]
+        body = '<div class="stats">' + ''.join(f'<div class="stat"><b>{e(number)}</b><span>{e(label)}</span></div>'
+                                               for number, label in stats) + '</div>'
+        if self.may('install-runner'):
+            body += '<div class="toolbar"><a class="btn go" href="/runners/new">+ Pridėti runner\'į</a></div>'
+        body += '<h2>GitHub Actions</h2>'
+        if not scopes:
+            body += '<div class="empty">GitHub runner\'ių dar nėra. <a href="/runners/new">Pridėti</a></div>'
+        for url, members in sorted(groups.items()):
+            base = runner_base(url)
+            members.sort(key=lambda scope: (runner_instance(scope, base) or 99, scope))
+            label = url.replace('https://github.com/', '') if url else 'nežinoma organizacija ar repo'
+            link = f' <a class="muted" href="{e(github_runners_page(url))}">GitHub nustatymai ↗</a>' if github_runners_page(url) else ''
+            rows = ''
+            for scope in members:
+                info, unit = details.get(scope) or {}, unit_of(scope)
+                job, boot, restarts = self.runner_facts(unit, info.get('busy'))
+                rows += (f'<tr><td><a href="/runners/github/{quote(scope)}">{e(info.get("name") or scope)}</a>'
+                         f'<small class="muted"> {e(scope)}</small></td>'
+                         f'<td>{unit_state(units, f"setup-server-github-runner@{scope}.service")}</td><td>{job}</td>'
+                         f'<td>{e(info.get("version") or "?")}</td><td>{e(boot)}</td><td>{e(restarts)}</td>'
+                         f'<td><div class="controls">{self.unit_controls(f"github-runner@{scope}", ("start", "stop", "restart"))}</div></td></tr>')
+            body += (f'<h3>{e(label)} <small>{len(members)} runner\'i{"s" if len(members) == 1 else "ai"}</small>{link}</h3>'
+                     '<table class="list runners"><tr><th>Runner\'is</th><th>Būsena</th><th>Job\'as</th><th>Versija</th>'
+                     f'<th>Startuoja</th><th>Perkrovimai</th><th>Valdymas</th></tr>{rows}</table>')
+        body += '<h2>Bitbucket Pipelines</h2>'
+        if bitbucket_installed:
+            job, boot, restarts = self.runner_facts(bitbucket)
+            body += ('<table class="list runners"><tr><th>Runner\'is</th><th>Būsena</th><th>Startuoja</th><th>Perkrovimai</th>'
+                     f'<th>Valdymas</th></tr><tr><td><a href="/runners/bitbucket">Bitbucket runner\'is</a>'
+                     f'<small class="muted"> setup-server-runner</small></td><td>{unit_state(units, "setup-server-runner.service")}</td>'
+                     f'<td>{e(boot)}</td><td>{e(restarts)}</td><td><div class="controls">'
+                     f'{self.unit_controls("runner", UNIT_OPERATIONS["runner"])}</div></td></tr></table>')
+        else:
+            body += '<div class="empty">Bitbucket runner\'is neįdiegtas. <a href="/runners/new#bitbucket">Įdiegti</a></div>'
+        body += ('<p class="note">Job\'as – ar runner\'is šiuo metu vykdo GitHub job\'ą (jo Runner.Worker procesas). Startuoja – '
+                 'ar paslauga paleidžiama įjungus serverį. Sustabdyti ar perkrauti runner\'į, vykdantį job\'ą, – job\'as nutrūks.</p>')
+        return self.layout("Runner'iai", body, section='runners')
+
+    def runner_install_fields(self, provider, url='', name='', instances=(), dialog=''):
+        text = lambda key, label, placeholder='', current='': (
+            f'<label><span>{e(label)}</span><input type="text" name="{key}" value="{e(current)}" placeholder="{e(placeholder)}" '
+            'autocomplete="off"></label>')
+        fields = f'<input type="hidden" name="provider" value="{provider}">'
+        if provider == 'github':
+            fields += text('runner_name', 'Vardas GitHub\'e', 'numatyta – serverio vardas', name)
+            if instances:
+                fields += ('<label><span>Egzempliorius</span><select name="instance">' +
+                           ''.join(f'<option value="{number}">{number}</option>' for number in instances) + '</select></label>')
+            else:
+                fields += ('<label><span>Egzempliorius</span><select name="instance"><option value="">pirmas (1)</option>' +
+                           ''.join(f'<option value="{number}">{number}</option>' for number in range(2, 10)) + '</select></label>')
+            fields += text('sha256', 'Archyvo SHA-256', 'tik ne pin\'intam archyvui')
+        fields += text('tarball', 'Archyvas (nebūtina)', 'https://… arba /kelias/runner.tar.gz')
+        label = 'GitHub puslapio eilutė' if provider == 'github' else 'Bitbucket dialogo tekstas'
+        return fields + (f'<label><span>{label}</span><textarea name="dialog" autocomplete="off" spellcheck="false">'
+                         f'{e(dialog)}</textarea></label>')
+
+    def runner_new(self):
+        steps = ('<ol class="steps-list"><li>GitHub: organizacijos arba repo <b>Settings → Actions → Runners → New self-hosted '
+                 'runner</b>, Linux, x64.</li><li>Nukopijuokite eilutę <code>./config.sh --url … --token …</code> (token\'as '
+                 'galioja valandą ir registruoja vieną kartą).</li><li>Įklijuokite žemiau. Archyvas – pin\'intas release\'as, '
+                 'patikrinamas SHA-256; runner\'is gauna žymą <code>setup.build</code>.</li></ol>')
+        body = ('<h2 id="github">GitHub Actions</h2>' + steps + '<div class="deck">' +
+                self.form('install-runner', 'Naujas GitHub runner\'is', self.runner_install_fields('github'),
+                          note='Vienas runner\'is vienai organizacijai ar repo; egzempliorius 2–9 – papildomas tos pačios organizacijos '
+                               'ar repo runner\'is lygiagretiems job\'ams (reikia savo vardo).',
+                          command='bin/install-runner --provider github') + '</div>')
+        body += ('<h2 id="bitbucket">Bitbucket Pipelines</h2><p class="note">Bitbucket: <b>Workspace settings → Runners → Add runner</b> '
+                 '(Linux Shell). Įklijuokite visą dialogo tekstą: atsisiuntimo eilutę ir <code>./start.sh …</code> komandą. Serveryje '
+                 'veikia vienas Bitbucket runner\'is; naujas pakeičia esamą.</p><div class="deck">' +
+                 self.form('install-runner', 'Bitbucket runner\'is', self.runner_install_fields('bitbucket'),
+                           note='Tekstas perduodamas per stdin, niekur neįrašomas ir nerodomas.', command='bin/install-runner') + '</div>')
+        body += '<p><a href="/runners">← Runner\'iai</a></p>'
+        return self.layout('Pridėti runner\'į', body, section='runners')
+
+    def github_runner(self, data, scope):
+        scopes = data.get('github_runners', [])
+        if scope not in scopes:
+            return None
+        units, info = data.get('units') or {}, (data.get('github_runner_details') or {}).get(scope) or {}
+        unit_name = f'setup-server-github-runner@{scope}.service'
+        unit, url = units.get(unit_name) or {}, info.get('url') or ''
+        job, boot, restarts = self.runner_facts(unit, info.get('busy'))
+        settings = github_runners_page(url)
+        agent = info.get('agent_id')
+        rows = [('Vardas GitHub\'e', e(info.get('name') or '?')),
+                ('Organizacija ar repo', f'<a href="{e(url)}">{e(url.replace("https://github.com/", ""))} ↗</a>' if url else '?'),
+                ('Būsena', unit_state(units, unit_name)), ('Job\'as dabar', job), ('Versija', e(info.get('version') or '?')),
+                ('Startuoja su serveriu', e(boot)), ('Perkrovimai', e(restarts)),
+                ('GitHub ID', f'<a href="{e(github_runners_page(url, f"/{agent}"))}">{agent} ↗</a>' if agent and settings else '—'),
+                ('Paslauga', f'<code>{e(unit_name)}</code>'),
+                ('Katalogas', f'<code>{e(data.get("root", ""))}/github-runner/{e(scope)}</code>')]
+        body = facts(rows)
+        controls = self.unit_controls(f'github-runner@{scope}', ('start', 'stop', 'restart'))
+        if controls:
+            body += f'<div class="controls">{controls}</div>'
+        base = runner_base(url)
+        used = {runner_instance(item, base) for item in scopes}
+        free = [number for number in range(2, 10) if number not in used]
+        first = (data.get('github_runner_details') or {}).get(base) or {}
+        stem = re.sub(r'-[2-9]$', '', first.get('name') or info.get('name') or '')
+        body += '<h2>Keisti</h2><div class="deck">'
+        if base and free and self.may('install-runner'):
+            new_page = github_runners_page(url, '/new')
+            body += self.form('install-runner', f'Pridėti egzempliorių ({len(used - {None})} → {len(used - {None}) + 1})',
+                              self.runner_install_fields('github', url, f'{stem}-{free[0]}' if stem else '', free,
+                                                         f'./config.sh --url {url} --token '),
+                              note=f'Dar vienas {e(url.replace("https://github.com/", ""))} runner\'is – job\'ai vyks lygiagrečiai. '
+                                   f'Token\'ą duoda <a href="{e(new_page)}">GitHub „New self-hosted runner“ ↗</a>: įklijuokite jį '
+                                   'eilutės gale.', command='bin/install-runner --provider github --instance N')
+        removal = github_runners_page(url, f'/{agent}') if agent else settings
+        body += self.form('remove-runner', f'Pašalinti {info.get("name") or scope}',
+                          f'<input type="hidden" name="provider" value="github"><input type="hidden" name="scope" value="{e(scope)}">'
+                          '<label><span>GitHub „Remove“ komanda (nebūtina)</span><textarea name="dialog" autocomplete="off" '
+                          'spellcheck="false" placeholder="./config.sh remove --token …"></textarea></label>',
+                          note=('Su komanda iš ' + (f'<a href="{e(removal)}">runner\'io puslapio GitHub\'e ↗</a>' if removal else 'GitHub') +
+                                ' („Remove“) runner\'is išregistruojamas ir GitHub\'e; be jos – tik čia, o GitHub\'e jis lieka „Offline“, '
+                                'kol pašalinsite ten. Runner\'is, vykdantis job\'ą, nešalinamas.'),
+                          command=f'bin/install-runner --provider github --remove --scope {scope}', danger=True)
+        body += ('</div><p class="note">Vardo ir žymų GitHub\'e čia pakeisti negalima: GitHub juos keičia tik registruojant iš naujo – '
+                 'pašalinkite ir pridėkite su nauju vardu.</p><p><a href="/runners">← Runner\'iai</a></p>')
+        return self.layout(f'Runner\'is {info.get("name") or scope}', body, section='runners')
+
+    def bitbucket_runner(self, data):
+        units = data.get('units') or {}
+        unit_name = 'setup-server-runner.service'
+        unit = units.get(unit_name) or {}
+        present = installed(units, unit_name)
+        body = ''
+        if present:
+            _, boot, restarts = self.runner_facts(unit)
+            body += facts([('Būsena', unit_state(units, unit_name)), ('Startuoja su serveriu', e(boot)), ('Perkrovimai', e(restarts)),
+                           ('Paslauga', f'<code>{unit_name}</code>'), ('Katalogas', f'<code>{e(data.get("root", ""))}/runner</code>')])
+            controls = self.unit_controls('runner', UNIT_OPERATIONS['runner'])
+            if controls:
+                body += f'<div class="controls">{controls}</div>'
+        else:
+            body += '<div class="callout"><p>Bitbucket runner\'is neįdiegtas.</p></div>'
+        body += '<h2>Keisti</h2><div class="deck">' + self.form(
+            'install-runner', 'Pakeisti (naujas dialogas)' if present else 'Įdiegti', self.runner_install_fields('bitbucket'),
+            note='Bitbucket: Workspace settings → Runners → Add runner (Linux Shell); visas dialogo tekstas. Tekstas niekur neįrašomas.',
+            command='bin/install-runner')
+        if present:
+            body += self.form('remove-runner', 'Pašalinti Bitbucket runner\'į', '<input type="hidden" name="provider" value="bitbucket">',
+                              note='Sustabdo paslaugą, ištrina runner\'io katalogą, unit\'ą ir runner.env. Bitbucket\'e runner\'is lieka, '
+                                   'kol pašalinsite jį ten (Workspace settings → Runners). Vykdomas žingsnis nutrūktų.',
+                              command='bin/install-runner --remove', danger=True)
+        body += '</div><p><a href="/runners">← Runner\'iai</a></p>'
+        return self.layout('Bitbucket runner\'is', body, section='runners')
 
     # --- Login, users and groups -----------------------------------------------------------------
     @staticmethod
@@ -3975,7 +4233,8 @@ def tail(path, limit=200):
 
 def path_section(path):
     """The section a GET path belongs to (its "mato" is needed), or None (checked where it is served)."""
-    for prefix, section in (('/project/', 'overview'), ('/access', 'access'), ('/files', 'files'), ('/update', 'update'),
+    for prefix, section in (('/project/', 'overview'), ('/runners', 'runners'), ('/access', 'access'), ('/files', 'files'),
+                            ('/update', 'update'),
                             ('/actions', 'actions'), ('/instructions', 'instructions'), ('/logs', 'logs'),
                             ('/worker-metrics', 'metrics'), ('/users', 'users'), ('/groups', 'users')):
         if path == prefix.rstrip('/') or path.startswith(prefix.rstrip('/') + '/'):
@@ -4164,6 +4423,22 @@ def handler(accounts):
                 return self.reply(200, page.overview(data, error))
             if path == '/account':
                 return self.reply(200, page.account_page(accounts.snapshot(), query, accounts.session_count(name)))
+            if path == '/runners':
+                data, error = status(fresh='fresh' in query)
+                return self.reply(200, page.runners(data, error))
+            if path == '/runners/new':
+                if not self.allowed(page, 'runners', 'manage'):
+                    return
+                return self.reply(200, page.runner_new())
+            if path in ('/runners/bitbucket', '/runners/github') or path.startswith('/runners/github/'):
+                data, error = status(fresh='fresh' in query)
+                if data is None:
+                    return self.reply(200, page.runners(data, error))
+                scope = path[len('/runners/github/'):] if path.startswith('/runners/github/') else None
+                rendered = page.bitbucket_runner(data) if path == '/runners/bitbucket' else \
+                    page.github_runner(data, scope) if scope and SCOPE.fullmatch(scope) else None
+                return self.reply(200, rendered) if rendered else \
+                    self.reply(404, page.layout("Nėra runner'io", '<p><a href="/runners">← Runner\'iai</a></p>', section='runners'))
             if path == '/users':
                 return self.reply(200, page.users_page(accounts.snapshot(), query))
             match = re.fullmatch(r'/users/(' + USER_NAME.pattern + ')', unquote(path))
@@ -4467,10 +4742,10 @@ def handler(accounts):
             builder = ACTIONS.get(form.get('action', ''))
             if builder is None:
                 return self.reply(400, page.invalid('Nežinomas veiksmas.'))
-            if not page.may(form['action']):
+            if not page.may(form['action'], form):
                 return self.reply(403, page.invalid('Šiam veiksmui jūsų grupės neduoda teisės „valdo“.'))
             try:
-                plan = builder(form, status()[0] if form.get('action') in ('pipeline', 'add-backup-key', 'key-bulk', 'tool-access',
+                plan = builder(form, status()[0] if form.get('action') in ('pipeline', 'add-backup-key', 'key-bulk', 'tool-access', 'remove-runner',
                                                                            'tool-bulk', 'tool-password', 'tool-person') else None)
             except Invalid as error:
                 return self.reply(400, page.invalid(str(error)))
@@ -4492,7 +4767,7 @@ def handler(accounts):
             plan = pending.take(form.get('pending', ''), name)
             if plan is None:
                 return self.reply(400, page.invalid('Peržiūra nebegalioja (pasibaigė, jau vykdyta ar sąsaja persikrovė): pradėk iš naujo.'))
-            if not page.may(plan.action):  # the groups may have changed since the preview
+            if not page.may(plan.action, getattr(plan, 'fields', None)):  # the groups may have changed since the preview
                 return self.reply(403, page.invalid('Šiam veiksmui jūsų grupės neduoda teisės „valdo“.'))
             if plan.kind == 'pipeline':
                 return self.pipeline(page, name, plan)

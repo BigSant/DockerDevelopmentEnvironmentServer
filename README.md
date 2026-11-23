@@ -174,9 +174,14 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
      atidaryti pull request'ą ir paleisti savo kodą šiame serveryje.
 
    Po minutės GitHub'e runner'is turi būti **Idle**. Patikrinti: `systemctl status setup-server-github-runner@bigsant`,
-   `journalctl -u setup-server-github-runner@bigsant -n 50`. Pašalinti: `sudo systemctl disable --now
-   setup-server-github-runner@<scope>`, GitHub'e *Runners → … → Remove runner*, tada
-   `sudo rm -r /srv/setup-server/github-runner/<scope>`.
+   `journalctl -u setup-server-github-runner@bigsant -n 50`. Pašalinti – `sudo bin/install-runner --provider github
+   --remove --scope <scope> [--check]` (arba sąsajoje *Runner'iai*): sustabdo ir išjungia paslaugą, ištrina
+   `/srv/setup-server/github-runner/<scope>`. Per stdin paduota GitHub'o *Runners → runner'is → Remove* komanda
+   (`./config.sh remove --token …`, token'as galioja valandą) runner'į išregistruoja ir GitHub'e; be jos GitHub jį rodo
+   *Offline*, kol pašalinsi ten. Runner'io, vykdančio job'ą (jo `Runner.Worker` procesas), komanda nešalina (`75`);
+   GitHub'ui atsisakius išregistruoti – runner'is lieka sustabdytas, bet nieko neištrinama. Bitbucket runner'is –
+   `sudo bin/install-runner --remove`: paslauga, jos unit'as, `runner.env` ir `/srv/setup-server/runner`
+   (Bitbucket'e jį pašalink pats).
 
 4. **Projektas:**
 
@@ -1023,16 +1028,19 @@ vartotojo vardu; naršyklės iššokančio langelio nebėra.
 
 **Vartotojai ir grupės.** Skiltis *Vartotojai* (`/users`): kas prisijungia prie sąsajos ir ką joje gali.
 
-- **Grupė** kiekvienai skilčiai (Apžvalga, Prieiga, Failai, Atnaujinimas, Veiksmai, Instrukcijos, Žurnalai, Metrikos,
-  Vartotojai) duoda „nėra“, „mato“ (skiltis rodoma) arba „valdo“ (dar ir jos veiksmai: peržiūra ir vykdymas; Instrukcijos,
+- **Grupė** kiekvienai skilčiai (Apžvalga, Runner'iai, Prieiga, Failai, Atnaujinimas, Veiksmai, Instrukcijos, Žurnalai,
+  Metrikos, Vartotojai) duoda „nėra“, „mato“ (skiltis rodoma) arba „valdo“ (dar ir jos veiksmai: peržiūra ir vykdymas; Instrukcijos,
   Žurnalai ir Metrikos tik rodomos). Veiksmas leidžiamas, jei vartotojas valdo bent vieną skiltį, kurioje yra jo forma
-  (pvz. „Backup dabar“ – Apžvalga, Failai ar Veiksmai). Kur vartotojas tik mato, mygtukų nėra, o tiesioginis POST – `403`.
+  (pvz. „Backup dabar“ – Apžvalga, Failai ar Veiksmai; runner'io paleidimas, sustabdymas, perkrovimas – Apžvalga ar
+  Runner'iai). Kur vartotojas tik mato, mygtukų nėra, o tiesioginis POST – `403`.
 - **Vartotojas** priklauso vienai ar kelioms grupėms; jo teisė skilčiai – didžiausia iš jų. Jį galima (nebūtina) susieti
   su *Prieigos* žmogumi (SSH raktu ir įrankiais): tai tik nuoroda, prisijungimas nuo rakto nepriklauso. Išjungtas
   vartotojas prisijungti negali, jo sesijos baigiamos iš karto; naujas slaptažodis baigia kitas jo sesijas.
-- **Pradinės grupės:** *Administratoriai* (valdo viską, keisti ar ištrinti negalima), *Operatoriai* (valdo Apžvalgą, Failus
-  ir Veiksmus, mato kitas skiltis, išskyrus Vartotojus), *Stebėtojai* (mato viską, išskyrus Vartotojus). Turi likti bent
-  vienas įjungtas administratorius: paskutinio išjungti, iš grupės išimti ar ištrinti sąsaja neleidžia.
+- **Pradinės grupės:** *Administratoriai* (valdo viską, keisti ar ištrinti negalima), *Operatoriai* (valdo Apžvalgą, Runner'ius,
+  Failus ir Veiksmus, mato kitas skiltis, išskyrus Vartotojus), *Stebėtojai* (mato viską, išskyrus Vartotojus). Turi likti bent
+  vienas įjungtas administratorius: paskutinio išjungti, iš grupės išimti ar ištrinti sąsaja neleidžia. Atsiradus naujai
+  skilčiai, esamos grupės ją gauna tokio lygio, kokį turi artimiausiai (*Runner'iai* – kaip *Veiksmai*); vėliau tai
+  keičiama kaip bet kuri teisė.
 - **Pirmasis administratorius.** Pirmą kartą pasileidusi sąsaja `ui.env` vardą (`admin`) padaro grupės
   *Administratoriai* nariu. Pakeitus `ui.env` slaptažodį (`sudo bin/install-ui --new-password`) tas vartotojas vėl
   įjungiamas, grąžinamas į *Administratorius* su nauju slaptažodžiu, jo sesijos baigiamos – root'o kelias atgal, jei
@@ -1049,11 +1057,18 @@ vartotojo vardu; naršyklės iššokančio langelio nebėra.
 **Ką rodo.** Navigacijoje prie *Prieigos* – raktų skaičius, prie *Atnaujinimo* – taškas: geltonas, kai yra naujesnis
 commit'as, raudonas, kai setup ne ant release tag'o.
 
+- *Runner'iai* (`/runners`) – visi šio serverio CI runner'iai viename puslapyje. GitHub runner'iai sugrupuoti pagal
+  organizaciją ar repo (su nuoroda į jų GitHub nustatymus): vardas GitHub'e, paslaugos būsena, ar dabar vykdo job'ą,
+  versija, ar startuoja su serveriu, perkrovimai ir mygtukai paleisti, sustabdyti, perkrauti. Runner'io puslapyje
+  (`/runners/github/<scope>`) – jo duomenys (ir GitHub ID su nuoroda), **papildomas egzempliorius** (laisvas numeris 2–9,
+  vardas ir `./config.sh --url …` eilutė jau užpildyti – belieka įklijuoti token'ą) ir **pašalinimas** (su GitHub'o
+  „Remove“ komanda arba be jos). *Pridėti runner'į* (`/runners/new`) – naujas GitHub ar Bitbucket runner'is.
+  Bitbucket runner'is – `/runners/bitbucket` (pakeisti, pašalinti). Vardo ir žymų GitHub'e pakeisti negalima – tik
+  pašalinus ir pridėjus iš naujo. Apžvalgoje runner'iai – viena kortelė (kiek veikia, kiek vykdo job'ą).
 - *Apžvalga* – viršuje „Reikia dėmesio“: viskas, kas sugedę ar laukia (nepavykę unit'ai, setup ne ant tag'o, naujesnė
   versija, mažai vietos, nepavykęs deploy'us, sustojęs secret store, nesveiki konteineriai, senesnė nei 26 val. kopija),
   kiekvienas su nuoroda. Toliau – Server OPS versija (įdiegta ir administratoriaus klono), bendro setup checkout'o versija
-  (commit'as, ar release tag'as, kiek naujesnis origin/master pagal paskutinį fetch), Bitbucket ir
-  GitHub runner'ių paslaugos, naktinių ir savaitinių pilnų kopijų laikmačiai (paskutinis paleidimas, rezultatas, kitas), metrikų paslauga,
+  (commit'as, ar release tag'as, kiek naujesnis origin/master pagal paskutinį fetch), runner'ių suvestinė, naktinių ir savaitinių pilnų kopijų laikmačiai (paskutinis paleidimas, rezultatas, kitas), metrikų paslauga,
   naktinių failų kopijų laikmatis, pati sąsaja, laisva vieta diske, kuriame `/srv/setup-server`. Prie kiekvienos įdiegtos paslaugos – jos mygtukai
   (paleisti, sustabdyti, perkrauti; kopijoms – „Paleisti dabar“), kurie veda į tą pačią peržiūrą kaip kiti veiksmai.
 - *Projektai* – kiekvienas build katalogas: repo URL, aplinkos (stage/prod), taikinys (`target*.env`, ne paslaptis),
@@ -1124,7 +1139,8 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 | --- | --- |
 | Pridėti projektą | `sudo -n L/add-project [--shared-key] --target … [VARDAS] URL [KODO_URL]` (naujam projektui taikinys privalomas) |
 | Pašalinti projektą (projekto puslapyje) | `sudo -n L/remove-project [--with-backups] VARDAS` |
-| Įdiegti runner'į | `sudo -n L/install-runner --provider bitbucket\|github [--name …] [--tarball URL\|FAILAS [--sha256 …]]`; dialogo tekstas – per stdin |
+| Įdiegti runner'į (*Runner'iai*) | `sudo -n L/install-runner --provider bitbucket\|github [--name …] [--instance N] [--tarball URL\|FAILAS [--sha256 …]]`; dialogo tekstas – per stdin |
+| Pašalinti runner'į (*Runner'iai*) | `sudo -n L/install-runner --provider github --remove --scope …` (GitHub „Remove“ komanda – per stdin, nerodoma) arba `--remove` (Bitbucket) |
 | Kopijų laikmačiai (naktinės, savaitinės pilnos ir failų) | `sudo -n L/install-backups [--at HH:MM] [--full-at "DAY HH:MM"] [--files-at HH:MM]` |
 | Kopija dabar serveryje (ir projekto bei *Failų* puslapiuose) | `sudo -n L/backup-projects [--full\|--files] [PROJEKTAS [ENV]]` – be Bitbucket, veikia ir GitHub projektams |
 | SSH iš VPN | `sudo -n L/install-ssh [--from TINKLAI]` |

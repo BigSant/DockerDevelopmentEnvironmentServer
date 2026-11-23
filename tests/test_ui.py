@@ -22,7 +22,7 @@ import time
 from urllib.parse import urlencode
 
 from test_metrics import WorkerTree, entry
-from test_scripts import DIALOG, ROOT, ScriptTest
+from test_scripts import DIALOG, GITHUB_PAGE as GITHUB_DIALOG, ROOT, ScriptTest
 
 PASSWORD = "correct-horse-battery-staple"
 PROJECT_TOKEN = "project-token-ABCdef0123456789"
@@ -77,7 +77,7 @@ for unit; do
     setup-server-runner.service) printf 'Id=%s\nLoadState=loaded\nActiveState=active\nSubState=running\nActiveEnterTimestamp=Sun 2026-10-11 10:00:00 UTC\n\n' "$unit";;
     setup-server-backup.timer) printf 'Id=%s\nLoadState=loaded\nActiveState=active\nLastTriggerUSec=Mon 2026-10-12 00:30:00 UTC\nNextElapseUSecRealtime=Tue 2026-10-13 00:30:00 UTC\n\n' "$unit";;
     setup-server-backup.service) printf 'Id=%s\nLoadState=loaded\nActiveState=inactive\nResult=exit-code\n\n' "$unit";;
-    setup-server-github-runner@*) printf 'Id=%s\nLoadState=loaded\nActiveState=failed\n\n' "$unit";;
+    setup-server-github-runner@*) printf 'Id=%s\nLoadState=loaded\nActiveState=failed\nUnitFileState=enabled\nControlGroup=/system.slice/%s\n\n' "$unit" "$unit";;
     -*|show) ;;
     *) printf 'Id=%s\nLoadState=not-found\nActiveState=inactive\n\n' "$unit";;
   esac
@@ -148,9 +148,20 @@ class Worker(ScriptTest):
             "DEPLOY_CONTEXT=setup-forsena_docker-stage\nDEPLOY_SSH=deploy@shop.example\nDEPLOY_PATH=/home/deploy/shop\n")
         shop = self.tree.project("shop-two", "prod")
         self.origin(shop.parent / "app", "git@bitbucket.org:rsmaizys/redirect_me.git")
+        # A registered GitHub runner as GitHub writes it (.runner: JSON with a byte order mark), running a job now.
         runner = self.tree.root / "github-runner/bigsant"
-        runner.mkdir(parents=True)
-        (runner / ".runner").write_text("{}\n")
+        (runner / "bin.2.338.2").mkdir(parents=True)
+        (runner / "bin").symlink_to(runner / "bin.2.338.2")
+        (runner / ".runner").write_text('\ufeff{"agentId": 7, "agentName": "worker1", "gitHubUrl": "https://github.com/BigSant", '
+                                        '"poolName": "Default"}\n', encoding="utf-8")
+        cgroup = self.root / "cgroup/system.slice/setup-server-github-runner@bigsant.service"
+        cgroup.mkdir(parents=True)
+        (cgroup / "cgroup.procs").write_text("4241\n4242\n")
+        for pid, comm in (("4241", "Runner.Listener"), ("4242", "Runner.Worker")):
+            (self.root / "proc" / pid).mkdir(parents=True)
+            (self.root / "proc" / pid / "comm").write_text(comm + "\n")
+        os.environ["SETUP_SERVER_CGROUP"] = str(self.root / "cgroup")
+        self.addCleanup(os.environ.pop, "SETUP_SERVER_CGROUP")
 
     @staticmethod
     def origin(checkout, url):
@@ -170,6 +181,23 @@ class ServerStatusTest(Worker):
                                 env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
                                      "SETUP_SERVER_ROOT": str(self.tree.root), "SETUP_SERVER_LIBRARY": str(self.library)})
         return result
+
+    def test_each_github_runner_shows_its_registration_version_and_job(self):
+        data = json.loads(self.status().stdout)
+        self.assertEqual(data["github_runner_details"]["bigsant"],
+                         {"name": "worker1", "url": "https://github.com/BigSant", "agent_id": 7, "version": "2.338.2", "busy": True})
+        self.assertEqual(data["units"]["setup-server-github-runner@bigsant.service"]["UnitFileState"], "enabled")
+        self.assertNotIn("ControlGroup", json.dumps(data["units"]), "used for the job, not shown")
+        (self.root / "proc/4242/comm").write_text("bash\n")
+        self.assertFalse(json.loads(self.status().stdout)["github_runner_details"]["bigsant"]["busy"])
+        # A .runner planted as a symlink is not read through.
+        runner = self.tree.root / "github-runner/bigsant/.runner"
+        runner.unlink()
+        (self.root / "secret.json").write_text('{"agentName": "root-secret"}')
+        runner.symlink_to(self.root / "secret.json")
+        data = json.loads(self.status().stdout)
+        self.assertIsNone(data["github_runner_details"]["bigsant"]["name"])
+        self.assertIn("a symlink; not read", " ".join(data["errors"]))
 
     def test_registered_monorepo_is_visible_as_local_without_server_access(self):
         checkout = self.tree.root / "development-checkout"
@@ -945,6 +973,95 @@ class WebUiTest(Worker):
         self.assertEqual(self.add_user("rimas", "rimo-slaptazodis-1", ["stebetojai"], person="tomas")[0], 303)
         self.assertIn('href="/access/tomas"', self.request("GET", "/users")[2])
 
+    # --- Runners --------------------------------------------------------------------------------
+    def test_the_runners_page_lists_each_runner_with_its_state_and_controls(self):
+        status, _, page = self.request("GET", "/runners")
+        self.assertEqual(status, 200, page)
+        for text in ('href="/runners/github/bigsant"', "worker1", "BigSant", "vykdo job&#x27;ą", "2.338.2",
+                     'href="https://github.com/organizations/BigSant/settings/actions/runners"', 'href="/runners/bitbucket"',
+                     'name="unit" value="github-runner@bigsant"', 'name="unit" value="runner"', 'href="/runners/new"'):
+            self.assertIn(text, page)
+        status, _, runner = self.request("GET", "/runners/github/bigsant")
+        self.assertEqual(status, 200, runner)
+        self.assertIn('href="https://github.com/organizations/BigSant/settings/actions/runners/7"', runner)
+        self.assertIn('name="runner_name" value="worker1-2"', runner)
+        self.assertEqual(re.findall(r'<select name="instance">(.*?)</select>', runner)[0].count("<option"), 8)
+        self.assertIn("./config.sh --url https://github.com/BigSant --token </textarea>", runner)
+        self.assertIn('name="action" value="remove-runner"', runner)
+        self.assertEqual(self.request("GET", "/runners/github/nope")[0], 404)
+        self.assertEqual(self.request("GET", "/runners/github/..%2Fetc")[0], 404)
+        self.assertEqual(self.request("GET", "/runners/bitbucket")[0], 200)
+        self.assertIn('name="provider" value="github"', self.request("GET", "/runners/new")[2])
+        self.assertIn('href="/runners"', self.request("GET", "/actions")[2], "the Veiksmai page points here")
+
+    def test_a_runner_is_removed_through_its_preview_and_the_token_is_never_kept(self):
+        token = "AREMOVALTOKEN0123456789"
+        status, _, body = self.preview("remove-runner", provider="github", scope="bigsant",
+                                       dialog=f"./config.sh remove --token {token}")
+        self.assertEqual(status, 200, body)
+        self.assertIn(f"{self.library}/bin/install-runner --check --provider github --remove --scope bigsant",
+                      " ".join(self.sudo_calls()))
+        result = self.confirm(body)
+        self.assertEqual(result[0], 200, result[1])
+        self.assertIn(f"{self.library}/bin/install-runner --provider github --remove --scope bigsant", self.sudo_calls()[-1])
+        self.assertNotIn(token, self.everything_written())
+        self.assertEqual(self.preview("remove-runner", provider="github", scope="other")[0], 400)
+        self.assertEqual(self.preview("remove-runner", provider="github", scope="../x")[0], 400)
+        self.assertEqual(self.preview("remove-runner", provider="gitlab")[0], 400)
+
+    def test_a_further_instance_needs_its_own_name(self):
+        status, _, body = self.preview("install-runner", provider="github", instance="3", dialog=GITHUB_DIALOG)
+        self.assertEqual(status, 400)
+        self.assertIn("savo vardo", body)
+        self.assertEqual(self.preview("install-runner", provider="github", instance="1", runner_name="w", dialog=GITHUB_DIALOG)[0], 400)
+        status, _, body = self.preview("install-runner", provider="github", instance="3", runner_name="worker1-3", dialog=GITHUB_DIALOG)
+        self.assertEqual(status, 200, body)
+        self.assertIn("--provider github --name worker1-3 --instance 3", " ".join(self.sudo_calls()))
+
+    def test_managing_runners_is_its_own_right(self):
+        form = {"csrf": self.csrf(), "group": "", "title": "CI", "level:runners": "manage"}
+        self.assertEqual(self.request("POST", "/groups/save", form)[0], 303)
+        self.assertEqual(self.add_user("ci", "ci-slaptazodis-12", ["ci"])[0], 303)
+        ci = ("ci", "ci-slaptazodis-12")
+        status, headers, _ = self.request("GET", "/", login=ci)
+        self.assertEqual((status, headers.get("Location")), (303, "/runners"), "no overview: the first page it may see")
+        page = self.request("GET", "/runners", login=ci)[2]
+        self.assertIn('name="unit" value="github-runner@bigsant"', page)
+        token = re.search(r'name="csrf" value="([0-9a-f]+)"', page)[1]
+        restart = {"csrf": token, "action": "unit", "operation": "restart"}
+        self.assertEqual(self.request("POST", "/preview", {**restart, "unit": "github-runner@bigsant"}, login=ci)[0], 200)
+        self.assertEqual(self.request("POST", "/preview", {**restart, "unit": "runner"}, login=ci)[0], 200)
+        self.assertEqual(self.request("POST", "/preview", {**restart, "unit": "metrics"}, login=ci)[0], 403)
+        self.assertEqual(self.request("POST", "/preview", {"csrf": token, "action": "unit", "unit": "backup",
+                                                           "operation": "start"}, login=ci)[0], 403)
+        # A viewer sees the runners, without a single button.
+        self.assertEqual(self.add_user("ziuri", "ziuri-slaptazodis", ["stebetojai"])[0], 303)
+        page = self.request("GET", "/runners", login=("ziuri", "ziuri-slaptazodis"))[2]
+        self.assertIn("worker1", page)
+        self.assertNotIn('action="/preview"', page)
+        self.assertEqual(self.request("GET", "/runners/new", login=("ziuri", "ziuri-slaptazodis"))[0], 403)
+
+    def test_existing_groups_get_runners_at_their_actions_level(self):
+        web_ui = load_web_ui()
+        state = self.root / "old-accounts"
+        state.mkdir()
+        (state / "accounts.json").write_text(json.dumps({
+            "env_hash": PASSWORD_HASH,
+            "groups": {"administratoriai": {"title": "Administratoriai", "sections": {}},
+                       "operatoriai": {"title": "Operatoriai", "sections": {"actions": "manage", "overview": "manage"}},
+                       "ziurovai": {"title": "Žiūrovai", "sections": {"actions": "view"}},
+                       "kiti": {"title": "Kiti", "sections": {"logs": "view"}}},
+            "users": {"admin": {"password": PASSWORD_HASH, "groups": ["administratoriai"]}}}))
+        accounts = web_ui.Accounts(state, "admin", PASSWORD_HASH)
+        groups = accounts.snapshot()["groups"]
+        self.assertEqual(groups["operatoriai"]["sections"]["runners"], "manage")
+        self.assertEqual(groups["ziurovai"]["sections"]["runners"], "view")
+        self.assertNotIn("runners", groups["kiti"]["sections"])
+        self.assertEqual(groups["administratoriai"]["sections"]["runners"], "manage")
+        # Once known, a group's choice stays: taking the right away is not undone on the next start.
+        accounts.save_group("ziurovai", "Žiūrovai", {"actions": "view", "runners": ""})
+        self.assertNotIn("runners", web_ui.Accounts(state, "admin", PASSWORD_HASH).snapshot()["groups"]["ziurovai"]["sections"])
+
     def test_every_action_belongs_to_a_section(self):
         web_ui = load_web_ui()
         self.assertEqual(set(web_ui.ACTION_SECTIONS), set(web_ui.ACTIONS))
@@ -1018,7 +1135,7 @@ class WebUiTest(Worker):
         for text in ("asana_tracker", "git@bitbucket.org:rsmaizys/asana_tracker.git", "v1.0.0", "rollback",
                      "laikoma 3", "2/3 veikia", "šis serveris", "deploy@shop.example:/home/deploy/shop",
                      "GitHub Actions", "v0.4.0", "nepavyko (exit-code)", "Tue 2026-10-13 00:30:00 UTC",
-                     "GitHub runner&#x27;is bigsant", "#41"):
+                     "Runner&#x27;iai", "1 iš 2 veikia", 'href="/runners"', "#41"):
             self.assertIn(text, body)
         self.assertNotIn("never-shown-password", body)
         self.assertIn(f"-n {self.library}/bin/server-status", self.sudo_calls())
@@ -1504,11 +1621,13 @@ class WebUiTest(Worker):
         self.assertIn(f"stub ran: {self.library}/bin/server-unit restart ui", page)
 
     def test_the_overview_and_the_project_offer_the_controls_and_read_only_views(self):
-        overview = self.request("GET", "/")[2]
-        for unit, operation in (("runner", "restart"), ("github-runner@bigsant", "stop"), ("backup", "start")):
+        overview, runners = self.request("GET", "/")[2], self.request("GET", "/runners")[2]
+        for unit, operation, page in (("runner", "restart", runners), ("github-runner@bigsant", "stop", runners),
+                                      ("backup", "start", overview)):
             with self.subTest(unit=unit):
-                self.assertRegex(overview, rf'name="unit" value="{re.escape(unit)}"><input type="hidden" name="operation" '
-                                           rf'value="{operation}">')
+                self.assertRegex(page, rf'name="unit" value="{re.escape(unit)}"><input type="hidden" name="operation" '
+                                       rf'value="{operation}">')
+        self.assertNotIn('name="unit" value="github-runner@bigsant"', overview, "the runners have their own page")
         self.assertNotIn('name="unit" value="ui"', overview, "no controls for a unit that is not installed")
         self.assertNotIn('name="unit" value="metrics"', overview)
         self.assertIn('value="github-runner@bigsant"', self.request("GET", "/actions")[2])

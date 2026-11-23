@@ -27,10 +27,14 @@ provider=bitbucket
 sha256=
 runner_name=
 instance=
+remove=0
+scope=
 usage() {
     cat <<EOF
 Usage: sudo $0 [--provider bitbucket] [--tarball URL|FILE] [--check] < dialog.txt
        sudo $0 --provider github [--name NAME] [--instance N] [--tarball URL|FILE --sha256 HASH] [--check] < dialog.txt
+       sudo $0 --provider github --remove --scope SCOPE [--check] [< removal.txt]
+       sudo $0 --remove [--check]
   --provider  bitbucket (default): the Bitbucket Pipelines Linux Shell runner, service setup-server-runner;
               github: a GitHub Actions runner of one organization or repository, service
               setup-server-github-runner@<scope> (one per organization or repository)
@@ -41,6 +45,10 @@ Usage: sudo $0 [--provider bitbucket] [--tarball URL|FILE] [--check] < dialog.tx
   --instance  GitHub: a further runner (2-9) of the same organization or repository, so its jobs run in
               parallel: scope <scope>.<N>, its own directory and service; it needs a --name of its own
   --check     validate the pasted text and show what would be installed; change nothing
+  --remove    stop and disable the runner's service, then delete its directory (GitHub: --scope, the
+              directory name under $ROOT/github-runner; Bitbucket: also its unit and runner.env). Refused
+              while a GitHub runner runs a job. GitHub's Remove dialog (./config.sh remove --token …) on
+              stdin also unregisters it in GitHub; without it GitHub lists the runner Offline until removed there.
 In a terminal it asks for the dialog's values one by one (secrets are not shown). Piped, it reads the
 whole dialog text: Bitbucket's (the curl download line and the ./start.sh … --runtime linux-shell
 command) or GitHub's (the ./config.sh --url … --token … line).
@@ -48,6 +56,8 @@ EOF
 }
 while [ $# -gt 0 ]; do
     case "$1" in
+        --remove) remove=1 ;;
+        --scope) scope=${2:?--scope needs a runner directory name}; shift ;;
         --provider) provider=${2:?--provider needs bitbucket or github}; shift ;;
         --tarball) tarball=${2:?--tarball needs a URL or file}; shift ;;
         --sha256) sha256=${2:?--sha256 needs a hash}; shift ;;
@@ -64,6 +74,13 @@ case "$provider" in
     github) ;;
     *) usage >&2; exit 64 ;;
 esac
+if [ "$remove" = 1 ]; then
+    [ -z "$tarball$sha256$runner_name$instance" ] || { echo "--remove takes no --tarball, --sha256, --name or --instance" >&2; exit 64; }
+    [ "$provider" = github ] || [ -z "$scope" ] || { echo "--scope is for --provider github" >&2; exit 64; }
+elif [ -n "$scope" ]; then
+    echo "--scope is for --remove" >&2
+    exit 64
+fi
 if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
     echo "Run with sudo (or use --check)" >&2
     exit 77
@@ -112,6 +129,79 @@ GITHUB_UNIT=setup-server-github-runner
 
 flag_value() {  # flag_value FLAG TEXT — the word after the flag ("--flag value" or "--flag=value")
     printf '%s' "$2" | tr '\n\\' '  ' | grep -oE -- "$1[[:space:]=]+[^[:space:]]+" | head -n1 | sed -E "s/^$1[[:space:]=]+//" || true
+}
+
+# --- Removing a runner ---------------------------------------------------------------------------
+busy() {  # busy UNIT — a GitHub runner runs a job: its Runner.Worker process is in the unit's cgroup
+    local group procs pid
+    group=$(systemctl show -p ControlGroup --value "$1" 2>/dev/null || true)
+    procs="${SETUP_SERVER_CGROUP:-/sys/fs/cgroup}$group/cgroup.procs"
+    [ -n "$group" ] && [ -r "$procs" ] || return 1
+    while read -r pid; do
+        [ "$(cat "${SETUP_SERVER_PROC:-/proc}/$pid/comm" 2>/dev/null)" != Runner.Worker ] || return 0
+    done < "$procs"
+    return 1
+}
+registered() {  # registered FIELD FILE — a value of the runner's .runner (UTF-8 JSON with a byte order mark)
+    tr -d '\r' < "$2" 2>/dev/null | grep -oE "\"$1\": *(\"[^\"]*\"|[0-9]+)" | head -n1 | sed -E 's/^[^:]*: *"?//; s/"$//' || true
+}
+remove_runner() {
+    local directory unit text= token= url= name= page=
+    if [ "$provider" = github ]; then
+        [[ "$scope" =~ ^[a-z0-9][a-z0-9._-]{0,99}$ ]] && [[ "$scope" != *..* ]] \
+            || { echo "--remove needs --scope: the runner's directory name under $ROOT/github-runner" >&2; exit 64; }
+        directory="$ROOT/github-runner/$scope" unit="$GITHUB_UNIT@$scope.service"
+        { [ -d "$directory" ] && [ ! -L "$directory" ]; } || { echo "$directory: no such runner" >&2; exit 65; }
+        url=$(registered gitHubUrl "$directory/.runner")
+        name=$(registered agentName "$directory/.runner")
+        if [[ "$url" =~ ^https://github\.com/([A-Za-z0-9-]+)$ ]]; then
+            page="https://github.com/organizations/${BASH_REMATCH[1]}/settings/actions/runners"
+        elif [[ "$url" =~ ^https://github\.com/[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]]; then
+            page="$url/settings/actions/runners"
+        fi
+        if [ ! -t 0 ]; then
+            read -r -d '' text || true
+            token=$(flag_value --token "$text")
+        fi
+        [ -z "$token" ] || [[ "$token" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "Unexpected characters in the removal token" >&2; exit 65; }
+        echo "==> GitHub runner ${name:-?} of ${url:-?} (directory $directory, service $unit)"
+        if busy "$unit"; then
+            echo "$unit runs a job now: remove it when GitHub shows the runner Idle" >&2
+            exit 75
+        fi
+        if [ -n "$token" ]; then
+            echo "==> removal token: <hidden> (${#token} characters): GitHub unregisters the runner"
+        else
+            echo "==> no removal token: GitHub keeps listing ${name:-the runner} (Offline) until it is removed there${page:+: $page}"
+        fi
+    else
+        directory="$ROOT/runner" unit=$(basename "$UNIT")
+        { [ -e "$UNIT" ] || [ -d "$directory" ]; } || { echo "No Bitbucket runner is installed" >&2; exit 65; }
+        [ ! -L "$directory" ] || { echo "$directory is a symlink; remove it by hand" >&2; exit 65; }
+        echo "==> Bitbucket runner (service $unit, $directory, $CONFIG/runner.env); Bitbucket lists it until removed there"
+        echo "==> a pipeline step running on it now stops"
+    fi
+    if [ "$check" = 1 ]; then
+        echo "==> would stop and disable $unit${token:+, unregister it in GitHub} and delete $directory"
+        exit 0
+    fi
+    # Stopping waits for the runner to end gracefully (TimeoutStopSec); a GitHub job finishing is not killed.
+    systemctl disable --now "$unit" 2>/dev/null || systemctl stop "$unit" 2>/dev/null || true
+    if [ -n "$token" ]; then
+        echo "==> unregistering in GitHub as $ACCOUNT"
+        if ! (cd "$directory" && ACTIONS_RUNNER_INPUT_TOKEN=$token sudo -u "$ACCOUNT" -H --preserve-env=ACTIONS_RUNNER_INPUT_TOKEN \
+                ./config.sh remove); then
+            echo "GitHub refused the removal (a removal token is valid one hour). The runner is stopped and disabled;" \
+                 "nothing was deleted: take a new token from GitHub's Remove dialog, or remove without it" >&2
+            exit 1
+        fi
+    fi
+    rm -rf --one-file-system -- "$directory"
+    if [ "$provider" = bitbucket ]; then
+        rm -f -- "$UNIT" "$CONFIG/runner.env"
+        systemctl daemon-reload
+    fi
+    echo "==> removed $unit and $directory"
 }
 
 github() {
@@ -278,6 +368,10 @@ EOF
     fi
     echo "==> runner service $unit is $(systemctl is-active "$unit" || true); GitHub shows the runner Idle within a minute"
 }
+if [ "$remove" = 1 ]; then
+    remove_runner
+    exit 0
+fi
 if [ "$provider" = github ]; then
     github
     exit 0
