@@ -1,4 +1,9 @@
-# setup-server – build serverio ir taikinio paruošimas
+# Server OPS – build serverio ir taikinio paruošimas
+
+**Server OPS** (trumpai **OPS**) – sistemos vardas: CI/CD, SSH prieiga, atsarginės kopijos ir serverio būsena vienoje
+vietoje; anksčiau vadinosi setup-server. Techniniai vardai lieka seni, kad jų keitimas nereikalautų migracijos
+kiekviename serveryje: klono katalogas `~/setup-server`, paslaugos `setup-server-*`, keliai `/etc/setup-server`,
+`/usr/local/lib/setup-server`, `/srv/setup-server`, kintamieji `SETUP_SERVER_*`.
 
 Scriptai, kurie paruošia Ubuntu serverį setup v2 projektams. Šis serveris kartu yra ir
 **build serveris** (Bitbucket Pipelines ir/ar GitHub Actions self-hosted runner'iai, image'ų ir release'ų
@@ -16,7 +21,7 @@ Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asan
 | `bin/install-runner` | Bitbucket Linux Shell runner'is kaip systemd paslauga `setup-server-runner` (paskyra `setup`); su `--provider github` – GitHub Actions runner'is, paslauga `setup-server-github-runner@<scope>` (po vieną organizacijai ar repo). |
 | `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<repo vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`; monorepo (`--monorepo`) – pats repo yra build katalogas. GitHub repo – su savo deploy key. |
 | `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
-| `bin/update` | Atnaujina šį setup-server checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
+| `bin/update` | Atnaujina šį Server OPS checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
 | `bin/install-auto-update` | Įdiegia vienos minutės systemd laikmatį dviem esamiems administratoriaus `master` klonams: tik po sėkmingo GitHub CI, neliečiant vietinio darbo. Veikia ir rankiniu būdu paruoštame CachyOS; `prepare-host` jam nereikia. |
 | `bin/install-backups` | DB kopijos: naktinė (`setup-server-backup.timer`, pagal lentelių registrą) ir savaitinė pilna (`setup-server-backup-full.timer`, visų lentelių duomenys); naktinė failų kopija (`setup-server-backup-files.timer`, projekto `BACKUP_FILE_PATHS` keliai iš taikinio); komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
 | `bin/install-ssh` | SSH iš VPN: `openssh-server` (Ubuntu Desktop jo neturi), paleistas ir startuojantis po perkrovimo, nustatymai `/etc/ssh/sshd_config.d/10-setup-server.conf` – iš už nurodytų tinklų ir šio serverio tik raktu, be slaptažodžio; įjungtam ufw – leidimas tiems tinklams. Reikia `make db-pull` ir valdymo sąsajos tuneliui. |
@@ -289,7 +294,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    `deploy.yml` (`workflow_dispatch` su `operation` `deploy|status`, `environment` `stage|prod`, `sha`, `attempt_id`,
    `request_id`, `expected_live`, `health_paths`; vardas `aios <operation> <environment> <request_id>`), job'as šio
    serverio runner'yje vykdo `make -C <build katalogas>/app pipeline-deploy`, o būseną grąžina artifact'u
-   `aios-<request_id>` (`dde-deploy-status/v1`, setup'o `make deploy-status`). setup-server tam duoda tik build
+   `aios-<request_id>` (`dde-deploy-status/v1`, setup'o `make deploy-status`). Server OPS tam duoda tik build
    katalogą, taikinius ir runner'į; AI OS serverio, SSH ar Docker prieigos negauna.
 
 5. **Projekto pašalinimas:**
@@ -367,7 +372,7 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    pvz. Ubuntu 24.04, tikrina reguliariąja išraiška). Senesnis sudo (Ubuntu 22.04: 1.9.9) turi tik
    šablonus: pirmas argumentas privalo būti build katalogas (ar `--full` ir build katalogas), o kitus
    argumentus atmeta pati komanda.
-   Atnaujinus setup-server, pakartok `sudo bin/install-backups`, jei `bin/update` parodo pastabą, kad
+   Atnaujinus Server OPS, pakartok `sudo bin/install-backups`, jei `bin/update` parodo pastabą, kad
    sudo taisyklė skiriasi.
 
    ```yaml
@@ -563,7 +568,7 @@ sudo setup-server-backup --files shop prod        # vienos aplinkos kopija dabar
   `fresh` – užsakyti naują (jaunesnė nei 30 min. atiduodama ta pati).
 - **Peržiūra** – sąsajos *Failai*: aplinkos su failų kopijomis (PrestaShop ar `BACKUP_FILE_PATHS`), jų kopijos, kopijos failai (nauji, pakeisti ir dingę
   nuo ankstesnės kopijos), failo turinys, skirtumai nuo ankstesnės kopijos ir atsisiuntimas (iki 2 MiB). Tik skaitoma.
-- **Metrikos** – `setup_worker_files_backup*` (žr. „Worker'io metrikos“). Atnaujinus setup-server, `bin/update` parodo, kad
+- **Metrikos** – `setup_worker_files_backup*` (žr. „Worker'io metrikos“). Atnaujinus Server OPS, `bin/update` parodo, kad
   laikmačio dar nėra (`note: … differs`) – paleisk `sudo bin/install-backups`.
 
 ## Įrankių prieiga (`bin/tool-access`)
@@ -606,7 +611,7 @@ sudo bin/tool-access --show                                      # būsena JSON,
   `openssl passwd -6`), leistos aplinkos, vardai ir prisijungimo vardai, paskutinio siuntimo rezultatas. Slaptažodis niekur neįrašomas.
 - `bin/add-backup-key --remove VARDAS` pašalina ir vartotoją: jo eilutės iškart dingsta iš visų taikinių. Naujo rakto
   vardas negali būti kito rakto prisijungimo vardas.
-- Atnaujinus setup-server sąsajai reikia naujos sudo taisyklės (`tool-access`): `sudo bin/install-ui`. Bendras setup
+- Atnaujinus Server OPS sąsajai reikia naujos sudo taisyklės (`tool-access`): `sudo bin/install-ui`. Bendras setup
   turi būti 3.6.0+ (`sudo bin/update-setup`); kol jis senesnis, failai laukia build kataloguose – atnaujinus
   `sudo bin/tool-access --apply`.
 - Sąsajoje – rakto puslapio skirtukas *Įrankiai* (slaptažodis ir aplinkos) ir *Prieiga* → „Įrankių prieiga“ (adresai,
@@ -629,7 +634,7 @@ kita aplinka:
   (rodomas, kai aplinka išvardyta, dar prieš pirmą deploy'ų).
 - **Kopijos** – naktinės, savaitinės pilnos ir „backup dabar“ (`… setup-server-backup "$BUILD_ROOT" mdv`), kai yra
   `env/mdv.env`; `make db-pull from=mdv`. Sudo taisyklė „backup dabar“ priima ir papildomos aplinkos vardą: atnaujinus
-  setup-server pakartok `sudo bin/install-backups` (`bin/update` parodo, kad taisyklė skiriasi).
+  Server OPS pakartok `sudo bin/install-backups` (`bin/update` parodo, kad taisyklė skiriasi).
 - **Metrikos** – tos pačios eilutės su `environment="mdv"`.
 - **Prieiga** – `--grant projektas:mdv=LYGIS` ir sąsajos *Prieiga* (rakto puslapyje mdv stovi greta prod ir stage;
   „Visoms iš karto“ – eilutė „kitos“). `--grant projektas=LYGIS` be aplinkos – tik stage ir prod.
@@ -675,10 +680,10 @@ bin/update --check --server-ref v0.2.0 --setup-ref v2.0.0   # parodo, kas keist�
 bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikrina, nepavykus grąžina
 ```
 
-- Leisk **be sudo**, kaip šio klono savininkas (setup-server parsiunčiamas tavo git raktu); setup checkout'o
+- Leisk **be sudo**, kaip šio klono savininkas (Server OPS parsiunčiamas tavo git raktu); setup checkout'o
   dalį scriptas pats vykdo per `sudo -u setup` (paprašys slaptažodžio). Paleistas su sudo – atsisako.
 - Galima nurodyti tik vieną pusę (`--setup-ref` arba `--server-ref`); kita lieka, kur buvo.
-- **Įdiegtos komandų kopijos.** Kai keičiasi setup-server, po perjungimo (prieš sveikatos patikrą) per
+- **Įdiegtos komandų kopijos.** Kai keičiasi Server OPS, po perjungimo (prieš sveikatos patikrą) per
   `sudo` perrašomos įdiegtos kopijos `/usr/local/sbin/setup-server-backup`, `/usr/local/sbin/setup-server-metrics`,
   `/usr/local/sbin/setup-server-backup-pull`, `/usr/local/sbin/setup-server-access` ir valdymo sąsajos `/usr/local/sbin/setup-server-ui` kartu su
   `/usr/local/lib/setup-server/bin/` (tik tos, kurios įdiegtos) iš naujos versijos: `bin/install-backups --refresh`,
@@ -693,7 +698,7 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
   sudo slaptažodžio paklausti negali, todėl jo kvietimai tada yra `sudo -n`. Jei savininkui sudo be slaptažodžio
   neleidžiamas, `bin/update` iškart atsisako (kodas 77, niekas nepakeista) – atnaujink terminale. Klonas taip pat turi
   parsisiųsti (`git fetch`) be slaptažodžio frazės. Atnaujinimo metu sąsaja persikrauna į naują kopiją, o veiksmas tęsiasi.
-- **Ref'as** – tag'as (pageidautina), `origin` šaka (`master` arba `origin/master`) arba commit'o id. setup-server gali būti ir ne ant tag'o
+- **Ref'as** – tag'as (pageidautina), `origin` šaka (`master` arba `origin/master`) arba commit'o id. Server OPS gali būti ir ne ant tag'o
   (tag'ų dar nėra). setup ne ant `vX.Y.Z` tag'o tinka **tik stage**: prod release'ui setup turi būti ant
   release tag'o – peržiūra tai parodo kaip pastabą.
 - `--check` parsiunčia (`git fetch`) ir parodo kiekvieno checkout'o dabartinį ir naują ref'ą, commit'ų
@@ -708,7 +713,7 @@ bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikri
 
 **Sveikatos patikra po atnaujinimo** (visos trys, bet kuri nepavykusi = grįžimas):
 
-1. setup-server testai (`python3 -m unittest discover -s tests`) iš naujos versijos – patikrina, kad
+1. Server OPS testai (`python3 -m unittest discover -s tests`) iš naujos versijos – patikrina, kad
    scriptai veikia šiame serveryje;
 2. setup checkout'as yra ant naujo commit'o ir paskyra `setup` jį skaito be pakeitimų – būtent jį
    pipeline'ai naudoja (`SETUP_DIRECTORY`);
@@ -739,7 +744,7 @@ GitHub Actions patikrina `master` ir paskelbia tik patikrintą versiją šakoje 
 
 - setup `Release` workflow po sėkmingo `Setup compatibility` vienu atominiu push paskelbia release commit'ą,
   jo `vX.Y.Z` tag'ą ir `deploy/local`. Jei tuo metu `master` pasikeitė, visas push atmetamas.
-- setup-server `tests` workflow priklausomas `publish-local` job'as po sėkmingų testų patikrina push commit'ą
+- Server OPS `tests` workflow priklausomas `publish-local` job'as po sėkmingų testų patikrina push commit'ą
   ir pastumia `deploy/local`. PR, nesėkmingas CI ir pasenęs patikros rezultatas kanalo nepastumia.
 
 Vietinis `setup-server-auto-update.timer` tikrina abu kanalus kas minutę (iki 10 s papildomo atidėjimo).
@@ -767,7 +772,7 @@ sudo env SETUP_SERVER_USER=tomas SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/
   SETUP_DIRECTORY=/home/tomas/Projects/setup bin/install-auto-update
 ```
 
-Numatytasis setup-server klonas yra tas, iš kurio leidžiamas installer'is, setup — jo kaimynas `setup`;
+Numatytasis Server OPS klonas yra tas, iš kurio leidžiamas installer'is, setup — jo kaimynas `setup`;
 kitą serverio kloną nurodo `SETUP_SERVER_CHECKOUT`. Abu turi priklausyti `SETUP_SERVER_USER` (numatytasis —
 serverio klono savininkas). `SETUP_SERVER_ROOT` čia parenka tik būsenos katalogą `auto-update/`, ne kitus klonus.
 Installer'is nereikalauja Ubuntu ir nekeičia `prepare-host`, paketų, projektų ar runner'ių. Kartojant esami
@@ -780,7 +785,7 @@ konteineryje, atnaujinimas atidedamas. Naujesnis vietinis `master`, kurio CI dar
 Setup atnaujinimo commit'as turi sutapti su jo `VERSION` atitinkančiu release tag'u. Leidžiami ir nauji MAJOR
 leidimai: tai du darbo klonai, ne produkcinio projekto versijos pasirinkimas.
 
-Po pakeitimo vykdomi abiejų repozitorijų vietiniai testai: setup-server unittest ir setup A lygis (`tests/run`,
+Po pakeitimo vykdomi abiejų repozitorijų vietiniai testai: Server OPS unittest ir setup A lygis (`tests/run`,
 be pasirenkamų Docker integracijų). Nepavykus abu klonai grįžta į ankstesnius commit'us per `git reset --keep`.
 Jei patikros metu pradėjai redaguoti, automatika darbo netrina ir palieka aiškią rankinio atkūrimo klaidą.
 Nutrauktas atnaujinimas atkuriamas iš transakcijos žurnalo prieš kitą bandymą. Vienu metu veikia tik vienas
@@ -806,7 +811,7 @@ tą patį `--state-dir` kaip paslauga. Sėkmingo darbo būsena — `updated` arb
 ### Tik setup (be slaptažodžio)
 
 Bendrą setup checkout'ą (`/srv/setup-server/setup`) atnaujina viena komanda, be administratoriaus slaptažodžio ir be
-setup-server atnaujinimo – arba sąsajoje *Atnaujinimas* („Atnaujinti į naujausią“):
+Server OPS atnaujinimo – arba sąsajoje *Atnaujinimas* („Atnaujinti į naujausią“):
 
 ```bash
 sudo bin/update-setup --check          # dabartinė versija, naujausias to paties MAJOR release'as, commit'ai
@@ -823,7 +828,7 @@ sudo bin/update-setup v2.6.0           # arba į nurodytą release tag'ą
 - Naujas MAJOR – tik nurodžius tag'ą; peržiūra perspėja, kad projektams gali reikėti pakeitimų.
 - **Deploy'us tai daro ir pats:** kai deploy'inamo commit'o `SETUP_MIN_VERSION` naujesnis už serverio setup, setup 2.7.0+
   `pipeline-deploy` perjungia setup į naujausią to paties MAJOR release'ą ir žingsnį paleidžia iš naujo.
-- Pilnas atnaujinimas (setup-server ir setup kartu, su sveikatos patikra) – `bin/update`, žemiau.
+- Pilnas atnaujinimas (Server OPS ir setup kartu, su sveikatos patikra) – `bin/update`, žemiau.
 
 ### Rankinis atstatymas
 
@@ -877,7 +882,7 @@ Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo 
    sudo bin/prepare-host --setup-ref <tag'as>
    ```
 
-   setup-server – nusiklonuok iš naujo greta ir sukeisk:
+   Server OPS – nusiklonuok iš naujo greta ir sukeisk:
 
    ```bash
    git clone git@github.com:BigSant/DockerDevelopmentEnvironmentServer.git ~/setup-server.new
@@ -1018,7 +1023,7 @@ commit'as, raudonas, kai setup ne ant release tag'o.
 
 - *Apžvalga* – viršuje „Reikia dėmesio“: viskas, kas sugedę ar laukia (nepavykę unit'ai, setup ne ant tag'o, naujesnė
   versija, mažai vietos, nepavykęs deploy'us, sustojęs secret store, nesveiki konteineriai, senesnė nei 26 val. kopija),
-  kiekvienas su nuoroda. Toliau – setup-server versija (įdiegta ir administratoriaus klono), bendro setup checkout'o versija
+  kiekvienas su nuoroda. Toliau – Server OPS versija (įdiegta ir administratoriaus klono), bendro setup checkout'o versija
   (commit'as, ar release tag'as, kiek naujesnis origin/master pagal paskutinį fetch), Bitbucket ir
   GitHub runner'ių paslaugos, naktinių ir savaitinių pilnų kopijų laikmačiai (paskutinis paleidimas, rezultatas, kitas), metrikų paslauga,
   naktinių failų kopijų laikmatis, pati sąsaja, laisva vieta diske, kuriame `/srv/setup-server`. Prie kiekvienos įdiegtos paslaugos – jos mygtukai
@@ -1055,13 +1060,13 @@ commit'as, raudonas, kai setup ne ant release tag'o.
   aplinkos puslapyje – visos jos kopijos ir „Failų kopija dabar“; kopijos puslapyje – failai su paieška, kas nauja, pakeista
   ir dingo nuo ankstesnės kopijos; failo puslapyje – turinys, skirtumai nuo ankstesnės kopijos ir „Atsisiųsti“. Tik
   skaitoma: nei kopijos, nei taikinys nekeičiami. „Reikia dėmesio“ rodo senesnę nei 26 val. failų kopiją (kai laikmatis įdiegtas).
-- *Atnaujinimas* – setup-server ir setup: versija, commit'as, ar release tag'as, kiek naujesnis origin/master.
-  „Atnaujinti į naujausią“ – setup-server į `origin/master` (`bin/update`, žr. „Atnaujinimas“), setup – į naujausią
+- *Atnaujinimas* – Server OPS ir setup: versija, commit'as, ar release tag'as, kiek naujesnis origin/master.
+  „Atnaujinti į naujausią“ – Server OPS į `origin/master` (`bin/update`, žr. „Atnaujinimas“), setup – į naujausią
   to paties MAJOR release'ą (`bin/update-setup`; setup release'ą daro kiekvienas sujungimas į master); konkreti versija
   ar naujas MAJOR – „Konkreti versija ar ref'as“.
 - *Metrikos* – worker'io `/metrics`, kaip jį mato Prometheus (`setup-server-metrics --once`, be token'o), ir kurios
   grupės surinktos.
-- *Žurnalai* – programuotojų veikla (visų raktų), `ui-actions.log`, `backup-pulls.log`, `access.log`, setup-server paslaugų journal (po 50 eilučių) ir paskutiniai
+- *Žurnalai* – programuotojų veikla (visų raktų), `ui-actions.log`, `backup-pulls.log`, `access.log`, Server OPS paslaugų journal (po 50 eilučių) ir paskutiniai
   veiksmai su jų išvestimi.
 - *Instrukcijos* – kaip paruošti kitą serverį projekto taikiniu (`bin/add-project --target ENV=ssh://…`): pasirenki OS
   (Ubuntu, Debian; CentOS/AlmaLinux/Rocky – netestuota), valdymo skydelį (DirectAdmin ar jokio), aplinką (prod, stage) ir
@@ -1100,7 +1105,7 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
 | Įrankių prieiga (rakto *Įrankiai*, *Prieiga*) | `sudo -n L/tool-access --name … --tools …\|--no-tools`, `--name … --password -` (slaptažodis per stdin, išvestyje – `<hidden>`) `\|--no-password`, `--name … --full-name … --login …`, `--allowed-ips …\|--no-allowed-ips`, `--apply` |
 | Paruošti serverį | `sudo -n L/prepare-host [--setup-ref …]` (`--check` kodas 1 – „Needs attention“ – vykdyti leidžia) |
 | Atnaujinti setup (*Atnaujinimas*) | `sudo -n L/update-setup [vX.Y.Z]` (tik release tag'ai, be slaptažodžio) |
-| Atnaujinti setup-server (*Atnaujinimas*) | `sudo -n -H -u <klono savininkas> <klonas>/bin/update --server-ref origin/master` (ar kiti `--server-ref`/`--setup-ref`) |
+| Atnaujinti Server OPS (*Atnaujinimas*) | `sudo -n -H -u <klono savininkas> <klonas>/bin/update --server-ref origin/master` (ar kiti `--server-ref`/`--setup-ref`) |
 | Deploy'us, „backup dabar“, runner'io testas | Bitbucket API (žr. žemiau) |
 
 - Vardai, URL, taikiniai, ref'ai, laikas ir adresai tikrinami griežtais šablonais, komanda paduodama argumentų sąrašu
@@ -1111,7 +1116,7 @@ klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis a
   tekstas laikomas tik sąsajos atmintyje (persikrovus – įklijuok iš naujo).
 - **Atnaujinimas** vykdomas kaip klono, iš kurio paleistas `install-ui`, savininkas; jam sudo turi veikti be
   slaptažodžio (žr. „Atnaujinimas“), kitaip – terminale.
-- **Paslaugos.** `bin/server-unit` valdo tik setup-server unit'us ir tik leidžiamais veiksmais; ką ir su kuo daryti,
+- **Paslaugos.** `bin/server-unit` valdo tik Server OPS unit'us ir tik leidžiamais veiksmais; ką ir su kuo daryti,
   nustato jo paties sąrašas, ne kvietėjas. `--check` parodo unit'o būseną ir ar vyksta pipeline'o žingsnis (sustabdžius
   ar perkrovus runner'į jis nutrūktų).
 
@@ -1257,7 +1262,7 @@ sudo tail -n 20 /srv/setup-server/ui-actions.log
   administratoriaus galią, todėl jos slaptažodį saugok kaip administratoriaus. Bitbucket token'ai – tik
   `/etc/setup-server/ui.env` (root, 0600); kiekvienas veiksmas – `ui-actions.log`.
 - `bin/update` iš sąsajos veikia tik tada, kai klono savininkas gali naudoti sudo be slaptažodžio. Tokios teisės
-  setup-server nesuteikia: jos suteikimas – administratoriaus sprendimas (savininko paskyra tada prilygsta root be
+  Server OPS nesuteikia: jos suteikimas – administratoriaus sprendimas (savininko paskyra tada prilygsta root be
   slaptažodžio).
 
 ## Dar neįtraukta

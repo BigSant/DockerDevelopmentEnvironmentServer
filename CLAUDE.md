@@ -1,4 +1,4 @@
-# setup-server — pointers
+# Server OPS (repository setup-server) — pointers
 
 - Tests: `python3 -m unittest discover -s tests`; one module from `tests/` (they import each other): `cd tests && python3 -m unittest test_ui`. CI runs on the local self-hosted worker, using the Ubuntu 22.04 / Python 3.10 Docker runtime in `tests/fixtures/ci.Dockerfile`; keep Python 3.10 compatibility (no 3.12-only syntax).
 - README.md (Lithuanian) is the documentation of record; a behaviour change updates its section. Commits: an English sentence as subject, the why in the body.

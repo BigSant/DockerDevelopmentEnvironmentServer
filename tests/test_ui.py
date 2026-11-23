@@ -779,7 +779,7 @@ class WebUiTest(Worker):
             with self.subTest(login=login):
                 status, headers, body = self.request("GET", "/", login=login)
                 self.assertEqual(status, 401)
-                self.assertEqual(headers.get("WWW-Authenticate"), 'Basic realm="setup-server", charset="UTF-8"')
+                self.assertEqual(headers.get("WWW-Authenticate"), 'Basic realm="Server OPS", charset="UTF-8"')
                 self.assertNotIn("asana_tracker", body)
         self.assertEqual(self.request("GET", "/ui.css", login=None)[0], 401)
         self.assertEqual(self.request("POST", "/preview", {"action": "add-project"}, login=None)[0], 401)
@@ -1141,7 +1141,7 @@ class WebUiTest(Worker):
                                      "key_name": "tomas", "sources": "10.8.0.0/24", "grants": "shop:prod=root"}, "Prieiga"),
                  ("add-backup-key", {"public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1",
                                      "key_name": "tomas", "sources": "10.8.0.0/24", "grants": "shop=full --remove=x"}, "Prieiga"),
-                 ("update", {"server_ref": "--upload-pack=x"}, "setup-server ref"),
+                 ("update", {"server_ref": "--upload-pack=x"}, "Server OPS ref"),
                  ("update", {"setup_ref": "v1..v2"}, "setup ref"),
                  ("update", {}, "bent vieną"),
                  ("install-runner", {"provider": "gitlab", "dialog": "x"}, "bitbucket arba github"),
@@ -1370,7 +1370,7 @@ class WebUiTest(Worker):
                      "Custom HTTPD Configurations", "ProxyPass / http://127.0.0.1:8081/", "LOCALHOST_PORT_SSL=8082",
                      "PMA_ALLOWED_IPS=&quot;BIURO_IP&quot;", "Deployments → <code>Production</code>", " žingsni",
                      "Kokia OS ir architektūra", ". /etc/os-release &amp;&amp; echo", "uname -m",
-                     "CSF ugniasienė (DirectAdmin)", "csf -a WORKER_IP &quot;setup-server worker&quot;",
+                     "CSF ugniasienė (DirectAdmin)", "csf -a WORKER_IP &quot;Server OPS worker&quot;",
                      "systemctl is-active --quiet docker &amp;&amp; systemctl restart docker", "dd if=/dev/zero of=/swapfile",
                      "Prieiga prie repo", "sudo -u setup -H git ls-remote APLINKOS_REPO_URL HEAD",
                      "Workspace runners → Add runner", "sudo bin/install-runner --check",

@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""The web UI of setup-server: the worker's status and the bin/ commands, on 127.0.0.1 only.
+"""The web UI of Server OPS (repository setup-server): the worker's status and the bin/ commands, on 127.0.0.1 only.
 
 bin/install-ui installs this as /usr/local/sbin/setup-server-ui and runs it as the systemd service
 setup-server-ui of its own account, setup-ui (not setup: pipeline steps run as setup and must not reach
@@ -724,12 +724,12 @@ def plan_update(form, status):
     where = installation()
     if not where['checkout']:
         raise Invalid('Nežinomas administratoriaus klonas: paleisk sudo bin/install-ui iš jo.')
-    server_ref = git_ref(form, 'server_ref', 'setup-server ref\'as')
+    server_ref = git_ref(form, 'server_ref', 'Server OPS ref\'as')
     setup_ref = git_ref(form, 'setup_ref', 'setup ref\'as')
     if flag(form, 'latest'):
-        server_ref = server_ref or 'origin/master'  # the newest setup-server: the repository has no release tags
+        server_ref = server_ref or 'origin/master'  # the newest Server OPS: the repository has no release tags
     if not server_ref and not setup_ref:
-        raise Invalid('Nurodyk bent vieną ref\'ą (setup-server arba setup).')
+        raise Invalid('Nurodyk bent vieną ref\'ą (Server OPS arba setup).')
     arguments = (['--server-ref', server_ref] if server_ref else []) + (['--setup-ref', setup_ref] if setup_ref else [])
     base = ['sudo', '-n', '-H', '-u', where['admin'], f"{where['checkout']}/bin/update"]
     return Plan('update', 'Atnaujinti', base + ['--check'] + arguments, base + arguments, timeout=3600)
@@ -1220,7 +1220,7 @@ GUIDE = (
          'Įleisk worker\'į į 22 portą (kitas SSH portas taikinio adrese nepalaikomas). Jei ufw išjungtas (`ufw status`), '
          'šis žingsnis nereikalingas.',
          blocks=((None, ('ufw allow proto tcp from {worker} to any port 22',)),),
-         when={'os': APT}, source='bin/add-project:159; spec setup-server „Ryšys“'),
+         when={'os': APT}, source='bin/add-project:159; spec Server OPS „Ryšys“'),
     Step('SSH iš worker\'io', 'target',
          'Įleisk worker\'į į 22 portą (kitas SSH portas taikinio adrese nepalaikomas).',
          blocks=((None, ('firewall-cmd --permanent --add-rich-rule=\'rule family="ipv4" source address="{worker}" '
@@ -1234,8 +1234,8 @@ GUIDE = (
          '`/etc/docker/daemon.json` jau yra, `live-restore` įrašyk į jį.',
          blocks=((None, ('sed -i -e \'s/^DOCKER = "0"/DOCKER = "1"/\' '
                          '-e \'s|^DOCKER_NETWORK4 = .*|DOCKER_NETWORK4 = "172.16.0.0/12"|\' /etc/csf/csf.conf',
-                         'csf -a {worker} "setup-server worker"',
-                         'echo "{worker} # setup-server worker" >> /etc/csf/csf.ignore',
+                         'csf -a {worker} "Server OPS worker"',
+                         'echo "{worker} # Server OPS worker" >> /etc/csf/csf.ignore',
                          '[ -f /etc/docker/daemon.json ] || printf \'{\\n  "live-restore": true\\n}\\n\' > /etc/docker/daemon.json',
                          '[ -f /etc/csf/csfpost.sh ] || printf \'#!/bin/sh\\n\' > /etc/csf/csfpost.sh',
                          'echo \'systemctl is-active --quiet docker && systemctl restart docker\' >> /etc/csf/csfpost.sh',
@@ -1287,7 +1287,7 @@ GUIDE = (
          'Be skydelio ir be SSL svetainė pasiekiama tik per VPN: portai publikuojami VPN adresu `{address}`, '
          'adresas – `http://{domain}:{port}`. Viešų portų nėra. Patikrink, kad portas laisvas:',
          blocks=((None, ("ss -ltn 'sport = :{port}'",)),),
-         when={'panel': ('none',), 'ssl': ('none',)}, source='setup doc/lt/09-aplinkos.md:46; spec setup-server „Prieiga“'),
+         when={'panel': ('none',), 'ssl': ('none',)}, source='setup doc/lt/09-aplinkos.md:46; spec Server OPS „Prieiga“'),
     Step('DNS', 'dns',
          'Du įrašai: svetainė ir jos įrankiai (`pma.`, `mailpit.`, `cron.`, `backup.{domain}`) vienu wildcard įrašu. Su '
          'Cloudflare `{domain}` gali būti Proxied, jei jis vieno lygio po zona (nemokamas sertifikatas dengia `*.zona`): SSL '
@@ -1409,7 +1409,7 @@ EXAMPLE = (
          'perduodami per SSH (`docker save | docker load`), kitos architektūros taikinys jų nepaleis.',
          blocks=((None, ('. /etc/os-release && echo "$PRETTY_NAME (ID=$ID VERSION_ID=$VERSION_ID)"', 'uname -m')),),
          source='bin/prepare-host:11,50; setup doc/lt/09-aplinkos.md „D modelis“'),
-    Step('setup-server ir setup versijos', 'worker',
+    Step('Server OPS ir setup versijos', 'worker',
          'Projektas nurodo seniausią tinkamą setup (`SETUP_MIN_VERSION` faile `env/common.env`). Atnaujink abu checkout\'us '
          'prieš registruodamas; tą patį daro puslapis „Atnaujinimas“.',
          blocks=((None, ('bin/update --check --server-ref origin/master --setup-ref vX.Y.Z',
@@ -2129,8 +2129,8 @@ class Page:
         busy = running_job()
         busy = (f'<a class="busy" href="/job/{e(busy)}">{lamp("run")}veiksmas eina</a>') if busy else ''
         return (f'<!doctype html><html lang="lt"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
-                f'{head}<title>{e(title)} · setup-server</title><link rel="stylesheet" href="/ui.css"></head><body>'
-                f'<header class="top"><a class="mark" href="/">SETUP-SERVER<small>{e(socket.gethostname())}</small></a>'
+                f'{head}<title>{e(title)} · Server OPS</title><link rel="stylesheet" href="/ui.css"></head><body>'
+                f'<header class="top"><a class="mark" href="/">OPS<small>{e(socket.gethostname())}</small></a>'
                 f'<nav class="nav">{navigation}</nav><span class="spacer"></span>{busy}'
                 f'<div class="who"><b>{e(time.strftime("%H:%M"))}</b>{e(self.user)}</div></header>'
                 f'<main><h1>{e(title)}</h1>{body}</main></body></html>')
@@ -2187,7 +2187,7 @@ class Page:
         share = disk['available'] / disk['size'] if disk.get('size') else None
         stats = [(len(projects), 'projektai'), (sum(len(item.get('environments', {})) for item in projects), 'aplinkos'),
                  (f'{share:.0%}' if share is not None else '?', 'laisva diske'),
-                 (versions.get('installed') or '?', 'setup-server'), (versions.get('setup') or '?', 'setup')]
+                 (versions.get('installed') or '?', 'Server OPS'), (versions.get('setup') or '?', 'setup')]
         body = '<div class="stats">' + ''.join(f'<div class="stat"><b>{e(number)}</b><span>{e(label)}</span></div>'
                                                for number, label in stats) + '</div>'
         body += self.attention(data)
@@ -2195,7 +2195,7 @@ class Page:
         installed_version, checkout = versions.get('installed'), versions.get('checkout')
         differs = checkout and installed_version and checkout != installed_version
         server_git, setup_git = versions.get('checkout_git') or {}, versions.get('setup_git') or {}
-        tiles.append(self.tile('setup-server', 'warn' if differs or server_git.get('behind') else 'ok', e(installed_version or '?'),
+        tiles.append(self.tile('Server OPS', 'warn' if differs or server_git.get('behind') else 'ok', e(installed_version or '?'),
                                (f'klonas: {e(checkout)}; ' if differs else '') + git_line(server_git or None, False),
                                '<a class="btn" href="/update">Atnaujinti</a>'))
         tiles.append(self.tile("setup (bendras checkout'as)", 'bad' if setup_git and not setup_git.get('tag') else
@@ -2267,7 +2267,7 @@ class Page:
         setup = versions.get('setup_git') or {}
         if setup and not setup.get('tag'):
             items.append(('bad', 'setup ne ant release tag\'o: prod deploy\'ai neveiks', '/update'))
-        updates = [label for label, state in (('setup', setup), ('setup-server', versions.get('checkout_git') or {}))
+        updates = [label for label, state in (('setup', setup), ('Server OPS', versions.get('checkout_git') or {}))
                    if state.get('behind')]
         if updates:
             items.append(('warn', 'Yra naujesnis ' + ' ir '.join(updates), '/update'))
@@ -2918,7 +2918,7 @@ class Page:
         if waiting:
             rows.append(('Laukia deploy\'aus', ' '.join(f'<span class="chip warn" title="{e(applied[item].get("note", ""))}">'
                                                          f'{e(item.replace(":", " "))}</span>' for item in waiting)))
-        field = (f'<label><span>setup-server adresai (IP ar CIDR, per kablelį)</span><input type="text" name="allowed_ips" '
+        field = (f'<label><span>Server OPS adresai (IP ar CIDR, per kablelį)</span><input type="text" name="allowed_ips" '
                  f'value="{e(",".join(addresses))}" placeholder="198.51.100.7" autocomplete="off"></label>')
         return ('<h2 id="tools">Įrankių prieiga</h2>' + facts(rows) +
                 '<p class="note">Kas kurios aplinkos įrankius atidaro – rakto puslapio skirtuke „Įrankiai“. Adresai pridedami prie '
@@ -3088,7 +3088,7 @@ class Page:
 
     def tools_tab(self, data, name, query, only_granted):
         """The key's tools password and the project environments whose tools it opens (bin/tool-access): a change holds
-        at once, setup-server sends the user file to the target and reloads its nginx-proxy."""
+        at once, Server OPS sends the user file to the target and reloads its nginx-proxy."""
         tools = (data or {}).get('tool_access') or {}
         user = (tools.get('users') or {}).get(name) or {}
         granted = set(user.get('projects', []))
@@ -3097,7 +3097,7 @@ class Page:
         state = (f'{badge("nustatytas", "ok")} <span class="muted">{e(user.get("password_set") or "")}</span>'
                  if user.get('password') else badge('nenustatytas', 'warn'))
         body = ('<div class="callout"><p>Pažymėtų aplinkų pma, cron, mailpit, backup, metrics ir projekto PROXY_TOOLS paklaus '
-                f'vardo <code>{e(user.get("login") or name)}</code> (<a href="#person">keisti</a>) ir šio slaptažodžio. Įleidžiama tik iš setup-server adresų '
+                f'vardo <code>{e(user.get("login") or name)}</code> (<a href="#person">keisti</a>) ir šio slaptažodžio. Įleidžiama tik iš Server OPS adresų '
                 f'({e(", ".join(addresses)) if addresses else "nenurodyti – tik projekto ALLOWED_IPS"}; '
                 '<a href="/access#tools">keisti</a>). Pakeitimas galioja iš karto, be deploy\'aus.</p></div>')
         fields = (f'<input type="hidden" name="key_name" value="{e(name)}"><p>Slaptažodis: {state}</p>'
@@ -3209,7 +3209,7 @@ class Page:
                      '<div class="term typed"><ol>' + ''.join(f'<li>{e(line)}</li>' for line in data.get('lines', [])) + '</ol></div>')
         return self.layout(f'Seansas {name}', body, section='access')
 
-    # --- Update: setup-server and setup to their newest ---
+    # --- Update: Server OPS and setup to their newest ---
     def update_page(self, data, error, where):
         if data is None:
             return self.layout('Atnaujinimas', f'<div class="callout bad"><p>Būsenos nepavyko gauti: {e(error)}</p></div>',
@@ -3220,7 +3220,7 @@ class Page:
         if setup and not setup.get('tag'):
             body += ('<div class="tape"><span>setup ne ant release tag\'o: make release ENV=prod atsisako, todėl prod '
                      'deploy\'ai neveiks, kol setup negrįš į tag\'ą („Atnaujinti į naujausią“ žemiau).</span></div>')
-        plate_server = (f'<div class="plate"><p class="plate-name">setup-server</p><p class="plate-version">'
+        plate_server = (f'<div class="plate"><p class="plate-name">Server OPS</p><p class="plate-version">'
                         f'{e(versions.get("installed") or "?")}</p><p class="plate-line">įdiegtos kopijos</p>'
                         f'<p class="plate-line">klonas {e(versions.get("checkout") or "?")} · {git_line(server, False)}</p>')
         if where['checkout']:
@@ -3248,8 +3248,8 @@ class Page:
             'update-setup', 'setup į release tag\'ą', text('setup_tag', 'setup tag\'as', 'v2.15.0'),
             note='Tik release tag\'ai (vX.Y.Z); ir naujas MAJOR ar grįžimas atgal.', command='bin/update-setup vX.Y.Z')
         if where['checkout']:
-            body += self.form('update', 'setup-server ir setup kartu',
-                              text('server_ref', 'setup-server ref\'as', 'origin/master') + text('setup_ref', 'setup ref\'as', 'v2.14.1'),
+            body += self.form('update', 'Server OPS ir setup kartu',
+                              text('server_ref', 'Server OPS ref\'as', 'origin/master') + text('setup_ref', 'setup ref\'as', 'v2.14.1'),
                               note='Tag\'as, origin šaka ar commit\'as; su sveikatos patikra ir grąžinimu.', command='bin/update')
         body += '</div></details>'
         return self.layout('Atnaujinimas', body, section='update')
@@ -3361,7 +3361,7 @@ class Page:
             note='Nuo 2026-11-12 Bitbucket git per SSH – tik ssh.bitbucket.org. Perkelia build katalogų (app/, app/public/) '
                  'remote\'us, kai naujas adresas atsako; GitHub nelieča. Prieš tai – „Paruošti serverį“ (host key).',
             command='bin/move-bitbucket-ssh')
-        body += ('<div class="pointer"><h3>Atnaujinti setup-server ir setup</h3><p class="note">Į naujausią vienu mygtuku, '
+        body += ('<div class="pointer"><h3>Atnaujinti Server OPS ir setup</h3><p class="note">Į naujausią vienu mygtuku, '
                  'su versijomis ir commit\'ų sąrašu.</p><a class="btn" href="/update">Atnaujinimas →</a></div></div>')
         body = f'<div class="split">{index}<div class="sections">{body}</div></div>'
         return self.layout('Veiksmai', body, section='actions')
@@ -3556,7 +3556,7 @@ def handler(user, stored):
                     if header:
                         log(f'refused {self.client()}: wrong login (401)')
                     self.reply(401, self.page_text('Reikia prisijungti.'),
-                               headers=[('WWW-Authenticate', 'Basic realm="setup-server", charset="UTF-8"')])
+                               headers=[('WWW-Authenticate', 'Basic realm="Server OPS", charset="UTF-8"')])
                     return None
                 with lock:
                     if len(verified) > 64:
