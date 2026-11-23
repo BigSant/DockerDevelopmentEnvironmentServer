@@ -4036,12 +4036,21 @@ def handler(accounts):
                     return text
             return ''
 
+        def caller(self):
+            """Who the wrong logins are counted for: behind a LAN proxy (nginx) every browser comes from 127.0.0.1,
+            so the address the proxy passes (X-Real-IP) counts; one device's guesses then lock out only itself."""
+            forwarded = self.headers.get('X-Real-IP', '').strip()
+            try:
+                return str(ipaddress.ip_address(forwarded)) if forwarded else self.client()
+            except ValueError:
+                return self.client()
+
         def limited(self):
             """True (and the reply sent) when this client has had too many wrong logins lately."""
             now = time.time()
             with lock:
-                recent = [moment for moment in failures.get(self.client(), []) if now - moment < LOGIN_FAILURES[1]]
-                failures[self.client()] = recent
+                recent = [moment for moment in failures.get(self.caller(), []) if now - moment < LOGIN_FAILURES[1]]
+                failures[self.caller()] = recent
             if len(recent) < LOGIN_FAILURES[0]:
                 return False
             log(f'refused {self.client()}: too many wrong logins (429)')
@@ -4051,10 +4060,10 @@ def handler(accounts):
 
         def failed(self):
             with lock:
-                failures.setdefault(self.client(), []).append(time.time())
+                failures.setdefault(self.caller(), []).append(time.time())
                 if len(failures) > 1000:
                     failures.clear()
-            log(f'refused {self.client()}: wrong login (401)')
+            log(f'refused {self.caller()}: wrong login (401)')
 
         def login(self):
             """The logged-in user, or None (the reply is sent). A browser has a session cookie (the login page

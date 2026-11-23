@@ -854,6 +854,13 @@ class WebUiTest(Worker):
         self.assertIn("Retry-After", headers)
         self.assertEqual(self.request("GET", "/", login=("admin", "wrong-password"))[0], 429)
         self.assertIn("too many wrong logins (429)", self.stderr.read_text())
+        # Behind the LAN proxy each device counts for itself: another one still logs in.
+        lan = lambda address, password: self.request("POST", "/login", {"user": "admin", "password": password}, login=None,
+                                                     headers={"X-Real-IP": address})[0]
+        for _ in range(10):
+            self.assertEqual(lan("192.168.10.50", "wrong-password"), 401)
+        self.assertEqual(lan("192.168.10.50", PASSWORD), 429)
+        self.assertEqual(lan("192.168.10.51", PASSWORD), 303)
 
     def test_the_first_start_makes_the_groups_and_the_ui_env_login_an_administrator(self):
         status, _, page = self.request("GET", "/users")

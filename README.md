@@ -1041,7 +1041,7 @@ vartotojo vardu; naršyklės iššokančio langelio nebėra.
 - **Kur laikoma:** `/var/lib/setup-server-ui/accounts.json` (`setup-ui`, 0600; slaptažodžiai – PBKDF2 hash'ai) ir
   `sessions.json` (tik sesijų slapukų sha256). Sesija – slapukas `ops_session` (HttpOnly, SameSite=Lax; per HTTPS proxy –
   ir Secure), baigiasi po 12 val. nenaudojimo ir ne vėliau kaip po 14 d.; mygtukas „Atsijungti“ ją baigia. 10 nepavykusių
-  prisijungimų iš vieno adreso per 15 min. – toliau `429`, kol praeis laikas. Sugadintas `accounts.json` – sąsaja
+  prisijungimų iš vieno adreso per 15 min. (per LAN proxy – pagal jo perduotą `X-Real-IP`) – toliau `429`, kol praeis laikas. Sugadintas `accounts.json` – sąsaja
   nepasileidžia (journal pasako kodėl); jį pašalinus, `ui.env` vartotojas vėl tampa pirmuoju administratoriumi.
 - Kiekvienas pakeitimas (prisijungimas, atsijungimas, vartotojo ar grupės išsaugojimas, ištrynimas, atsisakymas) įrašomas į
   `ui-actions.log` (`users …`); slaptažodžiai – niekada. Neįrašius eilutės, pakeitimas nedaromas.
