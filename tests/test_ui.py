@@ -519,6 +519,34 @@ class ServerStatusTest(Worker):
             with self.subTest(arguments=arguments):
                 self.assertEqual(self.status(*arguments).returncode, 64)
 
+    def test_a_files_target_has_no_containers_or_secret_store_and_its_own_file_decides(self):
+        # bin/add-project --target prod=files:ssh://…: no Docker there; its own file replaces the shared one, never mixed.
+        (self.tree.projects / "alpha_shop/target.prod.env").write_text(
+            "DEPLOY_MODE=files\nDEPLOY_SSH=deploy@client.example\nDEPLOY_PATH=/var/www/alpha\n")
+        result = self.status()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        projects = {item["name"]: item for item in json.loads(result.stdout)["projects"]}
+        alpha = projects["alpha_shop"]
+        self.assertEqual(alpha["targets"]["prod"], {"DEPLOY_MODE": "files", "DEPLOY_SSH": "deploy@client.example",
+                                                    "DEPLOY_PATH": "/var/www/alpha"})
+        prod = alpha["environments"]["prod"]
+        self.assertEqual((prod["mode"], prod["context"], prod["containers"], prod["secrets"]), ("files", None, [], None),
+                         "the docker stub lists alpha-prod containers: a files target looks at none")
+        self.assertEqual((prod["backups"]["count"], prod["deploys"]["count"]), (3, 2), "its files here are read as before")
+        self.assertEqual(projects["beta_docker"]["environments"]["stage"]["mode"], "docker")
+        self.assertEqual(projects["beta_docker"]["environments"]["stage"]["context"], "setup-beta_docker-stage")
+        logs = json.loads(self.status("--container-logs", "alpha_shop", "prod", "alpha-prod-cron").stdout)
+        self.assertIn("is a files deploy target: no containers", logs["error"])
+        self.assertFalse([call for call in self.calls("docker") if " logs " in f" {call} "])
+        # Only files targets (every environment of every project): Docker is not asked at all.
+        (self.tree.projects / "beta_docker/target.stage.env").write_text("DEPLOY_MODE=files\nDEPLOY_PATH=/srv/www/beta\n")
+        (self.tree.projects / "shop-two/target.env").write_text("DEPLOY_MODE=files\nDEPLOY_PATH=/srv/www/shop\n")
+        (self.tree.projects / "alpha_shop/target.env").write_text("DEPLOY_MODE=files\nDEPLOY_PATH=/srv/www/alpha\n")
+        (self.tree.projects / "beta_docker/target.env").write_text("DEPLOY_MODE=files\nDEPLOY_PATH=/srv/www/beta-all\n")
+        (self.stubs / "docker.calls").unlink()
+        self.assertEqual(self.status().returncode, 0)
+        self.assertEqual(self.calls("docker"), [])
+
     def test_the_overview_names_only_the_setup_accounts_public_key(self):
         self.assertIsNone(json.loads(self.status().stdout)["deploy_key"])
         ssh = self.tree.root / ".ssh"
@@ -1299,6 +1327,72 @@ class WebUiTest(Worker):
         beta = self.request("GET", "/project/beta_docker")[2]
         self.assertIn("<code>target.stage.env</code>", beta)
         self.assertNotIn("Remove an environment", beta)
+
+    def test_a_files_only_environment_shows_its_mode_and_no_docker_or_database(self):
+        projects = self.tree.projects
+        (projects / "alpha_shop/target.prod.env").write_text(
+            "DEPLOY_MODE=files\nDEPLOY_SSH=deploy@client.example\nDEPLOY_PATH=/var/www/alpha\n")
+        (projects / "alpha_shop/app/env/common.env").write_text("PROJECT_NAME=alpha\nBACKUP_FILE_PATHS=modules/*/translations/\n")
+        for path in (projects / "alpha_shop/app/.generated/backups").glob("worker-*"):
+            path.unlink()  # no DB backup at all: no alarm for a target without a database here
+        board = self.request("GET", "/projects")[2]
+        self.assert_board_cells_labelled(board)
+        row = board.split('<a href="/project/alpha_shop">')[1].split("</tr>")[0]
+        self.assertIn('<span class="chip muted">files only</span>', row)
+        self.assertIn("ssh deploy@client.example", row)
+        self.assertNotIn("no DB short backup", row)
+        self.assertNotIn("secrets", row)
+        overview = self.request("GET", "/")[2]
+        self.assertNotIn("alpha_shop prod", overview, "no DB, container or secret store alarm")
+        page = self.request("GET", "/project/alpha_shop")[2]
+        prod = page.split('<h2 id="env-prod">')[1].split('<h2 id="settings">')[0]
+        for text in ("deploy@client.example:/var/www/alpha", '<span class="chip muted">files only</span>',
+                     "<tr><th>Containers</th><td><span class=\"muted\">not used (files only)</span></td></tr>",
+                     "<tr><th>Secret store</th><td><span class=\"muted\">not used (files only)</span></td></tr>",
+                     "Files backup (BACKUP_FILE_PATHS)", '<select name="files">',
+                     '<input type="hidden" name="db-short" value="daily">'):
+            with self.subTest(text=text):
+                self.assertIn(text, prod)
+        for text in ("DB short backup", "DB full backup", "DB short, fresh", '<select name="db-short">', "Docker context",
+                     "Backup now on the server", "alpha-prod-secrets", "Container</th>"):
+            with self.subTest(absent=text):
+                self.assertNotIn(text, prod)
+        settings = page.split('<h2 id="settings">')[1].split('<h2 id="access">')[0]
+        self.assertIn('deploy@client.example:/var/www/alpha <span class="chip muted">files only</span>', settings)
+        self.assertIn('<select name="mode" aria-label="Target: type"><option value="docker" selected>Docker stack</option>'
+                      '<option value="files">Files only</option></select>', settings)
+        backups = self.request("GET", "/projects/backups")[2]
+        self.assert_board_cells_labelled(backups)
+        row = backups.split('<a href="/project/alpha_shop#backup-prod">')[1].split("</tr>")[0]
+        self.assertEqual(row.count("n/a (files only)"), 2, "DB short and DB full")
+        self.assertIn('<span class="nobreak">files daily</span>', row)
+        self.assertNotIn("DB short daily", row)
+        # The forms: a type per target; Files only puts files: in front, and the textarea takes files: as typed.
+        new = self.request("GET", "/projects/new")[2]
+        for name in ("mode_all", "mode_prod", "mode_stage"):
+            with self.subTest(field=name):
+                self.assertIn(f'<select name="{name}"', new)
+        self.assertIn("Files only", new)
+        add = f"-n {self.library}/bin/add-project --check"
+        self.preview("add-project", env_repo="git@bitbucket.org:ws/shop.git", target_stage="local:/srv/runtime/shop/stage",
+                     mode_prod="files", target_prod="ssh://deploy@client.example/var/www/shop",
+                     targets="demo=files:local:/srv/www/demo")
+        self.preview("project-target", project="alpha_shop", operation="set", environment="stage", mode="files",
+                     target="local:/srv/www/alpha-stage")
+        self.preview("project-target", project="alpha_shop", operation="set", environment="prod", mode="docker",
+                     target="ssh://deploy@client.example/home/deploy/alpha")
+        self.assertEqual(self.sudo_calls("add-project"), [
+            f"{add} --target prod=files:ssh://deploy@client.example/var/www/shop --target stage=local:/srv/runtime/shop/stage "
+            "--target demo=files:local:/srv/www/demo git@bitbucket.org:ws/shop.git",
+            f"{add} --target stage=files:local:/srv/www/alpha-stage alpha_shop git@bitbucket.org:example-team/alpha_shop.git",
+            f"{add} --target prod=ssh://deploy@client.example/home/deploy/alpha alpha_shop git@bitbucket.org:example-team/alpha_shop.git"])
+        for fields, message in (({"mode_all": "files", "target_all": "local"}, "A files-only target needs its own directory"),
+                                ({"mode_all": "rsync", "target_all": "local:/srv/x"}, "Docker stack or Files only"),
+                                ({"targets": "demo=files:local"}, "Invalid target")):
+            with self.subTest(fields=fields):
+                status, _, body = self.preview("add-project", env_repo="git@bitbucket.org:ws/shop.git", **fields)
+                self.assertIn(message, body)
+        self.assertEqual(len(self.sudo_calls("add-project")), 3, "nothing runs for a refused form")
 
     def test_a_new_ui_env_password_gives_the_first_administrator_back(self):
         web_ui = load_web_ui()

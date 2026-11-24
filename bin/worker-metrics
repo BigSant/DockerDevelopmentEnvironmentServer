@@ -12,7 +12,8 @@ Groups (setup_metrics_group_up{group} is 0 when a part of the group could not be
   backups  per project and ENV: age and size of the newest worker-<env>-…Z.sql.gz backup, how many are kept,
            and the same of the weekly full-<env>-…Z.sql.gz series (setup_worker_full_backup*) and of the nightly
            files-<env>-…Z.tar.gz series of BACKUP_FILE_PATHS (setup_worker_files_backup*); the interval the backup
-           policy sets for each series (setup_worker_backup_policy_interval_seconds, 0 when it is off)
+           policy sets for each series (setup_worker_backup_policy_interval_seconds, 0 when it is off); a files deploy
+           target (DEPLOY_MODE=files) has no database here: no DB series is expected of it
   deploys  per project and ENV: the last entry of .generated/release/<env>/deployments.json
   runner   the systemd state of setup-server-runner.service (Bitbucket)
   github_runner  per registered GitHub runner ($SETUP_SERVER_ROOT/github-runner/<scope>): the systemd state of
@@ -193,7 +194,8 @@ def backups(metrics, found, now):
     count of 0 only once its timer is installed (or the policy makes it nightly: db-full=daily), so a worker without
     weekly backups raises no alert. So has the files series (files-<env>-…Z.tar.gz): a count of 0 for an ENV with
     BACKUP_FILE_PATHS once its timer is installed. A series the backup policy switches off expects nothing (its
-    backups that exist still have their metrics); the policy's interval of each series is a gauge of its own."""
+    backups that exist still have their metrics); the policy's interval of each series is a gauge of its own. A files
+    deploy target (DEPLOY_MODE=files) has no database here: its DB series expect nothing and their interval is 0."""
     complete = True
     systemd = Path(os.environ.get('SETUP_SERVER_SYSTEMD', '/etc/systemd/system'))
     full_timer = (systemd / 'setup-server-backup-full.timer').is_file()
@@ -211,6 +213,7 @@ def backups(metrics, found, now):
                             series.setdefault((match[1], match[2]), []).append((info.st_mtime, info.st_size))
             declared = {env for env in server_environments(directory) if (directory / f'env/{env}.env').is_file()}
             with_files = {env for env in declared if files_declared(directory, env)} if files_timer else set()
+            with_database = {env for env in declared if not files_target(PROJECTS / name, env)}
         except OSError as error:
             log(f'backups {name}: {error}')
             complete = False
@@ -220,11 +223,13 @@ def backups(metrics, found, now):
             for kind in BACKUP_POLICY:
                 metrics.add('setup_worker_backup_policy_interval_seconds',
                             'How often the backup policy backs the series up (db-short: the DB short registry backups, '
-                            'db-full: the DB full ones, files), in seconds; 0 when it is off',
-                            POLICY_INTERVAL[policies[environment][kind]],
+                            'db-full: the DB full ones, files), in seconds; 0 when it is off (and for the DB series of a '
+                            'files deploy target)',
+                            POLICY_INTERVAL[policies[environment][kind]]
+                            if kind == 'files' or environment in with_database else 0,
                             {'project': name, 'environment': environment, 'series': kind})
-        expected = {'worker': {env for env in declared if policies[env]['db-short'] != 'off'},
-                    'full': {env for env in declared if policies[env]['db-full'] != 'off'
+        expected = {'worker': {env for env in with_database if policies[env]['db-short'] != 'off'},
+                    'full': {env for env in with_database if policies[env]['db-full'] != 'off'
                              and (full_timer or policies[env]['db-full'] == 'daily')},
                     'files': {env for env in with_files if policies[env]['files'] != 'off'}}
         for prefix, metric, what in (('worker', 'setup_worker_backup', 'nightly and "backup now"'),
@@ -268,6 +273,18 @@ def files_declared(directory, environment):
             if match:
                 found[match[1]] = match[3].strip()
     return found.get('PROFILE') == 'prestashop' or bool(found.get('BACKUP_FILE_PATHS'))
+
+
+def files_target(build_root, environment):
+    """Whether the ENV deploys only its files (DEPLOY_MODE=files in its own target.<env>.env, else in the shared
+    target.env, as setup reads them): no Docker there, so no database here."""
+    for path in (build_root / f'target.{environment}.env', build_root / 'target.env'):
+        try:
+            text = path.read_text(errors='replace')
+        except OSError:
+            continue
+        return re.search(r'(?m)^\s*DEPLOY_MODE\s*=\s*(["\']?)files\1\s*$', text) is not None
+    return False
 
 
 def timestamp(text):

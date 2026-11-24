@@ -55,6 +55,20 @@ def fixture():
             age = 4 * 86400 if (shop, environment) == ('coffee', 'prod') else 3 * 3600
             case.tree.backup(directory, f'worker-{environment}-{stamp(age)}Z.sql.gz', age, 240_000)
             case.tree.backup(directory, f'full-{environment}-{stamp(2 * 86400)}Z.sql.gz', 2 * 86400, 980_000)
+    # A files-only prod (bin/add-project --target prod=files:ssh://…): the client's server has no Docker, a deploy copies only
+    # the code; stage stays a Docker stack on this worker.
+    catalog = case.tree.project('catalog', 'prod', 'stage')
+    (catalog / 'env/common.env').write_text('PROJECT_NAME=catalog\nBACKUP_FILE_PATHS="modules/*/translations/"\n')
+    (catalog.parent / 'target.env').write_text(f'DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH={catalog.parent}\n')
+    (catalog.parent / 'target.prod.env').write_text('DEPLOY_MODE=files\nDEPLOY_SSH=catalog@client.example\n'
+                                                    'DEPLOY_PATH=/home/catalog/domains/catalog.example/app\n')
+    case.tree.backup(catalog, f'worker-stage-{stamp(3 * 3600)}Z.sql.gz', 3 * 3600, 310_000)
+    case.tree.backup(catalog, f'full-stage-{stamp(2 * 86400)}Z.sql.gz', 2 * 86400, 1_200_000)
+    test_ui.files_archive(catalog, 'prod', 4 * 3600, {'modules/ps_banner/translations/lt.php': b'<?php\n$_MODULE = array();\n'})
+    test_ui.files_archive(catalog, 'stage', 4 * 3600, {'modules/ps_banner/translations/lt.php': b'<?php\n$_MODULE = array();\n'})
+    deployed = time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime(time.time() - 6 * 3600))
+    case.tree.deployments(catalog, 'prod', [test_ui.entry('v2.3.0', 'e' * 40, deployed)])
+    case.tree.deployments(catalog, 'stage', [test_ui.entry('v2.4.0-rc1', 'f' * 40, deployed)])
     # Backup policies (bin/backup-projects --set): DB full only, daily; nothing at all; weekly and monthly; a late DB-full-only one.
     case.tree.backup(case.tree.projects / 'wellness/app', f'full-prod-{stamp(5 * 3600)}Z.sql.gz', 5 * 3600, 1_010_000)
     (case.root / 'config').mkdir(exist_ok=True)

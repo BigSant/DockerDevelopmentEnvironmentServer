@@ -32,6 +32,9 @@ Kinds (one series each, rotated on its own; anything else in .generated/backups 
 One database backup per project and ENV runs at a time (a lock in .generated/backups); the others wait for it, and
 so does a second files backup. A fresh backup is not made again when one with the same content (registry or full)
 is younger than 30 minutes. A files backup needs no secret store, only the target the deploy reaches.
+A files deploy target (DEPLOY_MODE=files in target.env / target.<env>.env, bin/add-project --target files:…) has no
+database here: its DB series (db-short, db-full, fresh) are skipped ("skipped: files deploy target (no database
+here)"), with no secret-store check; its files backups are made as for any other environment.
 
 Backup policy: how often the timers back up each series of a project environment, in the root-owned
 $SETUP_SERVER_CONFIG/backup-policy.conf (not in a build root: a pipeline cannot switch its backups off), written by
@@ -413,13 +416,42 @@ def read_env(path):
         return {}
 
 
+def target_values(name, environment):
+    """The deploy target bin/add-project registered for the project ENV: its own target.<env>.env, else the shared
+    target.env (as setup reads them; never the two mixed)."""
+    return read_env(PROJECTS / name / f'target.{environment}.env') or read_env(PROJECTS / name / 'target.env')
+
+
+def files_target(name, environment):
+    """Whether the project ENV deploys only its files (DEPLOY_MODE=files): no Docker there, so no database here."""
+    try:
+        return target_values(name, environment).get('DEPLOY_MODE') == 'files'
+    except Refused:
+        return False  # a target file that cannot be read: the backup itself reports it
+
+
+FILES_SKIP = 'skipped: files deploy target (no database here)'
+
+
+def with_database(candidates, kind):
+    """The candidates whose DB a DB backup can reach: a files deploy target's environment is said and skipped."""
+    if is_files(kind):
+        return candidates
+    kept = []
+    for name, environment in candidates:
+        if files_target(name, environment):
+            say(f'==> {name} {environment}: {FILES_SKIP}')
+        else:
+            kept.append((name, environment))
+    return kept
+
+
 def secret_store(name, environment):
     """(container, state): setup's secret store of the project ENV; state running, stopped or missing."""
     directory = environment_directory(PROJECTS / name)
     values = {**read_env(directory / 'env/common.env'), **read_env(directory / f'env/{environment}.env')} if directory else {}
     # The deploy target bin/add-project registered (target.env, target.<env>.env) names the context.
-    for target in (PROJECTS / name / 'target.env', PROJECTS / name / f'target.{environment}.env'):
-        values.update(read_env(target))
+    values.update(target_values(name, environment))
     container = f"{values.get('PROJECT_NAME', name)}-{environment}-secrets"
     context = values.get('DEPLOY_CONTEXT')
     command = ['docker', *(['--context', context] if context else []), 'inspect', '--type', 'container',
@@ -445,8 +477,8 @@ def as_account():
 
 
 def store_refusal(name, environment, kind='daily'):
-    """Why a backup cannot get its secrets, or None. A files backup needs none."""
-    if is_files(kind) or (os.environ.get('DATABASE_ROOT_PASSWORD') and os.geteuid() != 0):
+    """Why a backup cannot get its secrets, or None. A files backup needs none, nor does a files deploy target."""
+    if is_files(kind) or files_target(name, environment) or (os.environ.get('DATABASE_ROOT_PASSWORD') and os.geteuid() != 0):
         return None  # the caller's environment (a deployment step) has them
     container, state = secret_store(name, environment)
     if state == 'missing':
@@ -865,6 +897,10 @@ def main(arguments):
     if not candidates:
         say(f'==> No project under {PROJECTS} has an env/<env>.env of stage, prod or STAGE_ENVIRONMENTS' +
             (' with BACKUP_FILE_PATHS' if files else '') + '; nothing to back up')
+        return 0
+    candidates = with_database(candidates, kind)
+    if not candidates:
+        say('==> Nothing to back up: no database here (files deploy targets)')
         return 0
     # The timers follow each environment's backup policy; "backup now" (PROJECT) and --fresh: a person asked for it.
     if positional or fresh:

@@ -224,6 +224,24 @@ and change nothing. Run them with `--check` first.
      `USER`'s `authorized_keys`, and stops), checks Docker and whether `PATH` is writable, takes over the user's
      `id -u`/`id -g` and creates the Docker context `setup-<name>[-<env>]`. A new host key is written
      on the first connection (it is shown).
+   - **`files:ssh://USER@SERVER/PATH`** – a server **without Docker** (a client's server): this worker still builds the release
+     in its Docker build container (and may test it there), but a deploy copies only the code there (rsync over SSH, the
+     account's key, as for `ssh://`); nothing runs in containers there. The script logs in as `USER`, checks that `PATH`
+     exists (or creates it) and is writable and that `rsync` is installed there – no Docker check, no Docker context, no
+     `APP_UID`/`APP_GID` (the files belong to `USER`). It writes:
+
+     ```
+     DEPLOY_MODE=files
+     DEPLOY_SSH=USER@SERVER
+     DEPLOY_PATH=/PATH
+     ```
+
+     **`files:local:/PATH`** – the same into a directory of this server (`DEPLOY_MODE=files` and `DEPLOY_PATH` only; created for the
+     `setup` account like `local:/PATH`, not the build directory; `rsync` must be installed here), handy for testing. A files
+     target has no database managed here: no DB backups, no secret store (see "DB backups"); its files backups (`BACKUP_FILE_PATHS`)
+     work as for any target. Changing a target from `ssh://` to `files:ssh://` removes the stale Docker context `setup-<name>[-<env>]`
+     (`--check` says it would); registering `ssh://` again creates it as before. What setup skips for such a target is in its own
+     documentation.
    - **`stage=…` / `prod=…` / `demo=…`** – one environment only (`target.<env>.env`, wins over the shared `target.env`),
      when stage and prod are on different servers, or for an extra environment (see "Extra environments"). `--target` can be repeated.
    - **Stage and prod on the same server – each in its own directory:** `--target stage=local:/PATH/stage --target
@@ -346,6 +364,12 @@ and change nothing. Run them with `--check` first.
    ENV=<env>`: stage/prod according to the table registry, with `DATABASE_EXTRA_SCHEMAS` – all schemas in one dump
    (alpha.local). Only the database is backed up: `data/` directories (search indexes and the like) are not backed up,
    and which schemas and tables go into the dump is decided by the project's `DATABASE_EXTRA_SCHEMAS` and the registry.
+
+   **A files deploy target has no database here.** An environment whose target is `files:…` (`DEPLOY_MODE=files` in its own
+   `target.<env>.env`, else in `target.env`) has no DB series: the nightly, full and fresh runs say `==> NAME ENV: skipped: files
+   deploy target (no database here)` and exit 0 (a "backup now" of only such environments too), no secret store is looked
+   for, and `bin/worker-metrics` expects no DB backups of it (its DB policy intervals read 0). Its files backups are made as
+   for any other environment.
 
    **Passwords live only in Bitbucket.** The server has no copy of them. The timer runs without Bitbucket, so
    `make db-backup` (account `setup`) takes them from the project's stack: setup 2.5.0+ keeps in every stage/prod
@@ -1150,7 +1174,13 @@ commit, red when setup is not on a release tag.
   page `branch master (3 commits behind origin/master)`), read from the code clone's already fetched `origin/*` branches – the
   server fetches nothing for it, and git runs there without hooks, fsmonitor or system config; unknown, it is left out. *+ Add a project* (`/projects/new`) – the env repo URL, the code repo URL (optional), the name (optional),
   *monorepo* (`--monorepo`), *the account key* (`--shared-key`) and the targets: one for every environment (`target.env`), prod's and
-  stage's own, and further `ENV=target` lines (`local`, `local:/PATH`, `ssh://USER@HOST/PATH`). The project page (`/project/<name>`)
+  stage's own, and further `ENV=target` lines (`local`, `local:/PATH`, `ssh://USER@HOST/PATH`, `files:` in front for files only).
+  Each target field has its type in front: *Docker stack* or *Files only* (`--target …=files:…`: a server without Docker, only the
+  code goes there); *Change the target* and *Add an environment* have the same choice. A files-only environment carries a quiet
+  `files only` chip on the Projects list (its second line shows its files backup, or `no DB here`) and on the project page,
+  where *Containers* and *Secret store* read `not used (files only)`, there are no DB backup rows, no "Backup now" and only the
+  files series in its *Backup policy* form (none without `BACKUP_FILE_PATHS`), and no DB, container or secret-store alarm is
+  raised for it; on *Backups* its *DB short* and *DB full* columns read `n/a (files only)`. The project page (`/project/<name>`)
   shows each environment (the last successful deploy, all of its backups – DB short, DB full, DB short/full fresh, DB
   pre-deploy, files –, each container's
   `docker logs` – the last 200, 500 or 2000 lines – and "Backup now on the server"), then **Settings**: the layout and repos, every

@@ -646,7 +646,7 @@ class AddProjectTargetTest(ScriptTest):
                          'esac\n')
         self.stub("ssh", 'echo "$*" >> "$SSH_LOG"\n'
                          '[ -z "${FAKE_SSH_FAIL:-}" ] || { echo "Permission denied (publickey)." >&2; exit 255; }\n'
-                         'printf "1012\\n1013\\n27.3.1\\nwritable\\n"\n')
+                         'printf "${FAKE_SSH_ANSWER:-1012\\n1013\\n27.3.1\\nwritable\\n}"\n')
         self.stub("docker", 'echo "$*" >> "$DOCKER_LOG"\ncase "$1 $2" in "context inspect") [ -n "${FAKE_CONTEXT:-}" ] || exit 1;; esac\n')
         self.stub("ssh-keygen", 'echo "shop.example ssh-ed25519 AAAA"\n')
         (self.root / "srv/.ssh").mkdir(parents=True, exist_ok=True)
@@ -778,6 +778,94 @@ class AddProjectTargetTest(ScriptTest):
         for line in ("DEPLOY_CONTEXT=setup-beta_docker-prod", "DEPLOY_SSH=deploy@shop.example",
                      "DEPLOY_PATH=/home/deploy/shop", "APP_UID=1012", "APP_GID=1013"):
             self.assertIn(line + "\n", text)
+
+    def test_check_plans_a_files_only_target_without_docker(self):
+        build_root = self.root / "srv/projects/alpha_shop"
+        self.stub("rsync", "exit 0\n")
+        place = self.root / "www/alpha-demo"
+        check = self.run_script("add-project", "--check", "--target", "stage=local",
+                                "--target", "prod=files:ssh://deploy@client.example/var/www/shop",
+                                "--target", f"demo=files:local:{place}", "git@bitbucket.org:example-team/alpha_shop.git")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn(f"==> would write {build_root}/target.prod.env:\n    DEPLOY_MODE=files\n"
+                      "    DEPLOY_SSH=deploy@client.example\n    DEPLOY_PATH=/var/www/shop\n==> would write", check.stdout)
+        self.assertIn(f"==> would write {build_root}/target.demo.env:\n    DEPLOY_MODE=files\n    DEPLOY_PATH={place}\n==> Build root",
+                      check.stdout)
+        self.assertIn("would check over SSH as deploy on client.example: /var/www/shop exists (or is created) and is writable, "
+                      "rsync is installed", check.stderr)
+        self.assertIn(f"would create {place}", check.stderr)
+        self.assertIn("DEPLOY_CONTEXT=default", check.stdout, "stage stays a Docker target")
+        self.assertFalse((self.root / "srv").exists() or place.exists(), "--check changes nothing")
+        for spec, message in (("files:local", "expected files:local:/PATH or files:ssh://USER@HOST/ABSOLUTE/PATH"),
+                              ("files:ftp://x/y", "expected files:local:/PATH or files:ssh://"),
+                              ("files:ssh://deploy@client.example/var/www/shop/app", "give /var/www/shop"),
+                              (f"files:local:{self.root}/srv/projects/other", "belongs to setup-server"),
+                              (f"files:local:{build_root}", "the build root itself"),
+                              ("ftp://x/y", "(files:local:/PATH or files:ssh://… for files only)")):
+            with self.subTest(spec=spec):
+                refused = self.run_script("add-project", "--check", "--target", spec, "git@bitbucket.org:example-team/alpha_shop.git")
+                self.assertEqual(refused.returncode, 64, refused.stdout + refused.stderr)
+                self.assertIn(message, refused.stderr)
+
+    def test_a_files_target_needs_ssh_rsync_and_a_writable_path_and_no_docker(self):
+        arguments = ("--target", "prod=files:ssh://deploy@client.example/var/www/shop", "git@bitbucket.org:example-team/beta_docker.git")
+        target = self.root / "srv/projects/beta_docker/target.prod.env"
+        for answer, message in ((None, "cannot log in to deploy@client.example without a password"),
+                                ("no-rsync\\nwritable\\n", "rsync is not installed for deploy"),
+                                ("rsync\\nnot-writable\\n", "/var/www/shop is not writable for deploy"),
+                                ("rsync\\nnot-creatable\\n", "/var/www/shop is missing and deploy cannot create it"),
+                                ("1012\\n1013\\n", "Unexpected answer")):
+            with self.subTest(answer=answer):
+                refused = self.run_add(*arguments, **({"FAKE_SSH_FAIL": "1"} if answer is None else {"FAKE_SSH_ANSWER": answer}))
+                self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+                self.assertIn(message, refused.stderr)
+                self.assertFalse(target.parent.exists(), "nothing is cloned before the target answers")
+        result = self.run_add(*arguments, FAKE_SSH_ANSWER="rsync\\ncreated\\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("created /var/www/shop on deploy@client.example", result.stderr)
+        self.assertEqual(target.read_text(), "# bin/add-project: where prod of beta_docker deploys (setup-server; not secret, not in git).\n"
+                                             "DEPLOY_MODE=files\nDEPLOY_SSH=deploy@client.example\nDEPLOY_PATH=/var/www/shop\n")
+        calls = self.ssh_log.read_text().splitlines()[-1]
+        self.assertIn("BatchMode=yes", calls)
+        self.assertIn("command -v rsync", calls)
+        self.assertNotIn("docker", calls, "no Docker on a files target")
+        self.assertNotIn("context create", self.docker_log.read_text() if self.docker_log.exists() else "")
+
+    def test_a_local_files_target_is_a_directory_of_the_account(self):
+        self.stub("rsync", "exit 0\n")
+        place = self.root / "www/alpha"
+        result = self.run_add("--target", f"files:local:{place}", "git@bitbucket.org:example-team/alpha_shop.git")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(place.is_dir())
+        self.assertEqual((self.root / "srv/projects/alpha_shop/target.env").read_text().splitlines()[1:],
+                         ["DEPLOY_MODE=files", f"DEPLOY_PATH={place}"])
+        self.assertFalse(self.ssh_log.exists(), "no SSH for this host")
+
+    def test_switching_a_target_to_files_removes_its_docker_context_and_back_to_docker_works(self):
+        docker = ("--target", "prod=ssh://deploy@shop.example/home/deploy/shop", "git@bitbucket.org:example-team/beta_docker.git")
+        files = ("--target", "prod=files:ssh://deploy@shop.example/home/deploy/shop", "git@bitbucket.org:example-team/beta_docker.git")
+        target = self.root / "srv/projects/beta_docker/target.prod.env"
+        self.assertEqual(self.run_add(*docker).returncode, 0)
+        self.assertIn("DEPLOY_CONTEXT=setup-beta_docker-prod\n", target.read_text())
+        check = self.run_add("--check", *files, FAKE_CONTEXT="1")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn("would remove the Docker context setup-beta_docker-prod (the target is files only now)", check.stdout)
+        self.assertNotIn("context rm", self.docker_log.read_text(), "--check changes nothing")
+        moved = self.run_add(*files, FAKE_CONTEXT="1", FAKE_SSH_ANSWER="rsync\\nwritable\\n")
+        self.assertEqual(moved.returncode, 0, moved.stdout + moved.stderr)
+        self.assertIn("context rm -f setup-beta_docker-prod", self.docker_log.read_text())
+        self.assertIn("removed the Docker context setup-beta_docker-prod", moved.stdout)
+        text = target.read_text()
+        self.assertIn("DEPLOY_MODE=files\n", text)
+        self.assertNotIn("DEPLOY_CONTEXT", text)
+        self.assertNotIn("APP_UID", text)
+        back = self.run_add(*docker)
+        self.assertEqual(back.returncode, 0, back.stdout + back.stderr)
+        text = target.read_text()
+        self.assertNotIn("DEPLOY_MODE", text)
+        for line in ("DEPLOY_CONTEXT=setup-beta_docker-prod", "APP_UID=1012", "APP_GID=1013"):
+            self.assertIn(line + "\n", text)
+        self.assertEqual(self.docker_log.read_text().count("context create setup-beta_docker-prod"), 2)
 
     def registered(self, name, *environments, shared=True):
         """A build root with target files as add-project writes them: target.env (local) and remote target.<env>.env."""

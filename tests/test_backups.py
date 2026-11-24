@@ -372,6 +372,42 @@ class BackupProjectsTest(BackupFixture):
         self.assertIn("used instead of a new fresh-files backup", again.stdout)
         self.assertEqual(self.make_log.read_text().count("files-backup"), 2)
 
+    def test_a_files_deploy_target_has_no_database_here_but_its_files_are_backed_up(self):
+        # bin/add-project --target prod=files:ssh://…: no Docker there, so no DB series and no secret store; stage is Docker.
+        self.setup_checkout()
+        os.environ["STORES"] = "sample-stage-secrets"
+        shop = self.project("shop", "stage", "prod")
+        (shop / "env/common.env").write_text("PROJECT_NAME=sample\nBACKUP_FILE_PATHS=modules/*/translations/\n")
+        (self.projects / "shop/target.env").write_text("DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH=/srv/shop\n")
+        (self.projects / "shop/target.prod.env").write_text(
+            "DEPLOY_MODE=files\nDEPLOY_SSH=deploy@client.example\nDEPLOY_PATH=/var/www/shop\n")
+        skipped = "==> shop prod: skipped: files deploy target (no database here)"
+        backups = shop / ".generated/backups"
+        for arguments in ((), ("--full",), ("--check",), ("--fresh", "shop", "prod"), ("--fresh", "--full", "shop", "prod"),
+                          ("shop", "prod"), ("shop",)):
+            with self.subTest(arguments=arguments):
+                result = self.run_script("backup-projects", *arguments)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(skipped, result.stdout)
+                self.assertNotIn("secret store", result.stdout + result.stderr)
+                self.assertEqual(list(backups.glob("*prod-*.sql.gz")) if backups.exists() else [], [])
+        self.assertIn("Nothing to back up: no database here (files deploy targets)",
+                      self.run_script("backup-projects", "shop", "prod").stdout)
+        self.assertNotIn("sample-prod-secrets", self.docker_log.read_text(), "no secret store is looked for")
+        self.assertNotIn("ENV=prod", self.make_log.read_text())
+        self.assertIn("ENV=stage", self.make_log.read_text(), "the Docker environment is backed up as before")
+        files = self.run_script("backup-projects", "--files")
+        self.assertEqual(files.returncode, 0, files.stdout + files.stderr)
+        self.assertNotIn("skipped: files deploy target", files.stdout)
+        self.assertTrue((backups / "files-prod-20261009T013000Z.tar.gz").is_file(), "its files are backed up as today")
+        # Its own target file decides, not the shared one: a Docker prod beside a files-only target.env is backed up.
+        (self.projects / "shop/target.prod.env").write_text("DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH=/srv/shop-prod\n")
+        (self.projects / "shop/target.env").write_text("DEPLOY_MODE=files\nDEPLOY_SSH=deploy@client.example\nDEPLOY_PATH=/var/www/s\n")
+        os.environ["STORES"] = "sample-prod-secrets"
+        mixed = self.run_script("backup-projects", "--check")
+        self.assertIn("==> shop stage: skipped: files deploy target", mixed.stdout)
+        self.assertIn("would back up shop prod", mixed.stdout)
+
     def test_a_setup_without_make_files_backup_is_named_and_nothing_runs(self):
         self.setup_checkout(files=False)
         shop = self.project("shop", "prod")

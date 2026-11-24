@@ -397,6 +397,31 @@ class EndpointTest(ScriptTest):
         self.assertNotIn(("setup_worker_files_backups", archived_labels), samples)
         self.assertEqual(value(samples, "setup_worker_full_backups", project="beta_docker", environment="stage"), 0)
 
+    def test_a_files_deploy_target_expects_no_database_series_but_its_files(self):
+        # bin/add-project --target prod=files:ssh://…: no database here, so a missing DB backup is no alert; files are.
+        self.fixtures()
+        client = self.tree.project("client", "stage", "prod")
+        (client / "env/common.env").write_text("BACKUP_FILE_PATHS=modules/*/translations/\n")
+        (self.tree.projects / "client/target.env").write_text("DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH=/srv/client\n")
+        (self.tree.projects / "client/target.prod.env").write_text(
+            "DEPLOY_MODE=files\nDEPLOY_SSH=deploy@client.example\nDEPLOY_PATH=/var/www/client\n")
+        systemd = self.root / "systemd"
+        systemd.mkdir()
+        for timer in ("setup-server-backup-full.timer", "setup-server-backup-files.timer"):
+            (systemd / timer).write_text("[Timer]\n")
+        samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
+        prod, stage = (("environment", "prod"), ("project", "client")), (("environment", "stage"), ("project", "client"))
+        for metric in ("setup_worker_backups", "setup_worker_full_backups"):
+            with self.subTest(metric=metric):
+                self.assertNotIn((metric, prod), samples, "a files target expects no DB series")
+                self.assertEqual(samples[(metric, stage)], 0, "the Docker environment beside it still does")
+        self.assertEqual(samples[("setup_worker_files_backups", prod)], 0, "its files backups are expected as anywhere")
+        interval = "setup_worker_backup_policy_interval_seconds"
+        self.assertEqual(value(samples, interval, project="client", environment="prod", series="db-short"), 0)
+        self.assertEqual(value(samples, interval, project="client", environment="prod", series="db-full"), 0)
+        self.assertEqual(value(samples, interval, project="client", environment="prod", series="files"), 86400)
+        self.assertEqual(value(samples, interval, project="client", environment="stage", series="db-short"), 86400)
+
     def test_a_stage_class_environment_the_project_lists_has_its_backups_and_deploys(self):
         shop = self.tree.project("shop", "prod", "demo", "old")
         (shop / "env/common.env").write_text('STAGE_ENVIRONMENTS="demo"\n')

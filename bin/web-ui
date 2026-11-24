@@ -80,9 +80,13 @@ NAME = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}')
 GIT_URL = re.compile(r'(?:git@[A-Za-z0-9.-]+:|ssh://git@[A-Za-z0-9.-]+(?::[0-9]{1,5})?/|https://[A-Za-z0-9.-]+/)'
                      r'[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*')
 # bin/add-project's own pattern of a target: where it deploys, and that with the optional ENV= of one environment.
-TARGET_PLACE = re.compile(r'local(?::/[A-Za-z0-9._/-]+)?|ssh://(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+')
+# files: in front – a files-only target (DEPLOY_MODE=files): no Docker there, a deploy copies only the code.
+TARGET_PLACE = re.compile(r'(?:files:)?(?:local:/[A-Za-z0-9._/-]+|ssh://(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+)'
+                          r'|local')
 TARGET = re.compile(r'(?:(?!local=|test=)[a-z][a-z0-9]{1,15}=)?(?:' + TARGET_PLACE.pattern + ')')
-TARGET_HINT = 'local, local:/PATH or ssh://USER@SERVER/PATH'
+TARGET_HINT = 'local, local:/PATH or ssh://USER@SERVER/PATH; files: in front for files only'
+# The target types a form offers: a Docker stack (the project's containers run there) or files only (only the code goes there).
+TARGET_MODES = (('docker', 'Docker stack'), ('files', 'Files only'))
 REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,99}')
 RUNNER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
 KEY_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
@@ -637,9 +641,18 @@ def command(script, arguments):
     return base + ['--check'] + arguments, base + arguments
 
 
-def target_place(form, key, label, required=False):
-    """Where one environment deploys (bin/add-project's target after ENV=)."""
+def target_place(form, key, label, required=False, mode_key=None):
+    """Where one environment deploys (bin/add-project's target after ENV=); with the form's type "Files only" (mode_key)
+    a files-only target: files: in front."""
     text = value(form, key, label=label, required=required)
+    mode = form.get(mode_key, 'docker') if mode_key else 'docker'
+    if mode not in dict(TARGET_MODES):
+        raise Invalid(f'Target type of "{label}": Docker stack or Files only.')
+    if text and mode == 'files' and not text.startswith('files:'):
+        if text == 'local':
+            raise Invalid(f'A files-only target needs its own directory in the field "{label}": local:/PATH or '
+                          'ssh://USER@SERVER/PATH (the build root holds the clones).')
+        text = 'files:' + text
     if text and not TARGET_PLACE.fullmatch(text):
         raise Invalid(f'Invalid target in the field "{label}": {text[:80]} ({TARGET_HINT}).')
     return text
@@ -658,9 +671,9 @@ def plan_add_project(form, status):
     if monorepo and code_repo:
         raise Invalid('A monorepo holds the code in app/public/ itself: leave "Code repo URL" empty.')
     # The target every environment shares, prod's and stage's own, then any further ENV=target lines.
-    targets = [target_place(form, 'target_all', 'Every environment')]
+    targets = [target_place(form, 'target_all', 'Every environment', mode_key='mode_all')]
     targets += [f'{environment}={place}' if place else '' for environment in ('prod', 'stage')
-                for place in (target_place(form, f'target_{environment}', environment),)]
+                for place in (target_place(form, f'target_{environment}', environment, mode_key=f'mode_{environment}'),)]
     targets = [target for target in targets if target]
     for line in [line.strip() for line in form.get('targets', '').splitlines() if line.strip()]:
         if len(line) > 200 or not TARGET.fullmatch(line):
@@ -718,7 +731,7 @@ def plan_project_target(form, status):
                     *command('add-project', ['--remove-target', environment, '--name', name]),
                     danger=f'{environment} then deploys to the shared target.env; what runs on the old target stays there.')
     elif operation == 'set':
-        place = target_place(form, 'target', 'Target', required=True)
+        place = target_place(form, 'target', 'Target', required=True, mode_key='mode')
         repository = status_url(entry, 'repository', 'The environment repo')
         if not repository:
             raise Invalid(f'The status names no environment repo of {name}: run bin/add-project by hand.')
@@ -2252,6 +2265,7 @@ background:linear-gradient(var(--panel),var(--panel)) padding-box,repeating-line
 .scroll>.board,.scroll>.list,details .list{margin-bottom:0}
 label{display:grid;grid-template-columns:minmax(9em,14em) minmax(0,1fr);gap:10px;align-items:center;margin:0 0 8px;color:var(--dim);font-size:13px}
 label.check{display:flex;gap:9px;align-items:flex-start;color:var(--ink)}
+.typed{display:grid;grid-template-columns:minmax(10em,auto) minmax(0,1fr);gap:8px}
 label.check small{color:var(--dim)}label.check small.muted{display:block;line-height:1.45}
 input[type=text],input[type=password],textarea,select{font:14px/1.4 var(--mono);color:var(--ink);background:var(--field);
 border:1px solid var(--edge);border-radius:3px;padding:7px 10px;min-height:36px;width:100%;caret-color:var(--amber)}
@@ -2499,7 +2513,7 @@ main{padding:18px 16px}.deck,.deck.wide{grid-template-columns:1fr}
 .ramp li:not(:last-child)::after{display:none}
 .keyhead{grid-template-columns:1fr 1fr}form.bulk,form.bulk.tools,form.bulk.everything{grid-template-columns:1fr}
 .search input[type=text]{width:100%}
-label{grid-template-columns:1fr;gap:4px}.board thead{display:none}.board,.board tbody,.board tr,.board td{display:block;width:100%}
+label{grid-template-columns:1fr;gap:4px}.typed{grid-template-columns:1fr}.board thead{display:none}.board,.board tbody,.board tr,.board td{display:block;width:100%}
 .board tr{margin-bottom:10px;background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--amber);border-radius:4px;
 overflow:hidden}
 .board tr.is-ok{border-left-color:var(--go)}.board tr.is-bad{border-left-color:var(--stop)}.board tr.is-idle{border-left-color:var(--faint)}
@@ -2690,9 +2704,11 @@ def environment_policy(state):
             for series, default in BACKUP_DEFAULT.items()}
 
 
-def policy_text(policy, files=True):
+def policy_text(policy, files=True, database=True):
     """A policy in a few words: 'DB short daily · DB full weekly · files daily', 'DB full only, daily', 'DB off', 'off';
-    files only when the environment has files to back up."""
+    files only when the environment has files to back up; no DB part without a database here (a files-only target)."""
+    if not database:
+        return f'files {policy["files"]}' if files else 'no backups (files only)'
     short, full, files_policy = policy['db-short'], policy['db-full'], policy['files'] if files else 'off'
     if short == full == files_policy == 'off':
         return 'off'
@@ -2701,9 +2717,15 @@ def policy_text(policy, files=True):
     return ' · '.join(parts + ([f'files {policy["files"]}'] if files else []))
 
 
-def policy_html(policy, files=True):
+def policy_html(policy, files=True, database=True):
     """policy_text on a page: each part kept on one line, so a narrow cell wraps only between the parts."""
-    return ' · '.join(f'<span class="nobreak">{e(part)}</span>' for part in policy_text(policy, files).split(' · '))
+    return ' · '.join(f'<span class="nobreak">{e(part)}</span>' for part in policy_text(policy, files, database).split(' · '))
+
+
+def files_only(state):
+    """Whether an environment deploys to a files-only target (DEPLOY_MODE=files): no Docker there, so no containers,
+    no secret store and no database here."""
+    return (state or {}).get('mode') == 'files'
 
 
 def has_files(state):
@@ -2713,7 +2735,10 @@ def has_files(state):
 
 def backup_watch(state):
     """(series, frequency, newest) of the DB backup an environment's alarm watches: the DB short (registry) series while
-    it is on, else the DB full series while that is on; None when its database is not backed up at all."""
+    it is on, else the DB full series while that is on; None when its database is not backed up at all (or there is no
+    database here: a files-only target)."""
+    if files_only(state):
+        return None
     policy = environment_policy(state)
     if policy['db-short'] != 'off':
         return 'db-short', policy['db-short'], (state.get('backups') or {}).get('newest')
@@ -2820,17 +2845,27 @@ def git_line(state, tag_word=True):
 
 
 def target_values(entry, environment):
-    """The target an environment deploys to: its own target.<env>.env over the shared target.env."""
+    """The target an environment deploys to: its own target.<env>.env, else the shared target.env (as setup reads them)."""
     targets = entry.get('targets') or {}
-    return {**targets.get('all', {}), **targets.get(environment, {})}
+    return targets.get(environment) or targets.get('all') or {}
+
+
+def remote_target(values):
+    """Whether a target is another server (over SSH): a Docker context of its own, or a files-only target's DEPLOY_SSH."""
+    return bool(values.get('DEPLOY_SSH')) or values.get('DEPLOY_CONTEXT', 'default') != 'default'
+
+
+FILES_CHIP = badge('files only', 'muted')
 
 
 def target_place_text(values):
-    """Where one target file deploys: this server and its directory, or user@host:path over SSH."""
-    if values.get('DEPLOY_CONTEXT', 'default') == 'default':
-        return f'this server <code>{e(values["DEPLOY_PATH"])}</code>' if values.get('DEPLOY_PATH') else 'this server'
+    """Where one target file deploys: this server and its directory, or user@host:path over SSH; a files-only one marked."""
+    files = values.get('DEPLOY_MODE') == 'files'
+    if not remote_target(values):
+        text = f'this server <code>{e(values["DEPLOY_PATH"])}</code>' if values.get('DEPLOY_PATH') else 'this server'
+        return text + (f' {FILES_CHIP}' if files else '')
     return e(f'{values.get("DEPLOY_SSH", "?")}:{values.get("DEPLOY_PATH", "?")}') + \
-        f' <span class="muted">(Docker context {e(values.get("DEPLOY_CONTEXT"))})</span>'
+        (f' {FILES_CHIP}' if files else f' <span class="muted">(Docker context {e(values.get("DEPLOY_CONTEXT"))})</span>')
 
 
 class Page:
@@ -3112,7 +3147,7 @@ class Page:
         values = target_values(entry, environment)
         if not values:
             return None
-        if values.get('DEPLOY_CONTEXT', 'default') == 'default':
+        if not remote_target(values):
             path = values.get('DEPLOY_PATH') or ''
             return ('this server', path) if not path or path.endswith(f'/projects/{entry["name"]}') else (f'local:{path}', path)
         return f'ssh {values.get("DEPLOY_SSH") or "?"}', f'{values.get("DEPLOY_SSH", "?")}:{values.get("DEPLOY_PATH", "?")}'
@@ -3134,7 +3169,7 @@ class Page:
             deploy = (f'{e(name) + " · " if name and name != ref else ""}<b>{e(ref)}</b> '
                       f'<span class="muted">{e(ago(last["at"]))}{f" · {behind} behind" if behind else ""}</span>')
             note = f' title="{e(f"branch {name}: {branch_note(branch)}")}"' if name else ''
-        chips = ''.join(' ' + badge(word, 'bad') for word in problems)
+        chips = ''.join(' ' + badge(word, 'bad') for word in problems) + (f' {FILES_CHIP}' if files_only(state) else '')
         backup = '' if state.get('development') else ' · ' + e(self.backup_short(state))
         title = f' title="{e(target[1])}"' if target[1] else ''
         return (f'<span class="envline"{note}>{sign}{lamp(kind if kind != "idle" else "muted")}{deploy}{chips}</span>'
@@ -3143,7 +3178,13 @@ class Page:
     @staticmethod
     def backup_short(state):
         """The newest DB backup the policy watches, in a few words: 'DB short 5 h ago', 'DB full 2 d ago' (DB full only),
-        'no DB short backup', 'backups off' (nothing at all) or 'DB backups off' (files only)."""
+        'no DB short backup', 'backups off' (nothing at all) or 'DB backups off' (files only). A files-only target has no
+        database here: its files backup, 'files 3 h ago', 'no files backup', or 'no DB here'."""
+        if files_only(state):
+            newest = (state.get('files_backups') or {}).get('newest')
+            if not has_files(state) or environment_policy(state)['files'] == 'off':
+                return 'no DB here'
+            return f'files {ago(newest["time"])}' if newest else 'no files backup'
         watch = backup_watch(state)
         if watch is None:
             return 'backups off' if environment_policy(state)['files'] == 'off' or not has_files(state) else 'DB backups off'
@@ -3198,18 +3239,16 @@ class Page:
         """Whether an environment deploys anywhere: a development one here, else a registered target."""
         if (entry.get('environments', {}).get(environment) or {}).get('development'):
             return True
-        targets = entry.get('targets', {})
-        return bool({**targets.get('all', {}), **targets.get(environment, {})})
+        return bool(target_values(entry, environment))
 
     @staticmethod
     def target(entry, environment):
         if entry.get('environments', {}).get(environment, {}).get('development'):
             return 'this server · development environment'
-        targets = entry.get('targets', {})
-        values = {**targets.get('all', {}), **targets.get(environment, {})}
+        values = target_values(entry, environment)
         if not values:
             return badge('not registered', 'warn')
-        if values.get('DEPLOY_CONTEXT', 'default') == 'default':
+        if not remote_target(values):
             return 'this server'
         return e(f'{values.get("DEPLOY_SSH", "?")}:{values.get("DEPLOY_PATH", "?")}')
 
@@ -3329,7 +3368,8 @@ class Page:
         else:
             body += self.projects_board(shown)
             body += ('<p class="note">Each environment: a lamp, the last deploy and what is wrong; below it where it deploys and the '
-                     'newest DB backup its backup policy watches (the DB full one when it backs up DB full only). A project\'s page has its '
+                     'newest DB backup its backup policy watches (the DB full one when it backs up DB full only). A files only chip: a '
+                     'deploy copies only the code there – no Docker, no database here (its files backup is shown). A project\'s page has its '
                      'settings: each environment\'s target and backup policy, a new environment, removing. '
                      '<a href="/projects/backups">Backups</a>: every environment\'s policy and newest backups.</p>')
         if data.get('errors'):
@@ -3376,7 +3416,7 @@ class Page:
                 state = entry['environments'][environment] or {}
                 if state.get('development'):
                     continue
-                policy, files = environment_policy(state), has_files(state)
+                policy, files, database = environment_policy(state), has_files(state), not files_only(state)
                 problems = self.backup_problems(entry, environment, units)
                 late = {series for series, *_ in problems}
                 registered = self.registered(entry, environment) and state.get('declared')
@@ -3384,12 +3424,15 @@ class Page:
                     backup_watch(state) is None and (policy['files'] == 'off' or not files)) else 'ok'
                 link = f'/project/{e(quote(entry["name"]))}#backup-{e(quote(environment))}'
                 note = '' if registered else '<small>no target: no alarm</small>'
+                no_database = '<span class="muted" title="a files-only target: no database here">n/a (files only)</span>'
                 # Each value in one <span>: on a phone the cell is a row of its label and that.
                 values = (('Environment', f'<span class="sign {e(environment)}">{e(environment)}</span>'),
-                          ('Policy', policy_html(policy, files) +
-                           (' <span class="muted">· default</span>' if policy == BACKUP_DEFAULT else '')),
-                          ('DB short', self.newest_cell(state, 'backups', policy['db-short'], 'db-short' in late)),
-                          ('DB full', self.newest_cell(state, 'full_backups', policy['db-full'], 'db-full' in late)),
+                          ('Policy', policy_html(policy, files, database) +
+                           (' <span class="muted">· default</span>' if policy == BACKUP_DEFAULT and database else '')),
+                          ('DB short', self.newest_cell(state, 'backups', policy['db-short'], 'db-short' in late)
+                           if database else no_database),
+                          ('DB full', self.newest_cell(state, 'full_backups', policy['db-full'], 'db-full' in late)
+                           if database else no_database),
                           ('Files', self.newest_cell(state, 'files_backups', policy['files'], 'files' in late) if files else
                            '<span class="muted" title="no BACKUP_FILE_PATHS">—</span>'))
                 cells = (f'<td class="project" data-label="Project"><a href="{link}">{e(entry["name"])}</a>{note}</td>' +
@@ -3426,7 +3469,7 @@ class Page:
             body += ('<p class="note">The newest backup of each series and how old it is. Red: the series the alarm watches is late '
                      'or missing – the DB short one, or the DB full one when the policy backs up DB full only (daily 26 h, weekly 8 days, '
                      'monthly 29 days); files while the files timer runs. A series the policy turns off is no alarm; — in Files: '
-                     'the project lists no BACKUP_FILE_PATHS. '
+                     'the project lists no BACKUP_FILE_PATHS; n/a (files only): a files-only target has no database here. '
                      'A row leads to the environment\'s policy form on its project page.</p>')
         body += (f'<p class="foot">Status: {e(local_time(data.get("generated", time.time())))} · '
                  '<a href="/projects/backups?fresh=1">Refresh</a></p>')
@@ -3438,22 +3481,39 @@ class Page:
         return (f'<label><span>{e(label)}</span><input type="text" name="{key}" value="{e(current)}" '
                 f'placeholder="{e(placeholder)}" autocomplete="off" spellcheck="false"></label>')
 
+    @staticmethod
+    def target_field(key, mode_key, label, placeholder='', current='', mode='docker'):
+        """A target's field with its type in front: Docker stack (the project's containers run there) or Files only (a
+        deploy copies only the code there; bin/add-project --target files:…)."""
+        options = ''.join(f'<option value="{value}"{" selected" if value == mode else ""}>{e(words)}</option>'
+                          for value, words in TARGET_MODES)
+        return (f'<label><span>{e(label)}</span><span class="typed"><select name="{mode_key}" aria-label="{e(label)}: type">'
+                f'{options}</select><input type="text" name="{key}" value="{e(current)}" placeholder="{e(placeholder)}" '
+                'autocomplete="off" spellcheck="false"></span></label>')
+
     def project_new(self, target=''):
         """The add form; target ([ENV=]TARGET, from the instructions) fills the field it belongs to."""
         given = {'all': '', 'prod': '', 'stage': '', 'more': ''}
+        modes = {'all': 'docker', 'prod': 'docker', 'stage': 'docker'}
         if target:
             scope = target_scope(target)
-            if scope in ('prod', 'stage'):
-                given[scope] = target.split('=', 1)[1]
+            if scope in ('prod', 'stage') or not scope:
+                place = target.split('=', 1)[1] if scope else target
+                key = scope or 'all'
+                if place.startswith('files:'):
+                    place, modes[key] = place[len('files:'):], 'files'
+                given[key] = place
             else:
-                given['all' if not scope else 'more'] = target
-        text = self.text_field
+                given['more'] = target
+        text, typed = self.text_field, self.target_field
         steps = ('<ol class="steps-list"><li>The <b>env repo</b> (app/: Makefile, env/) is cloned into the build root; a separate '
                  '<b>code repo</b> into app/public/. A <b>monorepo</b> holds both (app/ and app/public/).</li>'
                  '<li>Bitbucket: the account\'s key reads the repos (add it to each, read-only). GitHub: each repo gets a deploy key of '
                  'its own; the preview shows it when GitHub does not accept it yet.</li>'
                  f'<li>Name where it deploys: <b>a target</b> for every environment, or one per environment ({e(TARGET_HINT)}). '
-                 'A remote server must be prepared first: <a href="/instructions">Instructions</a>.</li></ol>')
+                 'A remote server must be prepared first: <a href="/instructions">Instructions</a>.</li>'
+                 '<li>Its type: <b>Docker stack</b> – the project\'s containers run there; <b>Files only</b> – a server without '
+                 'Docker: a deploy copies only the code there (rsync over SSH), and no database is managed or backed up here.</li></ol>')
         fields = (text('env_repo', 'Env repo URL', 'git@ssh.bitbucket.org:workspace/shop_docker.git') +
                   text('code_repo', 'Code repo URL (optional)', 'git@ssh.bitbucket.org:workspace/shop.git') +
                   text('name', 'Name (optional)', 'default – the repo name') +
@@ -3462,16 +3522,19 @@ class Page:
                   '<label class="check"><input type="checkbox" name="shared_key" value="yes"> GitHub: the account key instead of a '
                   'deploy key per repo (--shared-key)</label>'
                   '<p class="block-label">Targets</p>' +
-                  text('target_all', 'Every environment', 'local, local:/PATH or ssh://USER@HOST/PATH', given['all']) +
-                  text('target_prod', 'prod (its own)', 'e.g. ssh://deploy@shop.example/home/deploy/prod', given['prod']) +
-                  text('target_stage', 'stage (its own)', 'e.g. local:/home/shop/stage', given['stage']) +
+                  typed('target_all', 'mode_all', 'Every environment', 'local, local:/PATH or ssh://USER@HOST/PATH', given['all'],
+                        modes['all']) +
+                  typed('target_prod', 'mode_prod', 'prod (its own)', 'e.g. ssh://deploy@shop.example/home/deploy/prod', given['prod'],
+                        modes['prod']) +
+                  typed('target_stage', 'mode_stage', 'stage (its own)', 'e.g. local:/home/shop/stage', given['stage'], modes['stage']) +
                   '<label><span>Other environments (ENV=target, one per line)</span><textarea name="targets" autocomplete="off" '
                   f'spellcheck="false" placeholder="demo=local:/home/shop/demo">{e(given["more"])}</textarea></label>')
         body = steps + '<div class="deck">' + self.form(
             'add-project', 'Add a project', fields,
             note='A new project needs a target: local – this server, the build root; local:/PATH – this server, another '
-                 'directory; ssh://USER@HOST/PATH – another server. An environment\'s own target wins over the shared one. '
-                 'For an existing project the fields left empty keep its targets.',
+                 'directory; ssh://USER@HOST/PATH – another server. Files only: no Docker there, PATH must exist or be creatable '
+                 'and writable for USER, and rsync installed (files:ssh://… or files:local:/PATH in the other lines). An '
+                 'environment\'s own target wins over the shared one. For an existing project the fields left empty keep its targets.',
             command='bin/add-project') + '</div>'
         body += '<p><a href="/projects">← Projects</a></p>'
         return self.layout('Add a project', body, section='projects')
@@ -3510,7 +3573,7 @@ class Page:
         else:
             body += '<div class="empty">No environment and no target yet. Add one below.</div>'
         hidden = f'<input type="hidden" name="project" value="{e(name)}"><input type="hidden" name="operation" value="set">'
-        target_field = self.text_field('target', 'Target', 'local:/PATH or ssh://USER@HOST/PATH')
+        target_field = self.target_field('target', 'mode', 'Target', 'local:/PATH or ssh://USER@HOST/PATH')
         rerun = f'bin/add-project {"--monorepo " if entry.get("monorepo") else ""}--target ENV=TARGET {name} ENV_REPO_URL' + \
             (' CODE_REPO_URL' if entry.get('code_repository') and not entry.get('monorepo') else '')
         monorepo = ' A monorepo\'s target lies outside its checkout: not local.' if entry.get('monorepo') else ''
@@ -3521,13 +3584,14 @@ class Page:
                                ''.join(f'<option value="{e(environment)}">{e(environment)}</option>' for environment in known) +
                                '</select></label>' + target_field,
                                note='Writes the environment\'s own target.ENV.env; the clones stay as they are. The next deploy goes '
-                                    'there, and what runs on the old target stays until it is stopped.' + monorepo,
+                                    'there, and what runs on the old target stays until it is stopped. Files only: a deploy copies '
+                                    'only the code there (no Docker, no database here); a Docker context of the old target goes.' + monorepo,
                                command=rerun)
         forms += self.form('project-target', 'Add an environment',
                            hidden + self.text_field('environment', 'Environment', 'demo – lowercase letters and digits, 2–16') +
                            target_field,
                            note='Not local or test. Besides stage and prod an environment deploys once the project lists it in '
-                                'STAGE_ENVIRONMENTS (env/common.env) and has env/ENV.env.' + monorepo,
+                                'STAGE_ENVIRONMENTS (env/common.env) and has env/ENV.env. Files only: a server without Docker.' + monorepo,
                            command=rerun)
         if removable:
             forms += self.form('project-target', 'Remove an environment\'s own target',
@@ -3553,8 +3617,13 @@ class Page:
                       ('PROJECT_NAME', e(entry.get('project_name')))])
         for environment, state in entry.get('environments', {}).items():
             body += f'<h2 id="env-{e(environment)}"><span class="sign {e(environment)}">{e(environment)}</span> environment</h2>'
-            rows = [('Target', f'{self.target(entry, environment)} <span class="muted">(Docker context {e(state["context"])})</span>'),
-                    ('Last deploy', self.deploy_cell(state)), ('Containers', self.containers_cell(state))]
+            # A files-only target: no Docker there (no containers, secret store or context) and no database here.
+            files = files_only(state)
+            not_used = '<span class="muted">not used (files only)</span>'
+            rows = [('Target', f'{self.target(entry, environment)} ' +
+                     (FILES_CHIP + ' <span class="muted">· a deploy copies only the code there (rsync); no database here</span>'
+                      if files else f'<span class="muted">(Docker context {e(state["context"])})</span>')),
+                    ('Last deploy', self.deploy_cell(state)), ('Containers', not_used if files else self.containers_cell(state))]
             success = (state.get('deploys') or {}).get('last_success')
             if success and success != state['deploys']['last']:
                 rows.append(('Last successful', deploy_shown(success)))
@@ -3562,16 +3631,19 @@ class Page:
                                   if (state.get(key) or {}).get('newest') else '')
             if not state.get('development'):
                 policy = environment_policy(state)
-                text = policy_html(policy, has_files(state))
-                rows.append(('Backup policy', (f'<a href="#backup-{e(environment)}">{text}</a>' if self.may('backup-policy') else text) +
-                             (' <span class="muted">(default)</span>' if policy == BACKUP_DEFAULT else '')))
-            rows += [('DB short backup', self.backup_cell(state) + newest('backups')),
-                     ('DB full backup', self.full_backup_cell(state) + newest('full_backups')),
-                     ('DB short, fresh', self.fresh_backup_cell(state) + ' <span class="muted">· make db-pull fresh=1</span>'),
-                     *([('Files backup (BACKUP_FILE_PATHS)', self.files_cell(state) +
+                text = policy_html(policy, has_files(state), not files)
+                linked = self.may('backup-policy') and (has_files(state) or not files)
+                rows.append(('Backup policy', (f'<a href="#backup-{e(environment)}">{text}</a>' if linked else text) +
+                             (' <span class="muted">(default)</span>' if policy == BACKUP_DEFAULT and not files else '')))
+            if not files:
+                rows += [('DB short backup', self.backup_cell(state) + newest('backups')),
+                         ('DB full backup', self.full_backup_cell(state) + newest('full_backups')),
+                         ('DB short, fresh', self.fresh_backup_cell(state) + ' <span class="muted">· make db-pull fresh=1</span>')]
+            rows += [*([('Files backup (BACKUP_FILE_PATHS)', self.files_cell(state) +
                          f' <a class="btn" href="/files/{e(quote(name))}/{e(environment)}">View</a>')]
                        if state.get('file_paths') or (state.get('files_backups') or {}).get('count') else []),
-                     ('Secret store', f'{self.secrets_cell(state)} <span class="muted">{e(state["compose_project"])}-secrets</span>')]
+                     ('Secret store', not_used if files else
+                      f'{self.secrets_cell(state)} <span class="muted">{e(state["compose_project"])}-secrets</span>')]
             body += facts(rows)
             if state.get('containers'):
                 body += ('<table class="board"><thead><tr><th scope="col">Container</th><th scope="col">State</th>'
@@ -3587,6 +3659,10 @@ class Page:
                 body += '<p class="note">The application manages a development environment\'s backups; the server\'s DB backup roles do not apply here.</p>'
                 continue
             body += self.backup_list(state)
+            if files:  # no database here: only the files series has a policy, and only when there are files to back up
+                forms = self.policy_form(name, environment, state) if has_files(state) else ''
+                body += f'<div class="deck" id="backup-{e(environment)}">{forms}</div>' if forms else ''
+                continue
             body += f'<div class="deck" id="backup-{e(environment)}">' + self.policy_form(name, environment, state) + self.form(
                 'backup-local', 'Backup now on the server',
                 f'<input type="hidden" name="project" value="{e(name)}"><input type="hidden" name="environment" value="{e(environment)}">'
@@ -3612,14 +3688,21 @@ class Page:
 
     def policy_form(self, name, environment, state):
         """How often each backup series of one environment is made (bin/backup-projects --set): a select per series with the
-        current value chosen; the files one only when the environment has files to back up (else its value goes as it is)."""
+        current value chosen; the files one only when the environment has files to back up (else its value goes as it is).
+        A files-only target has no database here: the files one only, the DB values go as they are."""
         policy = environment_policy(state)
+        hidden = lambda series: f'<input type="hidden" name="{series}" value="{e(policy[series])}">'
+        if files_only(state):
+            return self.form('backup-policy', 'Backup policy',
+                             f'<input type="hidden" name="project" value="{e(name)}"><input type="hidden" name="environment" '
+                             f'value="{e(environment)}">' + hidden('db-short') + hidden('db-full') +
+                             self.policy_select(policy, 'files', 'Files backup (BACKUP_FILE_PATHS)'),
+                             note='How often the files timer backs this environment\'s files up. A files-only target has no database '
+                                  'here: no DB backups, and no alarm for them.',
+                             command=f'bin/backup-projects --set {name} {environment} files=…')
 
         def select(series, label):
-            options = ''.join(f'<option value="{frequency}"{" selected" if frequency == policy[series] else ""}>'
-                              f'{e(self.FREQUENCY_WORDS[frequency])}{" (default)" if frequency == BACKUP_DEFAULT[series] else ""}</option>'
-                              for frequency in BACKUP_POLICY[series])
-            return f'<label><span>{e(label)}</span><select name="{series}">{options}</select></label>'
+            return self.policy_select(policy, series, label)
         fields = (f'<input type="hidden" name="project" value="{e(name)}"><input type="hidden" name="environment" value="{e(environment)}">' +
                   select('db-short', 'DB short backup') +
                   select('db-full', 'DB full backup') +
@@ -3630,6 +3713,13 @@ class Page:
                               'tables (the registry); DB full – every table\'s data. DB short off and DB full on: DB full backups only '
                               '(daily DB full ones come with the nightly run). All off: no backups, and no alarm for them.',
                          command=f'bin/backup-projects --set {name} {environment} db-short=… db-full=… files=…')
+
+    def policy_select(self, policy, series, label):
+        """The select of one backup series' frequency, its current value chosen."""
+        options = ''.join(f'<option value="{frequency}"{" selected" if frequency == policy[series] else ""}>'
+                          f'{e(self.FREQUENCY_WORDS[frequency])}{" (default)" if frequency == BACKUP_DEFAULT[series] else ""}</option>'
+                          for frequency in BACKUP_POLICY[series])
+        return f'<label><span>{e(label)}</span><select name="{series}">{options}</select></label>'
 
     @staticmethod
     def backup_list(state):

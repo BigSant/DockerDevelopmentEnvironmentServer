@@ -11,7 +11,9 @@
 # The deploy target is the server's, not the project's: target.env in the build root (setup reads it on
 # every deploy) names DEPLOY_CONTEXT, DEPLOY_SSH, DEPLOY_PATH, APP_UID and APP_GID. It is always named:
 # --target local is this host, the build root itself and the account's ids; ssh://USER@HOST/PATH a remote server (a Docker
-# context setup-<name> of the account), ENV=... one environment only (target.<env>.env). A rerun keeps
+# context setup-<name> of the account), ENV=... one environment only (target.<env>.env). files:ssh://USER@HOST/PATH and
+# files:local:/PATH are files-only targets (DEPLOY_MODE=files, DEPLOY_SSH, DEPLOY_PATH): no Docker there, setup rsyncs
+# only the code; no Docker context, no APP_UID/APP_GID (the files belong to the SSH user). A rerun keeps
 # the clones and the registered target unless --target is given. --remove-target ENV --name NAME deletes one
 # environment's own target.<env>.env (and its Docker context), which then deploys to the shared target.env;
 # it needs no URL and refuses to leave the environment without a target.
@@ -29,7 +31,7 @@ given_name=
 targets=()
 usage() {
     cat <<EOF
-Usage: sudo $0 [--check] [--shared-key] [--monorepo] [--target [ENV=]local|ssh://USER@HOST/PATH] [--name NAME|NAME] ENV_REPO_URL [CODE_REPO_URL]
+Usage: sudo $0 [--check] [--shared-key] [--monorepo] [--target [ENV=][files:]local|ssh://USER@HOST/PATH] [--name NAME|NAME] ENV_REPO_URL [CODE_REPO_URL]
        sudo $0 [--check] --remove-target ENV --name NAME|NAME
   NAME          directory under $ROOT/projects; defaults to the repository slug of ENV_REPO_URL,
                  which is what pipelines use (BITBUCKET_REPO_SLUG; on GitHub the repository name in
@@ -46,7 +48,10 @@ Usage: sudo $0 [--check] [--shared-key] [--monorepo] [--target [ENV=]local|ssh:/
   --target       where stage/prod deploy (target.env), required for a new project: local = this host, the build root, the
                  account's ids; local:/PATH = this host, project root PATH (created for $ACCOUNT, or writable by it);
                  ssh://USER@HOST/PATH = a server reached as USER (key: $ROOT/.ssh/id_ed25519),
-                 project root PATH. ENV=... registers one environment (target.<env>.env): stage, prod or one
+                 project root PATH; files:ssh://USER@HOST/PATH or files:local:/PATH = files only (no Docker there:
+                 a deploy copies only the code, with rsync; no database is managed or backed up here) - PATH must
+                 exist or be creatable and writable for USER, and rsync installed there.
+                 ENV=... registers one environment (target.<env>.env): stage, prod or one
                  of the project's STAGE_ENVIRONMENTS (e.g. demo=...; without its own target an environment
                  deploys to target.env).
                  Repeatable. Without it a rerun keeps the registered target.
@@ -65,7 +70,7 @@ while [ $# -gt 0 ]; do
         --shared-key) shared_key=1 ;;
         --monorepo) monorepo=1 ;;
         --name) given_name=${2:?--name needs NAME}; shift ;;
-        --target) targets+=("${2:?--target needs local or ssh://USER@HOST/PATH}"); shift ;;
+        --target) targets+=("${2:?--target needs local, ssh://USER@HOST/PATH or files:…}"); shift ;;
         -h|--help) usage; exit 0 ;;
         -*) usage >&2; exit 64 ;;
         *) args+=("$1") ;;
@@ -327,8 +332,69 @@ local_path() {  # local_path ENV SPEC — the project root of a local target, ch
     fi
     echo "$path"
 }
+files_lines() {  # files_lines ENV SPEC — the target.env lines of a files-only target (SPEC without files:)
+    local environment=$1 spec=$2 user host path ssh answer
+    if [[ "$spec" == local:* ]]; then
+        # This host, another directory: the deploys copy the code into it as $ACCOUNT, with rsync.
+        path=$(local_path "$environment" "$spec") || exit
+        [ "$(canonical "$path")" != "$(canonical "$build_root")" ] \
+            || { echo "--target files:$spec: the build root itself; give a directory of its own outside $ROOT" >&2; exit 64; }
+        command -v rsync >/dev/null 2>&1 || { echo "--target files:$spec: rsync is not installed on this host (apt install rsync)" >&2; exit 1; }
+        if [ "$check" = 1 ]; then
+            [ -e "$path" ] || echo "==> would create $path ($ACCOUNT, 0750)" >&2
+        elif [ ! -e "$path" ]; then
+            install -d -o "$ACCOUNT" -g "$ACCOUNT" -m 0750 "$path"
+            echo "==> created $path ($ACCOUNT, 0750)" >&2
+        elif ! as_account test -d "$path" -a -w "$path"; then
+            echo "$path is not a directory $ACCOUNT can reach and write (a home directory is often closed to others)." >&2
+            echo "Either let $ACCOUNT own it (chown $ACCOUNT: $path; every directory above it must let $ACCOUNT through)," >&2
+            echo "or copy as its owner: --target files:ssh://OWNER@localhost$path" >&2
+            exit 65
+        fi
+        printf 'DEPLOY_MODE=files\nDEPLOY_PATH=%s\n' "$path"
+        return
+    fi
+    [[ "$spec" =~ ^ssh://([a-z_][a-z0-9_.-]*@)?([A-Za-z0-9.-]+)(/[A-Za-z0-9._/-]+)$ ]] \
+        || { echo "--target files:$spec: expected files:local:/PATH or files:ssh://USER@HOST/ABSOLUTE/PATH" >&2; exit 64; }
+    user=${BASH_REMATCH[1]%@} host=${BASH_REMATCH[2]} path=${BASH_REMATCH[3]%/}
+    [ "${path##*/}" != app ] || { echo "--target files:$spec: PATH is the project root, which holds app/; give ${path%/app}" >&2; exit 64; }
+    ssh=${user:+$user@}$host
+    if [ "$check" = 1 ]; then
+        echo "==> would check over SSH as ${user:-the login} on $host: $path exists (or is created) and is writable, rsync is installed" >&2
+        printf 'DEPLOY_MODE=files\nDEPLOY_SSH=%s\nDEPLOY_PATH=%s\n' "$ssh" "$path"
+        return
+    fi
+    # The account's own key; a new host key is recorded on first contact. No Docker there: only rsync and the directory.
+    if ! answer=$(as_account ssh -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new "$ssh" \
+               "command -v rsync >/dev/null 2>&1 && echo rsync || echo no-rsync; if test -d '$path'; then test -w '$path' && echo writable || echo not-writable; elif mkdir -p '$path' 2>/dev/null; then echo created; else echo not-creatable; fi" 2>&1); then
+        echo "==> Needs attention: $ACCOUNT cannot log in to $ssh without a password." >&2
+        echo "    Add this key to ~${user:-<user>}/.ssh/authorized_keys on $host, then run this again:" >&2
+        sed 's/^/    /' "$ROOT/.ssh/id_ed25519.pub" >&2 2>/dev/null || echo "    (no $ROOT/.ssh/id_ed25519.pub: run bin/prepare-host)" >&2
+        echo "    ssh said: $(echo "$answer" | tail -n 1)" >&2
+        exit 1
+    fi
+    mapfile -t answer <<< "$answer"
+    case "${answer[0]:-}" in
+        rsync) ;;
+        no-rsync) echo "$ssh: rsync is not installed for ${user:-the login} (apt install rsync, or dnf install rsync)" >&2; exit 1 ;;
+        *) echo "Unexpected answer from $ssh: ${answer[*]}" >&2; exit 1 ;;
+    esac
+    case "${answer[1]:-}" in
+        writable) ;;
+        created) echo "==> created $path on $ssh" >&2 ;;
+        not-writable) echo "$ssh: $path is not writable for ${user:-the login}; let it own the directory" >&2; exit 1 ;;
+        not-creatable) echo "$ssh: $path is missing and ${user:-the login} cannot create it; create it for ${user:-the login}" >&2; exit 1 ;;
+        *) echo "Unexpected answer from $ssh: ${answer[*]}" >&2; exit 1 ;;
+    esac
+    echo "==> files target $ssh:$path: writable, rsync installed (host key $(as_account ssh-keygen -F "$host" 2>/dev/null | awk '!/^#/ {print $2; exit}'))" >&2
+    printf 'DEPLOY_MODE=files\nDEPLOY_SSH=%s\nDEPLOY_PATH=%s\n' "$ssh" "$path"
+}
 target_lines() {  # target_lines ENV SPEC — the target.env lines of one target (reaches a remote server once)
     local environment=$1 spec=$2 user host path ssh context ids
+    if [[ "$spec" == files:* ]]; then
+        files_lines "$environment" "${spec#files:}"
+        return
+    fi
     if [ "$spec" = local ] || [[ "$spec" == local:* ]]; then
         # This host. local: the build root is the project root; local:/PATH another directory, which the
         # deploys fill (code, data and the environment files, setup 2.7.0+) as $ACCOUNT, owner of the files.
@@ -351,7 +417,7 @@ target_lines() {  # target_lines ENV SPEC — the target.env lines of one target
         return
     fi
     [[ "$spec" =~ ^ssh://([a-z_][a-z0-9_.-]*@)?([A-Za-z0-9.-]+)(/[A-Za-z0-9._/-]+)$ ]] \
-        || { echo "--target $spec: expected local, local:/PATH or ssh://USER@HOST/ABSOLUTE/PATH" >&2; exit 64; }
+        || { echo "--target $spec: expected local, local:/PATH or ssh://USER@HOST/ABSOLUTE/PATH (files:local:/PATH or files:ssh://… for files only)" >&2; exit 64; }
     user=${BASH_REMATCH[1]%@} host=${BASH_REMATCH[2]} path=${BASH_REMATCH[3]%/}
     [ "${path##*/}" != app ] || { echo "--target $spec: PATH is the project root, which holds app/ and data/; give ${path%/app}" >&2; exit 64; }
     ssh=${user:+$user@}$host
@@ -391,7 +457,7 @@ split_target() {  # split_target [ENV=]SPEC — sets environment (empty: every e
     fi
 }
 place_of() {  # place_of ENV SPEC — where a target deploys, comparable between environments: this host's directories resolved
-    local spec=$2 path
+    local spec=${2#files:} path
     if [ "$spec" = local ] || [[ "$spec" == local:* ]]; then
         path=$(local_path "$1" "$spec") || exit
         echo "local $(canonical "$path")"
@@ -432,20 +498,26 @@ check_monorepo_targets() {  # with --monorepo: each environment its own place, t
         done
     done
 }
-planned_files=() planned_environments=() planned_lines=()
+planned_files=() planned_environments=() planned_lines=() planned_stale=()
 prepare_target() {  # prepare_target [ENV=]SPEC — check a target and work out its lines before any clone
-    local environment spec lines
+    local environment spec lines stale=
     split_target "$1"
     lines=$(target_lines "$environment" "$spec")
+    # A target that was a remote Docker one has a context setup-NAME[-ENV]; a files-only target needs none: it goes.
+    if [[ "$spec" == files:* ]] && as_account docker context inspect "setup-$name${environment:+-$environment}" >/dev/null 2>&1; then
+        stale="setup-$name${environment:+-$environment}"
+    fi
     planned_files+=("$build_root/target${environment:+.$environment}.env")
     planned_environments+=("$environment")
     planned_lines+=("$lines")
+    planned_stale+=("$stale")
 }
 write_target() {  # write_target INDEX — target.env or target.<env>.env of one prepared target
-    local file=${planned_files[$1]} environment=${planned_environments[$1]} lines=${planned_lines[$1]}
+    local file=${planned_files[$1]} environment=${planned_environments[$1]} lines=${planned_lines[$1]} stale=${planned_stale[$1]}
     if [ "$check" = 1 ]; then
         echo "==> would write $file:"
         echo "$lines" | sed 's/^/    /'
+        [ -z "$stale" ] || echo "==> would remove the Docker context $stale (the target is files only now)"
         return
     fi
     { echo "# bin/add-project: where ${environment:-stage and prod} of $name deploy$([ -z "$environment" ] || echo s) (setup-server; not secret, not in git)."
@@ -454,6 +526,10 @@ write_target() {  # write_target INDEX — target.env or target.<env>.env of one
     as_account mv -f "$file.new" "$file"
     echo "==> deploy target ${environment:-stage/prod}: $file"
     echo "$lines" | sed 's/^/    /'
+    if [ -n "$stale" ]; then
+        as_account docker context rm -f "$stale" >/dev/null && echo "==> removed the Docker context $stale (the target is files only now)" \
+            || echo "==> could not remove the Docker context $stale (docker context rm $stale)"
+    fi
 }
 
 # The target is always named: nothing is created for a project without one (target.env, or target.<env>.env
@@ -464,7 +540,8 @@ for file in "$build_root/target.env" "$build_root"/target.*.env; do
 done
 if [ ${#targets[@]} -eq 0 ] && [ -z "$registered" ]; then
     echo "Name the deploy target: --target local (this host, the build root $build_root) or" >&2
-    echo "--target ssh://USER@HOST/PATH (another server); stage=/prod=/demo= in front for one environment." >&2
+    echo "--target ssh://USER@HOST/PATH (another server), files:ssh://USER@HOST/PATH for a server without Docker (only the" >&2
+    echo "code is copied); stage=/prod=/demo= in front for one environment." >&2
     exit 64
 fi
 if [ "$monorepo" = 0 ] && [ -d "$build_root/.git" ]; then
