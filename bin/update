@@ -261,7 +261,7 @@ give_back() {  # return every moved checkout; print the manual commands for thos
         say "Returned both checkouts to the previous commits: setup-server $(label server "$server_previous"), setup $(label setup "$setup_previous"). The runners were not restarted."
         exit 1
     fi
-    say "The automatic return failed. Return by hand (README: \"Rankinis atstatymas\"):"
+    say "The automatic return failed. Return by hand (README: \"Manual recovery\"):"
     printf '    %s\n' "${manual[@]}"
     exit 2
 }

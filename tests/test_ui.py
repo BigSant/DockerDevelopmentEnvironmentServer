@@ -220,7 +220,7 @@ class ServerStatusTest(Worker):
         self.assertTrue(project["environments"]["local"]["development"])
         self.assertEqual(project["environments"]["local"]["compose_project"], "ai-os-dev-local")
         view = load_web_ui()
-        self.assertEqual(view.Page.target(project, 'local'), 'šis serveris · kūrimo aplinka')
+        self.assertEqual(view.Page.target(project, 'local'), 'this server · development environment')
         self.assertEqual(view.github_actions_link(project), 'https://github.com/BigSant/ai-os/actions')
         self.assertIsNone(view.github_actions_link({'repository': 'https://example.invalid/steal'}))
         self.assertNotIn(('ai-os', 'local'), view.access_columns({'projects': [project]}))
@@ -777,7 +777,7 @@ class WebUiTest(Worker):
         return self.request("POST", "/preview", {"csrf": self.csrf(), "action": action, **fields})
 
     def confirm(self, body):
-        """POST the preview's "Vykdyti" form; the job's page when it is done (or the reply)."""
+        """POST the preview's "Run" form; the job's page when it is done (or the reply)."""
         pending = re.search(r'name="pending" value="([^"]+)"', body)
         self.assertIsNotNone(pending, body)
         status, headers, reply = self.request("POST", "/run", {"csrf": self.csrf(), "pending": pending[1]})
@@ -847,7 +847,7 @@ class WebUiTest(Worker):
         self.assertIn('name="next" value="/files"', page)
         status, _, page = self.request("POST", "/login", {"user": "admin", "password": "wrong-password"}, login=None)
         self.assertEqual(status, 401)
-        self.assertIn("Neteisingas vardas arba slaptažodis", page)
+        self.assertIn("Wrong name or password", page)
         cookie, headers = self.login("admin", PASSWORD, "/files")
         self.assertEqual(headers["Location"], "/files")
         self.assertIn("HttpOnly", headers["Set-Cookie"])
@@ -893,11 +893,11 @@ class WebUiTest(Worker):
     def test_the_first_start_makes_the_groups_and_the_ui_env_login_an_administrator(self):
         status, _, page = self.request("GET", "/users")
         self.assertEqual(status, 200)
-        for title in ("Administratoriai", "Operatoriai", "Stebėtojai"):
+        for title in ("Administrators", "Operators", "Viewers"):
             self.assertIn(title, page)
         self.assertIn('href="/users/admin"', page)
         stored = json.loads((self.state / "accounts.json").read_text())
-        self.assertEqual(stored["users"]["admin"]["groups"], ["administratoriai"])
+        self.assertEqual(stored["users"]["admin"]["groups"], ["administrators"])
         self.assertEqual(stored["users"]["admin"]["password"], PASSWORD_HASH)
         self.assertEqual(oct((self.state / "accounts.json").stat().st_mode & 0o777), "0o600")
 
@@ -912,7 +912,7 @@ class WebUiTest(Worker):
         self.assertIn('href="/logs"', page)
         self.assertNotIn('href="/access"', page)
         self.assertNotIn('action="/preview"', page)  # view only: no action forms
-        self.assertIn("Tik peržiūra", page)
+        self.assertIn("View only", page)
         for path in ("/access", "/files", "/update", "/actions", "/users", "/users/admin", "/worker-metrics"):
             with self.subTest(path=path):
                 self.assertEqual(self.request("GET", path, login=jonas)[0], 403)
@@ -922,7 +922,7 @@ class WebUiTest(Worker):
         self.assertEqual(status, 403, body)
         self.assertEqual(self.request("POST", "/users/save", {"csrf": token, "new": "1", "name": "x"}, login=jonas)[0], 403)
         self.assertEqual(self.sudo_calls("server-unit"), [])
-        # "valdo" on the overview: its actions run; a group the user gains counts at once.
+        # "manage" on the overview: its actions run; a group the user gains counts at once.
         form = {"csrf": self.csrf(), "group": "ziurovai", "title": "Žiūrovai", "level:overview": "manage", "level:logs": "view"}
         self.assertEqual(self.request("POST", "/groups/save", form)[0], 303)
         status, _, body = self.request("POST", "/preview", {"csrf": token, "action": "unit", "unit": "runner",
@@ -933,26 +933,26 @@ class WebUiTest(Worker):
 
     def test_an_administrator_always_remains(self):
         self.assertEqual(self.request("POST", "/users/save", {"csrf": self.csrf(), "name": "admin", "disabled": "1",
-                                                              "group:administratoriai": "1"})[0], 400)
-        status, _, body = self.request("POST", "/users/save", {"csrf": self.csrf(), "name": "admin", "group:operatoriai": "1"})
+                                                              "group:administrators": "1"})[0], 400)
+        status, _, body = self.request("POST", "/users/save", {"csrf": self.csrf(), "name": "admin", "group:operators": "1"})
         self.assertEqual(status, 400)
-        self.assertIn("bent vienas įjungtas", body)
+        self.assertIn("At least one enabled user", body)
         self.assertEqual(self.request("POST", "/users/delete", {"csrf": self.csrf(), "name": "admin"})[0], 400)
-        self.assertEqual(self.request("POST", "/groups/delete", {"csrf": self.csrf(), "group": "administratoriai"})[0], 400)
-        self.assertEqual(self.request("POST", "/groups/save", {"csrf": self.csrf(), "group": "administratoriai",
-                                                               "title": "Visi"})[0], 400)
+        self.assertEqual(self.request("POST", "/groups/delete", {"csrf": self.csrf(), "group": "administrators"})[0], 400)
+        self.assertEqual(self.request("POST", "/groups/save", {"csrf": self.csrf(), "group": "administrators",
+                                                               "title": "Everyone"})[0], 400)
         self.assertEqual(self.request("GET", "/")[0], 200)
         self.assertIn("users user admin: refused (", self.log.read_text())
         # With a second administrator the first may go; a disabled user's sessions end at once.
-        self.assertEqual(self.add_user("ona", "onos-slaptazodis-1", ["administratoriai"])[0], 303)
+        self.assertEqual(self.add_user("ona", "onos-slaptazodis-1", ["administrators"])[0], 303)
         cookie, _ = self.login("ona", "onos-slaptazodis-1")
         self.assertEqual(self.request("POST", "/users/save", {"csrf": self.csrf(), "name": "ona", "disabled": "1",
-                                                              "group:administratoriai": "1"})[0], 303)
+                                                              "group:administrators": "1"})[0], 303)
         self.assertEqual(self.as_session("GET", "/", cookie)[0], 303)
         self.assertEqual(self.request("GET", "/", login=("ona", "onos-slaptazodis-1"))[0], 401)
 
     def test_a_user_changes_their_own_password(self):
-        self.assertEqual(self.add_user("petras", "petro-slaptazodis-1", ["stebetojai"])[0], 303)
+        self.assertEqual(self.add_user("petras", "petro-slaptazodis-1", ["viewers"])[0], 303)
         cookie, _ = self.login("petras", "petro-slaptazodis-1")
         other, _ = self.login("petras", "petro-slaptazodis-1")
         form = {"csrf": self.token_of(cookie), "current": "wrong-password", "password": "naujas-slaptazodis", "repeat": "naujas-slaptazodis"}
@@ -964,20 +964,20 @@ class WebUiTest(Worker):
         self.assertEqual(self.request("GET", "/", login=("petras", "naujas-slaptazodis"))[0], 200)
         self.assertEqual(self.request("GET", "/", login=("petras", "petro-slaptazodis-1"))[0], 401)
 
-    def test_a_user_links_to_a_prieiga_person(self):
+    def test_a_user_links_to_an_access_person(self):
         self.write_keys()
-        self.assertEqual(self.add_user("rimas", "rimo-slaptazodis-1", ["stebetojai"], person="no-such-key")[0], 400)
+        self.assertEqual(self.add_user("rimas", "rimo-slaptazodis-1", ["viewers"], person="no-such-key")[0], 400)
         status, _, page = self.request("GET", "/users/new")
         self.assertEqual(status, 200)
         self.assertEqual(re.findall(r'<option value="([^"]+)"', page), ["tomas"])
-        self.assertEqual(self.add_user("rimas", "rimo-slaptazodis-1", ["stebetojai"], person="tomas")[0], 303)
+        self.assertEqual(self.add_user("rimas", "rimo-slaptazodis-1", ["viewers"], person="tomas")[0], 303)
         self.assertIn('href="/access/tomas"', self.request("GET", "/users")[2])
 
     # --- Runners --------------------------------------------------------------------------------
     def test_the_runners_page_lists_each_runner_with_its_state_and_controls(self):
         status, _, page = self.request("GET", "/runners")
         self.assertEqual(status, 200, page)
-        for text in ('href="/runners/github/bigsant"', "worker1", "BigSant", "vykdo job&#x27;ą", "2.338.2",
+        for text in ('href="/runners/github/bigsant"', "worker1", "BigSant", "running a job", "2.338.2",
                      'href="https://github.com/organizations/BigSant/settings/actions/runners"', 'href="/runners/bitbucket"',
                      'name="unit" value="github-runner@bigsant"', 'name="unit" value="runner"', 'href="/runners/new"'):
             self.assertIn(text, page)
@@ -992,7 +992,7 @@ class WebUiTest(Worker):
         self.assertEqual(self.request("GET", "/runners/github/..%2Fetc")[0], 404)
         self.assertEqual(self.request("GET", "/runners/bitbucket")[0], 200)
         self.assertIn('name="provider" value="github"', self.request("GET", "/runners/new")[2])
-        self.assertIn('href="/runners"', self.request("GET", "/actions")[2], "the Veiksmai page points here")
+        self.assertIn('href="/runners"', self.request("GET", "/actions")[2], "the Actions page points here")
 
     def test_a_runner_is_removed_through_its_preview_and_the_token_is_never_kept(self):
         token = "AREMOVALTOKEN0123456789"
@@ -1012,7 +1012,7 @@ class WebUiTest(Worker):
     def test_a_further_instance_needs_its_own_name(self):
         status, _, body = self.preview("install-runner", provider="github", instance="3", dialog=GITHUB_DIALOG)
         self.assertEqual(status, 400)
-        self.assertIn("savo vardo", body)
+        self.assertIn("its own name", body)
         self.assertEqual(self.preview("install-runner", provider="github", instance="1", runner_name="w", dialog=GITHUB_DIALOG)[0], 400)
         status, _, body = self.preview("install-runner", provider="github", instance="3", runner_name="worker1-3", dialog=GITHUB_DIALOG)
         self.assertEqual(status, 200, body)
@@ -1035,7 +1035,7 @@ class WebUiTest(Worker):
         self.assertEqual(self.request("POST", "/preview", {"csrf": token, "action": "unit", "unit": "backup",
                                                            "operation": "start"}, login=ci)[0], 403)
         # A viewer sees the runners, without a single button.
-        self.assertEqual(self.add_user("ziuri", "ziuri-slaptazodis", ["stebetojai"])[0], 303)
+        self.assertEqual(self.add_user("ziuri", "ziuri-slaptazodis", ["viewers"])[0], 303)
         page = self.request("GET", "/runners", login=("ziuri", "ziuri-slaptazodis"))[2]
         self.assertIn("worker1", page)
         self.assertNotIn('action="/preview"', page)
@@ -1047,20 +1047,61 @@ class WebUiTest(Worker):
         state.mkdir()
         (state / "accounts.json").write_text(json.dumps({
             "env_hash": PASSWORD_HASH,
-            "groups": {"administratoriai": {"title": "Administratoriai", "sections": {}},
-                       "operatoriai": {"title": "Operatoriai", "sections": {"actions": "manage", "overview": "manage"}},
-                       "ziurovai": {"title": "Žiūrovai", "sections": {"actions": "view"}},
-                       "kiti": {"title": "Kiti", "sections": {"logs": "view"}}},
-            "users": {"admin": {"password": PASSWORD_HASH, "groups": ["administratoriai"]}}}))
+            "groups": {"administrators": {"title": "Administrators", "sections": {}},
+                       "operators": {"title": "Operators", "sections": {"actions": "manage", "overview": "manage"}},
+                       "watchers": {"title": "Watchers", "sections": {"actions": "view"}},
+                       "others": {"title": "Others", "sections": {"logs": "view"}}},
+            "users": {"admin": {"password": PASSWORD_HASH, "groups": ["administrators"]}}}))
         accounts = web_ui.Accounts(state, "admin", PASSWORD_HASH)
         groups = accounts.snapshot()["groups"]
-        self.assertEqual(groups["operatoriai"]["sections"]["runners"], "manage")
-        self.assertEqual(groups["ziurovai"]["sections"]["runners"], "view")
-        self.assertNotIn("runners", groups["kiti"]["sections"])
-        self.assertEqual(groups["administratoriai"]["sections"]["runners"], "manage")
+        self.assertEqual(groups["operators"]["sections"]["runners"], "manage")
+        self.assertEqual(groups["watchers"]["sections"]["runners"], "view")
+        self.assertNotIn("runners", groups["others"]["sections"])
+        self.assertEqual(groups["administrators"]["sections"]["runners"], "manage")
         # Once known, a group's choice stays: taking the right away is not undone on the next start.
-        accounts.save_group("ziurovai", "Žiūrovai", {"actions": "view", "runners": ""})
-        self.assertNotIn("runners", web_ui.Accounts(state, "admin", PASSWORD_HASH).snapshot()["groups"]["ziurovai"]["sections"])
+        accounts.save_group("watchers", "Watchers", {"actions": "view", "runners": ""})
+        self.assertNotIn("runners", web_ui.Accounts(state, "admin", PASSWORD_HASH).snapshot()["groups"]["watchers"]["sections"])
+
+    def test_the_lithuanian_default_groups_move_to_their_english_ids(self):
+        # accounts.json of a server from before the UI was English: the default groups under their old ids and titles.
+        web_ui = load_web_ui()
+        state = self.root / "lithuanian-accounts"
+        state.mkdir()
+        (state / "accounts.json").write_text(json.dumps({
+            "env_hash": PASSWORD_HASH,
+            "sections": [key for key, _, _ in web_ui.SECTIONS],
+            "groups": {"administratoriai": {"title": "Administratoriai", "sections": {}},
+                       "operatoriai": {"title": "Operatoriai", "sections": {"overview": "manage", "logs": "view"}},
+                       "stebetojai": {"title": "Mūsų stebėtojai", "sections": {"logs": "view"}},
+                       "viewers": {"title": "Viewers", "sections": {"files": "view"}}},
+            "users": {"admin": {"password": PASSWORD_HASH, "groups": ["administratoriai"]},
+                      "ona": {"password": PASSWORD_HASH, "groups": ["operatoriai", "stebetojai"]},
+                      "rimas": {"password": PASSWORD_HASH, "groups": ["stebetojai", "viewers"]}}}))
+        accounts = web_ui.Accounts(state, "admin", PASSWORD_HASH)
+        snapshot = accounts.snapshot()
+        groups, users = snapshot["groups"], snapshot["users"]
+        self.assertEqual(sorted(groups), ["administrators", "operators", "viewers"])
+        self.assertEqual(groups["administrators"]["title"], "Administrators")
+        self.assertEqual(groups["operators"], {"title": "Operators", "sections": {"overview": "manage", "logs": "view"}},
+                         "the group's own sections move with it")
+        self.assertEqual(groups["viewers"]["title"], "Viewers", "both ids existed: the new one stays")
+        self.assertEqual(users["admin"]["groups"], ["administrators"])
+        self.assertEqual(users["ona"]["groups"], ["operators", "viewers"])
+        self.assertEqual(users["rimas"]["groups"], ["viewers"], "memberships of both ids merge into one")
+        self.assertEqual(accounts.permissions("ona")["overview"], "manage")
+        self.assertEqual(accounts.permissions("admin")["users"], "manage", "the administrator still manages everything")
+        self.assertFalse(accounts.recovered, "the same ui.env: the migration is not a recovery")
+        stored = json.loads((state / "accounts.json").read_text())
+        self.assertNotIn("operatoriai", json.dumps(stored), "written back with the new ids")
+        # A title someone changed is kept; the migration runs once (a second start changes nothing).
+        groups = {key: group for key, group in stored["groups"].items() if key != "viewers"}
+        groups["stebetojai"] = {"title": "Mūsų stebėtojai", "sections": {"logs": "view"}}
+        (state / "accounts.json").write_text(json.dumps({**stored, "groups": groups}))
+        groups = web_ui.Accounts(state, "admin", PASSWORD_HASH).snapshot()["groups"]
+        self.assertEqual(groups["viewers"]["title"], "Mūsų stebėtojai", "a title someone changed stays")
+        before = (state / "accounts.json").read_text()
+        web_ui.Accounts(state, "admin", PASSWORD_HASH)
+        self.assertEqual((state / "accounts.json").read_text(), before)
 
     def test_every_action_belongs_to_a_section(self):
         web_ui = load_web_ui()
@@ -1072,7 +1113,7 @@ class WebUiTest(Worker):
         web_ui = load_web_ui()
         state = self.root / "accounts-state"
         accounts = web_ui.Accounts(state, "admin", PASSWORD_HASH)
-        accounts.save_user("ona", True, "", ["administratoriai"], "", False, PASSWORD_HASH)
+        accounts.save_user("ona", True, "", ["administrators"], "", False, PASSWORD_HASH)
         accounts.save_user("admin", False, "", [], "", True, None)
         self.assertEqual(accounts.permissions("admin"), {})
         self.assertFalse(web_ui.Accounts(state, "admin", PASSWORD_HASH).recovered)  # the same ui.env: nothing changes
@@ -1133,15 +1174,15 @@ class WebUiTest(Worker):
         status, _, body = self.request("GET", "/")
         self.assertEqual(status, 200, body)
         for text in ("asana_tracker", "git@bitbucket.org:rsmaizys/asana_tracker.git", "v1.0.0", "rollback",
-                     "laikoma 3", "2/3 veikia", "šis serveris", "deploy@shop.example:/home/deploy/shop",
-                     "GitHub Actions", "v0.4.0", "nepavyko (exit-code)", "Tue 2026-10-13 00:30:00 UTC",
-                     "Runner&#x27;iai", "1 iš 2 veikia", 'href="/runners"', "#41"):
+                     "3 kept", "2/3 running", "this server", "deploy@shop.example:/home/deploy/shop",
+                     "GitHub Actions", "v0.4.0", "failed (exit-code)", "Tue 2026-10-13 00:30:00 UTC",
+                     "Runners", "1 of 2 running", 'href="/runners"', "#41"):
             self.assertIn(text, body)
         self.assertNotIn("never-shown-password", body)
         self.assertIn(f"-n {self.library}/bin/server-status", self.sudo_calls())
         status, _, project = self.request("GET", "/project/asana_tracker")
         self.assertEqual(status, 200)
-        for text in ("asana-prod-php-fpm", "healthy", "asana-prod-cron", "asana-prod-secrets", "Deploy į prod", "Backup dabar"):
+        for text in ("asana-prod-php-fpm", "healthy", "asana-prod-cron", "asana-prod-secrets", "Deploy to prod", "Backup now"):
             self.assertIn(text, project)
         self.assertIn("https://github.com/BigSant/forsena_docker/actions", self.request("GET", "/project/forsena_docker")[2])
         self.assertEqual(self.request("GET", "/project/missing")[0], 404)
@@ -1160,10 +1201,10 @@ class WebUiTest(Worker):
         arguments = ("--target prod=ssh://deploy@shop.example/home/deploy/shop --target local "
                      "git@bitbucket.org:rsmaizys/forsena_docker.git git@bitbucket.org:rsmaizys/forsena.git")
         self.assertEqual(self.sudo_calls("add-project"), [f"{command} --check {arguments}"])
-        self.assertIn("Vykdyti", body)
+        self.assertIn(">Run</button>", body)
         status, page = self.confirm(body)
         self.assertEqual(status, 200, page)
-        self.assertIn("baigta, kodas 0", page)
+        self.assertIn("finished, code 0", page)
         self.assertIn(f"stub ran: {self.library}/bin/add-project {arguments}", page)
         self.assertEqual(self.sudo_calls("add-project"), [f"{command} --check {arguments}", f"{command} {arguments}"])
         log = self.log.read_text()
@@ -1227,7 +1268,7 @@ class WebUiTest(Worker):
         self.assertEqual(status, 200, page)
         for text in ("tomas", "lv-full", "lv-docker", "/access/new", "shell"):
             self.assertIn(text, page)
-        self.assertIn("Nė vienas raktas neatitinka", self.request("GET", "/access?q=nothing")[2])
+        self.assertIn("No key matches", self.request("GET", "/access?q=nothing")[2])
         status, _, key = self.request("GET", "/access/tomas")
         self.assertEqual(status, 200, key)
         self.assertRegex(key, r'name="grant:asana_tracker:prod" value="full" checked')
@@ -1238,7 +1279,7 @@ class WebUiTest(Worker):
         self.assertIn("<li>cat .env</li>", session)
         self.assertEqual(self.request("GET", "/access/nobody")[0], 404)
         self.assertIn('/access/tomas?q=asana_tracker#projects', self.request("GET", "/project/asana_tracker")[2])
-        self.assertIn("Programuotojų veikla", self.request("GET", "/logs")[2])
+        self.assertIn("Developer activity", self.request("GET", "/logs")[2])
 
     def test_a_key_page_changes_only_what_it_shows_and_bulk_sets_a_level_everywhere(self):
         self.write_keys()
@@ -1265,22 +1306,22 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
                          f"{library} --name tomas --pull-all none --pull asana_tracker:prod=db --pull forsena_docker:stage=fresh "
                          "--grant asana_tracker:prod=full --grant forsena_docker:stage=docker")
-        self.assertIn("+ kopijos: forsena_docker stage: fresh", body)
+        self.assertIn("+ backups: forsena_docker stage: fresh", body)
         status, _, body = self.preview("add-backup-key", key_name="tomas", merge="yes", pull_all="db",
                                        **{"pull:asana_tracker:prod": "", "pull:shop-two:prod": "fresh"})
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
                          f"{library} --name tomas --pull-all db --pull shop-two:prod=fresh "
                          "--grant asana_tracker:prod=full --grant forsena_docker:stage=docker")
-        self.assertIn("kopijos, visi projektai (ir nauji): none → db", body)
-        self.assertIn("− kopijos: asana_tracker prod: atimama db", body)
-        for action, fields, message in (("key-bulk", {"key_name": "nobody", "scope": "prod", "level": "full"}, "nėra"),
-                                        ("key-bulk", {"key_name": "tomas", "scope": "dev", "level": "full"}, "Pasirink"),
-                                        ("add-backup-key", {"key_name": "tomas", "merge": "yes", "grant:x:local": "full"}, "netinkamas"),
-                                        ("add-backup-key", {"key_name": "tomas", "grant:asana_tracker:prod": "root"}, "nežinomas"),
-                                        ("add-backup-key", {"key_name": "tomas", "pull:asana_tracker:prod": "full"}, "nežinomas"),
-                                        ("add-backup-key", {"key_name": "tomas", "pull_all": "all"}, "nežinomas"),
-                                        ("key-bulk", {"key_name": "tomas", "kind": "backups", "scope": "prod", "level": "docker"}, "Pasirink"),
-                                        ("add-backup-key", {"key_name": "ona", "sources": "10.8.0.0/24"}, "Įklijuok")):
+        self.assertIn("backups, every project (new ones too): none → db", body)
+        self.assertIn("− backups: asana_tracker prod: db removed", body)
+        for action, fields, message in (("key-bulk", {"key_name": "nobody", "scope": "prod", "level": "full"}, "no key named"),
+                                        ("key-bulk", {"key_name": "tomas", "scope": "dev", "level": "full"}, "Choose"),
+                                        ("add-backup-key", {"key_name": "tomas", "merge": "yes", "grant:x:local": "full"}, "invalid"),
+                                        ("add-backup-key", {"key_name": "tomas", "grant:asana_tracker:prod": "root"}, "unknown"),
+                                        ("add-backup-key", {"key_name": "tomas", "pull:asana_tracker:prod": "full"}, "unknown"),
+                                        ("add-backup-key", {"key_name": "tomas", "pull_all": "all"}, "unknown"),
+                                        ("key-bulk", {"key_name": "tomas", "kind": "backups", "scope": "prod", "level": "docker"}, "Choose"),
+                                        ("add-backup-key", {"key_name": "ona", "sources": "10.8.0.0/24"}, "Paste")):
             with self.subTest(action=action, fields=fields):
                 status, _, body = self.preview(action, **fields)
                 self.assertEqual(status, 400, body)
@@ -1304,7 +1345,7 @@ class WebUiTest(Worker):
         status, _, key = self.request("GET", "/access/tomas?tab=tools")
         self.assertEqual(status, 200, key)
         self.assertRegex(key, r'name="tool:asana_tracker:prod" value="tools" checked')
-        self.assertIn("nepritaikyta", key)
+        self.assertIn("not applied", key)
         self.assertIn('type="password" name="tool_password"', key)
         self.assertNotIn("never-shown-hash", key)
         library = f"-n {self.library}/bin/tool-access --check"
@@ -1314,8 +1355,8 @@ class WebUiTest(Worker):
         self.assertEqual(status, 200, body)
         self.assertEqual(self.sudo_calls("tool-access")[-1],
                          f"{library} --name tomas --tools forsena_docker:stage --tools shop-two:prod")
-        self.assertIn("− asana_tracker prod: įrankiai nebeįleis", body)
-        self.assertIn("+ shop-two prod: įrankiai įleis", body)
+        self.assertIn("− asana_tracker prod: the tools no longer let in", body)
+        self.assertIn("+ shop-two prod: the tools let in", body)
         # Every prod (or stage, the others, all) at once, as the other tabs; local and test never.
         self.assertIn('name="action" value="tool-bulk"', key)
         status, _, body = self.preview("tool-bulk", key_name="tomas", scope="prod", level="tools")
@@ -1323,7 +1364,7 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("tool-access")[-1],
                          f"{library} --name tomas --tools asana_tracker:prod --tools forsena_docker:stage "
                          "--tools shop-two:prod")
-        self.assertIn("+ shop-two prod: įrankiai įleis", body)
+        self.assertIn("+ shop-two prod: the tools let in", body)
         self.preview("tool-bulk", key_name="tomas", scope="stage", level="")
         self.assertEqual(self.sudo_calls("tool-access")[-1], f"{library} --name tomas --tools asana_tracker:prod")
         self.preview("tool-bulk", key_name="tomas", scope="all", level="")
@@ -1335,7 +1376,7 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("tool-access")[-1], f"{library} --name tomas --password -")
         self.assertNotIn(password, body, "the stub echoes its stdin: even then the page hides it")
         self.assertIn("&lt;hidden&gt;", body)
-        self.assertIn("perduotas per stdin", body)
+        self.assertIn("passed on stdin", body)
         self.assertEqual(self.stubs.joinpath("sudo.stdin").read_text().split("\n----\n")[-2], password)
         status, page = self.confirm(body)
         self.assertEqual(status, 200, page)
@@ -1347,14 +1388,14 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("tool-access --check --no")[-1:], [])
         self.preview("tool-ips", allowed_ips="")
         self.assertEqual(self.sudo_calls("tool-access")[-1], f"{library} --no-allowed-ips")
-        for action, fields, message in (("tool-password", {"key_name": "tomas", "tool_password": "short"}, "Slaptažodis"),
-                                        ("tool-password", {"key_name": "nobody", "tool_password": password}, "nėra"),
-                                        ("tool-access", {"key_name": "tomas", "tool:x:local": "tools"}, "netinkamas"),
-                                        ("tool-access", {"key_name": "tomas", "tool:asana_tracker:prod": "full"}, "netinkamas"),
-                                        ("tool-bulk", {"key_name": "tomas", "scope": "dev", "level": "tools"}, "Pasirink"),
-                                        ("tool-bulk", {"key_name": "tomas", "scope": "prod", "level": "full"}, "Pasirink"),
-                                        ("tool-bulk", {"key_name": "nobody", "scope": "prod", "level": "tools"}, "nėra"),
-                                        ("tool-ips", {"allowed_ips": "0.0.0.0/0"}, "konkretų tinklą")):
+        for action, fields, message in (("tool-password", {"key_name": "tomas", "tool_password": "short"}, "Password:"),
+                                        ("tool-password", {"key_name": "nobody", "tool_password": password}, "no key named"),
+                                        ("tool-access", {"key_name": "tomas", "tool:x:local": "tools"}, "invalid"),
+                                        ("tool-access", {"key_name": "tomas", "tool:asana_tracker:prod": "full"}, "invalid"),
+                                        ("tool-bulk", {"key_name": "tomas", "scope": "dev", "level": "tools"}, "Choose"),
+                                        ("tool-bulk", {"key_name": "tomas", "scope": "prod", "level": "full"}, "Choose"),
+                                        ("tool-bulk", {"key_name": "nobody", "scope": "prod", "level": "tools"}, "no key named"),
+                                        ("tool-ips", {"allowed_ips": "0.0.0.0/0"}, "a specific network")):
             with self.subTest(action=action, fields=fields):
                 status, _, body = self.preview(action, **fields)
                 self.assertEqual(status, 400, body)
@@ -1381,7 +1422,7 @@ class WebUiTest(Worker):
                 self.assertNotIn('href="/access/ona"', found)
         status, _, key = self.request("GET", "/access/tomas?tab=tools")
         self.assertIn('<p class="keytitle">Tomas Žarskis</p>', key)
-        self.assertIn("vardo <code>tomas@example.lt</code>", key, "the tools ask for the login")
+        self.assertIn("the login <code>tomas@example.lt</code>", key, "the tools ask for the login")
         self.assertIn('name="full_name" value="Tomas Žarskis"', key)
         self.assertIn('name="login" value="tomas@example.lt"', key)
         library = f"-n {self.library}/bin/tool-access --check"
@@ -1389,19 +1430,19 @@ class WebUiTest(Worker):
         self.assertEqual(status, 200, body)
         self.assertEqual(self.sudo_calls("tool-access")[-1],
                          f"{library} --name tomas --full-name Tomas Žarskis --login Tomas.Z")
-        self.assertIn("įrankiai klaus Tomas.Z vietoj tomas@example.lt", body)
-        self.assertNotIn("vardas:", body, "the full name stays")
+        self.assertIn("the tools ask for Tomas.Z instead of tomas@example.lt", body)
+        self.assertNotIn("name: Tomas", body, "the full name stays")
         # Empty: no full name, the key's name again.
         status, _, body = self.preview("tool-person", key_name="ona", full_name="Ona K", login="")
         self.assertEqual(status, 200, body)
         self.assertEqual(self.sudo_calls("tool-access")[-1], f"{library} --name ona --full-name Ona K --login ")
-        self.assertIn("įrankiai klaus ona vietoj ona.k", body)
-        for fields, message in (({"key_name": "ona", "login": "Tomas@Example.lt"}, "užimtas (raktas tomas)"),
-                                ({"key_name": "ona", "login": "TOMAS"}, "užimtas (raktas tomas)"),
-                                ({"key_name": "ona", "login": "ona k"}, "Prisijungimo vardas"),
-                                ({"key_name": "ona", "login": "ona:k"}, "Prisijungimo vardas"),
-                                ({"key_name": "ona", "full_name": "x" * 101}, "iki 100"),
-                                ({"key_name": "nobody", "full_name": "X"}, "nėra")):
+        self.assertIn("the tools ask for ona instead of ona.k", body)
+        for fields, message in (({"key_name": "ona", "login": "Tomas@Example.lt"}, "already taken (key tomas)"),
+                                ({"key_name": "ona", "login": "TOMAS"}, "already taken (key tomas)"),
+                                ({"key_name": "ona", "login": "ona k"}, "&quot;Login&quot;"),
+                                ({"key_name": "ona", "login": "ona:k"}, "&quot;Login&quot;"),
+                                ({"key_name": "ona", "full_name": "x" * 101}, "up to 100"),
+                                ({"key_name": "nobody", "full_name": "X"}, "no key named")):
             with self.subTest(fields=fields):
                 status, _, body = self.preview("tool-person", **fields)
                 self.assertEqual(status, 400, body)
@@ -1418,48 +1459,48 @@ class WebUiTest(Worker):
         self.assertIn("-> exit 65", self.log.read_text())
 
     def test_bad_values_are_refused_before_anything_runs(self):
-        cases = (("add-project", {"env_repo": "--upload-pack=touch /tmp/x"}, "Aplinkos repo"),
-                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git; rm -rf /"}, "Aplinkos repo"),
-                 ("add-project", {"env_repo": "file:///etc"}, "Aplinkos repo"),
-                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "name": "Bad Name"}, "Vardas"),
-                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "name": "-rf"}, "Vardas"),
-                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "ftp://x/y"}, "Netinkamas taikinys"),
-                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "ssh://u@h/p -oProxyCommand=x"}, "Netinkamas taikinys"),
-                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "test=local"}, "Netinkamas taikinys"),
-                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "Dev=local"}, "Netinkamas taikinys"),
-                 ("remove-project", {"name": "../etc"}, "Projektas"),
-                 ("install-backups", {"at": "25:00"}, "Laikas"),
-                 ("install-backups", {"full_at": "Sunday 04:30"}, "Pilnos kopijos diena"),
-                 ("install-metrics", {"address": "vpn.example"}, "Adresas"),
-                 ("install-metrics", {"allow": "0.0.0.0/0"}, "ne visus adresus"),
+        cases = (("add-project", {"env_repo": "--upload-pack=touch /tmp/x"}, "Environment repo"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git; rm -rf /"}, "Environment repo"),
+                 ("add-project", {"env_repo": "file:///etc"}, "Environment repo"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "name": "Bad Name"}, "&quot;Name&quot;"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "name": "-rf"}, "&quot;Name&quot;"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "ftp://x/y"}, "Invalid target"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "ssh://u@h/p -oProxyCommand=x"}, "Invalid target"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "test=local"}, "Invalid target"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "Dev=local"}, "Invalid target"),
+                 ("remove-project", {"name": "../etc"}, "&quot;Project&quot;"),
+                 ("install-backups", {"at": "25:00"}, "&quot;Time&quot;"),
+                 ("install-backups", {"full_at": "Sunday 04:30"}, "Full backup day"),
+                 ("install-metrics", {"address": "vpn.example"}, "&quot;Address&quot;"),
+                 ("install-metrics", {"allow": "0.0.0.0/0"}, "not all addresses"),
                  ("add-backup-key", {"public_key": "-----BEGIN OPENSSH PRIVATE KEY-----", "key_name": "tomas",
-                                     "sources": "10.8.0.0/24"}, "viešąjį raktą"),
+                                     "sources": "10.8.0.0/24"}, "one public key"),
                  ("add-backup-key", {"public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1",
-                                     "key_name": "tomas", "sources": "10.8.0.0/24", "grants": "shop:prod=root"}, "Prieiga"),
+                                     "key_name": "tomas", "sources": "10.8.0.0/24", "grants": "shop:prod=root"}, "&quot;Access&quot;"),
                  ("add-backup-key", {"public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0dB1i0xJm6yJYGQq3o2Wl3wq8l6q1u2f7m8c9d0e1",
-                                     "key_name": "tomas", "sources": "10.8.0.0/24", "grants": "shop=full --remove=x"}, "Prieiga"),
+                                     "key_name": "tomas", "sources": "10.8.0.0/24", "grants": "shop=full --remove=x"}, "&quot;Access&quot;"),
                  ("update", {"server_ref": "--upload-pack=x"}, "Server OPS ref"),
                  ("update", {"setup_ref": "v1..v2"}, "setup ref"),
-                 ("update", {}, "bent vieną"),
-                 ("install-runner", {"provider": "gitlab", "dialog": "x"}, "bitbucket arba github"),
+                 ("update", {}, "at least one ref"),
+                 ("install-runner", {"provider": "gitlab", "dialog": "x"}, "bitbucket or github"),
                  ("pipeline", {"project": "asana_tracker", "pipeline": "deploy-production", "ref": "$(id)"}, "REF"),
-                 ("pipeline", {"project": "asana_tracker", "pipeline": "custom-anything"}, "Nežinomas pipeline"),
-                 ("backup-local", {"environment": "prod"}, "tik kartu su projektu"),
+                 ("pipeline", {"project": "asana_tracker", "pipeline": "custom-anything"}, "Unknown pipeline"),
+                 ("backup-local", {"environment": "prod"}, "only together with a project"),
                  ("backup-local", {"project": "asana_tracker", "environment": "test"}, "STAGE_ENVIRONMENTS"),
-                 ("backup-local", {"project": "--full"}, "Projektas"),
-                 ("unit", {"unit": "ssh", "operation": "restart"}, "Nežinoma paslauga"),
-                 ("unit", {"unit": "github-runner@../x", "operation": "stop"}, "Nežinoma paslauga"),
-                 ("unit", {"unit": "ui", "operation": "stop"}, "galima tik"),
-                 ("unit", {"unit": "backup", "operation": "restart"}, "galima tik"),
-                 ("install-ssh", {"sources": "0.0.0.0/0"}, "ne visus adresus"),
-                 ("install-ssh", {"sources": "10.8.0.0/24 -oX"}, "nėra IP adresas"),
+                 ("backup-local", {"project": "--full"}, "&quot;Project&quot;"),
+                 ("unit", {"unit": "ssh", "operation": "restart"}, "Unknown service"),
+                 ("unit", {"unit": "github-runner@../x", "operation": "stop"}, "Unknown service"),
+                 ("unit", {"unit": "ui", "operation": "stop"}, "allows only"),
+                 ("unit", {"unit": "backup", "operation": "restart"}, "allows only"),
+                 ("install-ssh", {"sources": "0.0.0.0/0"}, "not all addresses"),
+                 ("install-ssh", {"sources": "10.8.0.0/24 -oX"}, "is not an IP address"),
                  ("install-runner", {"provider": "bitbucket", "tarball": "https://dl.example/r.tar.gz", "sha256": "a" * 64,
-                                     "dialog": "x"}, "tik GitHub"),
-                 ("install-runner", {"provider": "github", "sha256": "a" * 64, "dialog": "x"}, "tik kartu su archyvu"),
-                 ("install-runner", {"provider": "github", "tarball": "ftp://dl.example/r.tar.gz", "dialog": "x"}, "Archyvas"),
-                 ("install-runner", {"provider": "github", "tarball": "/tmp/../etc/shadow", "dialog": "x"}, "Archyvas"),
+                                     "dialog": "x"}, "for a GitHub runner only"),
+                 ("install-runner", {"provider": "github", "sha256": "a" * 64, "dialog": "x"}, "only together with an archive"),
+                 ("install-runner", {"provider": "github", "tarball": "ftp://dl.example/r.tar.gz", "dialog": "x"}, "Archive"),
+                 ("install-runner", {"provider": "github", "tarball": "/tmp/../etc/shadow", "dialog": "x"}, "Archive"),
                  ("install-runner", {"provider": "github", "tarball": "/r.tgz", "sha256": "XYZ", "dialog": "x"}, "SHA-256"),
-                 ("no-such-action", {}, "Nežinomas veiksmas"))
+                 ("no-such-action", {}, "Unknown action"))
         for action, fields, message in cases:
             with self.subTest(action=action, fields=fields):
                 status, _, body = self.preview(action, **fields)
@@ -1475,7 +1516,7 @@ class WebUiTest(Worker):
         self.assertNotIn(SECRET, body, "the stub echoes its stdin: the UI masks it")
         self.assertIn("--OAuthClientSecret &lt;hidden&gt;", body)
         status, page = self.confirm(body)
-        self.assertIn("baigta, kodas 0", page)
+        self.assertIn("finished, code 0", page)
         self.assertNotIn(SECRET, page)
         given = (self.stubs / "sudo.stdin").read_text().split("\n----\n")
         self.assertEqual(given[:2], [DIALOG.rstrip("\n")] * 2, "the check and the run both got the whole dialog")
@@ -1488,7 +1529,7 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("update"),
                          ["-n -H -u admin /home/admin/setup-server/bin/update --check --server-ref v0.5.0 --setup-ref origin/master"])
         (self.library / "install.env").write_text("VERSION=v0.4.0\n")
-        self.assertIn("Nežinomas administratoriaus klonas", self.preview("update", server_ref="v0.5.0")[2])
+        self.assertIn("Unknown admin clone", self.preview("update", server_ref="v0.5.0")[2])
 
     def test_one_action_at_a_time(self):
         (self.stubs / "sleep").write_text("3\n")
@@ -1499,7 +1540,7 @@ class WebUiTest(Worker):
         status, _, body = self.request("POST", "/run", {"csrf": self.csrf(),
                                                         "pending": re.search(r'name="pending" value="([^"]+)"', second)[1]})
         self.assertEqual(status, 409, body)
-        self.assertIn("Dar vykdomas kitas veiksmas", body)
+        self.assertIn("Another action is still running", body)
         self.assertEqual(self.sudo_calls("install-metrics"), [f"-n {self.library}/bin/install-metrics --check --new-token"])
         for _ in range(100):  # the first one finishes on its own
             if "finished" in self.log.read_text():
@@ -1516,7 +1557,7 @@ class WebUiTest(Worker):
                                                      "modules/b/translations/en.php": b"\0\1binary"})
         status, _, body = self.request("GET", "/files?fresh=1")
         self.assertEqual(status, 200, body)
-        self.assertIn('href="/files">Failai', body)
+        self.assertIn('href="/files">Files', body)
         self.assertIn("<code>modules/*/translations/</code>", body)
         self.assertIn('href="/files/asana_tracker/prod"', body)
         self.assertNotIn("/files/shop-two/", body, "a project without BACKUP_FILE_PATHS is not listed")
@@ -1527,9 +1568,9 @@ class WebUiTest(Worker):
         self.assertIn("setup-server-backup --files asana_tracker prod", body)
         status, _, body = self.request("GET", f"/files/asana_tracker/prod/{newest}")
         self.assertEqual(status, 200, body)
-        self.assertRegex(body, r'lt\.php</a></td>.*?pakeista')
-        self.assertRegex(body, r'en\.php</a></td>.*?nauja')
-        self.assertIn("Dingo nuo ankstesnės kopijos (1)", body)
+        self.assertRegex(body, r'lt\.php</a></td>.*?changed')
+        self.assertRegex(body, r'en\.php</a></td>.*?new')
+        self.assertIn("Gone since the previous backup (1)", body)
         self.assertIn(f"/files/asana_tracker/prod/{older}/view?path=modules/c/translations/gone.php", body)
         filtered = self.request("GET", f"/files/asana_tracker/prod/{newest}?q=EN.php")[2]
         self.assertIn("en.php", filtered)
@@ -1541,8 +1582,8 @@ class WebUiTest(Worker):
         self.assertIn("<li>$keep = 0;</li>", body)
         self.assertIn("/download?path=modules/a/translations/lt.php", body)
         binary = self.request("GET", f"/files/asana_tracker/prod/{newest}/view?path=modules/b/translations/en.php")[2]
-        self.assertIn("Dvejetainis failas", binary)
-        self.assertIn("šio failo nėra", binary)
+        self.assertIn("A binary file", binary)
+        self.assertIn("does not have this file", binary)
         status, headers, content = self.request("GET", f"/files/asana_tracker/prod/{newest}/download?path=modules/a/translations/lt.php")
         self.assertEqual((status, content), (200, "<?php\n$a = 2;\n$keep = 0;\n"))
         self.assertEqual(headers["Content-Type"], "application/octet-stream")
@@ -1556,7 +1597,7 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("backup-projects")[-1],
                          f"-n {self.library}/bin/backup-projects --check --files asana_tracker prod")
         status, _, body = self.preview("backup-local", project="asana_tracker", full="yes", files="yes")
-        self.assertIn("nėra DB kopija", body)
+        self.assertIn("is not a DB backup", body)
         self.preview("install-backups", files_at="02:40")
         self.assertEqual(self.sudo_calls("install-backups")[-1], f"-n {self.library}/bin/install-backups --check --files-at 02:40")
 
@@ -1585,7 +1626,7 @@ class WebUiTest(Worker):
     def test_nothing_runs_without_the_action_log(self):
         self.log.mkdir()  # a directory where the log should be: it cannot be appended to
         body = self.preview("install-backups")[2]
-        self.assertIn("vykdyti negalima", body)
+        self.assertIn("cannot run", body)
         self.assertNotIn('name="pending"', body)
 
     def test_every_command_line_action_has_its_form(self):
@@ -1596,7 +1637,7 @@ class WebUiTest(Worker):
                                                                f"{library}/backup-projects --check"])
         status, _, body = self.preview("unit", unit="runner", operation="restart")
         self.assertEqual(status, 200, body)
-        self.assertIn("pipeline&#x27;o žingsnis nutrūktų", body, "what can go wrong is shown above Vykdyti")
+        self.assertIn("A running pipeline step would be cut off", body, "what can go wrong is shown above Run")
         self.preview("unit", unit="github-runner@bigsant", operation="stop")
         self.preview("unit", unit="backup", operation="start")
         self.preview("unit", unit="backup-files", operation="start")
@@ -1617,7 +1658,7 @@ class WebUiTest(Worker):
         self.preview("move-bitbucket-ssh")
         self.assertEqual(self.sudo_calls("move-bitbucket-ssh"), [f"{library}/move-bitbucket-ssh --check"])
         status, page = self.confirm(self.preview("unit", unit="ui", operation="restart")[2])
-        self.assertIn("baigta, kodas 0", page)
+        self.assertIn("finished, code 0", page)
         self.assertIn(f"stub ran: {self.library}/bin/server-unit restart ui", page)
 
     def test_the_overview_and_the_project_offer_the_controls_and_read_only_views(self):
@@ -1632,7 +1673,7 @@ class WebUiTest(Worker):
         self.assertNotIn('name="unit" value="metrics"', overview)
         self.assertIn('value="github-runner@bigsant"', self.request("GET", "/actions")[2])
         project = self.request("GET", "/project/asana_tracker")[2]
-        self.assertIn("Visos kopijos (3)", project)
+        self.assertIn("All backups (3)", project)
         self.assertIn("/project/asana_tracker/logs?env=prod&amp;container=asana-prod-cron", project)
         self.assertIn('name="action" value="backup-local"', project)
         status, _, logs = self.request("GET", "/project/asana_tracker/logs?env=prod&container=asana-prod-cron&lines=500")
@@ -1647,12 +1688,12 @@ class WebUiTest(Worker):
         status, _, metrics = self.request("GET", "/worker-metrics")
         self.assertEqual(status, 200, metrics)
         self.assertIn("setup_worker_backup_size_bytes{project=&quot;asana&quot;} 4096", metrics)
-        self.assertIn("trūksta", metrics, "the runner group is not up")
+        self.assertIn("missing", metrics, "the runner group is not up")
 
     def test_a_remote_on_the_new_bitbucket_ssh_host_keeps_its_pipelines(self):
         self.origin(self.tree.projects / "asana_tracker/app", "git@ssh.bitbucket.org:rsmaizys/asana_tracker.git")
         page = self.request("GET", "/project/asana_tracker?fresh=1")[2]
-        self.assertIn("Deploy į prod", page)
+        self.assertIn("Deploy to prod", page)
         self.assertIn("pipelines/results/41", page)
         web_ui = load_web_ui()
         for url in ("git@ssh.bitbucket.org:ws/shop.git", "ssh://git@ssh.bitbucket.org/ws/shop.git", "git@bitbucket.org:ws/shop.git"):
@@ -1665,44 +1706,44 @@ class WebUiTest(Worker):
 
     def test_the_instructions_follow_the_chosen_os_panel_environment_and_certificate(self):
         default = self.instructions()
-        for text in ("Ubuntu 22.04 / 24.04", "apt-get install -y rsync", "download.docker.com/linux/ubuntu", "Domenas DirectAdmin",
+        for text in ("Ubuntu 22.04 / 24.04", "apt-get install -y rsync", "download.docker.com/linux/ubuntu", "The domain in DirectAdmin",
                      "Custom HTTPD Configurations", "ProxyPass / http://127.0.0.1:8081/", "LOCALHOST_PORT_SSL=8082",
-                     "PMA_ALLOWED_IPS=&quot;BIURO_IP&quot;", "Deployments → <code>Production</code>", " žingsni",
-                     "Kokia OS ir architektūra", ". /etc/os-release &amp;&amp; echo", "uname -m",
-                     "CSF ugniasienė (DirectAdmin)", "csf -a WORKER_IP &quot;Server OPS worker&quot;",
+                     "PMA_ALLOWED_IPS=&quot;OFFICE_IP&quot;", "Deployments → <code>Production</code>", " steps",
+                     "Which OS and architecture", ". /etc/os-release &amp;&amp; echo", "uname -m",
+                     "CSF firewall (DirectAdmin)", "csf -a WORKER_IP &quot;Server OPS worker&quot;",
                      "systemctl is-active --quiet docker &amp;&amp; systemctl restart docker", "dd if=/dev/zero of=/swapfile",
-                     "Prieiga prie repo", "sudo -u setup -H git ls-remote APLINKOS_REPO_URL HEAD",
+                     "Access to the repos", "sudo -u setup -H git ls-remote ENV_REPO_URL HEAD",
                      "Workspace runners → Add runner", "sudo bin/install-runner --check",
                      "make deploy-variables ENV=prod names=1", "str_replace(&quot;%%&quot;, &quot;%&quot;",
-                     "APLINKOS_REPO_URL [KODO_REPO_URL]", "ServerAlias *.DOMENAS"):
+                     "ENV_REPO_URL [CODE_REPO_URL]", "ServerAlias *.DOMAIN"):
             with self.subTest(text=text):
                 self.assertIn(text, default)
         self.assertNotRegex(default, r"\nALLOWED_IPS=", "prod: per-tool lists, not the site-wide one")
-        for text in ("certbot", "firewall-cmd", "SELinux", "Tik VPN"):
+        for text in ("certbot", "firewall-cmd", "SELinux", "Reachable over the VPN only"):
             with self.subTest(absent=text):
                 self.assertNotIn(text, default)
-        self.assertIn("Worker'io rakto nepavyko perskaityti", default)
+        self.assertIn("Could not read the worker's key", default)
         centos = self.instructions(os="centos", panel="none", env="stage", ssl="letsencrypt", host="shop.example.lt",
                                    user="shop", path="/home/shop/site", domain="shop.example.lt", worker="10.8.0.14")
-        for text in ("Ši OS setup&#x27;e netestuota", "dnf install -y rsync", "firewall-cmd --permanent --add-rich-rule",
+        for text in ("This OS is untested in setup", "dnf install -y rsync", "firewall-cmd --permanent --add-rich-rule",
                      'source address=&quot;10.8.0.14&quot;', "SELinux", "useradd -m -s /bin/bash shop",
                      "dnf install -y epel-release &amp;&amp; dnf install -y certbot",
                      "certbot certonly --standalone -d shop.example.lt",
                      "/etc/letsencrypt/live/shop.example.lt/privkey.pem /home/shop/site/data/stage/ssl/domain.key",
-                     "LOCALHOST_PORT=80", "LOCALHOST_PORT_SSL=443", "\nALLOWED_IPS=&quot;BIURO_IP&quot;", "Deployments → <code>Staging</code>",
-                     "DATABASE_BUFFER_POOL=512M\nDATABASE_CPUS=…", "shop.example.lt   A  TAIKINIO_IP",
+                     "LOCALHOST_PORT=80", "LOCALHOST_PORT_SSL=443", "\nALLOWED_IPS=&quot;OFFICE_IP&quot;", "Deployments → <code>Staging</code>",
+                     "DATABASE_BUFFER_POOL=512M\nDATABASE_CPUS=…", "shop.example.lt   A  TARGET_IP",
                      "--target stage=ssh://shop@shop.example.lt/home/shop/site",
                      "/actions?target=stage%3Dssh%3A%2F%2Fshop%40shop.example.lt%2Fhome%2Fshop%2Fsite#add-project"):
             with self.subTest(text=text):
                 self.assertIn(text, centos)
         self.assertNotIn("Custom HTTPD", centos)
         vpn = self.instructions(panel="none", ssl="none", vpn_address="10.8.0.14", public_address="192.0.2.1")
-        for text in ("Tik VPN", "PUBLISH_ADDRESS=10.8.0.14", "HTTP_FORCE_HTTPS=off"):
+        for text in ("Reachable over the VPN only", "PUBLISH_ADDRESS=10.8.0.14", "HTTP_FORCE_HTTPS=off"):
             self.assertIn(text, vpn)
-        self.assertNotIn("CSF ugniasienė", vpn, "CSF is a DirectAdmin server's firewall")
+        self.assertNotIn("CSF firewall", vpn, "CSF is a DirectAdmin server's firewall")
         self.assertNotIn("certbot", vpn)
         self.assertNotIn("192.0.2.1", vpn.split('class="steps"')[1], "a field this choice does not ask for is ignored")
-        self.assertNotIn("Atidaryti formą", vpn, "no form link without the server, user and path")
+        self.assertNotIn("Open the form", vpn, "no form link without the server, user and path")
 
     def test_the_form_asks_only_for_what_the_choice_needs(self):
         body = self.instructions(host="shop.example.lt", domain="shop.example.lt", da_user="shopda", address="ignored", worker="10.8.0.14")
@@ -1710,9 +1751,9 @@ class WebUiTest(Worker):
         self.assertIn("sudo -u shopda -H mkdir -p /home/shopda/docker/prod", steps,
                       "with DirectAdmin the directory comes from its user and the environment")
         self.assertIn("--target prod=ssh://shopda@shop.example.lt/home/shopda/docker/prod", steps)
-        self.assertIn("*.shop.example.lt   A  TAIKINIO_IP", steps, "DNS: the site and its tools by one wildcard")
+        self.assertIn("*.shop.example.lt   A  TARGET_IP", steps, "DNS: the site and its tools by one wildcard")
         self.assertNotIn("DATABASE_BUFFER_POOL", steps, "prod keeps setup's buffer pool")
-        self.assertIn("Atidaryti formą su šiuo taikiniu", steps)
+        self.assertIn("Open the form with this target", steps)
         self.assertIn("PUBLISH_ADDRESS=127.0.0.1", steps)
         css = self.request("GET", "/ui.css")[2]
         self.assertIn('.guide-form:has(select[name="panel"] option[value="none"]:checked) .field-da_user', css)
@@ -1722,7 +1763,7 @@ class WebUiTest(Worker):
         self.assertIn('<details class="more" open>', self.instructions(path="/srv/shop"))
         public = self.instructions(panel="none", ssl="letsencrypt", port="8081").split('class="steps"')[1]
         self.assertIn("LOCALHOST_PORT=80", public, "a public site without a panel takes 80/443, whatever the port field says")
-        self.assertIn("Netinkama reikšmė lauke „Projekto port&#x27;as“", self.instructions(port="70000"))
+        self.assertIn("Invalid value in the field &quot;Project port&quot;", self.instructions(port="70000"))
 
     def test_the_example_walks_through_adding_a_project(self):
         self.assertIn('href="/instructions/example"', self.instructions())
@@ -1733,11 +1774,11 @@ class WebUiTest(Worker):
                      "usermod -aG docker shopuser", "sudo -u shopuser -H mkdir -p /home/shopuser/docker/stage /home/shopuser/docker/prod",
                      "Access keys", "Host key verification failed", "ssh-keyscan -t ed25519 server.example.lt",
                      "--target stage=ssh://shopuser@server.example.lt/home/shopuser/docker/stage",
-                     "git@ssh.bitbucket.org:imone/shop_docker.git git@ssh.bitbucket.org:imone/shop.git",
+                     "git@ssh.bitbucket.org:company/shop_docker.git git@ssh.bitbucket.org:company/shop.git",
                      "Alias /shop /var/www/html", "ProxyPass /shop/ http://127.0.0.1:3045/shop/",
-                     "sudo bin/remove-project --check shop_docker", "Kokia OS ir architektūra",
-                     "Swap ir CSF", "*.server.example.lt   A  SERVERIO_IP", "Workspace runners → Add runner",
-                     "19 žingsnių"):
+                     "sudo bin/remove-project --check shop_docker", "Which OS and architecture",
+                     "Swap and CSF", "*.server.example.lt   A  SERVER_IP", "Workspace runners → Add runner",
+                     "19 steps"):
             with self.subTest(text=text):
                 self.assertIn(text, body)
         self.assertIn(f"{self.tree.root}/.ssh/id_ed25519.pub", body, "the worker's own root, not a fixed path")
@@ -1749,13 +1790,13 @@ class WebUiTest(Worker):
         (ssh / "id_ed25519.pub").write_text("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKey setup@worker1\n")
         body = self.instructions(os="windows", panel="none", ssl="none", host="x;rm -rf /", user="Root User",
                                  path="/home/shop/app", port="80; id")
-        for text in ("Netinkamas pasirinkimas", "lauke „Serveris“", "lauke „SSH vartotojas“", "negali baigtis /app",
-                     "lauke „Projekto port&#x27;as“"):
+        for text in ("Invalid choice", "field &quot;Server&quot;", "field &quot;SSH user&quot;", "cannot end in /app",
+                     "field &quot;Project port&quot;"):
             with self.subTest(text=text):
                 self.assertIn(text, body)
-        self.assertNotIn("rm -rf", body.split("Netinkama reikšmė", 1)[0] + body.split("</ol>")[0].split('class="steps"')[-1])
+        self.assertNotIn("rm -rf", body.split("Invalid value", 1)[0] + body.split("</ol>")[0].split('class="steps"')[-1])
         self.assertIn("echo &#x27;ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKey setup@worker1&#x27; &gt;&gt; ~deploy/.ssh/authorized_keys", body)
-        self.assertNotIn("rakto nepavyko perskaityti", body)
+        self.assertNotIn("Could not read the worker", body)
         prefilled = self.request("GET", "/actions?target=" + urlencode({"": "prod=ssh://shop@shop.example.lt/home/shop/site"})[1:])[2]
         self.assertIn(">prod=ssh://shop@shop.example.lt/home/shop/site</textarea>", prefilled)
         refused = self.request("GET", "/actions?target=" + urlencode({"": "prod=ssh://u@h/p -oProxyCommand=x"})[1:])[2]
@@ -1768,7 +1809,7 @@ class WebUiTest(Worker):
         self.write_keys()
         project = self.request("GET", "/project/asana_tracker?fresh=1")[2]
         self.assertIn('name="pipeline" value="deploy-mdv"', project, "listed: offered before its first deploy")
-        self.assertIn("Deploy į mdv", project)
+        self.assertIn("Deploy to mdv", project)
         status, _, body = self.preview("pipeline", project="asana_tracker", pipeline="deploy-mdv", ref="feature/x")
         self.assertEqual(status, 200, body)
         self.assertIn("&quot;pattern&quot;: &quot;deploy-mdv&quot;", body)
@@ -1820,7 +1861,7 @@ class WebUiTest(Worker):
     def test_backup_now_uses_the_general_token_and_a_redirect_is_not_followed(self):
         status, _, body = self.preview("pipeline", project="shop-two", pipeline="backup-now", branch="master")
         self.assertEqual(status, 200, body)
-        self.assertIn("token'as: BITBUCKET_ACCESS_TOKEN</p>", body)
+        self.assertIn("token: BITBUCKET_ACCESS_TOKEN</p>", body)
         status, page = self.confirm(body)
         self.assertEqual(status, 502, page)
         self.assertIn("HTTP 302", page)
@@ -1841,7 +1882,7 @@ class WebUiTest(Worker):
                        f"Bearer {PROJECT_TOKEN}"), [(request[1], request[2]["Authorization"]) for request in listed])
         status, _, body = self.preview("pipeline", project="forsena_docker", pipeline="deploy-stage")
         self.assertEqual(status, 400)
-        self.assertIn("GitHub dar nepalaikomas", body)
+        self.assertIn("GitHub is not supported yet", body)
 
 
 if __name__ == "__main__":

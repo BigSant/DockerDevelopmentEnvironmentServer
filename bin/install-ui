@@ -55,7 +55,7 @@ while [ $# -gt 0 ]; do
         --port) port=${2:-}; shift ;;
         --user) user=${2:-}; shift ;;
         --address)
-            [ "${2:-}" = "$ADDRESS" ] || { echo "The UI listens on $ADDRESS only; reach it through an SSH tunnel (README: Valdymo sąsaja)" >&2; exit 64; }
+            [ "${2:-}" = "$ADDRESS" ] || { echo "The UI listens on $ADDRESS only; reach it through an SSH tunnel (README: Web UI)" >&2; exit 64; }
             shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 64 ;;
@@ -125,7 +125,7 @@ printf '# bin/install-ui: where the copies in %s/bin come from (read by the UI a
 
 # --- The sudo rule: these copies as root, bin/update of the clone as its owner; nothing else ---
 {
-    echo "# bin/install-ui: the web UI's account runs only these root-owned copies as root (README: Valdymo sąsaja)."
+    echo "# bin/install-ui: the web UI's account runs only these root-owned copies as root (README: Web UI)."
     echo "# Their arguments are checked by the UI and again by each command."
     printf '%s ALL=(root) NOPASSWD:' "$UI_ACCOUNT"
     for index in "${!ROOT_COMMANDS[@]}"; do

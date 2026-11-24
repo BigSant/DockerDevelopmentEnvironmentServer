@@ -1,64 +1,64 @@
-# Server OPS – build serverio ir taikinio paruošimas
+# Server OPS – preparing the build server and targets
 
-**Server OPS** (trumpai **OPS**) – sistemos vardas: CI/CD, SSH prieiga, atsarginės kopijos ir serverio būsena vienoje
-vietoje; anksčiau vadinosi setup-server. Techniniai vardai lieka seni, kad jų keitimas nereikalautų migracijos
-kiekviename serveryje: klono katalogas `~/setup-server`, paslaugos `setup-server-*`, keliai `/etc/setup-server`,
-`/usr/local/lib/setup-server`, `/srv/setup-server`, kintamieji `SETUP_SERVER_*`.
+**Server OPS** (**OPS** for short) is the name of the system: CI/CD, SSH access, backups and server status in one
+place; it used to be called setup-server. The technical names stay the old ones so that changing them does not require
+a migration on every server: the clone directory `~/setup-server`, the services `setup-server-*`, the paths `/etc/setup-server`,
+`/usr/local/lib/setup-server`, `/srv/setup-server`, the variables `SETUP_SERVER_*`.
 
-Scriptai, kurie paruošia Ubuntu serverį setup v2 projektams. Šis serveris kartu yra ir
-**build serveris** (Bitbucket Pipelines ir/ar GitHub Actions self-hosted runner'iai, image'ų ir release'ų
-kūrimas), ir **taikinys** (ten veikia projektų konteineriai). Deploy'ai valdomi Bitbucket'e arba GitHub'e,
-o darbą atlieka runner'is šiame serveryje, todėl debesies build minutės nenaudojamos. Abu runner'iai gali
-veikti tame pačiame serveryje kartu.
+Scripts that prepare an Ubuntu server for setup v2 projects. This server is at the same time the
+**build server** (Bitbucket Pipelines and/or GitHub Actions self-hosted runners, building images and
+releases) and the **target** (the project containers run there). Deploys are controlled in Bitbucket or GitHub,
+while the work is done by the runner on this server, so no cloud build minutes are used. Both runners can
+run on the same server together.
 
-Pirmasis serveris – VPN serveris (Ubuntu Desktop), pirmasis projektas – asana.local.
+The first server is the VPN server (Ubuntu Desktop), the first project is asana.local.
 
-## Ką paruošia
+## What it sets up
 
-| Scriptas | Ką daro |
+| Script | What it does |
 | --- | --- |
-| `bin/prepare-host` | Paketai (`git`, `make`, `rsync`, `python3`, OpenJDK 25 runner'iui), Docker su Compose (jei jo nėra – iš download.docker.com; esamas Docker nekeičiamas), paskyra `setup` su Docker grupe, katalogai `/srv/setup-server`, git raktas, bendras setup checkout'as. |
-| `bin/install-runner` | Bitbucket Linux Shell runner'is kaip systemd paslauga `setup-server-runner` (paskyra `setup`); su `--provider github` – GitHub Actions runner'is, paslauga `setup-server-github-runner@<scope>` (po vieną organizacijai ar repo). |
-| `bin/add-project` | Projekto build katalogas `/srv/setup-server/projects/<repo vardas>`: aplinkos repo `app/`, atskiras kodo repo `app/public/`; monorepo (`--monorepo`) – pats repo yra build katalogas. GitHub repo – su savo deploy key. |
-| `bin/remove-project` | Pašalina projekto build katalogą; DB kopijas ir deploy'ų istoriją – tik su `--with-backups`; katalogo, kurį naudoja veikiantis konteineris, netrina. |
-| `bin/update` | Atnaujina šį Server OPS checkout'ą ir bendrą setup checkout'ą į nurodytą tag'ą, patikrina sveikatą, nepavykus grąžina abu į ankstesnius commit'us. Runner'io paslaugos neperkrauna. |
-| `bin/install-auto-update` | Įdiegia vienos minutės systemd laikmatį dviem esamiems administratoriaus `master` klonams: tik po sėkmingo GitHub CI, neliečiant vietinio darbo. Veikia ir rankiniu būdu paruoštame CachyOS; `prepare-host` jam nereikia. |
-| `bin/install-backups` | DB kopijos: naktinė (`setup-server-backup.timer`, pagal lentelių registrą) ir savaitinė pilna (`setup-server-backup-full.timer`, visų lentelių duomenys); naktinė failų kopija (`setup-server-backup-files.timer`, projekto `BACKUP_FILE_PATHS` keliai iš taikinio); komanda `/usr/local/sbin/setup-server-backup` (kopija iš `bin/backup-projects`) ir sudo taisyklė „backup dabar“ pipeline'ui. |
-| `bin/install-ssh` | SSH iš VPN: `openssh-server` (Ubuntu Desktop jo neturi), paleistas ir startuojantis po perkrovimo, nustatymai `/etc/ssh/sshd_config.d/10-setup-server.conf` – iš už nurodytų tinklų ir šio serverio tik raktu, be slaptažodžio; įjungtam ufw – leidimas tiems tinklams. Reikia `make db-pull` ir valdymo sąsajos tuneliui. |
-| `bin/add-backup-key` | Programuotojo SSH raktas DB kopijoms atsisiųsti (`make db-pull`) – tik leistų projektų aplinkų (`--pull PROJEKTAS:ENV=db`, `=fresh` – ir naujai kopijai užsakyti, `make db-pull fresh=1`; `--pull-all` – visų projektų): tik iš nurodyto tinklo (VPN), tik komanda `/usr/local/sbin/setup-server-backup-pull` (kopija iš `bin/backup-pull`), be shell'o ir Docker. Su `--grant PROJEKTAS:ENV=LYGIS` – ir prieiga prie to projekto taikinio per šį serverį (`make ssh`), per `/usr/local/sbin/setup-server-access` (kopija iš `bin/server-access`). |
-| `bin/tool-access` | Kas atidaro projektų naršyklės įrankius (pma, cron, mailpit, backup, metrics, projekto `PROXY_TOOLS`) ir iš kokių adresų: rakto vardas su administratoriaus nustatytu slaptažodžiu ir leistos projektų aplinkos, šio serverio adresai. Pakeitimas taikinyje galioja iš karto (setup 3.6.0+ `make tool-access`). Žr. „Įrankių prieiga“. |
-| `bin/install-metrics` | Worker'io Prometheus `/metrics`: systemd paslauga `setup-server-metrics` (paskyra `setup`, tik skaito), komanda `/usr/local/sbin/setup-server-metrics` (kopija iš `bin/worker-metrics`), nustatymai `/etc/setup-server/metrics.env`. |
-| `bin/install-ui` | Valdymo sąsaja naršyklėje (tik `127.0.0.1`, per SSH tunelį): paslauga `setup-server-ui` (atskira paskyra `setup-ui`), komanda `/usr/local/sbin/setup-server-ui` (kopija iš `bin/web-ui`), komandų kopijos `/usr/local/lib/setup-server/bin/`, sudo taisyklė, nustatymai `/etc/setup-server/ui.env`. |
-| `bin/move-bitbucket-ssh` | Perkelia build katalogų Bitbucket remote'us iš `bitbucket.org` į `ssh.bitbucket.org` (Bitbucket SSH adresas nuo 2026-11-12); perkelia tik tada, kai naujas adresas atsako. Žr. „Bitbucket SSH adresas“. |
-| `bin/server-status` | Serverio būsena JSON formatu (tik skaito): paslaugos, laikmačiai, versijos, diskas, projektai, konteineriai. Ją naudoja valdymo sąsaja; galima leisti ir ranka. |
+| `bin/prepare-host` | Packages (`git`, `make`, `rsync`, `python3`, OpenJDK 25 for the runner), Docker with Compose (if missing – from download.docker.com; an existing Docker is left unchanged), the `setup` account with the Docker group, the `/srv/setup-server` directories, the git key, the shared setup checkout. |
+| `bin/install-runner` | The Bitbucket Linux Shell runner as the systemd service `setup-server-runner` (account `setup`); with `--provider github` – the GitHub Actions runner, service `setup-server-github-runner@<scope>` (one per organization or repo). |
+| `bin/add-project` | The project build directory `/srv/setup-server/projects/<repo name>`: the environment repo `app/`, a separate code repo `app/public/`; monorepo (`--monorepo`) – the repo itself is the build directory. A GitHub repo – with its own deploy key. |
+| `bin/remove-project` | Removes a project build directory; DB backups and the deploy history – only with `--with-backups`; it does not delete a directory used by a running container. |
+| `bin/update` | Updates this Server OPS checkout and the shared setup checkout to the given tag, checks health, and on failure returns both to their previous commits. It does not restart the runner service. |
+| `bin/install-auto-update` | Installs a one-minute systemd timer for the administrator's two existing `master` clones: only after a successful GitHub CI, without touching local work. It also works on a manually prepared CachyOS; it does not need `prepare-host`. |
+| `bin/install-backups` | DB backups: nightly (`setup-server-backup.timer`, according to the table registry) and weekly full (`setup-server-backup-full.timer`, the data of all tables); a nightly file backup (`setup-server-backup-files.timer`, the project's `BACKUP_FILE_PATHS` paths from the target); the command `/usr/local/sbin/setup-server-backup` (a copy of `bin/backup-projects`) and a sudo rule "backup now" for the pipeline. |
+| `bin/install-ssh` | SSH from the VPN: `openssh-server` (Ubuntu Desktop does not have it), started and starting after a reboot, settings `/etc/ssh/sshd_config.d/10-setup-server.conf` – from the given networks and from this server only with a key, no password; with ufw enabled – an allow rule for those networks. Needed for `make db-pull` and the web UI tunnel. |
+| `bin/add-backup-key` | A developer's SSH key for downloading DB backups (`make db-pull`) – only for the allowed project environments (`--pull PROJECT:ENV=db`, `=fresh` – also to order a new backup, `make db-pull fresh=1`; `--pull-all` – all projects): only from the given network (VPN), only the command `/usr/local/sbin/setup-server-backup-pull` (a copy of `bin/backup-pull`), no shell and no Docker. With `--grant PROJECT:ENV=LEVEL` – also access to that project's target through this server (`make ssh`), via `/usr/local/sbin/setup-server-access` (a copy of `bin/server-access`). |
+| `bin/tool-access` | Who opens the projects' browser tools (pma, cron, mailpit, backup, metrics, the project's `PROXY_TOOLS`) and from which addresses: a key name with a password set by the administrator and the allowed project environments, this server's addresses. A change on the target takes effect immediately (setup 3.6.0+ `make tool-access`). See "Tool access". |
+| `bin/install-metrics` | The worker's Prometheus `/metrics`: systemd service `setup-server-metrics` (account `setup`, read-only), the command `/usr/local/sbin/setup-server-metrics` (a copy of `bin/worker-metrics`), settings `/etc/setup-server/metrics.env`. |
+| `bin/install-ui` | The web UI in a browser (only `127.0.0.1`, through an SSH tunnel): service `setup-server-ui` (a separate account `setup-ui`), the command `/usr/local/sbin/setup-server-ui` (a copy of `bin/web-ui`), command copies in `/usr/local/lib/setup-server/bin/`, a sudo rule, settings `/etc/setup-server/ui.env`. |
+| `bin/move-bitbucket-ssh` | Moves the build directories' Bitbucket remotes from `bitbucket.org` to `ssh.bitbucket.org` (Bitbucket SSH address since 2026-11-12); it moves them only when the new address responds. See "Bitbucket SSH address". |
+| `bin/server-status` | Server status in JSON (read-only): services, timers, versions, disk, projects, containers. The web UI uses it; it can also be run by hand. |
 
-Visi scriptai yra idempotentiški, juos galima kartoti. Su `--check` jie tik parodo, ką keistų,
-ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
+All scripts are idempotent and can be repeated. With `--check` they only show what they would change
+and change nothing. Run them with `--check` first.
 
 ```text
-~/setup-server/                 šis repo, administratoriaus klonas (iš jo leidžiami scriptai)
-/srv/setup-server/              paskyros setup namai
-├── setup/                      bendras setup checkout'as (serveriuose – ant release tag'o)
-├── projects/<vardas>/app/      projekto build katalogas (BUILD_ROOT = projects/<vardas>)
-│   └── .generated/backups/     DB kopijos: worker-<env>-<UTC laikas>Z.sql.gz – naktinės ir „backup dabar“,
-│                               full-<env>-…Z – savaitinės pilnos, fresh(-full)-<env>-…Z – programuotojų „fresh“;
-│                               files-<env>-…Z.tar.gz – failų kopijos (BACKUP_FILE_PATHS), .files-<env>/ – jų veidrodis
-├── runner/current/             Bitbucket runner'io versija; runner/temp – jo darbo katalogas
-├── github-runner/<scope>/      GitHub runner'is (organizacijai `bigsant`, repo `bigsant.<repo>`); _work – darbo katalogas
-├── ui-actions.log              valdymo sąsajos veiksmų žurnalas (setup-ui, 0640)
-├── backup-pulls.log, access.log   programuotojų raktų prašymai: kopijos ir prieiga prie taikinių
-├── access-sessions/<raktas>/   kas surinkta interaktyviuose seansuose (įvestis, 0600; laikoma 180 d.)
-├── .ssh/id_ed25519             git raktas (tik skaitymui): setup repo ir Bitbucket projektai
-└── .ssh/github-<savininkas>.<repo>   GitHub projekto deploy key (tik skaitymui); host alias'ai – .ssh/config
-/etc/setup-server/runner.env    Bitbucket runner'io OAuth duomenys (root, 0600)
-/etc/setup-server/metrics.env   worker'io /metrics adresas, leidžiami adresai ir neprivalomas token'as (root, 0600)
-/etc/setup-server/ui.env        valdymo sąsajos pirmojo administratoriaus prisijungimas (slaptažodžio hash'as) ir Bitbucket token'ai (root, 0600)
-/usr/local/lib/setup-server/bin/   komandų kopijos, kurias valdymo sąsaja vykdo per sudo (root)
+~/setup-server/                 this repo, the administrator's clone (the scripts are run from it)
+/srv/setup-server/              home of the setup account
+├── setup/                      the shared setup checkout (on servers – on a release tag)
+├── projects/<name>/app/        the project build directory (BUILD_ROOT = projects/<name>)
+│   └── .generated/backups/     DB backups: worker-<env>-<UTC time>Z.sql.gz – nightly and "backup now",
+│                               full-<env>-…Z – weekly full, fresh(-full)-<env>-…Z – developers' "fresh";
+│                               files-<env>-…Z.tar.gz – file backups (BACKUP_FILE_PATHS), .files-<env>/ – their mirror
+├── runner/current/             the Bitbucket runner version; runner/temp – its work directory
+├── github-runner/<scope>/      the GitHub runner (organization `bigsant`, repo `bigsant.<repo>`); _work – work directory
+├── ui-actions.log              the web UI action log (setup-ui, 0640)
+├── backup-pulls.log, access.log   developer key requests: backups and access to targets
+├── access-sessions/<key>/      what was captured in interactive sessions (input, 0600; kept 180 days)
+├── .ssh/id_ed25519             the git key (read-only): the setup repo and Bitbucket projects
+└── .ssh/github-<owner>.<repo>  a GitHub project deploy key (read-only); host aliases – .ssh/config
+/etc/setup-server/runner.env    the Bitbucket runner's OAuth credentials (root, 0600)
+/etc/setup-server/metrics.env   the worker's /metrics address, allowed addresses and an optional token (root, 0600)
+/etc/setup-server/ui.env        the web UI's first administrator login (password hash) and Bitbucket tokens (root, 0600)
+/usr/local/lib/setup-server/bin/   command copies the web UI runs via sudo (root)
 ```
 
-## Eiga
+## Steps
 
-1. **Serveryje** nusiklonuok šį repo ir patikrink mašiną:
+1. **On the server**, clone this repo and check the machine:
 
    ```bash
    git clone git@github.com:BigSant/DockerDevelopmentEnvironmentServer.git ~/setup-server
@@ -66,199 +66,199 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
    bin/prepare-host --check
    ```
 
-   Peržiūra parodo Ubuntu versiją, RAM, laisvą vietą, trūkstamus paketus, ar yra Docker ir
-   ar Compose pakankamai naujas, taip pat ką scriptas sukurtų. Runner'iui reikia **≥ 8 GB RAM**
-   ir **OpenJDK 25**.
+   The preview shows the Ubuntu version, RAM, free space, missing packages, whether Docker is present and
+   whether Compose is new enough, and also what the script would create. The runner needs **≥ 8 GB RAM**
+   and **OpenJDK 25**.
 
-2. **Paruošk** (reikia sudo):
+2. **Prepare** (needs sudo):
 
    ```bash
    sudo bin/prepare-host --setup-ref v2.0.0
    ```
 
-   Pabaigoje parodomas viešasis git raktas. Pridėk jį **tik skaitymui** prie setup repo (GitHub,
-   deploy key) ir prie kiekvieno Bitbucket projekto repo (Access keys); GitHub projekto repo gauna savo
-   raktą (žr. 4 žingsnį). Tada paleisk scriptą dar
-   kartą: jis nusiklonuos setup. `bitbucket.org`, `ssh.bitbucket.org` ir `github.com` SSH host raktai įrašomi tik tada, kai
-   nuskenuoto rakto fingerprint'as sutampa su paslaugos paskelbtu (jie įrašyti scripte su nuorodomis į
-   GitHub ir Atlassian puslapius); kitaip raktas neįrašomas ir parodoma „Needs attention“.
+   At the end the public git key is shown. Add it **read-only** to the setup repo (GitHub,
+   deploy key) and to every Bitbucket project repo (Access keys); a GitHub project repo gets its own
+   key (see step 4). Then run the script once
+   more: it will clone setup. The `bitbucket.org`, `ssh.bitbucket.org` and `github.com` SSH host keys are written only when
+   the scanned key's fingerprint matches the one published by the service (they are recorded in the script with links to
+   the GitHub and Atlassian pages); otherwise the key is not written and "Needs attention" is shown.
 
-3. **Runner'is.** Bitbucket: *Repository (arba Workspace) settings → Runners → Add runner → Linux
-   Shell*, pridėk žymą `setup.build`. Dialogo komandų **nevykdyk** – jose esančias reikšmes scriptas
-   paklaus po vieną:
-
-   ```bash
-   sudo bin/install-runner --check   # klausia reikšmių, nieko nekeičia
-   sudo bin/install-runner           # klausia tų pačių reikšmių, įdiegia
-   ```
-
-   Klausiama: atsisiuntimo nuoroda (galima įklijuoti visą `curl …` eilutę), `accountUuid`,
-   `repositoryUuid` (workspace runner'iui – Enter), `runnerUuid`, `OAuthClientId`, `OAuthClientSecret`
-   (rašant nerodomas). Galima įklijuoti ir `--accountUuid {…}` – paimama tik reikšmė; tuščia reikšmė –
-   klaida. Archyvas imamas tik iš `product-downloads.atlassian.com` (kitą galima nurodyti `--tarball`).
-   Visą dialogo tekstą galima ir paduoti per stdin (`sudo bin/install-runner < dialogas.txt`).
-
-   OAuth duomenys įrašomi tik į `/etc/setup-server/runner.env` (root, 0600); dialogo teksto niekur
-   kitur nekopijuok. Kol runner'is veikia, `OAuthClientId` ir `OAuthClientSecret` šiame serveryje
-   perskaitomi (taip jį sukūrė Atlassian):
-
-   - **komandų eilutėje**: systemd perduoda juos `start.sh` argumentais, o šis – `java` procesui kaip
-     `-D…` parametrus; `ps` ir `/proc/<PID>/cmdline` juos rodo **visoms** serverio paskyroms;
-   - **aplinkoje** (`RUNNER_ARGS` iš root failo): `/proc/<PID>/environ` skaito paskyra `setup`, taigi ir
-     visi jos procesai, **įskaitant pipeline žingsnius**.
-
-   `start.sh` (6.x) reikšmes priima ir iš aplinkos kintamųjų (`OAUTH_CLIENT_SECRET` ir kt.), konfigūracijos
-   failo neturi, bet `java` procesui jas vis tiek perduoda komandų eilutėje, todėl tai nieko nepaslėptų –
-   paliktas argumentų būdas. Dėl to į šį serverį neįleisk paskyrų, kurios neturi matyti šių duomenų.
-
-   Po minutės Bitbucket'e runner'is turi būti **ONLINE**. Worker'yje veikia **vienas** Bitbucket runner'is (paslauga
-   `setup-server-runner`): tas pats scriptas su kito runner'io reikšmėmis jį **pakeičia**. Todėl rinkis **workspace**
-   runner'į (*Workspace settings → Pipelines → Workspace runners → Add runner*, Linux Shell, žyma `setup.build`;
-   `repositoryUuid` – Enter): jį naudoja visi to workspace repo, o repository runner'is – tik savo. Pakeitus senasis lieka
-   OFFLINE – pašalink jį. Viešo API runner'iui sukurti Bitbucket neturi (tik vidinį, nepalaikomą).
-
-   **GitHub Actions runner'is** (projektams GitHub'e; veikia greta Bitbucket runner'io, jo neliečia).
-   GitHub: *organizacijos* (rekomenduojama: vienas runner'is visiems organizacijos repo) arba *repo
-   Settings → Actions → Runners → New self-hosted runner*, Linux. Organizacijos runner'iui reikia
-   organizacijos savininko, repo – repo administratoriaus teisių. Puslapio komandų **nevykdyk**:
+3. **Runner.** Bitbucket: *Repository (or Workspace) settings → Runners → Add runner → Linux
+   Shell*, add the label `setup.build`. **Do not run** the dialog's commands – the script will ask for
+   the values in them one by one:
 
    ```bash
-   sudo bin/install-runner --provider github --check   # klausia URL ir token'o, nieko nekeičia
-   sudo bin/install-runner --provider github           # klausia tų pačių reikšmių, įdiegia
+   sudo bin/install-runner --check   # asks for the values, changes nothing
+   sudo bin/install-runner           # asks for the same values, installs
    ```
 
-   Klausiama: organizacijos ar repo URL (`--url` reikšmė, pvz. `https://github.com/BigSant` arba
-   `https://github.com/BigSant/<repo>`) ir registracijos token'as (`--token` reikšmė, rašant nerodomas).
-   Galima paduoti ir visą puslapio tekstą per stdin (`sudo bin/install-runner --provider github < puslapis.txt`) –
-   iš jo imami tik `--url` ir `--token`. Token'as **galioja valandą** ir registruoja vieną kartą: pasibaigus –
-   atnaujink puslapį ir imk naują. Jį duoda ir API (`POST /orgs/{org}/actions/runners/registration-token`,
+   It asks for: the download link (the whole `curl …` line can be pasted), `accountUuid`,
+   `repositoryUuid` (for a workspace runner – Enter), `runnerUuid`, `OAuthClientId`, `OAuthClientSecret`
+   (not shown while typing). You can also paste `--accountUuid {…}` – only the value is taken; an empty value is
+   an error. The archive is taken only from `product-downloads.atlassian.com` (another one can be given with `--tarball`).
+   The whole dialog text can also be fed through stdin (`sudo bin/install-runner < dialog.txt`).
+
+   The OAuth credentials are written only to `/etc/setup-server/runner.env` (root, 0600); do not copy the dialog text
+   anywhere else. While the runner is running, `OAuthClientId` and `OAuthClientSecret` on this server
+   are readable (that is how Atlassian built it):
+
+   - **on the command line**: systemd passes them to `start.sh` as arguments, and it passes them to the `java` process as
+     `-D…` parameters; `ps` and `/proc/<PID>/cmdline` show them to **all** accounts on the server;
+   - **in the environment** (`RUNNER_ARGS` from the root file): `/proc/<PID>/environ` is readable by the `setup` account, and so by
+     all of its processes, **including pipeline steps**.
+
+   `start.sh` (6.x) also accepts the values from environment variables (`OAUTH_CLIENT_SECRET` etc.), it has no configuration
+   file, but it still passes them to the `java` process on the command line, so that would hide nothing –
+   the argument method is kept. Because of this, do not let accounts onto this server that must not see these credentials.
+
+   After a minute the runner must be **ONLINE** in Bitbucket. The worker runs **one** Bitbucket runner (the service
+   `setup-server-runner`): the same script with another runner's values **replaces** it. So choose a **workspace**
+   runner (*Workspace settings → Pipelines → Workspace runners → Add runner*, Linux Shell, label `setup.build`;
+   `repositoryUuid` – Enter): all repos of that workspace use it, while a repository runner serves only its own. After a replacement the old one stays
+   OFFLINE – remove it. Bitbucket has no public API for creating a runner (only an internal, unsupported one).
+
+   **GitHub Actions runner** (for projects on GitHub; it runs alongside the Bitbucket runner and does not touch it).
+   GitHub: *organization* (recommended: one runner for all of the organization's repos) or *repo
+   Settings → Actions → Runners → New self-hosted runner*, Linux. An organization runner needs
+   organization owner rights, a repo one – repo administrator rights. **Do not run** the page's commands:
+
+   ```bash
+   sudo bin/install-runner --provider github --check   # asks for the URL and token, changes nothing
+   sudo bin/install-runner --provider github           # asks for the same values, installs
+   ```
+
+   It asks for: the organization or repo URL (the `--url` value, e.g. `https://github.com/BigSant` or
+   `https://github.com/BigSant/<repo>`) and the registration token (the `--token` value, not shown while typing).
+   The whole page text can also be fed through stdin (`sudo bin/install-runner --provider github < page.txt`) –
+   only `--url` and `--token` are taken from it. The token **is valid for an hour** and registers once: when it expires –
+   refresh the page and take a new one. The API also issues it (`POST /orgs/{org}/actions/runners/registration-token`,
    `admin:org`; `POST /repos/{owner}/{repo}/actions/runners/registration-token`).
 
-   - **Archyvas** – scripte prisegta versija (2.338.0) iš `github.com/actions/runner` releases; įdiegiama tik
-     sutapus SHA-256 (įrašytas scripte, toks pat release puslapyje). Kita versija – `--tarball URL --sha256 HASH`.
-     Puslapyje siūloma naujesnė versija tik parodoma: runner'is atsinaujina pats.
-   - **Žymos.** GitHub pats prideda `self-hosted`, `Linux`, `X64`, scriptas – `setup.build`. Workflow job'ai:
-     `runs-on: [self-hosted, linux, setup.build]` (runner'is turi turėti visas nurodytas žymas). `--no-default-labels`
-     nenaudojamas: `self-hosted` tada būtų tik sava žyma, o `X64` netrukdo.
-   - **Vardas** GitHub'e – serverio vardas (`hostname -s`), kitas – `--name`. Registruojama su `--replace`: įdiegus
-     serverį iš naujo, tas pats vardas pakeičia seną registraciją.
-   - **Kur.** Kiekvienas scope (organizacija ar repo) – atskiras katalogas `/srv/setup-server/github-runner/<scope>`
-     (`bigsant`, `bigsant.<repo>`) ir atskira paslauga `setup-server-github-runner@<scope>` (vienas systemd šablonas
-     `setup-server-github-runner@.service`). Kitai organizacijai ar repo – tas pats scriptas su kitu URL.
-     Paslauga veikia paskyra `setup` su tais pačiais `SETUP_SERVER_ROOT` ir `SETUP_DIRECTORY`, kaip Bitbucket'o.
-   - **Keli runner'iai vienam scope.** Vienas runner'is vykdo vieną job'ą vienu metu; GitHub eilėje laukiantį job'ą
-     atiduoda bet kuriam laisvam runner'iui su tomis žymomis. Lygiagrečiam darbui –
-     `--instance N --name <kitas vardas>` (N nuo 2 iki 9): scope `<scope>.N`, katalogas
-     `github-runner/<scope>.N`, paslauga `setup-server-github-runner@<scope>.N`. Vardas privalomas ir turi skirtis:
-     su tuo pačiu vardu `--replace` perimtų pirmojo runner'io registraciją, todėl čia jau užregistruotas vardas
-     atmetamas. Metrikos, būsena ir UI naujus katalogus mato patys.
-   - **Pakartotinai** paleistas su jau užregistruotu scope (`.runner` yra) – nei atsisiunčia, nei registruoja,
-     token'o neklausia: įrašo unit'ą ir paleidžia paslaugą, jei ji neveikia. Veikiančios neperkrauna; pasikeitus
-     unit'ui parodo `sudo systemctl restart …` – paleisk, kai nevyksta job'as.
-   - **Token'as** niekur neįrašomas ir nerodomas: `config.sh` (jis atsisako veikti kaip root, todėl leidžiamas
-     paskyra `setup`) jį gauna per aplinkos kintamąjį `ACTIONS_RUNNER_INPUT_TOKEN`, ne komandų eilutėje.
-     Užsiregistravęs runner'is laiko savo duomenis savo kataloge (0750; `.runner`, `.credentials`, privatus raktas
-     `.credentials_rsaparams` – 0600): juos skaito paskyra `setup`, taigi ir job'ai (kaip Bitbucket OAuth duomenis).
-     Root failo nėra: runner'is veikia paskyra `setup` ir jam pačiam jų reikia.
-   - **Atnaujinimas.** Runner'is atsinaujina pats (GitHub numatyta; neatnaujintam per 30 dienų nuo naujos versijos
-     GitHub job'ų nebeduoda): pakeičia `bin/` savo kataloge, o paslauga leidžia `bin/runsvc.sh`, todėl po perkrovimo –
-     naują versiją. Pagrindinis procesas (`runsvc.sh`) lieka tas pats, todėl `bin/update` patikra nenukenčia.
-   - **Kodėl ne GitHub'o `svc.sh install setup`:** jo unit'o vardas priklauso nuo registracijos
-     (`actions.runner.<…>.service`), o pipeline'ams reikia `SETUP_SERVER_ROOT`/`SETUP_DIRECTORY`. Savas unit'as
-     kartoja GitHub šabloną (`KillMode=process`, `KillSignal=SIGTERM`, `TimeoutStopSec=5min` – vykstantis job'as
-     baigiasi tvarkingai) ir prideda `Restart=on-failure`.
-   - **Kodėl ne `--ephemeral`:** toks runner'is atlieka vieną job'ą ir išsiregistruoja, kitam reikia naujos
-     registracijos (token'o iš API su PAT ar GitHub App). Build katalogai ir taip išlieka tarp job'ų.
-   - **Prieiga.** Organizacijos runner'is patenka į *Default* runner group; pagal nutylėjimą grupės runner'iais
-     naudojasi tik **privatūs** repo. Viešiems repo self-hosted runner'io neleisk: GitHub perspėja, kad bet kas gali
-     atidaryti pull request'ą ir paleisti savo kodą šiame serveryje.
+   - **Archive** – the version pinned in the script (2.338.0) from the `github.com/actions/runner` releases; it is installed only
+     if the SHA-256 matches (recorded in the script, the same as on the release page). Another version – `--tarball URL --sha256 HASH`.
+     A newer version offered on the page is only shown: the runner updates itself.
+   - **Labels.** GitHub itself adds `self-hosted`, `Linux`, `X64`, the script – `setup.build`. Workflow jobs:
+     `runs-on: [self-hosted, linux, setup.build]` (the runner must have all the listed labels). `--no-default-labels`
+     is not used: `self-hosted` would then be just a custom label, and `X64` does no harm.
+   - **Name** on GitHub – the server name (`hostname -s`), another one – `--name`. It registers with `--replace`: when the
+     server is reinstalled, the same name replaces the old registration.
+   - **Where.** Each scope (organization or repo) is a separate directory `/srv/setup-server/github-runner/<scope>`
+     (`bigsant`, `bigsant.<repo>`) and a separate service `setup-server-github-runner@<scope>` (one systemd template
+     `setup-server-github-runner@.service`). For another organization or repo – the same script with another URL.
+     The service runs as the `setup` account with the same `SETUP_SERVER_ROOT` and `SETUP_DIRECTORY` as Bitbucket's.
+   - **Several runners for one scope.** One runner runs one job at a time; GitHub hands a queued job
+     to any free runner with those labels. For parallel work –
+     `--instance N --name <another name>` (N from 2 to 9): scope `<scope>.N`, directory
+     `github-runner/<scope>.N`, service `setup-server-github-runner@<scope>.N`. The name is required and must differ:
+     with the same name `--replace` would take over the first runner's registration, so an already registered name
+     is rejected here. Metrics, status and the UI see the new directories by themselves.
+   - **Run again** with an already registered scope (`.runner` exists) – it neither downloads nor registers,
+     and does not ask for a token: it writes the unit and starts the service if it is not running. It does not restart a running one; if the
+     unit changed it shows `sudo systemctl restart …` – run it when no job is running.
+   - **Token** is never written or shown: `config.sh` (it refuses to run as root, so it is run as the
+     `setup` account) gets it through the environment variable `ACTIONS_RUNNER_INPUT_TOKEN`, not on the command line.
+     Once registered, the runner keeps its credentials in its own directory (0750; `.runner`, `.credentials`, the private key
+     `.credentials_rsaparams` – 0600): the `setup` account reads them, and so do the jobs (like the Bitbucket OAuth credentials).
+     There is no root file: the runner runs as the `setup` account and needs them itself.
+   - **Updating.** The runner updates itself (GitHub's default; a runner not updated within 30 days of a new version
+     no longer gets jobs from GitHub): it replaces `bin/` in its directory, and the service runs `bin/runsvc.sh`, so after a restart –
+     the new version. The main process (`runsvc.sh`) stays the same, so the `bin/update` check is not affected.
+   - **Why not GitHub's `svc.sh install setup`:** its unit name depends on the registration
+     (`actions.runner.<…>.service`), and the pipelines need `SETUP_SERVER_ROOT`/`SETUP_DIRECTORY`. The own unit
+     repeats the GitHub template (`KillMode=process`, `KillSignal=SIGTERM`, `TimeoutStopSec=5min` – a running job
+     finishes cleanly) and adds `Restart=on-failure`.
+   - **Why not `--ephemeral`:** such a runner does one job and unregisters, the next one needs a new
+     registration (a token from the API with a PAT or a GitHub App). The build directories persist between jobs anyway.
+   - **Access.** An organization runner goes into the *Default* runner group; by default the group's runners
+     are used only by **private** repos. Do not allow a self-hosted runner for public repos: GitHub warns that anyone can
+     open a pull request and run their code on this server.
 
-   Po minutės GitHub'e runner'is turi būti **Idle**. Patikrinti: `systemctl status setup-server-github-runner@bigsant`,
-   `journalctl -u setup-server-github-runner@bigsant -n 50`. Pašalinti – `sudo bin/install-runner --provider github
-   --remove --scope <scope> [--check]` (arba sąsajoje *Runner'iai*): sustabdo ir išjungia paslaugą, ištrina
-   `/srv/setup-server/github-runner/<scope>`. Per stdin paduota GitHub'o *Runners → runner'is → Remove* komanda
-   (`./config.sh remove --token …`, token'as galioja valandą) runner'į išregistruoja ir GitHub'e; be jos GitHub jį rodo
-   *Offline*, kol pašalinsi ten. Runner'io, vykdančio job'ą (jo `Runner.Worker` procesas), komanda nešalina (`75`);
-   GitHub'ui atsisakius išregistruoti – runner'is lieka sustabdytas, bet nieko neištrinama. Bitbucket runner'is –
-   `sudo bin/install-runner --remove`: paslauga, jos unit'as, `runner.env` ir `/srv/setup-server/runner`
-   (Bitbucket'e jį pašalink pats).
+   After a minute the runner must be **Idle** on GitHub. To check: `systemctl status setup-server-github-runner@bigsant`,
+   `journalctl -u setup-server-github-runner@bigsant -n 50`. To remove – `sudo bin/install-runner --provider github
+   --remove --scope <scope> [--check]` (or *Runners* in the UI): stops and disables the service, deletes
+   `/srv/setup-server/github-runner/<scope>`. GitHub's *Runners → runner → Remove* command fed through stdin
+   (`./config.sh remove --token …`, the token is valid for an hour) also unregisters the runner on GitHub; without it GitHub shows it as
+   *Offline* until you remove it there. The command does not remove a runner that is running a job (its `Runner.Worker` process) (`75`);
+   if GitHub refuses to unregister – the runner stays stopped, but nothing is deleted. The Bitbucket runner –
+   `sudo bin/install-runner --remove`: the service, its unit, `runner.env` and `/srv/setup-server/runner`
+   (remove it in Bitbucket yourself).
 
-4. **Projektas:**
+4. **Project:**
 
    ```bash
    sudo bin/add-project --target local git@ssh.bitbucket.org:rsmaizys/asana_tracker.git
    sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@ssh.bitbucket.org:rsmaizys/forsena_docker.git git@ssh.bitbucket.org:rsmaizys/forsena.git
    ```
 
-   Build katalogas pavadinamas pagal repo vardą (`/srv/setup-server/projects/asana_tracker`), todėl
-   pipeline'as jį randa pats: `BUILD_ROOT=${BUILD_ROOT:-$SETUP_SERVER_ROOT/projects/$BITBUCKET_REPO_SLUG}`
-   (`SETUP_SERVER_ROOT` perduoda runner'io paslauga, `BITBUCKET_REPO_SLUG` – Bitbucket). Repository
-   variable `BUILD_ROOT` reikia tik nurodžius kitą vardą (`add-project VARDAS URL`). Slaptažodžius įrašyk
-   į Deployment variables (Secured). Kiekvienas pipeline žingsnis turi turėti
-   `runs-on: [self.hosted, linux.shell, setup.build]`, kitaip jis vyktų Bitbucket debesyje ir naudotų
-   minutes. Žingsnio scriptas turi prasidėti `unset DOCKER_HOST`: Bitbucket nustato
-   `DOCKER_HOST=tcp://localhost:2375` savo debesies docker servisui, o shell runner'yje Docker yra paties
-   serverio (unix socket'as) – kitaip `docker` ir `make release/deploy` neranda daemon'o.
+   The build directory is named after the repo (`/srv/setup-server/projects/asana_tracker`), so
+   the pipeline finds it by itself: `BUILD_ROOT=${BUILD_ROOT:-$SETUP_SERVER_ROOT/projects/$BITBUCKET_REPO_SLUG}`
+   (`SETUP_SERVER_ROOT` is passed by the runner service, `BITBUCKET_REPO_SLUG` – by Bitbucket). The repository
+   variable `BUILD_ROOT` is needed only when another name is given (`add-project NAME URL`). Put the passwords
+   into Deployment variables (Secured). Every pipeline step must have
+   `runs-on: [self.hosted, linux.shell, setup.build]`, otherwise it would run in the Bitbucket cloud and use
+   minutes. The step script must start with `unset DOCKER_HOST`: Bitbucket sets
+   `DOCKER_HOST=tcp://localhost:2375` for its cloud docker service, while on a shell runner Docker is the server's
+   own (a unix socket) – otherwise `docker` and `make release/deploy` do not find the daemon.
 
-   **Kur deploy'inama (taikinys)** – serverio, ne projekto žinojimas. `add-project` jį įrašo į build katalogo
-   `target.env` (setup 2.6.0+ jį prideda prie `env/<env>.env` kiekvieno deploy'aus metu), o projekto
-   `env/*.env.example` `DEPLOY_CONTEXT`, `DEPLOY_SSH`, `DEPLOY_PATH`, `APP_UID`, `APP_GID` nebemini (setup
-   tokį pavyzdį atmeta):
+   **Where it deploys (the target)** is the server's knowledge, not the project's. `add-project` writes it into the build directory's
+   `target.env` (setup 2.6.0+ adds it to `env/<env>.env` during every deploy), and the project's
+   `env/*.env.example` no longer mentions `DEPLOY_CONTEXT`, `DEPLOY_SSH`, `DEPLOY_PATH`, `APP_UID`, `APP_GID` (setup
+   rejects such an example):
 
    ```bash
-   sudo bin/add-project --target local git@ssh.bitbucket.org:rsmaizys/asana_tracker.git   # šis serveris
+   sudo bin/add-project --target local git@ssh.bitbucket.org:rsmaizys/asana_tracker.git   # this server
    sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@ssh.bitbucket.org:rsmaizys/forsena_docker.git
    ```
 
-   - **Taikinys nurodomas visada:** naujas projektas be `--target` nesukuriamas (nieko neklonuoja).
-   - **`local`** – šis serveris (`DEPLOY_CONTEXT=default`), projekto šaknis yra build katalogas,
-     konteineriai veikia paskyra `setup` (jos `APP_UID`/`APP_GID`).
-   - **`local:/KELIAS`** – šis serveris, bet projekto šaknis kitame kataloge (pvz. `local:/home/vardas/Projects/asana`),
-     ne `SETUP_SERVER_ROOT` viduje (tikrinama išskleidus symlink'us).
-     Nesantį katalogą scriptas sukuria paskyrai `setup` (0750); esamas turi būti jai rašomas. Failai ir konteineriai –
-     paskyros `setup`. Deploy'us ten kopijuoja kodą, o setup 2.7.0+ ir konteinerių prijungiamus aplinkos failus
-     (`config/` ir kt.). Jei failai turi priklausyti katalogo savininkui, naudok `ssh://SAVININKAS@localhost/KELIAS`
-     (tada kopijuojama ir konteineriai veikia jo vardu; jam reikia `setup` rakto ir `docker` grupės).
-   - **`ssh://VARTOTOJAS@SERVERIS/KELIAS`** – kitas serveris: paskyra `setup` jungiasi savo raktu
-     (`/srv/setup-server/.ssh/id_ed25519`; jei negali – scriptas parodo raktą, kurį reikia įdėti į
-     `VARTOTOJAS` `authorized_keys`, ir sustoja), patikrina Docker ir ar `KELIAS` rašomas, perima vartotojo
-     `id -u`/`id -g` ir sukuria Docker context'ą `setup-<vardas>[-<env>]`. Naujas host raktas įrašomas
-     pirmo prisijungimo metu (parodomas).
-   - **`stage=…` / `prod=…` / `mdv=…`** – tik viena aplinka (`target.<env>.env`, laimi prieš bendrą `target.env`),
-     kai stage ir prod skirtinguose serveriuose, ar papildomai aplinkai (žr. „Papildomos aplinkos“). `--target` galima kartoti.
-   - **Stage ir prod tame pačiame serveryje – po savo katalogą:** `--target stage=local:/KELIAS/stage --target
-     prod=local:/KELIAS/prod`. Su vienu `local` abi aplinkos naudoja build katalogą, o jo konteineriai prijungia aplinkos
-     failus (`config/` ir kt.) tiesiai iš jo: kiekvienas stage deploy'us perjungia build katalogą į savo commit'ą, todėl
-     prod'as imtų stage commit'o failus. Su atskirais katalogais kiekviena aplinka gauna savo deploy'into commit'o kopiją.
-   - Pakartotinai paleistas be `--target` taikinio nekeičia (nei `target.env`, nei `target.<env>.env`); su `--target` –
-     perrašo. `remove-project` pašalina ir build katalogą (su `target*.env`), ir projekto Docker context'us.
+   - **The target is always given:** a new project without `--target` is not created (nothing is cloned).
+   - **`local`** – this server (`DEPLOY_CONTEXT=default`), the project root is the build directory,
+     the containers run as the `setup` account (its `APP_UID`/`APP_GID`).
+   - **`local:/PATH`** – this server, but the project root is in another directory (e.g. `local:/home/name/Projects/asana`),
+     not inside `SETUP_SERVER_ROOT` (checked after resolving symlinks).
+     The script creates a missing directory for the `setup` account (0750); an existing one must be writable by it. Files and containers –
+     belong to the `setup` account. The deploy copies the code there, and setup 2.7.0+ also the environment files the containers mount
+     (`config/` etc.). If the files must belong to the directory owner, use `ssh://OWNER@localhost/PATH`
+     (then the copying is done and the containers run under that user; it needs the `setup` key and the `docker` group).
+   - **`ssh://USER@SERVER/PATH`** – another server: the `setup` account connects with its key
+     (`/srv/setup-server/.ssh/id_ed25519`; if it cannot – the script shows the key that has to be put into
+     `USER`'s `authorized_keys`, and stops), checks Docker and whether `PATH` is writable, takes over the user's
+     `id -u`/`id -g` and creates the Docker context `setup-<name>[-<env>]`. A new host key is written
+     on the first connection (it is shown).
+   - **`stage=…` / `prod=…` / `mdv=…`** – one environment only (`target.<env>.env`, wins over the shared `target.env`),
+     when stage and prod are on different servers, or for an extra environment (see "Extra environments"). `--target` can be repeated.
+   - **Stage and prod on the same server – each in its own directory:** `--target stage=local:/PATH/stage --target
+     prod=local:/PATH/prod`. With a single `local` both environments use the build directory, and its containers mount the environment
+     files (`config/` etc.) directly from it: every stage deploy switches the build directory to its own commit, so
+     prod would pick up the stage commit's files. With separate directories each environment gets its own copy of the deployed commit.
+   - Run again without `--target` it does not change the target (neither `target.env` nor `target.<env>.env`); with `--target` –
+     it overwrites it. `remove-project` removes both the build directory (with `target*.env`) and the project's Docker contexts.
 
-   **GitHub projektas:**
+   **GitHub project:**
 
    ```bash
-   sudo bin/add-project --target local git@github.com:BigSant/<aplinkos-repo>.git [git@github.com:BigSant/<kodo-repo>.git]
+   sudo bin/add-project --target local git@github.com:BigSant/<environment-repo>.git [git@github.com:BigSant/<code-repo>.git]
    ```
 
-   GitHub deploy key tinka **tik vienam** repo, o paskyros raktas `id_ed25519` jau yra setup repo deploy key. Todėl
-   kiekvienas GitHub SSH URL gauna savo raktą `/srv/setup-server/.ssh/github-<savininkas>.<repo>` ir host alias'ą
-   `github.com-<savininkas>.<repo>` paskyros `.ssh/config` (`IdentitiesOnly yes`, tikrinamas tas pats `github.com`
-   host raktas), ir klonuojama per jį. Pirmą kartą scriptas sukuria raktą, parodo jį ir nuorodą
-   `https://github.com/<savininkas>/<repo>/settings/keys` ir sustoja (kodas 1): pridėk jį (*Add deploy key*,
-   „Allow write access“ **neįjungtas**) ir paleisk tą pačią komandą dar kartą. Jei yra „machine user“ paskyra, kurios
-   raktas (paskyros `id_ed25519`) skaito visus repo, – `--shared-key`: klonuojama su juo, per paduotą URL.
+   A GitHub deploy key works for **only one** repo, and the account key `id_ed25519` is already the setup repo's deploy key. So
+   every GitHub SSH URL gets its own key `/srv/setup-server/.ssh/github-<owner>.<repo>` and a host alias
+   `github.com-<owner>.<repo>` in the account's `.ssh/config` (`IdentitiesOnly yes`, the same `github.com`
+   host key is checked), and the clone goes through it. The first time the script creates the key, shows it and the link
+   `https://github.com/<owner>/<repo>/settings/keys` and stops (code 1): add it (*Add deploy key*,
+   "Allow write access" **not enabled**) and run the same command again. If there is a "machine user" account whose
+   key (the account's `id_ed25519`) reads all repos – `--shared-key`: the clone uses it, through the given URL.
 
-   Build katalogas – repo vardas mažosiomis raidėmis, todėl workflow jį randa pats:
-   `BUILD_ROOT=${BUILD_ROOT:-$SETUP_SERVER_ROOT/projects/<repo vardas mažosiomis>}` (bash'e:
-   `repository=${GITHUB_REPOSITORY#*/}` ir `${repository,,}`; `SETUP_SERVER_ROOT` perduoda runner'io paslauga).
-   Kitu vardu – Actions variable `BUILD_ROOT`. Slaptažodžiai – GitHub environment secrets. Job'as turi turėti
-   `runs-on: [self-hosted, linux, setup.build]`. `unset DOCKER_HOST` nereikia: GitHub jo nenustato.
+   The build directory is the repo name in lowercase, so the workflow finds it by itself:
+   `BUILD_ROOT=${BUILD_ROOT:-$SETUP_SERVER_ROOT/projects/<repo name in lowercase>}` (in bash:
+   `repository=${GITHUB_REPOSITORY#*/}` and `${repository,,}`; `SETUP_SERVER_ROOT` is passed by the runner service).
+   Under another name – the Actions variable `BUILD_ROOT`. Passwords – GitHub environment secrets. The job must have
+   `runs-on: [self-hosted, linux, setup.build]`. `unset DOCKER_HOST` is not needed: GitHub does not set it.
 
-   **Repo vardas su tašku** (`zarskis.lt`) nėra tinkamas NAME (tik `a-z`, `0-9`, `_`, `-`): scriptas sustoja ir
-   pasiūlo vardą. Nurodyk jį `--name zarskis` (arba `zarskis` prieš URL). Build katalogas tada nesutampa su repo
-   vardu: workflow jį įrašo pats (`${SETUP_SERVER_ROOT}/projects/zarskis`) arba gauna per Actions variable `BUILD_ROOT`.
+   **A repo name with a dot** (`zarskis.lt`) is not a valid NAME (only `a-z`, `0-9`, `_`, `-`): the script stops and
+   suggests a name. Give it as `--name zarskis` (or `zarskis` before the URL). The build directory then does not match the repo
+   name: the workflow writes it itself (`${SETUP_SERVER_ROOT}/projects/zarskis`) or gets it through the Actions variable `BUILD_ROOT`.
 
-   **Monorepo GitHub projektas** – vienas repo, kuriame ir DDE aplinka `app/`, ir kodas `app/public/` (pvz.
-   `BigSant/zarskis.lt`). Šiame serveryje (`SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server`, paskyra
+   **A monorepo GitHub project** – one repo containing both the DDE environment `app/` and the code `app/public/` (e.g.
+   `BigSant/zarskis.lt`). On this server (`SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server`, account
    `tomas`):
 
    ```bash
@@ -267,123 +267,123 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
        --target stage=local:/home/tomas/Projects/runtime/zarskis/stage \
        --target prod=local:/home/tomas/Projects/runtime/zarskis/prod \
        --name zarskis git@github.com:BigSant/zarskis.lt.git
-   # tada tas pats be --check: pirmą kartą sustoja ties deploy key (žr. aukščiau), jį pridėjus – dar kartą
+   # then the same without --check: the first time it stops at the deploy key (see above), after adding it – once more
    ```
 
-   - `--monorepo` klonuoja repo **kaip build katalogą** (`projects/zarskis/`), ne į `app/` (kitaip būtų `app/app/`).
-     Repo turi turėti `app/Makefile`; kitoks repo atmetamas ir nieko nepaliekama. Kodo repo URL neduodamas – kodas jau
-     `app/public/`. `--check` parodo klonavimą ir taikinius, nieko nekeisdamas.
-   - **Taikinys – kiekvienai aplinkai savas `local:/KELIAS` (arba `ssh://`).** `local` (pats build katalogas) su
-     `--monorepo` atmetamas: build katalogas yra repo klonas, kurį kiekvienas deploy'us perjungia į savo commit'ą.
-     Todėl su `--monorepo`:
-     - kiekvienas `--target` turi aplinką priekyje (`stage=`, `prod=`); bendras `target.env` nepriimamas;
-     - keliai lyginami taip, kaip juos pasieks deploy'us: symlink'ai išskleidžiami (dar nesanti kelio dalis – nuo
-       artimiausio esamo tėvinio katalogo). Katalogas build kataloge ar `SETUP_SERVER_ROOT` viduje (ir per symlink'ą)
-       atmetamas;
-     - dvi aplinkos negali deploy'inti į tą pačią vietą ar viena kitos viduje – tikrinama ir su jau įrašytais
+   - `--monorepo` clones the repo **as the build directory** (`projects/zarskis/`), not into `app/` (otherwise it would be `app/app/`).
+     The repo must have `app/Makefile`; any other repo is rejected and nothing is left behind. No code repo URL is given – the code is already in
+     `app/public/`. `--check` shows the clone and the targets without changing anything.
+   - **The target – its own `local:/PATH` (or `ssh://`) for each environment.** `local` (the build directory itself) is
+     rejected with `--monorepo`: the build directory is a repo clone that every deploy switches to its own commit.
+     So with `--monorepo`:
+     - every `--target` has the environment in front (`stage=`, `prod=`); a shared `target.env` is not accepted;
+     - the paths are compared the way the deploy will reach them: symlinks are resolved (a part of the path that does not exist yet – from
+       the nearest existing parent directory). A directory inside the build directory or inside `SETUP_SERVER_ROOT` (also through a symlink) is
+       rejected;
+     - two environments cannot deploy to the same place or inside each other – this is also checked against already written
        `target.<env>.env`.
 
-     Nesančius katalogus scriptas sukuria paskyrai `SETUP_SERVER_USER` (0750), tik patikrinęs visus taikinius.
-   - `target.stage.env` ir `target.prod.env` guli klono šaknyje; jie įrašomi į klono `.git/info/exclude`, todėl
-     `git status` lieka švarus. Repo, kurio šaknyje sekami (`git`) `target.env` ar `target.*.env`, atmetamas: checkout'as
-     juos perrašytų registruotais repo failais.
-   - Pakartotinai paleistas klonas paliekamas (tikrinamas tas pats `origin` ir `app/Makefile`). Build katalogo su
-     atskirais repo (`app/.git`) į monorepo nepaverčia (pirma `bin/remove-project`), o monorepo klono be `--monorepo`
-     nepriima.
-   - Paskui projekte: `app/env/stage.env.example`, `app/env/prod.env.example` (be `DEPLOY_*`), GitHub environments
-     `staging`/`production` su secrets ir runner'is šiam repo (`bin/install-runner --provider github`, scope
-     `bigsant.zarskis.lt`). Kopijos, metrikos, apžvalga ir `remove-project` monorepo build katalogą skaito kaip bet kurį
-     kitą (aplinka – `app/`).
+     The script creates missing directories for the `SETUP_SERVER_USER` account (0750), only after checking all targets.
+   - `target.stage.env` and `target.prod.env` lie in the clone's root; they are written into the clone's `.git/info/exclude`, so
+     `git status` stays clean. A repo whose root tracks (`git`) `target.env` or `target.*.env` is rejected: a checkout
+     would overwrite them with the repo's tracked files.
+   - Run again, the clone is kept (the same `origin` and `app/Makefile` are checked). A build directory with
+     separate repos (`app/.git`) is not turned into a monorepo (first `bin/remove-project`), and a monorepo clone is not
+     accepted without `--monorepo`.
+   - Then in the project: `app/env/stage.env.example`, `app/env/prod.env.example` (without `DEPLOY_*`), GitHub environments
+     `staging`/`production` with secrets and a runner for this repo (`bin/install-runner --provider github`, scope
+     `bigsant.zarskis.lt`). Backups, metrics, the overview and `remove-project` read a monorepo build directory like any
+     other (the environment – `app/`).
 
-   **AI OS diegimai** (AI OS `docs/development-delivery-contract.md`) eina tik per GitHub: AI OS paleidžia projekto
-   `deploy.yml` (`workflow_dispatch` su `operation` `deploy|status`, `environment` `stage|prod`, `sha`, `attempt_id`,
-   `request_id`, `expected_live`, `health_paths`; vardas `aios <operation> <environment> <request_id>`), job'as šio
-   serverio runner'yje vykdo `make -C <build katalogas>/app pipeline-deploy`, o būseną grąžina artifact'u
-   `aios-<request_id>` (`dde-deploy-status/v1`, setup'o `make deploy-status`). Server OPS tam duoda tik build
-   katalogą, taikinius ir runner'į; AI OS serverio, SSH ar Docker prieigos negauna.
+   **AI OS deployments** (AI OS `docs/development-delivery-contract.md`) go only through GitHub: AI OS runs the project's
+   `deploy.yml` (`workflow_dispatch` with `operation` `deploy|status`, `environment` `stage|prod`, `sha`, `attempt_id`,
+   `request_id`, `expected_live`, `health_paths`; name `aios <operation> <environment> <request_id>`), the job on this
+   server's runner runs `make -C <build directory>/app pipeline-deploy`, and returns the status as the artifact
+   `aios-<request_id>` (`dde-deploy-status/v1`, setup's `make deploy-status`). Server OPS gives it only the build
+   directory, the targets and the runner; AI OS gets no server, SSH or Docker access.
 
-5. **Projekto pašalinimas:**
+5. **Removing a project:**
 
    ```bash
    ls /srv/setup-server/projects/
-   sudo bin/remove-project --check asana_tracker    # parodo dydį, kopijas, deploy'ų istoriją
+   sudo bin/remove-project --check asana_tracker    # shows the size, backups, deploy history
    sudo bin/remove-project asana_tracker
    ```
 
-   Jei kataloge yra DB kopijų ar deploy'ų istorijos (`app/.generated` arba senesniame išdėstyme
-   `app/docker/.generated`), reikia `--with-backups` – tada prarandamos kopijos ir rollback'as. Katalogo,
-   kurį naudoja veikiantis konteineris, scriptas netrina.
+   If the directory holds DB backups or deploy history (`app/.generated` or in the older layout
+   `app/docker/.generated`), `--with-backups` is needed – then the backups and the rollback are lost. The script does not delete
+   a directory used by a running container.
 
-6. **DB kopijos: naktinės ir savaitinės pilnos** (worker'is, ne Bitbucket):
+6. **DB backups: nightly and weekly full** (the worker, not Bitbucket):
 
    ```bash
-   sudo bin/install-backups --check          # unit'ai ir ką šią naktį kopijuotų; nieko nekeičia
-   sudo bin/install-backups                  # įdiegia; --at 03:30 ir --full-at "Sun 04:30" – laikai (numatyti)
+   sudo bin/install-backups --check          # units and what it would back up tonight; changes nothing
+   sudo bin/install-backups                  # installs; --at 03:30 and --full-at "Sun 04:30" – the times (defaults)
    ```
 
-   | Kopija | Laikmatis | Kas joje | Failai | Laikoma |
+   | Backup | Timer | What it contains | Files | Kept |
    | --- | --- | --- | --- | --- |
-   | Naktinė | `setup-server-backup.timer`, kasdien `--at` | pagal lentelių registrą: visų lentelių struktūra, `import` lentelių duomenys | `worker-<env>-…Z.sql.gz` | 7 dienų + 4 savaičių |
-   | Savaitinė pilna | `setup-server-backup-full.timer`, kartą per savaitę `--full-at` | visų lentelių duomenys (`make db-backup full=1`) | `full-<env>-…Z.sql.gz` | 2 naujausios |
-   | „Fresh“ | programuotojo `make db-pull fresh=1 [full=1]` (žr. 7 punktą) | registro arba pilna | `fresh-<env>-…Z`, `fresh-full-<env>-…Z` | po 2 naujausias |
+   | Nightly | `setup-server-backup.timer`, daily `--at` | according to the table registry: the structure of all tables, the data of `import` tables | `worker-<env>-…Z.sql.gz` | 7 days + 4 weeks |
+   | Weekly full | `setup-server-backup-full.timer`, once a week `--full-at` | the data of all tables (`make db-backup full=1`) | `full-<env>-…Z.sql.gz` | the 2 newest |
+   | "Fresh" | a developer's `make db-pull fresh=1 [full=1]` (see item 7) | registry or full | `fresh-<env>-…Z`, `fresh-full-<env>-…Z` | the 2 newest of each |
 
-   Kiekviena serija rotuojama atskirai, kitų failų rotacija neliečia. Vienam projektui ir aplinkai vienu metu
-   daroma viena kopija (užraktas `.generated/backups/.lock-<env>`): jei naktinė dar vyksta, savaitinė ar „fresh“
-   jos palaukia. Pilna kopija gali užtrukti iki 8 val., kitos – iki 4. Terminale (`sudo setup-server-backup --full
-   asana_tracker prod`) rodoma juosta: parašyti baitai, palyginti su ankstesnės tokios pat kopijos dydžiu.
+   Each series is rotated separately, rotation does not touch other files. One backup at a time is made for a project and
+   environment (lock `.generated/backups/.lock-<env>`): if the nightly one is still running, the weekly or "fresh" one
+   waits for it. A full backup may take up to 8 h, the others – up to 4. In a terminal (`sudo setup-server-backup --full
+   asana_tracker prod`) a bar is shown: the bytes written, compared with the size of the previous backup of the same kind.
 
-   **Kurie projektai ir aplinkos.** Kopijuojama kiekviena `/srv/setup-server/projects/<vardas>` aplinka,
-   kuriai aplinkos repo (`app/`, senesniame išdėstyme `app/docker/`) turi `env/stage.env`, `env/prod.env` ar
-   papildomos aplinkos (`STAGE_ENVIRONMENTS`, žr. „Papildomos aplinkos“) `env/<env>.env`.
-   Šį failą sukuria projekto deploy pipeline'as (`cp env/prod.env.example env/prod.env`), todėl kopijuojama
-   tai, kas iš šio serverio deploy'inama. `local` ir `test` nekopijuojamos. Kopija – setup `make db-backup
-   ENV=<env>`: stage/prod pagal lentelių registrą, su `DATABASE_EXTRA_SCHEMAS` – visos schemos vienu dump'u
-   (asana.local). Kopijuojama tik duomenų bazė: `data/` katalogai (paieškos indeksai ir pan.) nekopijuojami,
-   o kurios schemos ir lentelės patenka į dump'ą, nusprendžia projekto `DATABASE_EXTRA_SCHEMAS` ir registras.
+   **Which projects and environments.** Every environment of `/srv/setup-server/projects/<name>` is backed up
+   for which the environment repo (`app/`, in the older layout `app/docker/`) has `env/stage.env`, `env/prod.env` or
+   an extra environment's (`STAGE_ENVIRONMENTS`, see "Extra environments") `env/<env>.env`.
+   This file is created by the project's deploy pipeline (`cp env/prod.env.example env/prod.env`), so what is backed up is
+   what is deployed from this server. `local` and `test` are not backed up. The backup is setup's `make db-backup
+   ENV=<env>`: stage/prod according to the table registry, with `DATABASE_EXTRA_SCHEMAS` – all schemas in one dump
+   (asana.local). Only the database is backed up: `data/` directories (search indexes and the like) are not backed up,
+   and which schemas and tables go into the dump is decided by the project's `DATABASE_EXTRA_SCHEMAS` and the registry.
 
-   **Slaptažodžiai – tik Bitbucket'e.** Serveryje jų kopijos nėra. Laikmatis veikia be Bitbucket'o, todėl
-   `make db-backup` (paskyra `setup`) juos ima iš projekto stack'o: setup 2.5.0+ kiekvienoje stage/prod
-   aplinkoje laiko servisą `<PROJECT_NAME>-<env>-secrets`, kurį kiekvienas deploy'us užpildo Bitbucket
-   Deployment variables reikšmėmis (setup `doc/lt/09-aplinkos.md`, „Komandos serveryje be pipeline'o“).
-   Pakeitus slaptažodį Bitbucket'e, kopija naudoja naują po kito deploy'aus – nieko daugiau keisti nereikia.
-   Projektas, kuris dar nedeploy'intas su setup 2.5.0+ (store'o nėra), kopijuojamas nebus: `--check` ir
-   žurnalas tai įvardija (`no secret store …`). Su `DEPLOY_CONTEXT` store'as ieškomas per jį (paskyros
-   `setup` Docker context'ai). Senas `/etc/setup-server/projects/<vardas>/<env>.env` nebenaudojamas –
-   `--check` (su sudo) primena jį ištrinti.
+   **Passwords live only in Bitbucket.** The server has no copy of them. The timer runs without Bitbucket, so
+   `make db-backup` (account `setup`) takes them from the project's stack: setup 2.5.0+ keeps in every stage/prod
+   environment a service `<PROJECT_NAME>-<env>-secrets`, which every deploy fills with the Bitbucket
+   Deployment variables values (setup `doc/lt/09-aplinkos.md`, the section on commands on the server without a pipeline).
+   After a password is changed in Bitbucket, the backup uses the new one after the next deploy – nothing else needs changing.
+   A project not yet deployed with setup 2.5.0+ (no store) will not be backed up: `--check` and
+   the log name it (`no secret store …`). With `DEPLOY_CONTEXT` the store is looked up through it (the `setup`
+   account's Docker contexts). The old `/etc/setup-server/projects/<name>/<env>.env` is no longer used –
+   `--check` (with sudo) reminds you to delete it.
 
-   **Rotacija.** Kiekvienam projektui ir aplinkai paliekama naujausia kiekvienos iš 7 paskutinių dienų,
-   kurios turi kopiją, kopija ir dar 4 savaičių (ISO savaitė) naujausios kopijos – iš viso iki 11, maždaug
-   5 savaitės atgal. Senesnės ištrinamos tik po sėkmingos naujos kopijos; nepavykus nieko netrinama.
-   Liečiami tik `worker-<env>-…Z.sql.gz` failai: deploy'aus kopijos (`<projektas>-<env>-….sql.gz`) ir kiti
-   failai lieka (jas valo setup `make db-backup-prune`). Kopijos laikomos tik šio serverio diske.
+   **Rotation.** For each project and environment, the newest backup of each of the last 7 days
+   that have a backup is kept, plus the newest backups of 4 more weeks (ISO week) – up to 11 in total, roughly
+   5 weeks back. Older ones are deleted only after a successful new backup; on failure nothing is deleted.
+   Only `worker-<env>-…Z.sql.gz` files are touched: deploy backups (`<project>-<env>-….sql.gz`) and other
+   files stay (setup's `make db-backup-prune` cleans those). Backups are kept only on this server's disk.
 
-   **Klaidos.** Vieno projekto klaida kitų nestabdo; pabaigoje `==> Backups: N ok, M failed: projektas/env`,
-   o paslauga baigiasi klaida (`failed`). Patikrinti:
+   **Errors.** One project's error does not stop the others; at the end `==> Backups: N ok, M failed: project/env`,
+   and the service ends with an error (`failed`). To check:
 
    ```bash
-   systemctl list-timers 'setup-server-backup*'          # kada kitas naktinis ir savaitinis paleidimas
-   sudo systemctl start setup-server-backup.service     # naktinė dabar (laukia pabaigos)
-   sudo systemctl start setup-server-backup-full.service  # savaitinė pilna dabar
-   systemctl status setup-server-backup.service         # paskutinio paleidimo būsena
-   journalctl -u setup-server-backup.service -n 100     # kas nukopijuota, kas nepavyko (-full – savaitinės)
-   sudo setup-server-backup --check                     # ką kopijuotų, ar yra kiekvieno projekto secret store
-   sudo setup-server-backup --check --full              # tas pats savaitinei pilnai kopijai
+   systemctl list-timers 'setup-server-backup*'          # when the next nightly and weekly runs are
+   sudo systemctl start setup-server-backup.service     # nightly now (waits for it to finish)
+   sudo systemctl start setup-server-backup-full.service  # weekly full now
+   systemctl status setup-server-backup.service         # status of the last run
+   journalctl -u setup-server-backup.service -n 100     # what was backed up, what failed (-full – weekly)
+   sudo setup-server-backup --check                     # what it would back up, whether each project has a secret store
+   sudo setup-server-backup --check --full              # the same for the weekly full backup
    ```
 
-   **„Backup dabar“** – Bitbucket custom pipeline'as, vykdomas runner'io šiame serveryje. Jis kviečia tą pačią
-   komandą per `sudo`, todėl naudoja tą patį secret store, rotaciją ir nekuria įrašo
-   Deployments istorijoje. Sudo taisyklė leidžia paskyrai `setup` tik šią formą:
-   `/usr/local/sbin/setup-server-backup [--full] /srv/setup-server/projects/<vardas> [stage|prod]` (sudo 1.9.10+,
-   pvz. Ubuntu 24.04, tikrina reguliariąja išraiška). Senesnis sudo (Ubuntu 22.04: 1.9.9) turi tik
-   šablonus: pirmas argumentas privalo būti build katalogas (ar `--full` ir build katalogas), o kitus
-   argumentus atmeta pati komanda.
-   Atnaujinus Server OPS, pakartok `sudo bin/install-backups`, jei `bin/update` parodo pastabą, kad
-   sudo taisyklė skiriasi.
+   **"Backup now"** – a Bitbucket custom pipeline run by the runner on this server. It calls the same
+   command through `sudo`, so it uses the same secret store and rotation, and creates no entry in
+   the Deployments history. The sudo rule allows the `setup` account only this form:
+   `/usr/local/sbin/setup-server-backup [--full] /srv/setup-server/projects/<name> [stage|prod]` (sudo 1.9.10+,
+   e.g. Ubuntu 24.04, checks it with a regular expression). An older sudo (Ubuntu 22.04: 1.9.9) has only
+   wildcards: the first argument must be the build directory (or `--full` and the build directory), and other
+   arguments are rejected by the command itself.
+   After updating Server OPS, repeat `sudo bin/install-backups` if `bin/update` shows a note that
+   the sudo rule differs.
 
    ```yaml
    pipelines:
      custom:
-       backup-now:            # „backup dabar“
+       backup-now:            # "backup now"
          - variables:
              - name: FULL
                default: "no"
@@ -397,377 +397,377 @@ ir nieko nekeičia. Pirmiausia paleisk būtent su `--check`.
                - sudo -n /usr/local/sbin/setup-server-backup $([ "${FULL:-no}" = yes ] && echo --full) "$BUILD_ROOT"
    ```
 
-   Antras argumentas (`stage` arba `prod`) apriboja aplinką, `FULL=yes` – pilna kopija (į `full-<env>` seriją).
-   Kodo medžio failus, kurių nėra git'e (pvz. vertimus), saugo atskiros failų kopijos – žr. „Failų kopijos“.
-   Įdiegtą komandos kopiją atnaujina `bin/update` (žr. „Atnaujinimas“). Pakartotinai paleistas
-   `sudo bin/install-backups` palieka įdiegtus laikus, jei nenurodyti `--at` ir `--full-at`.
+   The second argument (`stage` or `prod`) limits the environment, `FULL=yes` – a full backup (into the `full-<env>` series).
+   Code tree files that are not in git (e.g. translations) are kept by separate file backups – see "File backups".
+   The installed copy of the command is updated by `bin/update` (see "Updating"). Run again,
+   `sudo bin/install-backups` keeps the installed times unless `--at` and `--full-at` are given.
 
-7. **Kopijų atsisiuntimas programuotojams (neprivaloma).** Programuotojas savo kompiuteryje setup komanda
-   `make db-pull` parsisiunčia naujausią šio serverio išsaugotą projekto kopiją (naktinę, „backup dabar“ ar
-   prieš deploy'ų – kuri naujausia; su `full=1` – savaitinę pilną) ir iš jos pasiruošia veikiančią aplinką.
-   Su `fresh=1` serveris kopiją padaro tuo metu. LIVE nepasiekiamas.
+7. **Backup downloads for developers (optional).** On their computer, a developer uses the setup command
+   `make db-pull` to download the newest project backup saved by this server (nightly, "backup now" or
+   pre-deploy – whichever is newest; with `full=1` – the weekly full one) and sets up a working environment from it.
+   With `fresh=1` the server makes the backup at that moment. LIVE is not reachable.
 
-   Pirmiausia serveris turi priimti SSH iš VPN. Ubuntu Desktop `openssh-server` neturi, tada į 22 port'ą
-   niekas neklauso (`ssh: connect to host … port 22: Connection refused`):
+   First the server must accept SSH from the VPN. Ubuntu Desktop has no `openssh-server`, and then
+   nothing listens on port 22 (`ssh: connect to host … port 22: Connection refused`):
 
    ```bash
-   bin/install-ssh --check --from 10.8.0.0/24   # paketas, sshd nustatymai, paslauga, ufw; nieko nekeičia
-   sudo bin/install-ssh --from 10.8.0.0/24      # įdiegia; vėliau užtenka sudo bin/install-ssh (tinklai lieka)
+   bin/install-ssh --check --from 10.8.0.0/24   # package, sshd settings, service, ufw; changes nothing
+   sudo bin/install-ssh --from 10.8.0.0/24      # installs; later sudo bin/install-ssh is enough (the networks are kept)
    ```
 
-   - **Nustatymai** – `/etc/ssh/sshd_config.d/10-setup-server.conf` (įrašomas prieš diegiant paketą, todėl naujas
-     sshd be jo nepasileidžia): iš už `--from` tinklų ir ne iš šio serverio – tik raktas
-     (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`). VPN viduje galioja serverio paties nustatymai.
-     sshd ima pirmą perskaitytą reikšmę, todėl failo vardas eina prieš kitus (`50-cloud-init.conf` ir pan.).
-     `sshd -t` jo nepriėmus, ankstesnis failas grąžinamas. Port'ų, `ListenAddress` ir kitų failų scriptas nekeičia.
-   - **Paslauga** – Ubuntu 22.10+ `ssh.socket` (sshd startuoja pirmu prisijungimu), senesniuose `ssh.service`;
-     įjungiama, kad veiktų ir po perkrovimo. Pasikeitus nustatymams veikianti paslauga perkraunama `reload`
-     (atidaryti seansai lieka).
-   - **Tikrinama**, ar sshd klauso visais adresais ar VPN adresu; jei tik kitais (`ListenAddress`) – parodoma.
-   - **ufw** – jei įjungtas, pridedama `ufw allow proto tcp from 10.8.0.0/24 to any port 22`; išjungtas paliekamas
-     išjungtas (pakartotinai paleistas scriptas taisyklę pridės, kai ufw bus įjungtas).
-   - Pabaigoje parodomas serverio ED25519 host rakto fingerprint'as: pirmą kartą jungiantis programuotojas jį
-     palygina prieš atsakydamas `yes`.
+   - **Settings** – `/etc/ssh/sshd_config.d/10-setup-server.conf` (written before the package is installed, so a new
+     sshd never starts without it): from outside the `--from` networks and not from this server – key only
+     (`PasswordAuthentication no`, `KbdInteractiveAuthentication no`). Inside the VPN the server's own settings apply.
+     sshd takes the first value it reads, so the file name sorts before the others (`50-cloud-init.conf` and the like).
+     If `sshd -t` does not accept it, the previous file is restored. The script does not change ports, `ListenAddress` or other files.
+   - **Service** – on Ubuntu 22.10+ `ssh.socket` (sshd starts on the first connection), on older ones `ssh.service`;
+     enabled so it also runs after a reboot. When the settings change, a running service is reloaded with `reload`
+     (open sessions stay).
+   - **It checks** whether sshd listens on all addresses or on the VPN address; if only on others (`ListenAddress`) – this is shown.
+   - **ufw** – if enabled, `ufw allow proto tcp from 10.8.0.0/24 to any port 22` is added; a disabled one is left
+     disabled (the script run again will add the rule once ufw is enabled).
+   - At the end the server's ED25519 host key fingerprint is shown: when connecting for the first time, the developer
+     compares it before answering `yes`.
 
-   Tada – programuotojo raktas:
+   Then – the developer's key:
 
    ```bash
-   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --pull shop=db --check   # parodo, ką keistų
-   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --pull shop=db           # shop stage ir prod kopijos
-   sudo bin/add-backup-key --name tomas --pull shop:prod=fresh --pull forsena:stage=db         # esamam – tik vardas
-   sudo bin/add-backup-key --name qa --pull-all db                    # visų projektų (ir naujų) kopijos
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --pull shop=db --check   # shows what it would change
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --pull shop=db           # shop stage and prod backups
+   sudo bin/add-backup-key --name tomas --pull shop:prod=fresh --pull forsena:stage=db         # an existing one – just the name
+   sudo bin/add-backup-key --name qa --pull-all db                    # backups of all projects (including new ones)
    sudo bin/add-backup-key --list          # tomas  from 10.8.0.0/24  backups all=none forsena:stage=db shop:prod=fresh
-   sudo bin/add-backup-key --remove tomas                                        # atima leidimą
+   sudo bin/add-backup-key --remove tomas                                        # revokes the permission
    ```
 
-   **Kopijų leidimai** – kiekvienai projekto aplinkai atskirai, kaip prieiga (8 žingsnis): `db` – parsisiųsti kopijas
-   (registro ir pilnas, `make db-pull [full=1]`), `fresh` – ir užsakyti naują dabar (`make db-pull fresh=1`; apkrauna
-   projekto DB). `--pull PROJEKTAS[:ENV]=LYGIS` (be `:ENV` – stage ir prod, kartojamas ar per kablelį), `--pull-all
-   none|db|fresh` – visų projektų, ir naujų; projekto aplinkos leidimas jį gali tik padidinti. Naujas raktas be jų
-   kopijų negauna. Esamam raktui nenurodyti dalykai lieka (raktas, tinklai, `--pull` ir `--grant` sąrašai, `--pull-all`);
-   `--no-pulls`, `--no-grants` sąrašą išvalo. Patogiausia – sąsajos *Prieiga* → raktas → kortelė „Kopijos“ (masiškai
-   ir po projektą). **Iki šių leidimų įrašyti raktai** (be `--pull-all`) ir toliau traukia visų projektų kopijas
-   (`--allow-fresh` – ir šviežias), kol pirmą kartą pakeičiami: tada tai įrašoma aiškiai (`--pull-all db|fresh`).
+   **Backup permissions** – for each project environment separately, like access (step 8): `db` – download backups
+   (registry and full, `make db-pull [full=1]`), `fresh` – also order a new one now (`make db-pull fresh=1`; loads
+   the project's DB). `--pull PROJECT[:ENV]=LEVEL` (without `:ENV` – stage and prod, repeated or comma-separated), `--pull-all
+   none|db|fresh` – all projects, including new ones; a project environment's permission can only raise it. A new key without them
+   gets no backups. For an existing key, whatever is not given stays (the key, networks, the `--pull` and `--grant` lists, `--pull-all`);
+   `--no-pulls`, `--no-grants` clear the list. Most convenient – the UI's *Access* → key → the "Backups" card (in bulk
+   and per project). **Keys written before these permissions existed** (without `--pull-all`) keep pulling backups of all projects
+   (`--allow-fresh` – fresh ones too) until they are changed for the first time: then this is written explicitly (`--pull-all db|fresh`).
 
-   Raktas (programuotojo `.pub` failas, niekada ne privatus) įrašomas į paskyros `setup`
-   `.ssh/authorized_keys` su apribojimais: `from="10.8.0.0/24"` – jungtis galima tik iš nurodyto tinklo (VPN;
-   `0.0.0.0/0` atmetamas), `command="/usr/local/sbin/setup-server-backup-pull --key tomas --pull-all none --pull
-   shop:prod=db …"` – raktas vykdo tik šią komandą ir tik leistoms aplinkoms, `restrict` – be terminalo, port'ų ir
-   agento persiuntimo. Shell'o, Docker ir kitų failų raktas negauna. Tas pats vardas pakartotinai – raktas pakeičiamas;
-   kiti `authorized_keys` įrašai nekeičiami. Prisijungiama tik raktu (paskyra `setup` slaptažodžio neturi). Neleistos
-   aplinkos prašymas atmetamas: `this key may not download backups of PROJEKTAS ENV`.
+   The key (the developer's `.pub` file, never the private one) is written into the `setup` account's
+   `.ssh/authorized_keys` with restrictions: `from="10.8.0.0/24"` – connecting is possible only from the given network (VPN;
+   `0.0.0.0/0` is rejected), `command="/usr/local/sbin/setup-server-backup-pull --key tomas --pull-all none --pull
+   shop:prod=db …"` – the key runs only this command and only for allowed environments, `restrict` – no terminal, port or
+   agent forwarding. The key gets no shell, Docker or other files. The same name again – the key is replaced;
+   other `authorized_keys` entries are not changed. Login is by key only (the `setup` account has no password). A request for a
+   disallowed environment is rejected: `this key may not download backups of PROJECT ENV`.
 
-   Komanda moka:
+   The command understands:
 
-   | Prašymas | Atsakymas |
+   | Request | Response |
    | --- | --- |
-   | `latest <projektas> <stage\|prod> [full\|files]` | naujausios kopijos vardas: be `full` – registro kopija (naktinė, „fresh“, prieš deploy'ų), su `full` – pilna (savaitinė ar „fresh“ pilna), su `files` – failų kopija (`files-<env>-…Z.tar.gz`, „Failų kopijos“) |
-   | `info <projektas> <stage\|prod> [full\|files]` | tas pats ir dydis baitais: `<failas> <dydis>` (atsisiuntimo progresui) |
-   | `get <projektas> <stage\|prod> <failas>` | tos kopijos turinys |
-   | `fresh <projektas> <stage\|prod> [full\|files]` | tik tos aplinkos `fresh` leidimą turinčiam raktui: paleidžia `setup-server-backup --fresh [--full\|--files]` paskyra `setup`, eigą siunčia į stderr (`progress backup BAITAI TIKĖTINA`), pabaigoje – `<failas> <dydis>` |
+   | `latest <project> <stage\|prod> [full\|files]` | the newest backup's name: without `full` – a registry backup (nightly, "fresh", pre-deploy), with `full` – a full one (weekly or "fresh" full), with `files` – a file backup (`files-<env>-…Z.tar.gz`, "File backups") |
+   | `info <project> <stage\|prod> [full\|files]` | the same plus the size in bytes: `<file> <size>` (for download progress) |
+   | `get <project> <stage\|prod> <file>` | the contents of that backup |
+   | `fresh <project> <stage\|prod> [full\|files]` | only for a key with the `fresh` permission for that environment: runs `setup-server-backup --fresh [--full\|--files]` as the `setup` account, sends progress to stderr (`progress backup BYTES EXPECTED`), at the end – `<file> <size>` |
 
-   Failų kopijas (setup `make files-pull`) saugo tie patys leidimai: `db` – parsisiųsti, `fresh` – užsakyti naują.
-   „Fresh“ apkrauna projekto DB, todėl jo nedaro du kartus: jei tos pačios rūšies (registro, pilna ar failų) kopija
-   jaunesnė nei 30 min., atiduodama ji; jei kopija tuo metu daroma, laukiama jos pabaigos (užraktas). Reikia
-   įdiegtos `/usr/local/sbin/setup-server-backup` (`sudo bin/install-backups`). Kiekvienas prašymas (ir atmestas)
-   įrašomas į `/srv/setup-server/backup-pulls.log`: laikas, rakto vardas, adresas, prašymas, rezultatas. Projekto
-   vardas – build katalogo vardas (`projects/<vardas>`, pvz. `asana_tracker`).
+   File backups (setup `make files-pull`) are guarded by the same permissions: `db` – download, `fresh` – order a new one.
+   "Fresh" loads the project's DB, so it is not done twice: if a backup of the same kind (registry, full or files)
+   is younger than 30 min., that one is returned; if a backup is being made at that moment, it waits for it to finish (lock). It needs
+   the installed `/usr/local/sbin/setup-server-backup` (`sudo bin/install-backups`). Every request (including rejected ones)
+   is written to `/srv/setup-server/backup-pulls.log`: time, key name, address, request, result. The project
+   name is the build directory name (`projects/<name>`, e.g. `asana_tracker`).
 
-   Kopijose yra tikri klientų duomenys (stage/prod pagal lentelių registrą): leisk tik tiems, kam jų reikia,
-   ir atimk leidimą (`--remove`), kai nebereikia. Įdiegtą komandos kopiją atnaujina `bin/update`.
+   The backups contain real customer data (stage/prod according to the table registry): allow them only to those who need them,
+   and revoke the permission (`--remove`) when it is no longer needed. The installed copy of the command is updated by `bin/update`.
 
-8. **Prieiga prie taikinių per šį serverį (neprivaloma).** Šis serveris jau pasiekia kiekvieną projekto taikinį:
-   deploy'us jungiasi `DEPLOY_SSH` savo raktu, o konteinerius valdo per Docker context'ą. Tuo pačiu keliu gali eiti
-   ir programuotojas: jo raktas LIVE serveryje nereikalingas, o tiesioginės prieigos prie LIVE jam nereikia. Tas pats
-   raktas, kaip kopijoms, gauna leidimus kiekvienam projektui ir aplinkai:
+8. **Access to targets through this server (optional).** This server already reaches every project target:
+   the deploy connects to `DEPLOY_SSH` with its key, and manages the containers through a Docker context. A developer can go
+   the same way: their key is not needed on the LIVE server, and they need no direct access to LIVE. The same
+   key as for backups gets permissions for each project and environment:
 
    ```bash
    sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 \
-       --grant forsena:prod=phpfpm-readonly --grant forsena:stage=docker --check     # parodo, ką keistų
+       --grant forsena:prod=phpfpm-readonly --grant forsena:stage=docker --check     # shows what it would change
    sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 \
-       --grant forsena:prod=phpfpm-readonly --grant forsena:stage=docker             # įrašo
-   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --grant asana_tracker=full   # abi aplinkos
+       --grant forsena:prod=phpfpm-readonly --grant forsena:stage=docker             # writes it
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --grant asana_tracker=full   # both environments
    sudo bin/add-backup-key --list          # tomas  from 10.8.0.0/24  access forsena:prod=phpfpm-readonly …
    ```
 
-   `--grant` galima kartoti arba rašyti per kablelį; be `:stage`/`:prod` – abi aplinkos. Pakartotinai paleidus su tuo
-   pačiu vardu įrašas pakeičiamas visas: išvardyk visus leidimus (be `--grant` – lieka tik kopijos). Esamam raktui
-   rakto failo ir `--from` nereikia – lieka įrašytas raktas, tinklai ir kopijų leidimai: `sudo bin/add-backup-key --name
-   tomas --grant forsena=docker` pakeičia tik prieigos leidimus. Projektas – build katalogo vardas (`projects/<vardas>`);
-   dar nesančiam projektui leidimas įrašomas su pastaba. Patogiausia – sąsajos puslapyje *Prieiga* (žr. „Valdymo sąsaja“).
+   `--grant` can be repeated or comma-separated; without `:stage`/`:prod` – both environments. Run again with the same
+   name, the whole entry is replaced: list all permissions (without `--grant` – only backups remain). For an existing key
+   the key file and `--from` are not needed – the written key, networks and backup permissions stay: `sudo bin/add-backup-key --name
+   tomas --grant forsena=docker` changes only the access permissions. The project is the build directory name (`projects/<name>`);
+   for a project that does not exist yet the permission is written with a note. Most convenient – the UI's *Access* page (see "Web UI").
 
-   | Lygis | Ką leidžia | Ko neleidžia |
+   | Level | What it allows | What it does not allow |
    | --- | --- | --- |
-   | `phpfpm-readonly` | shell ir komandos aplinkos php-fpm konteineryje vartotoju `nobody` (65534) | rašyti į projekto vartotojo failus. **Tik failai:** konteinerio aplinkoje ir parduotuvės konfigūracijoje (`parameters.php`) lieka DB slaptažodis, todėl duomenų bazę keisti galima |
-   | `phpfpm` | tas pats projekto vartotoju (`APP_UID`, failų savininkas) arba `root` konteineryje | kitų konteinerių, taikinio |
-   | `docker` | projekto konteineriai: `ps`, `logs`, `exec` (ir `root`), `start`, `stop`, `restart`, `top`, `stats`, `inspect` | `docker run`, `exec --privileged`, image'ų, volume'ų, kitų projektų konteinerių ir `exec` į konteinerį su Docker socket'u (`metrics-docker`, `metrics-logs`: tai būtų root serveryje) |
-   | `full` | taikinio shell: `DEPLOY_SSH` vartotojas taikinyje, kataloge `DEPLOY_PATH` | – (tiek, kiek gali tas vartotojas). **`--target local` projektui tai paskyra `setup` šiame serveryje:** visi projektai, jų paslaptys ir Docker, t. y. root |
+   | `phpfpm-readonly` | a shell and commands in the environment's php-fpm container as the user `nobody` (65534) | writing to the project user's files. **Files only:** the DB password remains in the container environment and in the shop configuration (`parameters.php`), so the database can still be changed |
+   | `phpfpm` | the same as the project user (`APP_UID`, the file owner) or `root` in the container | other containers, the target |
+   | `docker` | the project's containers: `ps`, `logs`, `exec` (and `root`), `start`, `stop`, `restart`, `top`, `stats`, `inspect` | `docker run`, `exec --privileged`, images, volumes, other projects' containers and `exec` into a container with the Docker socket (`metrics-docker`, `metrics-logs`: that would be root on the server) |
+   | `full` | a target shell: the `DEPLOY_SSH` user on the target, in the `DEPLOY_PATH` directory | – (as much as that user can). **For a `--target local` project this is the `setup` account on this server:** all projects, their secrets and Docker, i.e. root |
 
-   Kiekvienas lygis apima žemesnius. Raktas su leidimais įrašomas kaip
+   Each level includes the lower ones. A key with permissions is written as
    `from="10.8.0.0/24",command="/usr/local/sbin/setup-server-access --key tomas --grant forsena:prod=phpfpm-readonly …",restrict,pty`:
-   tik iš VPN, tik ši komanda, su terminalu (`pty`), bet be port'ų, agento ir X11 persiuntimo, todėl nei `ProxyJump`,
-   nei tunelis į LIVE neveikia. Kopijų prašymus (`latest`, `info`, `get`, `fresh`) komanda perduoda
-   `setup-server-backup-pull`, todėl `make db-pull` veikia kaip anksčiau.
+   only from the VPN, only this command, with a terminal (`pty`), but without port, agent and X11 forwarding, so neither `ProxyJump`
+   nor a tunnel to LIVE works. Backup requests (`latest`, `info`, `get`, `fresh`) are passed by the command to
+   `setup-server-backup-pull`, so `make db-pull` works as before.
 
-   Programuotojo kompiuteryje – setup `make ssh` (tas pats serveris ir raktas, kaip `make db-pull`) arba tiesiogiai:
+   On the developer's computer – setup's `make ssh` (the same server and key as `make db-pull`) or directly:
 
-   | Prašymas (`ssh -t setup@10.8.0.14 …`) | Ką daro |
+   | Request (`ssh -t setup@10.8.0.14 …`) | What it does |
    | --- | --- |
-   | `access` | kur raktas gali jungtis: `PROJEKTAS ENV LYGIS` eilutės |
-   | `shell PROJEKTAS ENV [root\|readonly]` | shell php-fpm konteineryje (raktui tik su `phpfpm-readonly` – visada `readonly`) |
-   | `exec PROJEKTAS ENV [root\|readonly] -- KOMANDA …` | viena komanda ten |
-   | `host PROJEKTAS ENV [-- KOMANDA …]` | `full`: shell (ar komanda) taikinyje, `DEPLOY_PATH` kataloge |
-   | `docker PROJEKTAS ENV ps [-a]` | projekto konteineriai |
-   | `docker PROJEKTAS ENV logs [--tail N] [-f] [--since LAIKAS] [-t] KONTEINERIS` | žurnalas |
-   | `docker PROJEKTAS ENV exec [--root\|-u VARTOTOJAS] [-w KATALOGAS] KONTEINERIS [KOMANDA …]` | shell ar komanda konteineryje |
-   | `docker PROJEKTAS ENV start\|stop\|restart KONTEINERIS …`, `top`, `stats`, `inspect` | valdymas |
+   | `access` | where the key may connect: `PROJECT ENV LEVEL` lines |
+   | `shell PROJECT ENV [root\|readonly]` | a shell in the php-fpm container (for a key with only `phpfpm-readonly` – always `readonly`) |
+   | `exec PROJECT ENV [root\|readonly] -- COMMAND …` | one command there |
+   | `host PROJECT ENV [-- COMMAND …]` | `full`: a shell (or a command) on the target, in the `DEPLOY_PATH` directory |
+   | `docker PROJECT ENV ps [-a]` | the project's containers |
+   | `docker PROJECT ENV logs [--tail N] [-f] [--since TIME] [-t] CONTAINER` | the log |
+   | `docker PROJECT ENV exec [--root\|-u USER] [-w DIRECTORY] CONTAINER [COMMAND …]` | a shell or a command in the container |
+   | `docker PROJECT ENV start\|stop\|restart CONTAINER …`, `top`, `stats`, `inspect` | management |
 
-   Konteineris – vardas (`forsena-prod-php-fpm-1`) arba servisas (`php-fpm`, `database`). Taikinys, Docker context'as ir
-   `APP_UID` imami iš build katalogo (`target*.env`, `env/<env>.env`), kaip deploy'aus. Terminalą komanda duoda, kai jį
-   turi SSH seansas (`ssh -t`); be jo – stdin perduodamas, todėl veikia ir `… exec … -- mysqldump … > failas`.
-   Kiekvienas prašymas (ir atmestas) ir jo pabaiga (išėjimo kodas) įrašomi į `/srv/setup-server/access.log`: laikas,
-   rakto vardas, adresas, prašymas, lygis ir vykdoma komanda. **Interaktyvaus seanso** (su terminalu) įvestis – tai, ką
-   žmogus surinko, ne tai, ką rodė ekranas – įrašoma `script --log-in` į
-   `/srv/setup-server/access-sessions/<raktas>/<UTC laikas>-<pid>.log` (paskyra `setup`, 0600, laikoma 180 dienų), o
-   `access.log` eilutė nurodo failą (`session=…`). Taip žinomos ir shell'e surinktos komandos; jose surinktas
-   slaptažodis (pvz. `mysql -p`) įrašomas taip pat. Be terminalo įrašo nėra: komanda jau yra prašyme. Sąsaja rodo
-   kiekvieno rakto veiklą (prisijungimai, kopijos, shell'ai su trukme, komandos, atmesti bandymai) ir seansų įrašus –
-   `server-status --activity [RAKTAS]`, `--session RAKTAS FAILAS`. Įdiegtą komandos kopiją atnaujina `bin/update`.
+   A container is a name (`forsena-prod-php-fpm-1`) or a service (`php-fpm`, `database`). The target, the Docker context and
+   `APP_UID` are taken from the build directory (`target*.env`, `env/<env>.env`), like the deploy's. The command gives a terminal when
+   the SSH session has one (`ssh -t`); without it – stdin is passed through, so `… exec … -- mysqldump … > file` works too.
+   Every request (including rejected ones) and its end (exit code) are written to `/srv/setup-server/access.log`: time,
+   key name, address, request, level and the command run. **An interactive session's** (with a terminal) input – what
+   the person typed, not what the screen showed – is recorded with `script --log-in` into
+   `/srv/setup-server/access-sessions/<key>/<UTC time>-<pid>.log` (account `setup`, 0600, kept for 180 days), and
+   the `access.log` line names the file (`session=…`). This way the commands typed in a shell are known too; a
+   password typed in them (e.g. `mysql -p`) is recorded as well. Without a terminal there is no recording: the command is already in the request. The UI shows
+   each key's activity (logins, backups, shells with their duration, commands, rejected attempts) and the session recordings –
+   `server-status --activity [KEY]`, `--session KEY FILE`. The installed copy of the command is updated by `bin/update`.
 
-## Failų kopijos (`BACKUP_FILE_PATHS`)
+## File backups (`BACKUP_FILE_PATHS`)
 
-Kai kuriuos kodo medžio failus rašo pati parduotuvė taikinyje, o git'e jų nėra (pvz. modulių vertimai
-`modules/*/translations/`). Deploy'us jų netrina, bet ir niekur kitur jų nėra: sugedus taikiniui jie dingtų. Projektas juos
-išvardija setup kintamuoju `BACKUP_FILE_PATHS` (kaip `DEPLOY_PROTECTED_PATHS`: keliai nuo kodo šaknies, per tarpą, katalogas
-baigiasi `/`, leidžiamas `*`), o worker'is kas naktį juos parsisiunčia ir laiko kopijas. PrestaShop projektui (`PROFILE=prestashop`)
-nieko nustatyti nereikia: setup 4.0.0+ profilis visada kopijuoja vertimus (`modules/*/translations/`,
-`themes/*/modules/*/translations/` ir kalbų paketus `translations/*-*/`; setup 5.3.0+ – ir laiškų temas `mails/*/lang.php`,
-`themes/*/mails/*/lang.php`), o `BACKUP_FILE_PATHS` prideda projekto kelius:
+Some code tree files are written by the shop itself on the target and are not in git (e.g. module translations
+`modules/*/translations/`). The deploy does not delete them, but they exist nowhere else either: if the target broke they would be lost. The project
+lists them in the setup variable `BACKUP_FILE_PATHS` (like `DEPLOY_PROTECTED_PATHS`: paths from the code root, space-separated, a directory
+ends with `/`, `*` is allowed), and the worker downloads them every night and keeps backups. For a PrestaShop project (`PROFILE=prestashop`)
+nothing needs to be set: the setup 4.0.0+ profile always backs up the translations (`modules/*/translations/`,
+`themes/*/modules/*/translations/` and the language packs `translations/*-*/`; setup 5.3.0+ – also the mail templates `mails/*/lang.php`,
+`themes/*/mails/*/lang.php`), and `BACKUP_FILE_PATHS` adds the project's paths:
 
 ```dotenv
-# env/common.env (env/<env>.env reikšmė laimi)
+# env/common.env (the env/<env>.env value wins)
 BACKUP_FILE_PATHS="modules/*/translations/ themes/*/lang/"
 ```
 
 ```bash
-sudo bin/install-backups --check                  # be kitko – setup-server-backup-files.timer ir ką šią naktį kopijuotų
-sudo bin/install-backups [--files-at 02:30]       # numatyta – tuo pačiu laiku kaip naktinė DB kopija (--at)
-sudo setup-server-backup --check --files          # kurių projektų aplinkos ir kokie keliai
-sudo setup-server-backup --files shop prod        # vienos aplinkos kopija dabar (ar sąsajoje „Failų kopija dabar“)
+sudo bin/install-backups --check                  # among other things – setup-server-backup-files.timer and what it would back up tonight
+sudo bin/install-backups [--files-at 02:30]       # default – the same time as the nightly DB backup (--at)
+sudo setup-server-backup --check --files          # which projects' environments and which paths
+sudo setup-server-backup --files shop prod        # a backup of one environment now (or "Files backup now" in the UI)
 ```
 
-- **Kurios aplinkos** – tos pačios, kurių DB kopijuojama (`env/<env>.env` build kataloge), jei projektas yra PrestaShop arba
-  joms `BACKUP_FILE_PATHS` netuščias. Kitų projektų naktinis paleidimas nekeičia. PrestaShop projektui be `BACKUP_FILE_PATHS`
-  reikia setup 4.0.0+: senesnis setup tokio projekto kopijos nedaro (`BACKUP_FILE_PATHS is empty`).
-- **Kaip** – setup `make files-backup ENV=<env> file=…` (setup 3.1.0+; senesnis – „setup has no make files-backup“; iš 2.x – naujas MAJOR,
-  `sudo bin/update-setup v3.1.0`), paskyra `setup`, tuo pačiu keliu kaip deploy'us (`DEPLOY_SSH` jos raktu arba vietinis katalogas). rsync
-  parsiunčia tik išvardytus kelius į veidrodį `.generated/backups/.files-<env>/` (kitą naktį – tik pasikeitimus), iš jo
-  supakuojama `files-<env>-<UTC laikas>Z.tar.gz`. **Taikinys tik skaitomas**: niekas į jį nerašoma ir niekas iš ten
-  neatkuriama.
-- **Rotacija** – kaip naktinių DB kopijų: 7 paskutinių dienų ir 4 savaičių naujausios (iki 11); senesnės trinamos tik po
-  sėkmingos naujos. DB kopijų ji neliečia, o DB kopijos – jos. Savas užraktas (`.lock-files-<env>`): DB kopijos nelaukia.
-- **Slaptažodžių nereikia** (secret store neskaitomas). Klaidos – kaip DB kopijų: vienos aplinkos klaida kitų nestabdo,
-  paslauga baigiasi `failed`, `journalctl -u setup-server-backup-files.service`.
-- **Programuotojams** – setup `make files-pull [from=prod] [fresh=1] [extract=1]` parsiunčia naujausią (su `fresh=1` – ką tik
-  padarytą) failų kopiją per tą patį raktą ir leidimus, kaip `make db-pull` (žr. „Eiga“, 7 žingsnį): `db` – parsisiųsti,
-  `fresh` – užsakyti naują (jaunesnė nei 30 min. atiduodama ta pati).
-- **Peržiūra** – sąsajos *Failai*: aplinkos su failų kopijomis (PrestaShop ar `BACKUP_FILE_PATHS`), jų kopijos, kopijos failai (nauji, pakeisti ir dingę
-  nuo ankstesnės kopijos), failo turinys, skirtumai nuo ankstesnės kopijos ir atsisiuntimas (iki 2 MiB). Tik skaitoma.
-- **Metrikos** – `setup_worker_files_backup*` (žr. „Worker'io metrikos“). Atnaujinus Server OPS, `bin/update` parodo, kad
-  laikmačio dar nėra (`note: … differs`) – paleisk `sudo bin/install-backups`.
+- **Which environments** – the same ones whose DB is backed up (`env/<env>.env` in the build directory), if the project is PrestaShop or
+  `BACKUP_FILE_PATHS` is not empty for them. The nightly run of other projects does not change. A PrestaShop project without `BACKUP_FILE_PATHS`
+  needs setup 4.0.0+: an older setup does not back up such a project (`BACKUP_FILE_PATHS is empty`).
+- **How** – setup's `make files-backup ENV=<env> file=…` (setup 3.1.0+; older – "setup has no make files-backup"; from 2.x – a new MAJOR,
+  `sudo bin/update-setup v3.1.0`), account `setup`, the same way as the deploy (`DEPLOY_SSH` with its key or a local directory). rsync
+  downloads only the listed paths into the mirror `.generated/backups/.files-<env>/` (the next night – only the changes), from which
+  `files-<env>-<UTC time>Z.tar.gz` is packed. **The target is only read**: nothing is written to it and nothing is restored
+  from there.
+- **Rotation** – like the nightly DB backups: the newest of the last 7 days and 4 weeks (up to 11); older ones are deleted only after
+  a successful new one. It does not touch the DB backups, and the DB backups do not touch it. Its own lock (`.lock-files-<env>`): it does not wait for DB backups.
+- **No passwords are needed** (the secret store is not read). Errors – like the DB backups: one environment's error does not stop the others,
+  the service ends `failed`, `journalctl -u setup-server-backup-files.service`.
+- **For developers** – setup's `make files-pull [from=prod] [fresh=1] [extract=1]` downloads the newest (with `fresh=1` – just
+  made) file backup through the same key and permissions as `make db-pull` (see "Steps", step 7): `db` – download,
+  `fresh` – order a new one (one younger than 30 min. is returned as is).
+- **Viewing** – the UI's *Files*: the environments with file backups (PrestaShop or `BACKUP_FILE_PATHS`), their backups, a backup's files (new, changed and missing
+  since the previous backup), a file's contents, the differences from the previous backup and a download (up to 2 MiB). Read-only.
+- **Metrics** – `setup_worker_files_backup*` (see "Worker metrics"). After updating Server OPS, `bin/update` shows that
+  the timer does not exist yet (`note: … differs`) – run `sudo bin/install-backups`.
 
-## Įrankių prieiga (`bin/tool-access`)
+## Tool access (`bin/tool-access`)
 
-Projektų įrankiai (`pma.`, `cron.`, `mailpit.`, `backup.`, `metrics.<domenas>` ir projekto `PROXY_TOOLS`) stage/prod
-įleidžia tik iš IP sąrašo. Iki šiol kiekvienas projektas jį ir htpasswd eilutes turėjo savo Deployment variables:
-tą patį VPN adresą reikėjo kartoti visur, o atimant žmogaus prieigą – keisti ir deploy'inti kiekvieną projektą.
-Dabar tai valdoma čia, vienoje vietoje (setup 3.6.0+):
+The projects' tools (`pma.`, `cron.`, `mailpit.`, `backup.`, `metrics.<domain>` and the project's `PROXY_TOOLS`) on stage/prod
+let in only from an IP list. Until now every project kept that list and the htpasswd lines in its own Deployment variables:
+the same VPN address had to be repeated everywhere, and revoking a person's access meant changing and deploying every project.
+Now this is managed here, in one place (setup 3.6.0+):
 
-- **Adresai** – šio serverio adresai, kuriuos taikiniai įleidžia, pvz. VPN serverio viešas IP (per jį eina
-  programuotojų srautas į taikinius). Jie pridedami prie kiekvieno įrankio IP sąrašo, bet ne prie svetainės.
-- **Vartotojai** – programuotojų raktų vardai (`bin/add-backup-key`). Kiekvienam administratorius nustato įrankių
-  slaptažodį ir pažymi, kurių projektų aplinkų įrankius jis atidaro. Įrankis paklausia vardo ir slaptažodžio prie IP
-  taisyklės. Jei projektas įrankiui turi savo `<ĮRANKIS>_HTPASSWD`, įleidžia abu sąrašai (setup 3.8.0+; senesnis setup
-  tada naudoja tik projekto sąrašą); vardas, esantis abiejuose, tikrinamas pagal projekto slaptažodį.
-- **Žmogus** – rakto savininko vardas ir pavardė (`--full-name`), kurį sąsaja rodo vietoj rakto vardo (sąraše,
-  rakto puslapyje, veikloje; paieška randa ir pagal jį), ir prisijungimo vardas įrankiams (`--login`): vardas ar el.
-  paštas, kurį žmogus pats renkasi, vietoj rakto vardo. Prisijungimo vardas – lotyniškos raidės, skaitmenys,
-  `. _ @ + -` (be tarpų ir dvitaškio: taip jį vienodai siunčia visos naršyklės), unikalus nepaisant didžiųjų raidžių
-  ir nesutampa su kito rakto vardu; įrankiai skiria didžiąsias raides. Tuščia reikšmė grąžina rakto vardą. Žurnaluose
-  ir `authorized_keys` raktas lieka raktu.
-- **Iš karto.** Po kiekvieno pakeitimo komanda įrašo `projects/<vardas>/tool-access/<env>/users.htpasswd` ir
-  `allowed-ips` ir paleidžia ten `make tool-access ENV=<env>`: setup juos nukopijuoja į taikinio `data/<env>/tool-access/`
-  ir perkrauna nginx-proxy. Leidimas ar jo atėmimas galioja per kelias sekundes, be deploy'aus; kiekvienas deploy'us juos
-  atveža dar kartą. Dar nedeploy'intai aplinkai failai laukia pirmo deploy'aus.
-- **Atėmus paskutinį leidimą** aplinkos failas lieka tuščias: įrankiai neįleidžia nieko, o ne grįžta prie vien IP
-  sąrašo. Aplinkos, kurios niekas niekada negavo, nekeičiamos.
+- **Addresses** – this server's addresses that the targets let in, e.g. the VPN server's public IP (developer
+  traffic to the targets goes through it). They are added to every tool's IP list, but not to the website's.
+- **Users** – the developer key names (`bin/add-backup-key`). For each one the administrator sets a tools
+  password and marks which project environments' tools they may open. The tool asks for a name and password on top of the IP
+  rule. If the project has its own `<TOOL>_HTPASSWD` for a tool, both lists let in (setup 3.8.0+; an older setup
+  then uses only the project's list); a name present in both is checked against the project's password.
+- **Person** – the key owner's first and last name (`--full-name`), which the UI shows instead of the key name (in the list,
+  on the key page, in the activity; search finds by it too), and the login name for the tools (`--login`): a name or e-mail
+  address the person chooses, instead of the key name. The login name is Latin letters, digits,
+  `. _ @ + -` (no spaces or colon: that way all browsers send it the same), unique regardless of case
+  and different from any other key's name; the tools are case-sensitive. An empty value returns to the key name. In the logs
+  and in `authorized_keys` the key stays the key.
+- **Immediately.** After every change the command writes `projects/<name>/tool-access/<env>/users.htpasswd` and
+  `allowed-ips` and runs `make tool-access ENV=<env>` there: setup copies them to the target's `data/<env>/tool-access/`
+  and reloads nginx-proxy. Granting or revoking takes effect within a few seconds, without a deploy; every deploy brings them
+  again. For an environment not yet deployed the files wait for the first deploy.
+- **When the last permission is revoked** the environment's file stays empty: the tools let nobody in, rather than falling back to the IP
+  list alone. Environments that nobody ever got are not changed.
 
 ```bash
-sudo bin/tool-access --allowed-ips 198.51.100.7                 # VPN serverio viešas IP
-sudo bin/tool-access --name tomas --password - < slaptazodis.txt # 12+ simbolių, per stdin; saugomas tik hash'as
-sudo bin/tool-access --name tomas --tools shop:prod,blog         # be :ENV – stage ir prod; sąrašas pakeičiamas
-sudo bin/tool-access --name tomas --no-tools                     # atima visas
-sudo bin/tool-access --name tomas --full-name 'Tomas Žarskis' --login tomas@imone.lt  # žmogus; '' – nėra / rakto vardas
-sudo bin/tool-access --apply                                     # siunčia visus failus dar kartą (pvz. po klaidos)
-sudo bin/tool-access --show                                      # būsena JSON, be hash'ų
+sudo bin/tool-access --allowed-ips 198.51.100.7                 # the VPN server's public IP
+sudo bin/tool-access --name tomas --password - < password.txt    # 12+ characters, via stdin; only the hash is stored
+sudo bin/tool-access --name tomas --tools shop:prod,blog         # without :ENV – stage and prod; the list is replaced
+sudo bin/tool-access --name tomas --no-tools                     # revokes all
+sudo bin/tool-access --name tomas --full-name 'Tomas Žarskis' --login tomas@imone.lt  # the person; '' – none / the key name
+sudo bin/tool-access --apply                                     # sends all files again (e.g. after an error)
+sudo bin/tool-access --show                                      # the state as JSON, without hashes
 ```
 
-- Būsena – `/etc/setup-server/tool-access.json` (root, 0600): adresai, vartotojų slaptažodžių hash'ai (crypt SHA-512,
-  `openssl passwd -6`), leistos aplinkos, vardai ir prisijungimo vardai, paskutinio siuntimo rezultatas. Slaptažodis niekur neįrašomas.
-- `bin/add-backup-key --remove VARDAS` pašalina ir vartotoją: jo eilutės iškart dingsta iš visų taikinių. Naujo rakto
-  vardas negali būti kito rakto prisijungimo vardas.
-- Atnaujinus Server OPS sąsajai reikia naujos sudo taisyklės (`tool-access`): `sudo bin/install-ui`. Bendras setup
-  turi būti 3.6.0+ (`sudo bin/update-setup`); kol jis senesnis, failai laukia build kataloguose – atnaujinus
+- State – `/etc/setup-server/tool-access.json` (root, 0600): addresses, user password hashes (crypt SHA-512,
+  `openssl passwd -6`), allowed environments, names and login names, the result of the last send. The password is never written anywhere.
+- `bin/add-backup-key --remove NAME` removes the user too: their lines disappear from all targets at once. A new key's
+  name cannot be another key's login name.
+- After updating Server OPS the UI needs a new sudo rule (`tool-access`): `sudo bin/install-ui`. The shared setup
+  must be 3.6.0+ (`sudo bin/update-setup`); while it is older, the files wait in the build directories – after updating,
   `sudo bin/tool-access --apply`.
-- Sąsajoje – rakto puslapio skirtukas *Įrankiai* (slaptažodis ir aplinkos) ir *Prieiga* → „Įrankių prieiga“ (adresai,
-  nepavykę siuntimai, „Siųsti iš naujo“).
-- Taikinio DNS ir TLS: įrankių subdomenai gali būti vienas wildcard įrašas `*.<domenas>` ir wildcard sertifikatas
-  `*.<domenas>` – tada Certificate Transparency žurnaluose nesimato atskirų įrankių vardų. Saugo ne vardai, o IP sąrašas
-  ir slaptažodis.
+- In the UI – the key page's *Tools* tab (password and environments) and *Access* → "Tool access" (addresses,
+  failed sends, "Send again").
+- Target DNS and TLS: the tool subdomains can be a single wildcard record `*.<domain>` and a wildcard certificate
+  `*.<domain>` – then the individual tool names do not show up in the Certificate Transparency logs. Protection comes not from the names but from the IP list
+  and the password.
 
-## Papildomos aplinkos (pvz. laikina `mdv`)
+## Extra environments (e.g. a temporary `mdv`)
 
-Didesniam darbui projektas gali turėti daugiau aplinkų nei stage ir prod. Jas išvardija projekto `env/common.env`:
-`STAGE_ENVIRONMENTS="mdv"` (setup; vardas – mažosios raidės ir skaitmenys, 2–16 simbolių, ne `local`/`test`/`stage`/`prod`).
-Kiekviena tokia aplinka setup'e elgiasi kaip stage (žr. setup `doc/lt/09-aplinkos.md`), o šiame serveryje – kaip bet kuri
-kita aplinka:
+For a bigger piece of work a project can have more environments than stage and prod. The project's `env/common.env` lists them:
+`STAGE_ENVIRONMENTS="mdv"` (setup; the name is lowercase letters and digits, 2–16 characters, not `local`/`test`/`stage`/`prod`).
+Each such environment behaves like stage in setup (see setup `doc/lt/09-aplinkos.md`), and on this server – like any
+other environment:
 
-- **Taikinys** – bendras `target.env` arba savas: `sudo bin/add-project --target mdv=ssh://deploy@mdv.example/home/deploy/shop VARDAS URL`
-  (`target.mdv.env`). Tame pačiame taikinyje kaip stage ar prod aplinkai reikia savo port'ų ar adreso (setup tai tikrina).
-- **Deploy'us** – projekto `bitbucket-pipelines.yml` custom pipeline'as `deploy-mdv` su `deployment: mdv` (Bitbucket
-  deployment environment `mdv`, tipas Staging) arba GitHub environment `mdv`; sąsajos projekto puslapyje – „Deploy į mdv“
-  (rodomas, kai aplinka išvardyta, dar prieš pirmą deploy'ų).
-- **Kopijos** – naktinės, savaitinės pilnos ir „backup dabar“ (`… setup-server-backup "$BUILD_ROOT" mdv`), kai yra
-  `env/mdv.env`; `make db-pull from=mdv`. Sudo taisyklė „backup dabar“ priima ir papildomos aplinkos vardą: atnaujinus
-  Server OPS pakartok `sudo bin/install-backups` (`bin/update` parodo, kad taisyklė skiriasi).
-- **Metrikos** – tos pačios eilutės su `environment="mdv"`.
-- **Prieiga** – `--grant projektas:mdv=LYGIS` ir sąsajos *Prieiga* (rakto puslapyje mdv stovi greta prod ir stage;
-  „Visoms iš karto“ – eilutė „kitos“). `--grant projektas=LYGIS` be aplinkos – tik stage ir prod.
-- **Kai aplinkos nebereikia** – setup pusėje `make down ENV=mdv`, `data/mdv` pašalinimas ir vardas iš `STAGE_ENVIRONMENTS`;
-  čia – `target.mdv.env` ir `app/.generated/backups/*-mdv-*` (jei kopijų nebereikia) ištrinami ranka, raktų `…:mdv` leidimai
-  atimami *Prieigoje* (neišvardytai aplinkai vartai ir taip neleidžia jungtis).
+- **Target** – the shared `target.env` or its own: `sudo bin/add-project --target mdv=ssh://deploy@mdv.example/home/deploy/shop NAME URL`
+  (`target.mdv.env`). On the same target as stage or prod the environment needs its own ports or address (setup checks this).
+- **Deploy** – the project's `bitbucket-pipelines.yml` custom pipeline `deploy-mdv` with `deployment: mdv` (Bitbucket
+  deployment environment `mdv`, type Staging) or the GitHub environment `mdv`; on the project page in the UI – "Deploy to mdv"
+  (shown once the environment is listed, even before the first deploy).
+- **Backups** – nightly, weekly full and "backup now" (`… setup-server-backup "$BUILD_ROOT" mdv`), when
+  `env/mdv.env` exists; `make db-pull from=mdv`. The "backup now" sudo rule also accepts an extra environment's name: after updating
+  Server OPS repeat `sudo bin/install-backups` (`bin/update` shows that the rule differs).
+- **Metrics** – the same lines with `environment="mdv"`.
+- **Access** – `--grant project:mdv=LEVEL` and the UI's *Access* (on the key page mdv stands next to prod and stage;
+  "All at once" – the row "others"). `--grant project=LEVEL` without an environment – only stage and prod.
+- **When the environment is no longer needed** – on the setup side `make down ENV=mdv`, removing `data/mdv` and the name from `STAGE_ENVIRONMENTS`;
+  here – `target.mdv.env` and `app/.generated/backups/*-mdv-*` (if the backups are no longer needed) are deleted by hand, the keys' `…:mdv` permissions
+  are revoked in *Access* (the gate does not let anyone connect to an unlisted environment anyway).
 
-## Bitbucket SSH adresas (nuo 2026-11-12)
+## Bitbucket SSH address (since 2026-11-12)
 
-Nuo 2026-11-12 Bitbucket git per SSH atsako tik `ssh.bitbucket.org` (`git@ssh.bitbucket.org:darbo-erdve/repo.git`);
-`bitbucket.org` SSH ryšių nebepriims. HTTPS (API, asana.local git mirror) nesikeičia. Naujas vardas turi tuos pačius
-host raktus (ED25519 `SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM`), bet `known_hosts` įrašas rišamas prie
-vardo, o build katalogų `origin` lieka toks, su kokiu jie nuklonuoti. Todėl serveryje, iki tos datos:
-
-```bash
-cd ~/setup-server
-sudo bin/prepare-host --check          # turi rodyti: would record the SSH host key of ssh.bitbucket.org
-sudo bin/prepare-host                  # įrašo jį (tik su paskelbtu fingerprint'u)
-sudo bin/move-bitbucket-ssh --check    # kurie remote'ai persikels ir ar naujas adresas atsako
-sudo bin/move-bitbucket-ssh            # perkelia app/ ir app/public/ remote'us; GitHub nelieča
-sudo bin/install-ui                    # sudo taisyklė web sąsajai (veiksmas „Bitbucket SSH“)
-```
-
-- `move-bitbucket-ssh` kiekvieną naują URL pirmiau perskaito `git ls-remote` kaip `setup` paskyra (jos raktu ir
-  `known_hosts`); neatsakiusio remote'o nekeičia ir baigia kodu 1. Kartoti galima.
-- `bin/add-project` seną `git@bitbucket.org:…` URL nuo šiol klonuoja per `ssh.bitbucket.org`, o pakartotinai
-  paleistas esamo build katalogo remote'ą perkelia pats.
-- Web sąsaja atpažįsta abu vardus (pipeline'ai, deploy'ai).
-- **Programuotojo kompiuteryje** ta pati komanda be sudo perkelia savo klonų remote'us (visus, ne tik `origin`):
-  `bin/move-bitbucket-ssh --check --under ~/Projects`, tada be `--check`. Pirmiau į `~/.ssh/known_hosts` įrašyk
-  `ssh.bitbucket.org` raktą, palyginęs jo fingerprint'ą su paskelbtu (`ssh-keyscan -t ed25519 ssh.bitbucket.org | ssh-keygen -lf -`).
-
-## Atnaujinimas
-
-Viena komanda atnaujina abu checkout'us: šį repo (`~/setup-server`, administratoriaus klonas, iš kurio
-paleista komanda) ir bendrą setup checkout'ą `/srv/setup-server/setup` (paskyros `setup`). Žemiau aprašytas
-rankinis bendro serverio atnaujinimas. Dviem administratoriaus darbo klonams galima įjungti ir automatinį
-atnaujinimą po GitHub Actions patikrų (žr. „Automatinis vietinių klonų atnaujinimas“).
+Since 2026-11-12 Bitbucket answers git over SSH only on `ssh.bitbucket.org` (`git@ssh.bitbucket.org:workspace/repo.git`);
+`bitbucket.org` will no longer accept SSH connections. HTTPS (API, the asana.local git mirror) does not change. The new name has the same
+host keys (ED25519 `SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM`), but a `known_hosts` entry is bound to the
+name, and the build directories' `origin` stays the one they were cloned with. So on the server, before that date:
 
 ```bash
 cd ~/setup-server
-bin/update --check --server-ref v0.2.0 --setup-ref v2.0.0   # parodo, kas keistųsi
-bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # atnaujina, patikrina, nepavykus grąžina
+sudo bin/prepare-host --check          # must show: would record the SSH host key of ssh.bitbucket.org
+sudo bin/prepare-host                  # records it (only with the published fingerprint)
+sudo bin/move-bitbucket-ssh --check    # which remotes will move and whether the new address responds
+sudo bin/move-bitbucket-ssh            # moves the app/ and app/public/ remotes; does not touch GitHub
+sudo bin/install-ui                    # the sudo rule for the web UI (the "Bitbucket SSH" action)
 ```
 
-- Leisk **be sudo**, kaip šio klono savininkas (Server OPS parsiunčiamas tavo git raktu); setup checkout'o
-  dalį scriptas pats vykdo per `sudo -u setup` (paprašys slaptažodžio). Paleistas su sudo – atsisako.
-- Galima nurodyti tik vieną pusę (`--setup-ref` arba `--server-ref`); kita lieka, kur buvo.
-- **Įdiegtos komandų kopijos.** Kai keičiasi Server OPS, po perjungimo (prieš sveikatos patikrą) per
-  `sudo` perrašomos įdiegtos kopijos `/usr/local/sbin/setup-server-backup`, `/usr/local/sbin/setup-server-metrics`,
-  `/usr/local/sbin/setup-server-backup-pull`, `/usr/local/sbin/setup-server-access` ir valdymo sąsajos `/usr/local/sbin/setup-server-ui` kartu su
-  `/usr/local/lib/setup-server/bin/` (tik tos, kurios įdiegtos) iš naujos versijos: `bin/install-backups --refresh`,
-  `bin/install-metrics --refresh`, `bin/add-backup-key --refresh` ir `bin/install-ui --refresh`.
-  Pasikeitus metrikų ar sąsajos kopijai, perkraunama paslauga `setup-server-metrics` ar `setup-server-ui` (runner'io – ne).
-  Jei klonas jau ant nurodyto ref'o (pvz. po `git pull`), `bin/update` vis tiek palygina įdiegtas kopijas su klonu
-  (`bin/… --refresh --check`) ir perrašo pasenusias – kitaip sąsaja, vartai ir laikmačiai liktų senos versijos.
-  Kiti failai (unit'ai, sudo taisyklės, nustatymai) nekeičiami; jei naujoje versijoje jie kitokie, išvedama pastaba
-  `note: … differs` – tada pakartok `sudo bin/install-backups` (laikas lieka), `sudo bin/install-metrics` arba
-  `sudo bin/install-ui`. Nepavykus perrašymui ar sveikatos patikrai, kartu su checkout'ais grąžinamos ir ankstesnės kopijos.
-- **Iš valdymo sąsajos** (*Veiksmai → Atnaujinti*) `bin/update` vykdomas kaip klono savininkas, bet be terminalo:
-  sudo slaptažodžio paklausti negali, todėl jo kvietimai tada yra `sudo -n`. Jei savininkui sudo be slaptažodžio
-  neleidžiamas, `bin/update` iškart atsisako (kodas 77, niekas nepakeista) – atnaujink terminale. Klonas taip pat turi
-  parsisiųsti (`git fetch`) be slaptažodžio frazės. Atnaujinimo metu sąsaja persikrauna į naują kopiją, o veiksmas tęsiasi.
-- **Ref'as** – tag'as (pageidautina), `origin` šaka (`master` arba `origin/master`) arba commit'o id. Server OPS gali būti ir ne ant tag'o
-  (tag'ų dar nėra). setup ne ant `vX.Y.Z` tag'o tinka **tik stage**: prod release'ui setup turi būti ant
-  release tag'o – peržiūra tai parodo kaip pastabą.
-- `--check` parsiunčia (`git fetch`) ir parodo kiekvieno checkout'o dabartinį ir naują ref'ą, commit'ų
-  skaičių pirmyn/atgal, pakeistų failų suvestinę ir commit'ų sąrašą (`+` – atsiras, `-` – dings).
-  Checkout'ų nekeičia.
-- Atsisako, jei checkout'e yra vietinių pakeitimų, ref'as nežinomas (parodo naujausius tag'us) arba vyksta
-  pipeline žingsnis (paskyros `setup` `make` procesas ne konteineryje; projekto cron konteinerio darbų `make` su
-  ta pačia UID neskaičiuojamas) – tada palauk, kol jis baigsis.
-- Tag'ai parsiunčiami be `--force`: jei `origin` tag'as perkeltas į kitą commit'ą (perrašytas), vietinis
-  lieka, kur buvo, o `bin/update` (ir `--check`) baigiasi klaida, parodydamas tag'ą ir abu commit'us.
-  Release tag'as neturi judėti – išsiaiškink, kas ir kodėl jį perkėlė.
+- `move-bitbucket-ssh` first reads every new URL with `git ls-remote` as the `setup` account (with its key and
+  `known_hosts`); it does not change a remote that did not respond and ends with code 1. It can be repeated.
+- `bin/add-project` from now on clones an old `git@bitbucket.org:…` URL through `ssh.bitbucket.org`, and when run again
+  it moves an existing build directory's remote by itself.
+- The web UI recognizes both names (pipelines, deploys).
+- **On a developer's computer** the same command without sudo moves the remotes of their clones (all of them, not only `origin`):
+  `bin/move-bitbucket-ssh --check --under ~/Projects`, then without `--check`. First write the
+  `ssh.bitbucket.org` key into `~/.ssh/known_hosts`, after comparing its fingerprint with the published one (`ssh-keyscan -t ed25519 ssh.bitbucket.org | ssh-keygen -lf -`).
 
-**Sveikatos patikra po atnaujinimo** (visos trys, bet kuri nepavykusi = grįžimas):
+## Updating
 
-1. Server OPS testai (`python3 -m unittest discover -s tests`) iš naujos versijos – patikrina, kad
-   scriptai veikia šiame serveryje;
-2. setup checkout'as yra ant naujo commit'o ir paskyra `setup` jį skaito be pakeitimų – būtent jį
-   pipeline'ai naudoja (`SETUP_DIRECTORY`);
-3. runner'io paslauga `setup-server-runner` ir kiekviena prieš atnaujinimą veikusi GitHub runner'io paslauga
-   `setup-server-github-runner@<scope>` tebėra aktyvios **su tuo pačiu PID** – tai įrodo, kad jos nebuvo
-   perkrautos. Jei Bitbucket runner'is prieš atnaujinimą neveikė, tai tik parodoma; neveikusios GitHub paslaugos
-   netikrinamos.
+One command updates both checkouts: this repo (`~/setup-server`, the administrator's clone from which
+the command is run) and the shared setup checkout `/srv/setup-server/setup` (of the `setup` account). The manual
+update of the shared server is described below. For the administrator's two working clones an automatic
+update after the GitHub Actions checks can also be enabled (see "Automatic update of local clones").
 
-Runner'ių paslaugos niekada neperkraunamos: jos leidžiamos iš `/srv/setup-server/runner/current` ir
-`/srv/setup-server/github-runner/<scope>`, ne iš šio repo, o setup checkout'ą kiekvienas pipeline žingsnis
-skaito iš naujo. Ar runner'is ONLINE (GitHub'e – Idle), patikrink Bitbucket'e ar GitHub'e (scriptas jų API
-neskaito).
+```bash
+cd ~/setup-server
+bin/update --check --server-ref v0.2.0 --setup-ref v2.0.0   # shows what would change
+bin/update --server-ref v0.2.0 --setup-ref v2.0.0           # updates, checks, rolls back on failure
+```
 
-Nepavykus patikrai abu checkout'ai grąžinami į ankstesnius commit'us (ar šaką, jei checkout'as buvo ant
-jos), o įdiegtos komandų kopijos – į ankstesnes; išvedama, kuri patikra nepavyko, ir grąžinamas kodas 1. Kodas 2 reiškia, kad nepavyko ir grįžimas –
-išvedamos komandos rankiniam atstatymui.
+- Run it **without sudo**, as the owner of this clone (Server OPS is fetched with your git key); the setup checkout
+  part the script runs itself through `sudo -u setup` (it will ask for a password). Run with sudo – it refuses.
+- Only one side can be given (`--setup-ref` or `--server-ref`); the other stays where it was.
+- **Installed command copies.** When Server OPS changes, after the switch (before the health check) the installed copies
+  `/usr/local/sbin/setup-server-backup`, `/usr/local/sbin/setup-server-metrics`,
+  `/usr/local/sbin/setup-server-backup-pull`, `/usr/local/sbin/setup-server-access` and the web UI's `/usr/local/sbin/setup-server-ui` together with
+  `/usr/local/lib/setup-server/bin/` (only those installed) are overwritten through `sudo` from the new version: `bin/install-backups --refresh`,
+  `bin/install-metrics --refresh`, `bin/add-backup-key --refresh` and `bin/install-ui --refresh`.
+  When the metrics or UI copy changes, the service `setup-server-metrics` or `setup-server-ui` is restarted (the runner's – not).
+  If the clone is already on the given ref (e.g. after `git pull`), `bin/update` still compares the installed copies with the clone
+  (`bin/… --refresh --check`) and overwrites outdated ones – otherwise the UI, the gates and the timers would stay on the old version.
+  Other files (units, sudo rules, settings) are not changed; if they differ in the new version, a note
+  `note: … differs` is printed – then repeat `sudo bin/install-backups` (the time is kept), `sudo bin/install-metrics` or
+  `sudo bin/install-ui`. If the overwrite or the health check fails, the previous copies are restored together with the checkouts.
+- **From the web UI** (*Actions → Update*) `bin/update` runs as the clone owner, but without a terminal:
+  it cannot ask for the sudo password, so its calls are then `sudo -n`. If the owner is not allowed sudo without a password,
+  `bin/update` refuses right away (code 77, nothing changed) – update in a terminal. The clone must also be able to
+  fetch (`git fetch`) without a passphrase. During the update the UI restarts into the new copy, and the action continues.
+- **Ref** – a tag (preferred), an `origin` branch (`master` or `origin/master`) or a commit id. Server OPS may also be off a tag
+  (there are no tags yet). setup off a `vX.Y.Z` tag is fine **for stage only**: for a prod release setup must be on a
+  release tag – the preview shows this as a note.
+- `--check` fetches (`git fetch`) and shows, for each checkout, the current and new ref, the number of commits
+  ahead/behind, a summary of changed files and the list of commits (`+` – will appear, `-` – will disappear).
+  It does not change the checkouts.
+- It refuses if a checkout has local changes, the ref is unknown (it shows the newest tags) or a
+  pipeline step is running (a `make` process of the `setup` account outside a container; `make` of the project cron container's jobs with
+  the same UID is not counted) – then wait until it finishes.
+- Tags are fetched without `--force`: if an `origin` tag was moved to another commit (rewritten), the local one
+  stays where it was, and `bin/update` (and `--check`) ends with an error, showing the tag and both commits.
+  A release tag must not move – find out who moved it and why.
 
-### Automatinis vietinių klonų atnaujinimas
+**Health check after the update** (all three; any failure = rollback):
 
-Visi `tests` workflow job'ai vykdomi šios repozitorijos vietiniame runner'yje
-`[self-hosted, linux, setup.build]`: testai, kanalo publikavimas ir vietinis atnaujinimas. Testai išlaiko
-Ubuntu 22.04 / Python 3.10 aplinką iš `tests/fixtures/ci.Dockerfile`, vykdomą Docker konteineryje šiame PC.
-Konteineris dirba su runner'io UID/GID; prijungiamas tik checkout, be Docker socket ar naudotojo namų katalogo.
-CI paleidžiamas kiekvienos repo šakos push ir rankiniu workflow_dispatch; PR patikros ateina iš šakos push.
-Išorinių fork PR workflow automatiškai nepaleidžia. Tik `master` push po testų gali skelbti kanalą ar atnaujinti aplinką.
+1. The Server OPS tests (`python3 -m unittest discover -s tests`) from the new version – they check that the
+   scripts work on this server;
+2. the setup checkout is on the new commit and the `setup` account reads it without changes – that is exactly what
+   the pipelines use (`SETUP_DIRECTORY`);
+3. the runner service `setup-server-runner` and every GitHub runner service `setup-server-github-runner@<scope>`
+   that was running before the update are still active **with the same PID** – this proves they were not
+   restarted. If the Bitbucket runner was not running before the update, this is only shown; GitHub services that were not running
+   are not checked.
 
-GitHub Actions patikrina `master` ir paskelbia tik patikrintą versiją šakoje `deploy/local`:
+The runner services are never restarted: they are run from `/srv/setup-server/runner/current` and
+`/srv/setup-server/github-runner/<scope>`, not from this repo, and every pipeline step reads the setup checkout
+afresh. Whether the runner is ONLINE (on GitHub – Idle), check in Bitbucket or GitHub (the script does not read their
+API).
 
-- setup `Release` workflow po sėkmingo `Setup compatibility` vienu atominiu push paskelbia release commit'ą,
-  jo `vX.Y.Z` tag'ą ir `deploy/local`. Jei tuo metu `master` pasikeitė, visas push atmetamas.
-- Server OPS `tests` workflow priklausomas `publish-local` job'as po sėkmingų testų patikrina push commit'ą
-  ir pastumia `deploy/local`. PR, nesėkmingas CI ir pasenęs patikros rezultatas kanalo nepastumia.
+If the check fails, both checkouts are returned to their previous commits (or to the branch, if the checkout was on
+one), and the installed command copies – to the previous ones; it prints which check failed and returns code 1. Code 2 means that the rollback failed too –
+the commands for manual recovery are printed.
 
-Vietinis `setup-server-auto-update.timer` tikrina abu kanalus kas minutę (iki 10 s papildomo atidėjimo).
+### Automatic update of local clones
 
-Workflow taip pat turi priklausomą `local-update` job'ą: po `publish-local` jis vykdomas šios
-repozitorijos registruotame GitHub runner'yje su žymomis `[self-hosted, linux, setup.build]`.
-Jis paleidžia esamą `setup-server-auto-update.service`, palaukia jo pabaigos ir patikrina, kad abu vietiniai
-klonai švarūs, sutampa su CI patvirtintais kanalais ir turi workflow patikrintą commit'ą. Runner'io systemd
-paslauga perduoda `SETUP_SERVER_ROOT`; jo paskyrai turi būti leidžiama neinteraktyviai paleisti atnaujinimo
-paslaugą. Job'as nepaleidžiamas PR kodui. Neprijungus šios repozitorijos runner'io jis lauks eilėje;
-nepriklausomas timer'is lieka veikti ir tada, kai GitHub job'as negali pasiekti PC.
+All `tests` workflow jobs run on this repository's local runner
+`[self-hosted, linux, setup.build]`: tests, channel publishing and the local update. The tests keep the
+Ubuntu 22.04 / Python 3.10 environment from `tests/fixtures/ci.Dockerfile`, run in a Docker container on this PC.
+The container works with the runner's UID/GID; only the checkout is mounted, without the Docker socket or the user's home directory.
+CI runs on a push to any branch of the repo and on a manual workflow_dispatch; PR checks come from the branch push.
+The workflow does not run automatically for PRs from external forks. Only a `master` push may, after the tests, publish the channel or update the environment.
 
-Vietinėms patikroms turi būti paruošti Python 3.10+, Git, Make, Docker su Compose ir PHP CLI; installer'is
-trūkstamų paketų nediegia. CachyOS PHP CLI paketas — `php`.
-Jam reikia tik esamos neinteraktyvios Git SSH prieigos. GitHub API token'o, self-hosted runner'io ar įeinančio
-tinklo prievado nereikia. Po išjungto PC jis patikrina vėl; veikia ir prieš grafinį prisijungimą.
+GitHub Actions checks `master` and publishes only a verified version on the `deploy/local` branch:
 
-Pavyzdys dviem naudotojo `tomas` klonams; pradžioje peržiūra, paskui ta pati komanda be `--check`:
+- setup's `Release` workflow, after a successful `Setup compatibility`, publishes in one atomic push the release commit,
+  its `vX.Y.Z` tag and `deploy/local`. If `master` changed in the meantime, the whole push is rejected.
+- In the Server OPS `tests` workflow, the dependent `publish-local` job, after successful tests, checks the pushed commit
+  and pushes `deploy/local`. A PR, a failed CI and an outdated check result do not push the channel.
+
+The local `setup-server-auto-update.timer` checks both channels every minute (with up to 10 s of extra delay).
+
+The workflow also has a dependent `local-update` job: after `publish-local` it runs on this
+repository's registered GitHub runner with the labels `[self-hosted, linux, setup.build]`.
+It starts the existing `setup-server-auto-update.service`, waits for it to finish and checks that both local
+clones are clean, match the channels confirmed by CI and have the commit verified by the workflow. The runner's systemd
+service passes `SETUP_SERVER_ROOT`; its account must be allowed to start the update
+service non-interactively. The job does not run for PR code. If this repository's runner is not connected, it will wait in the queue;
+the independent timer keeps working even when the GitHub job cannot reach the PC.
+
+For the local checks Python 3.10+, Git, Make, Docker with Compose and PHP CLI must be in place; the installer
+does not install missing packages. On CachyOS the PHP CLI package is `php`.
+It needs only the existing non-interactive Git SSH access. No GitHub API token, self-hosted runner or incoming
+network port is needed. After the PC was off it checks again; it also works before a graphical login.
+
+An example for user `tomas`'s two clones; first the preview, then the same command without `--check`:
 
 ```bash
 cd /home/tomas/Projects/setup-server
@@ -777,77 +777,77 @@ sudo env SETUP_SERVER_USER=tomas SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/
   SETUP_DIRECTORY=/home/tomas/Projects/setup bin/install-auto-update
 ```
 
-Numatytasis Server OPS klonas yra tas, iš kurio leidžiamas installer'is, setup — jo kaimynas `setup`;
-kitą serverio kloną nurodo `SETUP_SERVER_CHECKOUT`. Abu turi priklausyti `SETUP_SERVER_USER` (numatytasis —
-serverio klono savininkas). `SETUP_SERVER_ROOT` čia parenka tik būsenos katalogą `auto-update/`, ne kitus klonus.
-Installer'is nereikalauja Ubuntu ir nekeičia `prepare-host`, paketų, projektų ar runner'ių. Kartojant esami
-unit'ai lyginami; veikiantis atnaujinimas nestabdomas. Keisti šiuos kelius reikia sustabdžius laikmatį ir palaukus
-veikiančios atnaujinimo paslaugos pabaigos.
+The default Server OPS clone is the one the installer is run from, setup is its sibling `setup`;
+another server clone is given by `SETUP_SERVER_CHECKOUT`. Both must belong to `SETUP_SERVER_USER` (default –
+the owner of the server clone). `SETUP_SERVER_ROOT` here chooses only the state directory `auto-update/`, not the other clones.
+The installer does not require Ubuntu and does not change `prepare-host`, packages, projects or runners. When repeated, the existing
+units are compared; a running update is not stopped. To change these paths, stop the timer and wait for
+the running update service to finish.
 
-`bin/auto-update` abiejuose klonuose palieka `master` ir atlieka tik fast-forward. Jei yra pakeistų ar
-neįtrauktų failų, kita šaka, nebaigta Git operacija, nepublikuotų commit'ų arba to naudotojo `make` ne
-konteineryje, atnaujinimas atidedamas. Naujesnis vietinis `master`, kurio CI dar vyksta, negrąžinamas atgal.
-Setup atnaujinimo commit'as turi sutapti su jo `VERSION` atitinkančiu release tag'u. Leidžiami ir nauji MAJOR
-leidimai: tai du darbo klonai, ne produkcinio projekto versijos pasirinkimas.
+`bin/auto-update` keeps `master` in both clones and only does a fast-forward. If there are modified or
+untracked files, another branch, an unfinished Git operation, unpublished commits or that user's `make` outside a
+container, the update is postponed. A newer local `master` whose CI is still running is not moved back.
+The setup update commit must match the release tag corresponding to its `VERSION`. New MAJOR
+releases are allowed too: these are two working clones, not a production project's choice of version.
 
-Po pakeitimo vykdomi abiejų repozitorijų vietiniai testai: Server OPS unittest ir setup A lygis (`tests/run`,
-be pasirenkamų Docker integracijų). Nepavykus abu klonai grįžta į ankstesnius commit'us per `git reset --keep`.
-Jei patikros metu pradėjai redaguoti, automatika darbo netrina ir palieka aiškią rankinio atkūrimo klaidą.
-Nutrauktas atnaujinimas atkuriamas iš transakcijos žurnalo prieš kitą bandymą. Vienu metu veikia tik vienas
-atnaujinimas; tos pačios patikros neišlaikiusios versijos nebekartoja, kol neatsiranda nauja arba neduodi `--retry`.
+After the change the local tests of both repositories run: the Server OPS unittest and setup level A (`tests/run`,
+without the optional Docker integrations). On failure both clones return to their previous commits via `git reset --keep`.
+If you started editing during the check, the automation does not delete your work and leaves a clear manual recovery error.
+An interrupted update is recovered from the transaction log before the next attempt. Only one
+update runs at a time; a version that failed the same checks is not retried until a new one appears or you pass `--retry`.
 
-Šis režimas atnaujina **tik dviejų Git klonų kodą**. Root priklausančių įdiegtų komandų kopijų, sudo taisyklių,
-unit'ų ir konteinerių jis nekeičia. Joms lieka `bin/update` ir atitinkami `bin/install-*`; setup host pagalbinėms
-kopijoms — `setup/install-host` (CachyOS sistemoje jas atnaujink rankiniu būdu, nevykdyk Ubuntu paketų diegimo).
+This mode updates **only the code of the two Git clones**. It does not change the root-owned installed command copies, sudo rules,
+units or containers. For those there are still `bin/update` and the corresponding `bin/install-*`; for setup's host helper
+copies – `setup/install-host` (on CachyOS update them by hand, do not run the Ubuntu package installation).
 
 ```bash
 systemctl list-timers setup-server-auto-update.timer
 journalctl -u setup-server-auto-update.service -n 50
 cat /home/tomas/Projects/runtime/setup-server/auto-update/status.json
 bin/auto-update --check --state-dir /home/tomas/Projects/runtime/setup-server/auto-update
-sudo systemctl disable --now setup-server-auto-update.timer  # sustabdo būsimus bandymus
+sudo systemctl disable --now setup-server-auto-update.timer  # stops future attempts
 ```
 
-Laikmačio išjungimas nenutraukia jau vykstančio atnaujinimo. Prieš rankinį atkūrimą palauk jo pabaigos.
-`--check` tik parsiunčia ir parodo; darbo klonų nekeičia. Rankiniam pakartojimui pridėk `--retry` ir naudok
-tą patį `--state-dir` kaip paslauga. Sėkmingo darbo būsena — `updated` arba `up_to_date`; nesukurtas kanalas —
-`waiting_for_ci`; grąžinta versija — `rolled_back`; `updating` po proceso pabaigos reikalauja atkūrimo.
+Disabling the timer does not interrupt an update already in progress. Wait for it to finish before a manual recovery.
+`--check` only fetches and shows; it does not change the working clones. For a manual retry add `--retry` and use
+the same `--state-dir` as the service. The status of a successful run is `updated` or `up_to_date`; a channel not yet created –
+`waiting_for_ci`; a rolled-back version – `rolled_back`; `updating` after the process has ended requires recovery.
 
-### Tik setup (be slaptažodžio)
+### Setup only (no password)
 
-Bendrą setup checkout'ą (`/srv/setup-server/setup`) atnaujina viena komanda, be administratoriaus slaptažodžio ir be
-Server OPS atnaujinimo – arba sąsajoje *Atnaujinimas* („Atnaujinti į naujausią“):
+The shared setup checkout (`/srv/setup-server/setup`) is updated by one command, without the administrator's password and without
+updating Server OPS – or in the UI's *Update* ("Update to the newest"):
 
 ```bash
-sudo bin/update-setup --check          # dabartinė versija, naujausias to paties MAJOR release'as, commit'ai
-sudo bin/update-setup                  # perjungia į jį
-sudo bin/update-setup v2.6.0           # arba į nurodytą release tag'ą
+sudo bin/update-setup --check          # the current version, the newest release of the same MAJOR, commits
+sudo bin/update-setup                  # switches to it
+sudo bin/update-setup v2.6.0           # or to the given release tag
 ```
 
-- Tik release tag'ai (`vX.Y.Z`), tik švarus checkout'as, ne pipeline žingsnio metu (`make` paskyros `setup` ne konteineryje).
-  Nepavykus perjungti checkout'as grįžta. Git darbą atlieka paskyra `setup`.
-- **Naujausias release'as yra `master`:** setup kiekvieną sujungimą į `master` po sėkmingo CI išleidžia pats
-  (`Release X.Y.Z`, tag'as `vX.Y.Z`), todėl „į naujausią“ – tai, ką turi `master`, o prod deploy'ai veikia (setup
-  `make release ENV=prod` stato tik iš release tag'o). Jei setup kada nors liko ne ant tag'o (ranka perjungtas),
-  *Atnaujinimas* ir *Apžvalga* („Reikia dėmesio“) tai rodo; grįžti – „Atnaujinti į naujausią“.
-- Naujas MAJOR – tik nurodžius tag'ą; peržiūra perspėja, kad projektams gali reikėti pakeitimų.
-- **Deploy'us tai daro ir pats:** kai deploy'inamo commit'o `SETUP_MIN_VERSION` naujesnis už serverio setup, setup 2.7.0+
-  `pipeline-deploy` perjungia setup į naujausią to paties MAJOR release'ą ir žingsnį paleidžia iš naujo.
-- Pilnas atnaujinimas (Server OPS ir setup kartu, su sveikatos patikra) – `bin/update`, žemiau.
+- Only release tags (`vX.Y.Z`), only a clean checkout, not during a pipeline step (`make` of the `setup` account outside a container).
+  If the switch fails the checkout returns. The Git work is done by the `setup` account.
+- **The newest release is `master`:** setup releases every merge into `master` itself after a successful CI
+  (`Release X.Y.Z`, tag `vX.Y.Z`), so "to the latest" means what `master` has, and prod deploys work (setup's
+  `make release ENV=prod` builds only from a release tag). If setup was ever left off a tag (switched by hand),
+  *Update* and *Overview* ("Needs attention") show it; to go back – "Update to the newest".
+- A new MAJOR – only when the tag is given; the preview warns that projects may need changes.
+- **The deploy also does this by itself:** when the deployed commit's `SETUP_MIN_VERSION` is newer than the server's setup, setup 2.7.0+
+  `pipeline-deploy` switches setup to the newest release of the same MAJOR and restarts the step.
+- A full update (Server OPS and setup together, with the health check) – `bin/update`, below.
 
-### Rankinis atstatymas
+### Manual recovery
 
-Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo nutrauktas netikėtai:
+When `bin/update` ends with "The automatic return failed" (code 2) or was interrupted unexpectedly:
 
-1. **Ankstesni commit'ai.** Juos išveda eilutė `Previous commits (for a manual return): …`. Jei jos
-   nebeturi – reflog'as (pirmoji eilutė prieš atnaujinimo `checkout`):
+1. **The previous commits.** They are printed by the line `Previous commits (for a manual return): …`. If you
+   no longer have it – the reflog (the first line before the update's `checkout`):
 
    ```bash
    git -C ~/setup-server reflog -n 5
    (cd / && sudo -u setup -H git -C /srv/setup-server/setup reflog -n 5)
    ```
 
-2. **Kodėl nepavyko grįžti.** Dažniausiai – teisės (`.git` neįrašomas) arba sugadinti failai:
+2. **Why the return failed.** Most often – permissions (`.git` not writable) or corrupted files:
 
    ```bash
    ls -ld ~/setup-server/.git /srv/setup-server/setup/.git
@@ -855,119 +855,119 @@ Kai `bin/update` baigiasi „The automatic return failed“ (kodas 2) arba buvo 
    sudo chown -R setup:setup /srv/setup-server/setup
    ```
 
-3. **Grąžink** (komandos tos pačios, kurias išveda scriptas):
+3. **Return** (the same commands the script prints):
 
    ```bash
-   git -C ~/setup-server checkout --force <setup-server commit'as>
-   (cd / && sudo -u setup -H git -C /srv/setup-server/setup checkout --force <setup commit'as>)
+   git -C ~/setup-server checkout --force <setup-server commit>
+   (cd / && sudo -u setup -H git -C /srv/setup-server/setup checkout --force <setup commit>)
    ```
 
-   Jei scriptas išvedė ir `sudo install … /usr/local/sbin/setup-server-…` (ar `… /usr/local/lib/setup-server/bin/`)
-   eilutę, įvykdyk ją (ankstesnė kopija laikoma `/tmp/tmp.…` kataloge). Be jos įdiegtas kopijas iš grąžinto checkout'o
-   perrašo `sudo bin/install-backups --refresh`, `sudo bin/install-metrics --refresh`, `sudo bin/add-backup-key --refresh`
-   ir `sudo bin/install-ui --refresh`.
+   If the script also printed a `sudo install … /usr/local/sbin/setup-server-…` (or `… /usr/local/lib/setup-server/bin/`)
+   line, run it (the previous copy is kept in a `/tmp/tmp.…` directory). Without it, the installed copies are overwritten from the returned checkout
+   by `sudo bin/install-backups --refresh`, `sudo bin/install-metrics --refresh`, `sudo bin/add-backup-key --refresh`
+   and `sudo bin/install-ui --refresh`.
 
-4. **Patikrink:**
+4. **Check:**
 
    ```bash
    cd ~/setup-server && python3 -m unittest discover -s tests
    (cd / && sudo -u setup -H git -C /srv/setup-server/setup describe --tags --always)
-   systemctl is-active setup-server-runner      # active; Bitbucket'e runner'is ONLINE
-   systemctl is-active 'setup-server-github-runner@*'   # active; GitHub'e runner'is Idle
+   systemctl is-active setup-server-runner      # active; in Bitbucket the runner is ONLINE
+   systemctl is-active 'setup-server-github-runner@*'   # active; on GitHub the runner is Idle
    ```
 
-   Jei runner'is neaktyvus, žr. `journalctl -u setup-server-runner -n 50` (`-u setup-server-github-runner@<scope>`)
-   ir tik tada `sudo systemctl start setup-server-runner` (`setup-server-github-runner@<scope>`).
+   If the runner is not active, see `journalctl -u setup-server-runner -n 50` (`-u setup-server-github-runner@<scope>`)
+   and only then `sudo systemctl start setup-server-runner` (`setup-server-github-runner@<scope>`).
 
-5. **Jei checkout'as sugadintas** (git klaidos ir po `chown`): setup – perkelk seną į šalį ir leisk
-   `prepare-host` nusiklonuoti iš naujo (kol nėra `setup/`, pipeline'ai nepavyks):
+5. **If the checkout is corrupted** (git errors even after `chown`): setup – move the old one aside and let
+   `prepare-host` clone it again (while there is no `setup/`, the pipelines will fail):
 
    ```bash
    sudo mv /srv/setup-server/setup /srv/setup-server/setup.broken
-   sudo bin/prepare-host --setup-ref <tag'as>
+   sudo bin/prepare-host --setup-ref <tag>
    ```
 
-   Server OPS – nusiklonuok iš naujo greta ir sukeisk:
+   Server OPS – clone it again alongside and swap:
 
    ```bash
    git clone git@github.com:BigSant/DockerDevelopmentEnvironmentServer.git ~/setup-server.new
-   git -C ~/setup-server.new checkout <commit'as>
+   git -C ~/setup-server.new checkout <commit>
    mv ~/setup-server ~/setup-server.broken && mv ~/setup-server.new ~/setup-server
    ```
 
-## Worker'io metrikos
+## Worker metrics
 
-Worker'is atiduoda savo Prometheus `/metrics` – tai, ką žino tik jis: DB kopijos, deploy'ai, runner'is ir
-diskas. Taikinio metrikos (sistema, svetainė, konteineriai, cron) – atskiras setup endpoint'as projekto
-domene; šis jų nedubliuoja.
+The worker serves its own Prometheus `/metrics` – what only it knows: DB backups, deploys, the runner and
+the disk. The target's metrics (system, website, containers, cron) are a separate setup endpoint on the project's
+domain; this one does not duplicate them.
 
 ```bash
 cd ~/setup-server
-sudo bin/install-metrics --check --address 10.8.0.14 --allow 10.8.0.20   # parodo unit'ą ir nustatymus; nieko nekeičia
-sudo bin/install-metrics --address 10.8.0.14 --allow 10.8.0.20           # įdiegia ir paleidžia
+sudo bin/install-metrics --check --address 10.8.0.14 --allow 10.8.0.20   # shows the unit and the settings; changes nothing
+sudo bin/install-metrics --address 10.8.0.14 --allow 10.8.0.20           # installs and starts
 ```
 
-- `--address` – kur klausoma: VPN serveryje jo VPN adresas (`10.8.0.14`); numatytas `127.0.0.1` (tik iš paties
-  serverio). `--allow` – Prometheus adresas(-ai), IP/CIDR, atskirti tarpais ar kableliais; privalomas su bet
-  kuriuo adresu, išskyrus `127.0.0.1`/`::1`. `--port` – numatytas `9101`.
-- **Token'as neprivalomas.** Prieigą saugo IP sąrašas; be token'o atsako kiekvienam sąrašo adresui.
-  `--new-token` – sugeneruoja 43 simbolių token'ą (arba pakeičia esamą; Prometheus'ui:
-  `sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env`), `--no-token` – pašalina esamą.
-  Token'as naudingas, kai sąraše daugiau adresų nei Prometheus (pvz. visas VPN potinklis).
-- Nustatymai laikomi `/etc/setup-server/metrics.env` (root, 0600). Pakartotinai paleidus nenurodyti nustatymai
-  (ir token'as) lieka, paslauga perkraunama tik pasikeitus failui; runner'io paslauga neliečiama. Įdiegtą komandos
-  kopiją atnaujina `bin/update` (žr. „Atnaujinimas“).
-- Prieiga kaip taikinio `/metrics`: ne iš sąrašo – `403`, su token'u – be jo ar su neteisingu `401`, kitas kelias –
-  `404`. Be sąrašo ar su trumpesniu nei 24 simbolių token'u paslauga nepasileidžia (`journalctl -u setup-server-metrics`).
-  `X-Forwarded-For` ignoruojamas: priešais nėra proxy, klientai jungiasi tiesiogiai.
+- `--address` – where it listens: on the VPN server its VPN address (`10.8.0.14`); the default is `127.0.0.1` (only from the
+  server itself). `--allow` – the Prometheus address(es), IP/CIDR, separated by spaces or commas; required with any
+  address except `127.0.0.1`/`::1`. `--port` – the default is `9101`.
+- **The token is optional.** Access is protected by the IP list; without a token it answers every address on the list.
+  `--new-token` – generates a 43-character token (or replaces the existing one; for Prometheus:
+  `sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env`), `--no-token` – removes the existing one.
+  A token is useful when the list has more addresses than Prometheus (e.g. the whole VPN subnet).
+- The settings are kept in `/etc/setup-server/metrics.env` (root, 0600). When run again, settings not given
+  (and the token) stay, the service is restarted only if the file changed; the runner service is not touched. The installed copy
+  of the command is updated by `bin/update` (see "Updating").
+- Access like the target's `/metrics`: not from the list – `403`, with a token – without it or with a wrong one `401`, another path –
+  `404`. Without a list or with a token shorter than 24 characters the service does not start (`journalctl -u setup-server-metrics`).
+  `X-Forwarded-For` is ignored: there is no proxy in front, clients connect directly.
 
-**Kodėl atskira paslauga, ne nginx-proxy.** Worker'is neturi savo nginx-proxy (projektų nginx-proxy priklauso
-projektams ir jų release'ams). Python standartinės bibliotekos HTTP serveris paskyra `setup` (build katalogų
-savininkė) skaito failus tiesiogiai: be Docker socket'o, be root, be naujų paketų. systemd jį laiko tik
-skaitančiu (`ProtectSystem=strict`, `NoNewPrivileges`, be capability). Klausoma vienu adresu, todėl
-viešai jis nematomas; VPN adresą jis užima ir tada, kai VPN sąsaja pakyla vėliau (`IP_FREEBIND`).
+**Why a separate service, not nginx-proxy.** The worker has no nginx-proxy of its own (the projects' nginx-proxy belongs to
+the projects and their releases). A Python standard library HTTP server running as the `setup` account (the owner of the build
+directories) reads the files directly: no Docker socket, no root, no new packages. systemd keeps it
+read-only (`ProtectSystem=strict`, `NoNewPrivileges`, no capabilities). It listens on one address, so
+it is not visible publicly; it takes the VPN address even when the VPN interface comes up later (`IP_FREEBIND`).
 
-**Metrikos** (žymos `project` – build katalogo vardas, `environment` – `stage`/`prod`):
+**Metrics** (labels `project` – the build directory name, `environment` – `stage`/`prod`):
 
-| Metrika | Reikšmė |
+| Metric | Meaning |
 | --- | --- |
-| `setup_worker_backup_newest_age_seconds` | Kiek sekundžių praėjo nuo naujausios kopijos (failo laikas) |
-| `setup_worker_backup_newest_size_bytes` | Naujausios kopijos dydis |
-| `setup_worker_backups` | Kiek kopijų laikoma; `0` – aplinka deploy'inama iš čia (`env/<env>.env`), bet kopijos nėra |
-| `setup_worker_deploy_last_timestamp_seconds` | Paskutinio deploy'aus laikas (ir nepavykusio) |
-| `setup_worker_deploy_last_success` | `1` – paskutinis deploy'us baigtas; `0` – sustojo po rsync (`"failed": "after-rsync"`) |
-| `setup_worker_deploy_last_success_timestamp_seconds` | Paskutinio baigto deploy'aus laikas |
-| `setup_worker_deploy_last_rollback` | `1` – paskutinis deploy'us buvo `rollback=1` |
-| `setup_worker_deploy_last_info{ref,commit}` | Paskutinio deploy'aus ref'as (iki 64 simbolių) ir commit'as (12 simbolių) |
-| `setup_worker_files_backups`, `setup_worker_files_backup_newest_age_seconds`, `_newest_size_bytes` | Tas pats failų kopijoms (`files-<env>-…Z.tar.gz`, `BACKUP_FILE_PATHS`); `0` – tik aplinkai su `BACKUP_FILE_PATHS` ir tik įdiegus `setup-server-backup-files.timer` |
-| `setup_worker_runner_up`, `setup_worker_runner_state{state}`, `setup_worker_runner_restarts` | `setup-server-runner` (Bitbucket) būsena iš `systemctl show` (`active`, `failed`, `not-found` …) ir automatiniai perkrovimai |
-| `setup_worker_github_runner_up{scope}`, `setup_worker_github_runner_state{scope,state}`, `setup_worker_github_runner_restarts{scope}` | Tas pats kiekvienam užregistruotam GitHub runner'iui (`github-runner/<scope>` su `.runner`): paslauga `setup-server-github-runner@<scope>`. Nė vieno nėra – šių eilučių nėra |
-| `setup_worker_disk_size_bytes`, `_used_bytes`, `_available_bytes` `{path}` | Failų sistema, kurioje `/srv/setup-server` (kaip `df`) |
-| `setup_metrics_group_up{group}` | `0`, jei grupės (`backups`, `deploys`, `runner`, `github_runner`, `disk`) dalies nepavyko perskaityti (priežastis – journal'e) |
+| `setup_worker_backup_newest_age_seconds` | How many seconds have passed since the newest backup (file time) |
+| `setup_worker_backup_newest_size_bytes` | The size of the newest backup |
+| `setup_worker_backups` | How many backups are kept; `0` – the environment is deployed from here (`env/<env>.env`), but there is no backup |
+| `setup_worker_deploy_last_timestamp_seconds` | The time of the last deploy (including a failed one) |
+| `setup_worker_deploy_last_success` | `1` – the last deploy finished; `0` – it stopped after rsync (`"failed": "after-rsync"`) |
+| `setup_worker_deploy_last_success_timestamp_seconds` | The time of the last finished deploy |
+| `setup_worker_deploy_last_rollback` | `1` – the last deploy was `rollback=1` |
+| `setup_worker_deploy_last_info{ref,commit}` | The last deploy's ref (up to 64 characters) and commit (12 characters) |
+| `setup_worker_files_backups`, `setup_worker_files_backup_newest_age_seconds`, `_newest_size_bytes` | The same for file backups (`files-<env>-…Z.tar.gz`, `BACKUP_FILE_PATHS`); `0` – only for an environment with `BACKUP_FILE_PATHS` and only once `setup-server-backup-files.timer` is installed |
+| `setup_worker_runner_up`, `setup_worker_runner_state{state}`, `setup_worker_runner_restarts` | The `setup-server-runner` (Bitbucket) state from `systemctl show` (`active`, `failed`, `not-found` …) and automatic restarts |
+| `setup_worker_github_runner_up{scope}`, `setup_worker_github_runner_state{scope,state}`, `setup_worker_github_runner_restarts{scope}` | The same for every registered GitHub runner (`github-runner/<scope>` with `.runner`): the service `setup-server-github-runner@<scope>`. If there are none – these lines are absent |
+| `setup_worker_disk_size_bytes`, `_used_bytes`, `_available_bytes` `{path}` | The file system holding `/srv/setup-server` (like `df`) |
+| `setup_metrics_group_up{group}` | `0` if part of a group (`backups`, `deploys`, `runner`, `github_runner`, `disk`) could not be read (the reason is in the journal) |
 
-Bitbucket runner'io metrikos paliktos kaip buvo (be žymų), kad esami įspėjimai ir grafikai nesikeistų; GitHub
-runner'iai – atskiros metrikos su žyma `scope`, nes jų gali būti keli.
+The Bitbucket runner metrics were left as they were (without labels) so that existing alerts and graphs do not change; GitHub
+runners have separate metrics with the `scope` label, because there may be several.
 
-Kopijos – tik `worker-<env>-…Z.sql.gz` (naktinės ir „backup dabar“). Deploy'aus ir „fresh“ kopijos
-neskaičiuojamos, kad neuždengtų sustojusio laikmačio. Savaitinė pilna serija (`full-<env>-…Z.sql.gz`) turi savo
-metrikas `setup_worker_full_backups`, `setup_worker_full_backup_newest_age_seconds` ir
-`setup_worker_full_backup_newest_size_bytes`; `0` aplinkai be pilnos kopijos rodomas tik įdiegus
-`setup-server-backup-full.timer`, kad serveris be savaitinių kopijų nekeltų įspėjimo. Deploy'ai – iš setup istorijos
-`app/.generated/release/<env>/deployments.json` (paskutinis įrašas). Patikrinti be Prometheus:
+Backups – only `worker-<env>-…Z.sql.gz` (nightly and "backup now"). Deploy and "fresh" backups
+are not counted, so that they do not hide a stopped timer. The weekly full series (`full-<env>-…Z.sql.gz`) has its own
+metrics `setup_worker_full_backups`, `setup_worker_full_backup_newest_age_seconds` and
+`setup_worker_full_backup_newest_size_bytes`; `0` for an environment without a full backup is shown only once
+`setup-server-backup-full.timer` is installed, so that a server without weekly backups does not raise an alert. Deploys – from setup's history
+`app/.generated/release/<env>/deployments.json` (the last entry). To check without Prometheus:
 
 ```bash
 systemctl status setup-server-metrics
-sudo -u setup /usr/local/sbin/setup-server-metrics --once          # metrikos be serverio ir token'o
-curl http://10.8.0.14:9101/metrics                                  # iš sąrašo adreso, be token'o
-curl -H "Authorization: Bearer $(sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env)" http://10.8.0.14:9101/metrics   # su token'u
+sudo -u setup /usr/local/sbin/setup-server-metrics --once          # metrics without the server and the token
+curl http://10.8.0.14:9101/metrics                                  # from a listed address, without a token
+curl -H "Authorization: Bearer $(sudo sed -n 's/^METRICS_TOKEN=//p' /etc/setup-server/metrics.env)" http://10.8.0.14:9101/metrics   # with the token
 ```
 
-**Prometheus** (serveris prijungtas prie VPN; `authorization` – tik su token'u):
+**Prometheus** (the server is connected to the VPN; `authorization` – only with a token):
 
 ```yaml
 scrape_configs:
   - job_name: 'setup-worker'
-    scheme: http                      # srautą šifruoja VPN
+    scheme: http                      # the VPN encrypts the traffic
     metrics_path: /metrics
     scrape_interval: 1m
     authorization:
@@ -976,370 +976,372 @@ scrape_configs:
       - targets: ['10.8.0.14:9101']
 ```
 
-**Siūlomas Grafana įspėjimas „kopija senesnė nei 26 val.“** (įjungiamas kartu su kitais įspėjimais):
+**Suggested Grafana alert "backup older than 26 h"** (enabled together with the other alerts):
 
 ```promql
 max by (project, environment) (setup_worker_backup_newest_age_seconds) > 26 * 3600
   or setup_worker_backups == 0
 ```
 
-Failų kopijai – tas pats su `setup_worker_files_backup_newest_age_seconds` ir `setup_worker_files_backups`.
-Savaitinei pilnai kopijai – „senesnė nei 8 dienos“:
+For the file backup – the same with `setup_worker_files_backup_newest_age_seconds` and `setup_worker_files_backups`.
+For the weekly full backup – "older than 8 days":
 
 ```promql
 max by (project, environment) (setup_worker_full_backup_newest_age_seconds) > 8 * 24 * 3600
   or setup_worker_full_backups == 0
 ```
 
-Papildomai verta: `up{job="setup-worker"} == 0` arba „no data“ (VPN ar paslauga neveikia),
+Also worth having: `up{job="setup-worker"} == 0` or "no data" (the VPN or the service is down),
 `setup_metrics_group_up == 0`, `setup_worker_runner_up == 0`, `setup_worker_github_runner_up == 0`,
 `setup_worker_deploy_last_success == 0`.
 
-## Valdymo sąsaja (web)
+## Web UI
 
-Naršyklėje – serverio būsena ir tie patys `bin/` veiksmai. Sąsaja klauso tik `127.0.0.1` (numatytas port'as `9102`),
-todėl iš kompiuterio ji pasiekiama tik per SSH tunelį.
+The server status and the same `bin/` actions in a browser. The UI listens only on `127.0.0.1` (default port `9102`),
+so from a computer it is reachable only through an SSH tunnel.
 
 ```bash
 cd ~/setup-server
-sudo bin/install-ui --check        # paskyra, unit'as, sudo taisyklė, nustatymai (paslaptys paslėptos); nieko nekeičia
-sudo bin/install-ui                # įdiegia, paleidžia ir vieną kartą parodo slaptažodį
+sudo bin/install-ui --check        # account, unit, sudo rule, settings (secrets hidden); changes nothing
+sudo bin/install-ui                # installs, starts and shows the password once
 ```
 
-- `--port` – kitas port'as (1024–65535). Kito adreso nėra: `--address` priima tik `127.0.0.1`, pati paslauga kitu
-  adresu nepasileidžia.
-- `--user` – pirmojo administratoriaus vardas (numatytas `admin`), `--new-password` – naujas jo slaptažodis (senasis
-  nebetinka; žr. „Vartotojai ir grupės“ – taip root'as visada grąžina prieigą).
-- Pakartotinai paleistas palieka vardą, port'ą, slaptažodį ir token'us; paslaugą perkrauna tik pasikeitus failui.
-  Įdiegtas kopijas atnaujina `bin/update` (žr. „Atnaujinimas“).
+- `--port` – another port (1024–65535). There is no other address: `--address` accepts only `127.0.0.1`, the service itself does not
+  start on another address.
+- `--user` – the first administrator's name (default `admin`), `--new-password` – a new password for them (the old one
+  no longer works; see "Users and groups" – this is how root always gets access back).
+- Run again, it keeps the name, port, password and tokens; it restarts the service only if the file changed.
+  The installed copies are updated by `bin/update` (see "Updating").
 
-**Prisijungimas.** Kompiuteryje atidaryk tunelį ir naršyklėje – `http://localhost:9102/`:
+**Signing in.** On your computer open the tunnel and in the browser – `http://localhost:9102/`:
 
 ```bash
-ssh -L 9102:127.0.0.1:9102 <serveris>    # kol tunelis atidarytas, sąsaja pasiekiama
+ssh -L 9102:127.0.0.1:9102 <server>    # the UI is reachable while the tunnel is open
 ```
 
-Tunelis eina per serverio SSH; jei jis neatsako, žr. `bin/install-ssh` („Eiga“, 7 žingsnis).
+The tunnel goes through the server's SSH; if it does not respond, see `bin/install-ssh` ("Steps", step 7).
 
-Atsidaro prisijungimo puslapis (vardas ir slaptažodis; srautą šifruoja SSH). Pirmą kartą – `install-ui` parodytas
-`admin` slaptažodis; serveryje laikomas tik jo PBKDF2 hash'as `/etc/setup-server/ui.env` (root, 0600). Pamiršus –
-`sudo bin/install-ui --new-password`. Skriptams (`curl -u vardas:slaptažodis`) tinka ir Basic auth bet kurio įjungto
-vartotojo vardu; naršyklės iššokančio langelio nebėra.
+A sign-in page opens (name and password; SSH encrypts the traffic). The first time – the `admin` password shown by `install-ui`;
+the server keeps only its PBKDF2 hash in `/etc/setup-server/ui.env` (root, 0600). If you forget it –
+`sudo bin/install-ui --new-password`. For scripts (`curl -u name:password`) Basic auth also works with any enabled
+user's name; the browser's pop-up dialog is gone.
 
-**Vartotojai ir grupės.** Skiltis *Vartotojai* (`/users`): kas prisijungia prie sąsajos ir ką joje gali.
+**Users and groups.** The *Users* section (`/users`): who signs in to the UI and what they can do there.
 
-- **Grupė** kiekvienai skilčiai (Apžvalga, Runner'iai, Prieiga, Failai, Atnaujinimas, Veiksmai, Instrukcijos, Žurnalai,
-  Metrikos, Vartotojai) duoda „nėra“, „mato“ (skiltis rodoma) arba „valdo“ (dar ir jos veiksmai: peržiūra ir vykdymas; Instrukcijos,
-  Žurnalai ir Metrikos tik rodomos). Veiksmas leidžiamas, jei vartotojas valdo bent vieną skiltį, kurioje yra jo forma
-  (pvz. „Backup dabar“ – Apžvalga, Failai ar Veiksmai; runner'io paleidimas, sustabdymas, perkrovimas – Apžvalga ar
-  Runner'iai). Kur vartotojas tik mato, mygtukų nėra, o tiesioginis POST – `403`.
-- **Vartotojas** priklauso vienai ar kelioms grupėms; jo teisė skilčiai – didžiausia iš jų. Jį galima (nebūtina) susieti
-  su *Prieigos* žmogumi (SSH raktu ir įrankiais): tai tik nuoroda, prisijungimas nuo rakto nepriklauso. Išjungtas
-  vartotojas prisijungti negali, jo sesijos baigiamos iš karto; naujas slaptažodis baigia kitas jo sesijas.
-- **Pradinės grupės:** *Administratoriai* (valdo viską, keisti ar ištrinti negalima), *Operatoriai* (valdo Apžvalgą, Runner'ius,
-  Failus ir Veiksmus, mato kitas skiltis, išskyrus Vartotojus), *Stebėtojai* (mato viską, išskyrus Vartotojus). Turi likti bent
-  vienas įjungtas administratorius: paskutinio išjungti, iš grupės išimti ar ištrinti sąsaja neleidžia. Atsiradus naujai
-  skilčiai, esamos grupės ją gauna tokio lygio, kokį turi artimiausiai (*Runner'iai* – kaip *Veiksmai*); vėliau tai
-  keičiama kaip bet kuri teisė.
-- **Pirmasis administratorius.** Pirmą kartą pasileidusi sąsaja `ui.env` vardą (`admin`) padaro grupės
-  *Administratoriai* nariu. Pakeitus `ui.env` slaptažodį (`sudo bin/install-ui --new-password`) tas vartotojas vėl
-  įjungiamas, grąžinamas į *Administratorius* su nauju slaptažodžiu, jo sesijos baigiamos – root'o kelias atgal, jei
-  visi užsirakino.
-- **Mano paskyra** (`/account`, vardas viršuje dešinėje) – savo grupės, teisės ir slaptažodžio keitimas (12–128 simbolių).
-- **Kur laikoma:** `/var/lib/setup-server-ui/accounts.json` (`setup-ui`, 0600; slaptažodžiai – PBKDF2 hash'ai) ir
-  `sessions.json` (tik sesijų slapukų sha256). Sesija – slapukas `ops_session` (HttpOnly, SameSite=Lax; per HTTPS proxy –
-  ir Secure), baigiasi po 12 val. nenaudojimo ir ne vėliau kaip po 14 d.; mygtukas „Atsijungti“ ją baigia. 10 nepavykusių
-  prisijungimų iš vieno adreso per 15 min. (per LAN proxy – pagal jo perduotą `X-Real-IP`) – toliau `429`, kol praeis laikas. Sugadintas `accounts.json` – sąsaja
-  nepasileidžia (journal pasako kodėl); jį pašalinus, `ui.env` vartotojas vėl tampa pirmuoju administratoriumi.
-- Kiekvienas pakeitimas (prisijungimas, atsijungimas, vartotojo ar grupės išsaugojimas, ištrynimas, atsisakymas) įrašomas į
-  `ui-actions.log` (`users …`); slaptažodžiai – niekada. Neįrašius eilutės, pakeitimas nedaromas.
+- **A group** gives, for each section (Overview, Runners, Access, Files, Update, Actions, Instructions, Logs,
+  Metrics, Users), "none", "view" (the section is shown) or "manage" (its actions as well: preview and run; Instructions,
+  Logs and Metrics are only shown). An action is allowed if the user manages at least one section that contains its form
+  (e.g. "Backup now" – Overview, Files or Actions; starting, stopping, restarting a runner – Overview or
+  Runners). Where the user can only view, there are no buttons, and a direct POST gets `403`.
+- **A user** belongs to one or more groups; their permission for a section is the highest of them. They can (optionally) be linked
+  to a person in *Access* (an SSH key and tools): this is only a link, signing in does not depend on the key. A disabled
+  user cannot sign in, their sessions end immediately; a new password ends their other sessions.
+- **Default groups:** *Administrators* (manages everything, cannot be changed or deleted), *Operators* (manages Overview, Runners,
+  Files and Actions, views the other sections except Users), *Viewers* (views everything except Users). Their ids are
+  `administrators`, `operators` and `viewers`; on start the UI automatically migrates the old Lithuanian group ids in an existing
+  `accounts.json` (`administratoriai`, `operatoriai`, `stebetojai`) to them. At least
+  one enabled administrator must remain: the UI does not allow the last one to be disabled, removed from the group or deleted. When a new
+  section appears, the existing groups get it at the level they have on the closest one (*Runners* – like *Actions*); later this
+  is changed like any other permission.
+- **The first administrator.** When the UI starts for the first time, it makes the `ui.env` name (`admin`) a member of the
+  *Administrators* group. When the `ui.env` password is changed (`sudo bin/install-ui --new-password`) that user is
+  enabled again, put back into *Administrators* with the new password, and their sessions are ended – root's way back if
+  everyone got locked out.
+- **My account** (`/account`, the name at the top right) – one's own groups, permissions and password change (12–128 characters).
+- **Where it is kept:** `/var/lib/setup-server-ui/accounts.json` (`setup-ui`, 0600; passwords – PBKDF2 hashes) and
+  `sessions.json` (only the sha256 of session cookies). A session is the cookie `ops_session` (HttpOnly, SameSite=Lax; behind an HTTPS proxy –
+  also Secure), it ends after 12 h of inactivity and no later than after 14 days; the "Sign out" button ends it. After 10 failed
+  sign-ins from one address within 15 min. (behind the LAN proxy – by the `X-Real-IP` it passes) – `429` from then on until the time has passed. A corrupted `accounts.json` – the UI
+  does not start (the journal says why); once it is removed, the `ui.env` user becomes the first administrator again.
+- Every change (sign-in, sign-out, saving a user or group, deletion, refusal) is written to
+  `ui-actions.log` (`users …`); passwords – never. If the line cannot be written, the change is not made.
 
-**Ką rodo.** Navigacijoje prie *Prieigos* – raktų skaičius, prie *Atnaujinimo* – taškas: geltonas, kai yra naujesnis
-commit'as, raudonas, kai setup ne ant release tag'o.
+**What it shows.** In the navigation, next to *Access* – the number of keys, next to *Update* – a dot: yellow when there is a newer
+commit, red when setup is not on a release tag.
 
-- *Runner'iai* (`/runners`) – visi šio serverio CI runner'iai viename puslapyje. GitHub runner'iai sugrupuoti pagal
-  organizaciją ar repo (su nuoroda į jų GitHub nustatymus): vardas GitHub'e, paslaugos būsena, ar dabar vykdo job'ą,
-  versija, ar startuoja su serveriu, perkrovimai ir mygtukai paleisti, sustabdyti, perkrauti. Runner'io puslapyje
-  (`/runners/github/<scope>`) – jo duomenys (ir GitHub ID su nuoroda), **papildomas egzempliorius** (laisvas numeris 2–9,
-  vardas ir `./config.sh --url …` eilutė jau užpildyti – belieka įklijuoti token'ą) ir **pašalinimas** (su GitHub'o
-  „Remove“ komanda arba be jos). *Pridėti runner'į* (`/runners/new`) – naujas GitHub ar Bitbucket runner'is.
-  Bitbucket runner'is – `/runners/bitbucket` (pakeisti, pašalinti). Vardo ir žymų GitHub'e pakeisti negalima – tik
-  pašalinus ir pridėjus iš naujo. Apžvalgoje runner'iai – viena kortelė (kiek veikia, kiek vykdo job'ą).
-- *Apžvalga* – viršuje „Reikia dėmesio“: viskas, kas sugedę ar laukia (nepavykę unit'ai, setup ne ant tag'o, naujesnė
-  versija, mažai vietos, nepavykęs deploy'us, sustojęs secret store, nesveiki konteineriai, senesnė nei 26 val. kopija),
-  kiekvienas su nuoroda. Toliau – Server OPS versija (įdiegta ir administratoriaus klono), bendro setup checkout'o versija
-  (commit'as, ar release tag'as, kiek naujesnis origin/master pagal paskutinį fetch), runner'ių suvestinė, naktinių ir savaitinių pilnų kopijų laikmačiai (paskutinis paleidimas, rezultatas, kitas), metrikų paslauga,
-  naktinių failų kopijų laikmatis, pati sąsaja, laisva vieta diske, kuriame `/srv/setup-server`. Prie kiekvienos įdiegtos paslaugos – jos mygtukai
-  (paleisti, sustabdyti, perkrauti; kopijoms – „Paleisti dabar“), kurie veda į tą pačią peržiūrą kaip kiti veiksmai.
-- *Projektai* – kiekvienas build katalogas: repo URL, aplinkos (stage/prod), taikinys (`target*.env`, ne paslaptis),
-  paskutinis deploy'us (laikas, commit'as, pavyko ar ne, rollback), naujausia naktinė ir savaitinė pilna kopija (amžius,
-  dydis, kiek laikoma; projekto puslapyje – ir paskutinė „fresh“),
-  ar veikia `<PROJECT_NAME>-<env>-secrets`, konteineriai (būsena, sveikata) ir paskutiniai Bitbucket pipeline'ai.
-  Projekto puslapyje – ir visos aplinkos kopijos (naktinės, pilnos, šviežios, prieš deploy'ų: failas, laikas, dydis),
-  kiekvieno konteinerio `docker logs` (200, 500 ar 2000 paskutinių eilučių) ir „Kopija dabar serveryje“.
-- *Prieiga* – programuotojų raktai: kiekvienam – kiek prod, stage ir kitų aplinkų jis pasiekia kokiu lygiu (`make ssh`),
-  kopijos (`make db-pull`: visų projektų lygis ir aplinkos virš jo), tinklai ir paskutinis naudojimas; paieška pagal raktą
-  ar projektą; visų raktų paskutinė veikla. „Pridėti raktą“ – viešasis raktas, vardas, tinklai, pradinės kopijos (visi
-  projektai, prod, stage) ir prieiga (prod, stage). Rakto puslapyje dvi kortelės – *Prieiga (make ssh)* ir *Kopijos
-  (make db-pull)*, abiejose:
-  - *Visoms iš karto* – vienas lygis (arba „—“, atimti) visoms prod, visoms stage ar visoms aplinkoms, visiems projektams
-    arba tik ten, kur raktas jau turi leidimą; kopijų kortelėje dar „visi projektai“ (ir nauji);
-  - *Projektai* – po eilutę projektui, jo aplinkos (prod, stage, kitos) šalia, lygis – mygtukų juosta (kopijose „visi: db“
-    – aplinka be savo leidimo, galioja visų projektų lygis); filtras pagal vardą ir „tik su leidimu“ (keičiamos tik
-    rodomos aplinkos, paslėptos lieka);
-  - *Rakto nustatymai* – „Žmogus“ (vardas ir pavardė, rodomi vietoj rakto vardo, ir prisijungimo vardas įrankiams –
-    `bin/tool-access --full-name … --login …`), tinklai, naujas viešasis raktas (galioja visoms aplinkoms), dar nesančio
-    projekto leidimai; rakto atėmimas;
-  - *Veikla* – kas, kada, iš kur: prisijungimai, kopijos, shell'ai (lygis, trukmė, rezultatas, seanso įrašas), komandos,
-    atmesti bandymai; seanso puslapyje – surinktos eilutės.
+- *Runners* (`/runners`) – all of this server's CI runners on one page. GitHub runners are grouped by
+  organization or repo (with a link to their GitHub settings): the name on GitHub, the service state, whether it is running a job now,
+  the version, whether it starts with the server, restarts and the start, stop, restart buttons. On a runner's page
+  (`/runners/github/<scope>`) – its details (and the GitHub ID with a link), **an extra instance** (a free number 2–9,
+  the name and the `./config.sh --url …` line already filled in – only the token remains to be pasted) and **removal** (with GitHub's
+  "Remove" command or without it). *Add runner* (`/runners/new`) – a new GitHub or Bitbucket runner.
+  The Bitbucket runner – `/runners/bitbucket` (replace, remove). The name and labels on GitHub cannot be changed – only by
+  removing and adding again. In the Overview the runners are one card (how many are running, how many are running a job).
+- *Overview* – at the top "Needs attention": everything that is broken or waiting (failed units, setup off a tag, a newer
+  version, little space, a failed deploy, a stopped secret store, unhealthy containers, a backup older than 26 h),
+  each with a link. Then – the Server OPS version (installed and of the administrator's clone), the shared setup checkout's version
+  (commit, whether it is a release tag, how far ahead origin/master is as of the last fetch), the runner summary, the nightly and weekly full backup timers (last run, result, next), the metrics service,
+  the nightly file backup timer, the UI itself, the free space on the disk holding `/srv/setup-server`. Next to every installed service – its buttons
+  (start, stop, restart; backups – "Start"), which lead to the same preview as the other actions.
+- *Projects* – every build directory: repo URL, environments (stage/prod), target (`target*.env`, not a secret),
+  the last deploy (time, commit, success or not, rollback), the newest nightly and weekly full backup (age,
+  size, how many are kept; on the project page – also the last "fresh"),
+  whether `<PROJECT_NAME>-<env>-secrets` is running, the containers (state, health) and the latest Bitbucket pipelines.
+  On the project page – also all of the environment's backups (nightly, full, fresh, pre-deploy: file, time, size),
+  each container's `docker logs` (the last 200, 500 or 2000 lines) and "Backup now on the server".
+- *Access* – developer keys: for each – how many prod, stage and other environments it reaches and at what level (`make ssh`),
+  backups (`make db-pull`: the all-projects level and the environments above it), networks and last use; search by key
+  or project; the latest activity of all keys. "Add key" – public key, name, networks, initial backups (all
+  projects, prod, stage) and access (prod, stage). On a key's page there are two cards – *Access (make ssh)* and *Backups
+  (make db-pull)*, both with:
+  - *All at once* – one level (or "—", revoke) for all prod, all stage or all environments, for all projects
+    or only where the key already has a permission; the backups card also has "all projects" (including new ones);
+  - *Projects* – a row per project, its environments (prod, stage, others) side by side, the level – a button bar (in backups "all: db"
+    – an environment without its own permission, the all-projects level applies); a filter by name and "only with permission" (only the shown
+    environments are changed, hidden ones stay);
+  - *Key settings* – "Person" (first and last name, shown instead of the key name, and the login name for the tools –
+    `bin/tool-access --full-name … --login …`), networks, a new public key (applies to all environments), permissions for a project
+    that does not exist yet; revoking the key;
+  - *Activity* – who, when, from where: logins, backups, shells (level, duration, result, session recording), commands,
+    rejected attempts; on a session's page – the typed lines.
 
-  Visi pakeitimai – ta pati `add-backup-key` komanda su visu rakto leidimų sąrašu; peržiūra virš komandos parodo, kas
-  pasikeis (`+` nauja, `~` kitas lygis, `−` atimama). Projekto puslapyje – kas pasiekia to projekto aplinkas.
-  Trečias skirtukas *Įrankiai* – `bin/tool-access`: rakto įrankių slaptažodis (įvedamas, nerodomas, nustatymo data) ir
-  projektų aplinkos, kurių įrankius jis atidaro (nepavykęs siuntimas pažymimas), su tuo pačiu *Visoms iš karto*
-  (įrankiai arba „—“ visoms prod, stage, kitoms ar visoms aplinkoms; local ir test – niekada). Sąraše – stulpelis *Įrankiai*, puslapio
-  apačioje „Įrankių prieiga“ – šio serverio adresai ir „Siųsti iš naujo“ (žr. „Įrankių prieiga“).
-- *Failai* – failų kopijos (`BACKUP_FILE_PATHS`, žr. „Failų kopijos“): kiekviena aplinka su keliais ir naujausia kopija;
-  aplinkos puslapyje – visos jos kopijos ir „Failų kopija dabar“; kopijos puslapyje – failai su paieška, kas nauja, pakeista
-  ir dingo nuo ankstesnės kopijos; failo puslapyje – turinys, skirtumai nuo ankstesnės kopijos ir „Atsisiųsti“. Tik
-  skaitoma: nei kopijos, nei taikinys nekeičiami. „Reikia dėmesio“ rodo senesnę nei 26 val. failų kopiją (kai laikmatis įdiegtas).
-- *Atnaujinimas* – Server OPS ir setup: versija, commit'as, ar release tag'as, kiek naujesnis origin/master.
-  „Atnaujinti į naujausią“ – Server OPS į `origin/master` (`bin/update`, žr. „Atnaujinimas“), setup – į naujausią
-  to paties MAJOR release'ą (`bin/update-setup`; setup release'ą daro kiekvienas sujungimas į master); konkreti versija
-  ar naujas MAJOR – „Konkreti versija ar ref'as“.
-- *Vartotojai* – sąsajos vartotojai ir grupės (žr. „Vartotojai ir grupės“); be teisės „mato“ skiltis nerodoma.
-- *Metrikos* – worker'io `/metrics`, kaip jį mato Prometheus (`setup-server-metrics --once`, be token'o), ir kurios
-  grupės surinktos.
-- *Žurnalai* – programuotojų veikla (visų raktų), `ui-actions.log`, `backup-pulls.log`, `access.log`, Server OPS paslaugų journal (po 50 eilučių) ir paskutiniai
-  veiksmai su jų išvestimi.
-- *Instrukcijos* – kaip paruošti kitą serverį projekto taikiniu (`bin/add-project --target ENV=ssh://…`): pasirenki OS
-  (Ubuntu, Debian; CentOS/AlmaLinux/Rocky – netestuota), valdymo skydelį (DirectAdmin ar jokio), aplinką (prod, stage) ir
-  SSL (Let's Encrypt, savas, be SSL – tik VPN), įrašai serverį, vartotoją, katalogą, domeną, port'ą ir gauni
-  sunumeruotus žingsnius su komandomis: kaip taikinyje sužinoti OS ir architektūrą (`/etc/os-release`, `uname -m`),
-  paketai, Docker, vartotojas ir `docker` grupė, katalogas, worker'io raktas (tikras, iš
-  `/srv/setup-server/.ssh/id_ed25519.pub`), ugniasienė (DirectAdmin – ir CSF: po `csf -r` Docker'is atkuria savo
-  taisykles, `live-restore` palieka konteinerius veikti), swap, portai, DirectAdmin domenas (katalogai
-  `/home/VARTOTOJAS/docker/<aplinka>`: stage ir prod gali būti vieno vartotojo), DNS (svetainė ir `*.` įrankiams;
-  Cloudflare – įrankių wildcard DNS only), sertifikatas ir proxy (įjungiamas po pirmo deploy'aus),
-  `env/<env>.env.example` (limitai – lubos, stage – mažas buffer pool), slaptažodžiai (PS raktų eksportas iš esamos
-  parduotuvės `parameters.php`), Access keys abiem repo, registracija, host key palyginimas, workspace runner'is ir
-  pirmas deploy'us. Kiekvienas žingsnis
-  nurodo šaltinį; kur setup dar nieko neaprašo (DirectAdmin proxy, sertifikatas be skydelio, ne Debian OS), tai
-  pažymėta įspėjimu. Puslapis nieko nevykdo; mygtukas atidaro „Pridėti projektą“ su įrašytu taikiniu.
-  Šalia – *pavyzdys* (`/instructions/example`): visas projekto pridėjimas su išgalvotais vardais (PrestaShop su aplinkos
-  ir atskiru kodo repo, stage DirectAdmin serveryje, svetainė bendro hostname poaplankyje) ir tai, kas tikrame
-  pridėjime užkliūva: versijos ir vieta diske, Docker vartotojui, Access keys abiem repo, host key prieš `BatchMode`,
-  runner'io lygis, `Alias` ir proxy poaplankiui, atšaukimas.
+  All changes are the same `add-backup-key` command with the key's full permission list; the preview above the command shows what
+  will change (`+` new, `~` another level, `−` revoked). On the project page – who reaches that project's environments.
+  The third tab *Tools* – `bin/tool-access`: the key's tools password (entered, not shown, the date it was set) and
+  the project environments whose tools it opens (a failed send is marked), with the same *All at once*
+  (tools or "—" for all prod, stage, other or all environments; local and test – never). In the list – a *Tools* column, at the bottom of the
+  page "Tool access" – this server's addresses and "Send again" (see "Tool access").
+- *Files* – file backups (`BACKUP_FILE_PATHS`, see "File backups"): every environment with its paths and newest backup;
+  on the environment page – all of its backups and "Files backup now"; on a backup's page – the files with search, what is new, changed
+  and gone since the previous backup; on a file's page – the contents, the differences from the previous backup and "Download". Read-
+  only: neither the backups nor the target are changed. "Needs attention" shows a file backup older than 26 h (when the timer is installed).
+- *Update* – Server OPS and setup: version, commit, whether it is a release tag, how far ahead origin/master is.
+  "Update to the newest" – Server OPS to `origin/master` (`bin/update`, see "Updating"), setup – to the newest
+  release of the same MAJOR (`bin/update-setup`; every merge into master makes a setup release); a specific version
+  or a new MAJOR – "A specific version or ref".
+- *Users* – the UI's users and groups (see "Users and groups"); without the "view" permission the section is not shown.
+- *Metrics* – the worker's `/metrics` as Prometheus sees it (`setup-server-metrics --once`, without a token), and which
+  groups were collected.
+- *Logs* – developer activity (all keys), `ui-actions.log`, `backup-pulls.log`, `access.log`, the Server OPS services' journal (50 lines each) and the latest
+  actions with their output.
+- *Instructions* – how to prepare another server as a project target (`bin/add-project --target ENV=ssh://…`): you choose the OS
+  (Ubuntu, Debian; CentOS/AlmaLinux/Rocky – untested), the control panel (DirectAdmin or none), the environment (prod, stage) and
+  SSL (Let's Encrypt, own, no SSL – VPN only), enter the server, user, directory, domain, port and get
+  numbered steps with commands: how to find out the OS and architecture on the target (`/etc/os-release`, `uname -m`),
+  packages, Docker, the user and the `docker` group, the directory, the worker's key (the real one, from
+  `/srv/setup-server/.ssh/id_ed25519.pub`), the firewall (DirectAdmin – also CSF: after `csf -r` Docker restores its
+  rules, `live-restore` keeps the containers running), swap, ports, the DirectAdmin domain (directories
+  `/home/USER/docker/<environment>`: stage and prod can belong to one user), DNS (the website and `*.` for the tools;
+  Cloudflare – the tools' wildcard DNS only), the certificate and the proxy (enabled after the first deploy),
+  `env/<env>.env.example` (limits – ceilings, stage – a small buffer pool), passwords (exporting the PS keys from the existing
+  shop's `parameters.php`), Access keys for both repos, registration, host key comparison, the workspace runner and
+  the first deploy. Every step
+  names its source; where setup does not describe anything yet (DirectAdmin proxy, a certificate without a panel, a non-Debian OS), this
+  is marked with a warning. The page runs nothing; the button opens "Add a project" with the target filled in.
+  Next to it – an *example* (`/instructions/example`): the whole addition of a project with made-up names (PrestaShop with an environment
+  repo and a separate code repo, stage on a DirectAdmin server, the website in a subfolder of a shared hostname) and what trips up a real
+  addition: versions and disk space, Docker for the user, Access keys for both repos, the host key before `BatchMode`,
+  the runner level, `Alias` and the proxy for a subfolder, cancellation.
 
-**Veiksmai.** Kiekvienas pirmiausia paleidžiamas su `--check`: puslapis parodo komandą ir jos išvestį. Tik tada
-„Vykdyti“ paleidžia **tą pačią** komandą be `--check` (peržiūra galioja 15 min. ir vieną kartą; jei `--check` baigėsi
-klaida, „Vykdyti“ nėra). Vienu metu vykdomas vienas veiksmas; jo puslapis atsinaujina, kol jis baigsis.
+**Actions.** Each one is first run with `--check`: the page shows the command and its output. Only then does
+"Run" start **the same** command without `--check` (the preview is valid for 15 min. and once; if `--check` ended
+with an error, there is no "Run"). One action runs at a time; its page refreshes until it finishes.
 
-| Veiksmas | Ką vykdo (`L` = `/usr/local/lib/setup-server/bin`) |
+| Action | What it runs (`L` = `/usr/local/lib/setup-server/bin`) |
 | --- | --- |
-| Pridėti projektą | `sudo -n L/add-project [--shared-key] --target … [VARDAS] URL [KODO_URL]` (naujam projektui taikinys privalomas) |
-| Pašalinti projektą (projekto puslapyje) | `sudo -n L/remove-project [--with-backups] VARDAS` |
-| Įdiegti runner'į (*Runner'iai*) | `sudo -n L/install-runner --provider bitbucket\|github [--name …] [--instance N] [--tarball URL\|FAILAS [--sha256 …]]`; dialogo tekstas – per stdin |
-| Pašalinti runner'į (*Runner'iai*) | `sudo -n L/install-runner --provider github --remove --scope …` (GitHub „Remove“ komanda – per stdin, nerodoma) arba `--remove` (Bitbucket) |
-| Kopijų laikmačiai (naktinės, savaitinės pilnos ir failų) | `sudo -n L/install-backups [--at HH:MM] [--full-at "DAY HH:MM"] [--files-at HH:MM]` |
-| Kopija dabar serveryje (ir projekto bei *Failų* puslapiuose) | `sudo -n L/backup-projects [--full\|--files] [PROJEKTAS [ENV]]` – be Bitbucket, veikia ir GitHub projektams |
-| SSH iš VPN | `sudo -n L/install-ssh [--from TINKLAI]` |
-| Paslaugos (ir Apžvalgoje) | `sudo -n L/server-unit start\|stop\|restart UNIT` (žr. žemiau) |
-| Worker'io metrikos | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |
-| Raktai (*Prieiga*) | `sudo -n L/add-backup-key [-] --name … [--from …] --pull-all … --pull …\|--no-pulls --grant …\|--no-grants` (visi sąrašai aiškiai; naujas raktas per stdin, esamam – be jo), `--remove VARDAS` |
-| Įrankių prieiga (rakto *Įrankiai*, *Prieiga*) | `sudo -n L/tool-access --name … --tools …\|--no-tools`, `--name … --password -` (slaptažodis per stdin, išvestyje – `<hidden>`) `\|--no-password`, `--name … --full-name … --login …`, `--allowed-ips …\|--no-allowed-ips`, `--apply` |
-| Paruošti serverį | `sudo -n L/prepare-host [--setup-ref …]` (`--check` kodas 1 – „Needs attention“ – vykdyti leidžia) |
-| Atnaujinti setup (*Atnaujinimas*) | `sudo -n L/update-setup [vX.Y.Z]` (tik release tag'ai, be slaptažodžio) |
-| Atnaujinti Server OPS (*Atnaujinimas*) | `sudo -n -H -u <klono savininkas> <klonas>/bin/update --server-ref origin/master` (ar kiti `--server-ref`/`--setup-ref`) |
-| Deploy'us, „backup dabar“, runner'io testas | Bitbucket API (žr. žemiau) |
+| Add a project | `sudo -n L/add-project [--shared-key] --target … [NAME] URL [CODE_URL]` (the target is required for a new project) |
+| Remove project (on the project page) | `sudo -n L/remove-project [--with-backups] NAME` |
+| Install runner (*Runners*) | `sudo -n L/install-runner --provider bitbucket\|github [--name …] [--instance N] [--tarball URL\|FILE [--sha256 …]]`; the dialog text – via stdin |
+| Remove runner (*Runners*) | `sudo -n L/install-runner --provider github --remove --scope …` (the GitHub "Remove" command – via stdin, not shown) or `--remove` (Bitbucket) |
+| Backup timers (nightly, weekly full and files) | `sudo -n L/install-backups [--at HH:MM] [--full-at "DAY HH:MM"] [--files-at HH:MM]` |
+| Backup now on the server (also on the project and *Files* pages) | `sudo -n L/backup-projects [--full\|--files] [PROJECT [ENV]]` – without Bitbucket, works for GitHub projects too |
+| SSH from the VPN | `sudo -n L/install-ssh [--from NETWORKS]` |
+| Services (also in the Overview) | `sudo -n L/server-unit start\|stop\|restart UNIT` (see below) |
+| Worker metrics | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |
+| Keys (*Access*) | `sudo -n L/add-backup-key [-] --name … [--from …] --pull-all … --pull …\|--no-pulls --grant …\|--no-grants` (all lists explicit; a new key via stdin, for an existing one – without it), `--remove NAME` |
+| Tool access (the key's *Tools*, *Access*) | `sudo -n L/tool-access --name … --tools …\|--no-tools`, `--name … --password -` (the password via stdin, in the output – `<hidden>`) `\|--no-password`, `--name … --full-name … --login …`, `--allowed-ips …\|--no-allowed-ips`, `--apply` |
+| Prepare the server | `sudo -n L/prepare-host [--setup-ref …]` (`--check` code 1 – "Needs attention" – still allows running) |
+| Update setup (*Update*) | `sudo -n L/update-setup [vX.Y.Z]` (only release tags, no password) |
+| Update Server OPS (*Update*) | `sudo -n -H -u <clone owner> <clone>/bin/update --server-ref origin/master` (or other `--server-ref`/`--setup-ref`) |
+| Deploy, "backup now", runner test | Bitbucket API (see below) |
 
-- Vardai, URL, taikiniai, ref'ai, laikas ir adresai tikrinami griežtais šablonais, komanda paduodama argumentų sąrašu
-  (ne shell eilute): `;`, `$(…)` ar `--parinktis` vietoje reikšmės atmetami dar prieš `--check`.
-- **Runner'io dialogas.** Bitbucket „Runner installation“ dialogo ar GitHub „New self-hosted runner“ puslapio tekstas
-  įklijuojamas į laukelį ir komandai perduodamas per stdin – kaip `sudo bin/install-runner < dialogas.txt`. Jis niekur
-  neįrašomas; `--OAuthClientSecret` ir `--token` reikšmės išvestyje keičiamos į `<hidden>`. Tarp peržiūros ir „Vykdyti“
-  tekstas laikomas tik sąsajos atmintyje (persikrovus – įklijuok iš naujo).
-- **Atnaujinimas** vykdomas kaip klono, iš kurio paleistas `install-ui`, savininkas; jam sudo turi veikti be
-  slaptažodžio (žr. „Atnaujinimas“), kitaip – terminale.
-- **Paslaugos.** `bin/server-unit` valdo tik Server OPS unit'us ir tik leidžiamais veiksmais; ką ir su kuo daryti,
-  nustato jo paties sąrašas, ne kvietėjas. `--check` parodo unit'o būseną ir ar vyksta pipeline'o žingsnis (sustabdžius
-  ar perkrovus runner'į jis nutrūktų).
+- Names, URLs, targets, refs, times and addresses are checked against strict patterns, the command is passed as an argument list
+  (not a shell line): `;`, `$(…)` or `--option` in place of a value are rejected even before `--check`.
+- **Runner dialog.** The text of the Bitbucket "Runner installation" dialog or the GitHub "New self-hosted runner" page
+  is pasted into a field and passed to the command through stdin – like `sudo bin/install-runner < dialog.txt`. It is never
+  written anywhere; the `--OAuthClientSecret` and `--token` values are replaced with `<hidden>` in the output. Between the preview and "Run"
+  the text is kept only in the UI's memory (after a restart – paste it again).
+- **Update** runs as the owner of the clone `install-ui` was run from; sudo must work for them without a
+  password (see "Updating"), otherwise – in a terminal.
+- **Services.** `bin/server-unit` manages only Server OPS units and only with allowed actions; what to do and with what is
+  set by its own list, not by the caller. `--check` shows the unit's state and whether a pipeline step is running (stopping
+  or restarting the runner would interrupt it).
 
-  | UNIT | Veiksmai | systemd unit'as |
+  | UNIT | Actions | systemd unit |
   | --- | --- | --- |
   | `runner` | start, stop, restart | `setup-server-runner.service` |
-  | `github-runner@SCOPE` | start, stop, restart | `setup-server-github-runner@SCOPE.service` (tik užregistruotas SCOPE) |
+  | `github-runner@SCOPE` | start, stop, restart | `setup-server-github-runner@SCOPE.service` (only a registered SCOPE) |
   | `metrics` | start, stop, restart | `setup-server-metrics.service` |
-  | `backup`, `backup-full`, `backup-files` | start (laukia, kol kopija baigsis) | `setup-server-backup.service`, `setup-server-backup-full.service`, `setup-server-backup-files.service` |
-  | `ui` | restart (perskaito `ui.env`, pvz. naujus token'us) | `setup-server-ui.service` |
+  | `backup`, `backup-full`, `backup-files` | start (waits until the backup finishes) | `setup-server-backup.service`, `setup-server-backup-full.service`, `setup-server-backup-files.service` |
+  | `ui` | restart (rereads `ui.env`, e.g. new tokens) | `setup-server-ui.service` |
 
-  Ranka: `sudo bin/server-unit --check restart runner`.
-- **Ko sąsaja nedaro:** `bin/install-ui` (port'as, vardas, slaptažodis) ir rankinis atstatymas po nepavykusio
-  `bin/update` (žr. „Rankinis atstatymas“) lieka terminale: jie keičia pačią sąsają arba reikalingi, kai ji neveikia.
+  By hand: `sudo bin/server-unit --check restart runner`.
+- **What the UI does not do:** `bin/install-ui` (port, name, password) and the manual recovery after a failed
+  `bin/update` (see "Manual recovery") stay in the terminal: they change the UI itself or are needed when it is not working.
 
-**Deploy'ai per Bitbucket.** Projekto puslapyje – „Deploy į stage“, „Deploy į prod“ ir kiekvienai papildomai aplinkai
-„Deploy į mdv“ (custom pipeline'ai `deploy-stage`, `deploy-<env>`,
-`deploy-production` su kintamaisiais `REF`, `IMAGES`, `BACKUP`, `ROLLBACK`; pažymėjus CACHE – ir `CACHE=yes`, o
-nepažymėjus jis nesiunčiamas, ir setup 5.2.0+ pipeline'as cache išvalo tik kai deploy'us jį keičia), „Backup dabar“ (`backup-now`, pažymėjus
-FULL – su kintamuoju `FULL=yes`; nepažymėjus kintamasis nesiunčiamas) ir „Runner'io
-testas“ (`runner-test`). Sąsaja juos paleidžia per Bitbucket API, todėl istorija lieka Bitbucket'e (Pipelines,
-Deployments), o darbą atlieka runner'is šiame serveryje. Repo – build katalogo `app/` `origin` URL, šaka – jo
-`origin/HEAD` (formoje galima pakeisti). Peržiūra parodo užklausą (JSON), „Vykdyti“ ją išsiunčia ir parodo nuorodą į
-pipeline'ą. GitHub projektams pipeline'ų paleidimas dar nepalaikomas.
+**Deploys through Bitbucket.** On the project page – "Deploy to stage", "Deploy to prod" and for every extra environment
+"Deploy to mdv" (custom pipelines `deploy-stage`, `deploy-<env>`,
+`deploy-production` with the variables `REF`, `IMAGES`, `BACKUP`, `ROLLBACK`; with CACHE checked – also `CACHE=yes`, and
+unchecked it is not sent, and the setup 5.2.0+ pipeline clears the cache only when the deploy changes it), "Backup now" (`backup-now`, with
+FULL checked – with the variable `FULL=yes`; unchecked the variable is not sent) and "Runner
+test" (`runner-test`). The UI starts them through the Bitbucket API, so the history stays in Bitbucket (Pipelines,
+Deployments), while the work is done by the runner on this server. The repo is the `origin` URL of the build directory's `app/`, the branch – its
+`origin/HEAD` (it can be changed in the form). The preview shows the request (JSON), "Run" sends it and shows a link to
+the pipeline. Starting pipelines for GitHub projects is not supported yet.
 
 ```bash
-sudo nano /etc/setup-server/ui.env        # įrašyk token'ą (žr. žemiau)
-sudo systemctl restart setup-server-ui    # paslauga token'us skaito pasileisdama (arba Apžvalgoje: Valdymo sąsaja → Perkrauti)
+sudo nano /etc/setup-server/ui.env        # write the token (see below)
+sudo systemctl restart setup-server-ui    # the service reads the tokens when it starts (or in the Overview: Web UI → Restart)
 ```
 
 ```ini
-BITBUCKET_ACCESS_TOKEN_ASANA_TRACKER=…    # vienam build katalogui: vardas didžiosiomis, - keičiamas į _
-BITBUCKET_ACCESS_TOKEN=…                  # visiems kitiems (pvz. workspace access token)
+BITBUCKET_ACCESS_TOKEN_ASANA_TRACKER=…    # for one build directory: the name in uppercase, - replaced with _
+BITBUCKET_ACCESS_TOKEN=…                  # for all others (e.g. a workspace access token)
 ```
 
-Token'as – Bitbucket *Repository* arba *Workspace access token* (Bearer) su teisėmis **Repositories: Read** ir
-**Pipelines: Read, Write**. Jis laikomas tik `ui.env` (root, 0600), paslauga jį gauna per aplinką; komandoms jis
-neperduodamas, puslapiuose nerodomas, į žurnalus nerašomas (žurnale – tik kintamojo vardas). Siunčiamas tik į
-`api.bitbucket.org`, nukreipimai (redirect) nesekami.
+The token is a Bitbucket *Repository* or *Workspace access token* (Bearer) with the permissions **Repositories: Read** and
+**Pipelines: Read, Write**. It is kept only in `ui.env` (root, 0600), the service gets it through the environment; it is
+not passed to commands, not shown on pages, not written to logs (the log has only the variable name). It is sent only to
+`api.bitbucket.org`, redirects are not followed.
 
-**Teisės ir kodėl taip.**
+**Permissions and why.**
 
-- Sąsaja veikia **atskira paskyra `setup-ui`** (be shell'o ir namų katalogo), ne `setup`: pipeline žingsniai vykdomi kaip
-  `setup`, o jiems sąsajos teisių duoti negalima. `setup-ui` yra grupėje `setup` (pasiekia `/srv/setup-server`, 0750, ir
-  savo žurnalą), bet **ne** `docker` grupėje (jei yra, `install-ui` atsisako).
-- Tai, kam reikia root, sąsaja daro tik per `sudo -n` pagal `/etc/sudoers.d/setup-server-ui` (tikrinama `visudo -cf`):
-  root teisėmis – tik root'ui priklausančios kopijos `/usr/local/lib/setup-server/bin/` (`add-project`, `remove-project`,
+- The UI runs as **a separate account `setup-ui`** (no shell and no home directory), not `setup`: pipeline steps run as
+  `setup`, and they must not be given the UI's permissions. `setup-ui` is in the `setup` group (it reaches `/srv/setup-server`, 0750, and
+  its own log), but **not** in the `docker` group (if it is, `install-ui` refuses).
+- What needs root the UI does only through `sudo -n` according to `/etc/sudoers.d/setup-server-ui` (checked with `visudo -cf`):
+  with root permissions – only the root-owned copies in `/usr/local/lib/setup-server/bin/` (`add-project`, `remove-project`,
   `install-backups`, `install-metrics`, `install-runner`, `install-ssh`, `add-backup-key`, `backup-projects`, `prepare-host`,
-  `server-status`, `server-unit`, `update-setup`), niekada
-  administratoriaus klonas, kurį gali keisti jo savininkas. `bin/update` – tik klono savininko teisėmis (root'u jis nevyksta).
-- Argumentų sudo neriboja: ribą nustato sąsajos patikra ir pačios komandos. Todėl `setup-ui` per šias komandas
-  (pvz. `install-runner`, `prepare-host`) turi administratoriaus galią; ją saugo `127.0.0.1`, prisijungimas, grupių teisės
-  ir CSRF token'as.
-- Būseną skaito viena tik skaitanti komanda `server-status` (JSON): `systemctl show`, `journalctl`, versijas ir diską –
-  root teisėmis, o build katalogus, Docker konteinerius ir secret store – paskyros `setup` teisėmis. Pipeline'o pakištas
-  simlink'as todėl nieko daugiau neatskleidžia, o iš env failų išeina tik taikinio reikšmės. Konteinerio log'ai –
-  tik to projekto aplinkos konteinerio (to paties sąrašo, kurį rodo apžvalga), jo Docker context'e. Ranka:
-  `sudo /usr/local/lib/setup-server/bin/server-status | less` (`--logs 100` – žurnalai,
-  `--container-logs PROJEKTAS ENV KONTEINERIS [EILUTĖS]`, `--metrics`, `--files PROJEKTAS ENV KOPIJA` – failų kopijos sąrašas,
-  `--file PROJEKTAS ENV KOPIJA KELIAS` – vienas jos failas). Failų kopijos skaitomos paskyros `setup` teisėmis ir niekur
-  neišpakuojamos: tik perskaitomas prašytas failas.
-- **systemd.** `NoNewPrivileges` išjungtas: su juo neveiktų nė vienas `sudo`. `ProtectSystem`, `ProtectHome`, `PrivateTmp`
-  taip pat išjungti: veiksmai vyksta paslaugos vardų erdvėje ir rašo `/usr`, `/etc` (diegimai), administratoriaus kloną
-  (`bin/update`) ir `/tmp` (ankstesnės kopijos rankiniam grąžinimui). Palikta, kas netrukdo: `ProtectKernelModules`,
-  `ProtectControlGroups`, `LockPersonality`, `RestrictRealtime`. `KillMode=process`: perkraunama tik sąsaja, vykdomas
-  veiksmas tęsiasi.
-- **CSRF.** Kiekviena forma (ir atsijungimas) turi token'ą – vartotojo vardo HMAC su raktu, kurį paslauga sukuria pasileisdama
-  (persikrovus atidarytos formos nebetinka: atnaujink puslapį). POST be jo ar su svetimu `Origin` – `403`. `Host` turi būti
-  `127.0.0.1` ar `localhost` (apsauga nuo DNS rebinding), kitaip – `400`. Vardas, slaptažodis ir token'ai lyginami
-  pastovaus laiko palyginimu.
+  `server-status`, `server-unit`, `update-setup`), never
+  the administrator's clone, which its owner can change. `bin/update` – only with the clone owner's permissions (it does not run as root).
+- sudo does not restrict the arguments: the limit is set by the UI's check and by the commands themselves. So through these commands `setup-ui`
+  (e.g. `install-runner`, `prepare-host`) has administrator power; it is protected by `127.0.0.1`, the sign-in, group permissions
+  and the CSRF token.
+- The status is read by one read-only command `server-status` (JSON): `systemctl show`, `journalctl`, versions and disk –
+  with root permissions, and the build directories, Docker containers and the secret store – with the `setup` account's permissions. A symlink planted by a pipeline
+  therefore reveals nothing more, and only the target values come out of the env files. Container logs –
+  only of that project environment's container (from the same list the overview shows), in its Docker context. By hand:
+  `sudo /usr/local/lib/setup-server/bin/server-status | less` (`--logs 100` – logs,
+  `--container-logs PROJECT ENV CONTAINER [LINES]`, `--metrics`, `--files PROJECT ENV BACKUP` – a file backup's list,
+  `--file PROJECT ENV BACKUP PATH` – one of its files). File backups are read with the `setup` account's permissions and are never
+  unpacked anywhere: only the requested file is read.
+- **systemd.** `NoNewPrivileges` is off: no `sudo` would work with it. `ProtectSystem`, `ProtectHome`, `PrivateTmp`
+  are off too: the actions run in the service's namespace and write `/usr`, `/etc` (installations), the administrator's clone
+  (`bin/update`) and `/tmp` (previous copies for a manual return). What does no harm is kept: `ProtectKernelModules`,
+  `ProtectControlGroups`, `LockPersonality`, `RestrictRealtime`. `KillMode=process`: only the UI is restarted, a running
+  action continues.
+- **CSRF.** Every form (including sign-out) has a token – an HMAC of the user name with a key the service creates when it starts
+  (after a restart open forms no longer work: refresh the page). A POST without it or with a foreign `Origin` – `403`. `Host` must be
+  `127.0.0.1` or `localhost` (protection against DNS rebinding), otherwise – `400`. The name, password and tokens are compared
+  in constant time.
 
-**Žurnalas.** Kiekvienas veiksmas įrašomas į `/srv/setup-server/ui-actions.log` (tik pridedama): laikas, vartotojas,
-klientas, komanda (argv) ir išėjimo kodas; pipeline'ams – repo, pipeline'as, kintamieji, HTTP atsakymas ir token'o
-kintamojo vardas. Stdin (runner'io dialogas, raktas) ir token'ai neįrašomi. Neįrašius eilutės, veiksmas nevykdomas.
-Kiekvieną komandą registruoja ir pats sudo. Veiksmų išvestis – `/var/lib/setup-server-ui/jobs/` (`setup-ui`, 0700;
-laikoma 100 paskutinių).
+**Log.** Every action is written to `/srv/setup-server/ui-actions.log` (append-only): time, user,
+client, command (argv) and exit code; for pipelines – repo, pipeline, variables, the HTTP response and the token's
+variable name. Stdin (the runner dialog, a key) and tokens are not written. If the line cannot be written, the action is not run.
+sudo itself also records every command. The actions' output – `/var/lib/setup-server-ui/jobs/` (`setup-ui`, 0700;
+the last 100 are kept).
 
 ```bash
 systemctl status setup-server-ui
-journalctl -u setup-server-ui -n 50                 # atmesti prisijungimai ir CSRF, klaidos
+journalctl -u setup-server-ui -n 50                 # rejected sign-ins and CSRF, errors
 sudo tail -n 20 /srv/setup-server/ui-actions.log
 ```
 
-## Projektų konteineriai serveryje
+## Project containers on the server
 
-- **Kuris Docker.** Projektus paleidžia paskyra `setup` per `DEPLOY_CONTEXT=default`, t. y. serverio sistemos
-  Docker (`/var/run/docker.sock`). Ubuntu Desktop'e administratoriaus `docker` dažnai rodo į Docker Desktop
-  (`docker context ls` žvaigždute pažymėtas `desktop-linux`) – tai kita VM su kitais konteineriais, todėl
-  projektų ten nematyti. Projektų konteineriai, log'ai ir `exec`:
+- **Which Docker.** The projects are started by the `setup` account through `DEPLOY_CONTEXT=default`, i.e. the server's system
+  Docker (`/var/run/docker.sock`). On Ubuntu Desktop the administrator's `docker` often points to Docker Desktop
+  (`docker context ls` marks `desktop-linux` with an asterisk) – that is another VM with other containers, so
+  the projects are not visible there. The projects' containers, logs and `exec`:
   ```sh
-  sudo docker --context default ps -a --filter name=<projektas>-prod
-  sudo docker --context default logs --tail 50 <konteineris>
+  sudo docker --context default ps -a --filter name=<project>-prod
+  sudo docker --context default logs --tail 50 <container>
   ```
-  zsh nekaido kintamojo į žodžius: `D="sudo docker --context default"; $D ps` neveikia, rašyk komandą visą.
-- **Prievadai 80/443.** Jei taikinyje juos laiko kompiuterio web serveris (pvz. ankstesnio stack'o nginx),
-  projekto nginx-proxy jų negauna. Naujesnis nei 2.7.1 setup tai patikrina prieš paleisdamas konteinerius ir sustoja;
-  atlaisvink prievadą (`sudo ss -ltnp 'sport = :80'`, tada pvz. `sudo systemctl disable --now nginx`) ir deploy'ink
-  iš naujo.
-- **Duomenų katalogų keitimas.** Prieš keisdamas ar pervadindamas projekto duomenų katalogą
-  (`data/<env>/mysql`, `…/meilisearch` ir pan.), sustabdyk tą konteinerį: veikiantis konteineris lieka prijungtas
-  prie pervadinto katalogo (ištrynus jį – `No such file or directory`), o naują katalogą pamato tik po
+  zsh does not split a variable into words: `D="sudo docker --context default"; $D ps` does not work, write the whole command.
+- **Ports 80/443.** If on the target they are held by the computer's web server (e.g. the nginx of an earlier stack),
+  the project's nginx-proxy does not get them. A setup newer than 2.7.1 checks this before starting the containers and stops;
+  free the port (`sudo ss -ltnp 'sport = :80'`, then e.g. `sudo systemctl disable --now nginx`) and deploy
+  again.
+- **Changing data directories.** Before changing or renaming a project's data directory
+  (`data/<env>/mysql`, `…/meilisearch` and the like), stop that container: a running container stays attached
+  to the renamed directory (if it is deleted – `No such file or directory`), and sees the new directory only after
   `docker restart`.
 
-## Saugumas
+## Security
 
-- Paskyra `setup` yra Docker grupėje, o tai šiame serveryje prilygsta root teisėms. Tai priimta,
-  nes serveris yra ir build serveris, ir taikinys. Nutolusiems taikiniams šis klausimas sprendžiamas
-  atskirai.
-- Esamas Docker niekada nepakeičiamas ir neperkraunamas, todėl jau veikiantys konteineriai
-  (dabartinė asana.local) lieka veikti.
-- Runner'io OAuth duomenys laikomi tik `/etc/setup-server/runner.env` (root, 0600), bet veikiančio runner'io
-  komandų eilutėje jie matomi visoms serverio paskyroms, o aplinkoje – paskyros `setup` procesams ir pipeline
-  žingsniams (žr. „Eiga“, 3 žingsnis).
-- GitHub runner'io registracijos token'as niekur neįrašomas; užsiregistravusio runner'io raktas yra jo kataloge
-  (paskyra `setup`, todėl pasiekiamas ir job'ams). Self-hosted runner'is – tik privatiems repo.
-- GitHub projektų deploy key – po vieną kiekvienam repo, tik skaitymui (`/srv/setup-server/.ssh/github-…`).
-- Slaptažodžiai į šį repo, į projekto katalogus ir į serverio failus nerašomi: jie tik Bitbucket'e ir veikiančių
-  konteinerių aplinkoje (Docker konfigūracija, kaip ir DB slaptažodžiai DB konteineryje); naktinės kopijos juos ima
-  iš projekto `secrets` konteinerio. Sudo taisyklė `setup` paskyrai naujų teisių neprideda: ji ir taip Docker grupėje.
-- SSH (`bin/install-ssh`) iš už VPN tinklo ir ne iš šio serverio priima tik raktus; slaptažodžiu jungtis galima tik
-  iš VPN (jei serverio nustatymai tai leidžia). Port'as iš interneto neatidaromas: tai lemia maršrutizatorius ar ufw.
-- Kopijų atsisiuntimo raktai (`bin/add-backup-key`) prisijungia prie paskyros `setup`, bet tik iš nurodyto tinklo
-  ir tik su priverstine komanda, kuri atiduoda vien leistų projektų aplinkų kopijas (`restrict`: be terminalo ir
-  persiuntimų). Kopijose yra tikri klientų duomenys: duok tik tų projektų, kurių reikia (`--pull`, ne `--pull-all`);
-  kiekvienas atsisiuntimas ir atmestas prašymas registruojamas `backup-pulls.log`.
-- Raktai su `--grant` per šį serverį pasiekia projektų taikinius tuo pačiu keliu, kaip deploy'us (žr. „Eiga“, 8
-  žingsnį): leidimai įrašyti rakto eilutėje, juos tikrina priverstinė komanda, persiuntimų nėra (`restrict,pty`),
-  kiekvienas prašymas – `access.log`, interaktyvaus seanso įvestis – `access-sessions/` (ir joje surinkti slaptažodžiai). `full` local taikiniui ir `docker` (`exec` kaip root į projekto konteinerius su
-  jų prijungtais katalogais) – didelės teisės; `phpfpm-readonly` saugo tik failus, ne duomenų bazę. `authorized_keys`
-  priklauso paskyrai `setup`, todėl pipeline žingsnis galėtų jį keisti – bet jis ir taip yra `setup` su Docker.
-- Įrankių slaptažodžius (`bin/tool-access`) nustato administratorius; sąsaja juos perduoda tik per stdin, išvestyje jie
-  keičiami į `<hidden>`, o serveryje lieka tik crypt SHA-512 hash'ai (`/etc/setup-server/tool-access.json`, root 0600;
-  build kataloge ir taikinyje – `users.htpasswd`). Įrankiai Basic-auth slaptažodį gauna kiekviena užklausa, todėl jų
-  subdomenams reikia HTTPS.
-- Failų kopijos (`BACKUP_FILE_PATHS`) taikinį tik skaito, tuo pačiu `setup` raktu, kaip deploy'us; į jį nerašoma. Kopijos –
-  paskyros `setup` failai (0600) build kataloge, šalia DB kopijų; sąsaja jas tik rodo. Neįrašyk į `BACKUP_FILE_PATHS`
-  kelių su paslaptimis (pvz. `app/config/parameters.php`): sąsaja rodo failų turinį.
-- Worker'io `/metrics` token'as (jei naudojamas) yra tik `/etc/setup-server/metrics.env` (root, 0600); paslauga
-  jį gauna per aplinką. Endpoint'as klauso tik nurodytu adresu (VPN), atsako tik leidžiamiems adresams (ir, kai
-  token'as nustatytas, tik su juo) ir nieko nekeičia.
-- Valdymo sąsaja klauso tik `127.0.0.1` (iš kitur – per SSH tunelį), reikalauja slaptažodžio ir kiekvienai formai –
-  CSRF token'o. Ji veikia atskira paskyra `setup-ui` (ne `setup`, ne `docker` grupėje) ir root teisėmis vykdo tik
-  root'ui priklausančias komandų kopijas `/usr/local/lib/setup-server/bin/` pagal savo sudo taisyklę. Per jas ji turi
-  administratoriaus galią, todėl jos slaptažodį saugok kaip administratoriaus. Bitbucket token'ai – tik
-  `/etc/setup-server/ui.env` (root, 0600); kiekvienas veiksmas – `ui-actions.log`.
-- `bin/update` iš sąsajos veikia tik tada, kai klono savininkas gali naudoti sudo be slaptažodžio. Tokios teisės
-  Server OPS nesuteikia: jos suteikimas – administratoriaus sprendimas (savininko paskyra tada prilygsta root be
-  slaptažodžio).
+- The `setup` account is in the Docker group, which on this server is equivalent to root permissions. This is accepted
+  because the server is both the build server and the target. For remote targets this question is solved
+  separately.
+- The existing Docker is never replaced or restarted, so the containers already running
+  (the current asana.local) keep running.
+- The runner's OAuth credentials are kept only in `/etc/setup-server/runner.env` (root, 0600), but on the running runner's
+  command line they are visible to all accounts on the server, and in its environment – to the `setup` account's processes and pipeline
+  steps (see "Steps", step 3).
+- The GitHub runner's registration token is never written anywhere; a registered runner's key is in its directory
+  (account `setup`, so it is reachable by jobs too). A self-hosted runner – only for private repos.
+- GitHub project deploy keys – one per repo, read-only (`/srv/setup-server/.ssh/github-…`).
+- Passwords are not written to this repo, to the project directories or to server files: they live only in Bitbucket and in the running
+  containers' environment (Docker configuration, just like the DB passwords in the DB container); the nightly backups take them
+  from the project's `secrets` container. The sudo rule adds no new permissions to the `setup` account: it is in the Docker group anyway.
+- SSH (`bin/install-ssh`) accepts only keys from outside the VPN network and not from this server; password login is possible only
+  from the VPN (if the server's settings allow it). The port is not opened to the internet: that is decided by the router or ufw.
+- Backup download keys (`bin/add-backup-key`) connect to the `setup` account, but only from the given network
+  and only with a forced command that hands out only the backups of the allowed project environments (`restrict`: no terminal and no
+  forwarding). The backups contain real customer data: give only the projects that are needed (`--pull`, not `--pull-all`);
+  every download and rejected request is recorded in `backup-pulls.log`.
+- Keys with `--grant` reach the project targets through this server the same way as the deploy (see "Steps", step
+  8): the permissions are written in the key line, the forced command checks them, there is no forwarding (`restrict,pty`),
+  every request – `access.log`, an interactive session's input – `access-sessions/` (including passwords typed in it). `full` for a local target and `docker` (`exec` as root into project containers with
+  their mounted directories) are high permissions; `phpfpm-readonly` protects only the files, not the database. `authorized_keys`
+  belongs to the `setup` account, so a pipeline step could change it – but it already is `setup` with Docker anyway.
+- Tool passwords (`bin/tool-access`) are set by the administrator; the UI passes them only through stdin, in the output they are
+  replaced with `<hidden>`, and the server keeps only crypt SHA-512 hashes (`/etc/setup-server/tool-access.json`, root 0600;
+  in the build directory and on the target – `users.htpasswd`). The tools get the Basic-auth password with every request, so their
+  subdomains need HTTPS.
+- File backups (`BACKUP_FILE_PATHS`) only read the target, with the same `setup` key as the deploy; nothing is written to it. The backups are
+  the `setup` account's files (0600) in the build directory, next to the DB backups; the UI only shows them. Do not put
+  paths with secrets into `BACKUP_FILE_PATHS` (e.g. `app/config/parameters.php`): the UI shows file contents.
+- The worker's `/metrics` token (if used) is only in `/etc/setup-server/metrics.env` (root, 0600); the service
+  gets it through the environment. The endpoint listens only on the given address (VPN), answers only allowed addresses (and, when
+  a token is set, only with it) and changes nothing.
+- The web UI listens only on `127.0.0.1` (from elsewhere – through an SSH tunnel), requires a password and, for every form, a
+  CSRF token. It runs as a separate account `setup-ui` (not `setup`, not in the `docker` group) and with root permissions runs only
+  the root-owned command copies in `/usr/local/lib/setup-server/bin/` according to its sudo rule. Through them it has
+  administrator power, so protect its password like an administrator's. Bitbucket tokens – only in
+  `/etc/setup-server/ui.env` (root, 0600); every action – `ui-actions.log`.
+- `bin/update` from the UI works only when the clone owner can use sudo without a password. Server OPS does not grant
+  such permissions: granting them is the administrator's decision (the owner's account then becomes equivalent to root without a
+  password).
 
-## Dar neįtraukta
+## Not yet included
 
-Šios dalys dar daromos (žemėlapis „Map — setup-server“):
+These parts are still in progress (the map "Map — setup-server"):
 
-- Prometheus prijungimas per VPN ir Grafana įspėjimai (kopija senesnė nei 26 val., „no data“);
-- GitHub Actions workflow'ų paleidimas iš valdymo sąsajos (Bitbucket pipeline'ai jau paleidžiami);
+- Connecting Prometheus through the VPN and the Grafana alerts (backup older than 26 h, "no data");
+- Starting GitHub Actions workflows from the web UI (Bitbucket pipelines can already be started);
 
-## Testai
+## Tests
 
 ```bash
-python3 -m unittest discover -s tests                                    # be root ir be tinklo
-SETUP_SERVER_UBUNTU_IMAGE=ubuntu:24.04 python3 -m unittest discover -s tests   # + tikras Ubuntu konteineris
-SETUP_PROMTOOL_IMAGE=prom/prometheus:latest python3 -m unittest discover -s tests  # + metrikų formato patikra (be promtool)
+python3 -m unittest discover -s tests                                    # without root and without network
+SETUP_SERVER_UBUNTU_IMAGE=ubuntu:24.04 python3 -m unittest discover -s tests   # + a real Ubuntu container
+SETUP_PROMTOOL_IMAGE=prom/prometheus:latest python3 -m unittest discover -s tests  # + a metrics format check (without promtool)
 ```
 
-### Esama vietinė monorepo kūrimo aplinka
+### Existing local monorepo development environment
 
-Kai DDE failai yra monorepo `app/`, o kodas `app/public/`, nenaudok `add-project` klonavimui į jau veikiantį katalogą (serverio stage/prod build katalogui monorepo – `add-project --monorepo`, žr. „GitHub projektas“). Vykdyk kaip jo savininkas:
+When the DDE files are in the monorepo's `app/` and the code in `app/public/`, do not use `add-project` to clone into an already working directory (for a server stage/prod build directory of a monorepo – `add-project --monorepo`, see "GitHub project"). Run as its owner:
 
 ```sh
 SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server bin/register-development-project ai-os /home/tomas/Projects/ai-os
 ```
 
-Registracija sukuria `projects/ai-os/app` nuorodą ir `development.json`; kodas, privatūs env ir DB neperkeliami. Web apžvalga rodo `local` konteinerius, jų žurnalus, DDE formato diegimų istoriją ir nuorodą į GitHub Actions; deployment metrikos taip pat skaitomos. Tai nesuteikia serverinių SSH, DB kopijavimo ar atsarginių kopijų teisių `local` aplinkai. AI OS naudoja savo šifruotas recovery kopijas. CI/CD vykdo šio repo atskiras GitHub runner (`bin/install-runner --provider github`); konkretaus produkto diegimą aprašo produkto pipeline ir jo DDE komandos.
+Registration creates the `projects/ai-os/app` link and `development.json`; the code, private env files and the DB are not moved. The web overview shows the `local` containers, their logs, the DDE-format deployment history and a link to GitHub Actions; deployment metrics are read too. This grants no server SSH, DB copy or backup permissions for the `local` environment. AI OS uses its own encrypted recovery backups. CI/CD is run by this repo's separate GitHub runner (`bin/install-runner --provider github`); the deployment of a specific product is described by the product's pipeline and its DDE commands.
 
-Automatinio atnaujinimo systemd tarnyba naudoja `--wait-lock`: aktyvaus DDE CI ar diegimo užraktas atideda atnaujinimą, kol darbai baigiasi. Įprastas `bin/auto-update` be šios parinkties išlieka neblokuojantis. Jei naudojamas vietinis `ExecStartPost` įdiegtų kopijų atnaujinimui, jo `flock` taip pat turi laukti užrakto, o ne naudoti `-n`.
+The automatic update systemd service uses `--wait-lock`: an active DDE CI or deployment lock postpones the update until the jobs finish. A plain `bin/auto-update` without this option stays non-blocking. If a local `ExecStartPost` is used to update the installed copies, its `flock` must also wait for the lock rather than use `-n`.
 
-Po `bin/auto-update` atnaujinimo pakartok `bin/install-auto-update` su tais pačiais `SETUP_SERVER_ROOT`, `SETUP_SERVER_USER`, `SETUP_DIRECTORY` ir `SETUP_SERVER_CHECKOUT`: vien Git pull nepakeičia jau įdiegtos systemd komandos. `systemctl cat setup-server-auto-update.service` turi rodyti `--wait-lock`; vietiniam įdiegtų kopijų `ExecStartPost` naudok `flock --wait 1800`, ne `flock -n`.
+After a `bin/auto-update` update, repeat `bin/install-auto-update` with the same `SETUP_SERVER_ROOT`, `SETUP_SERVER_USER`, `SETUP_DIRECTORY` and `SETUP_SERVER_CHECKOUT`: a Git pull alone does not change the already installed systemd command. `systemctl cat setup-server-auto-update.service` must show `--wait-lock`; for the local installed-copies `ExecStartPost` use `flock --wait 1800`, not `flock -n`.
 
-CI žingsnis `bin/apply-local-update` palaukia tarnybos ir patikrina savo ištestuotą commit. Jei pasibaigęs atnaujinimas pradėtas dar prieš šį publikavimą, jis paleidžia kitą atnaujinimą (iki trijų bandymų, be aklo laukimo). Tikros sveikatos patikrų klaidos, vietiniai pakeitimai ar nepatvirtinta versija iškart sustabdo žingsnį. Tai apsaugo nuo klaidingai žalio seno diegimo ir nuo klaidos vien todėl, kad tarnyba jau vykdė ankstesnį darbą.
+The CI step `bin/apply-local-update` waits for the service and checks its own tested commit. If a finished update was started before this publication, it starts another update (up to three attempts, without blind waiting). Real health check errors, local changes or an unconfirmed version stop the step immediately. This protects against a falsely green old deployment and against an error merely because the service was already running an earlier job.
 
-Vietinės versijos tikrinimas ima bendrą skaitymo užraktą: kitas laikmačio atnaujinimas negali tarp būsenos failo ir Git HEAD/ref nuskaitymų pakeisti tikrinamos versijos.
+The local version check takes a shared read lock: another timer update cannot change the version being checked between reading the state file and the Git HEAD/ref.

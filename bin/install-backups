@@ -178,7 +178,7 @@ if [ "$(printf '%s\n%s\n' 1.9.10 "${sudo_version:-0}" | sort -V | head -n1)" = 1
 else
     allowed="$command $projects/[a-z0-9]*, $command --full $projects/[a-z0-9]*"
 fi
-printf '# "Backup now" pipelines of the runner account back up one project (README: Kopijos).\n%s ALL=(root) NOPASSWD: %s\n' \
+printf '# "Backup now" pipelines of the runner account back up one project (README: "Steps", step 6).\n%s ALL=(root) NOPASSWD: %s\n' \
     "$ACCOUNT" "$allowed" > "$staging/sudoers"
 if command -v visudo >/dev/null; then
     visudo -cqf "$staging/sudoers" || { echo "The sudoers rule does not validate" >&2; exit 70; }
@@ -230,6 +230,6 @@ for timer in "$NAME.timer" "$FULL.timer" "$FILES.timer"; do
     echo "==> $timer: $(systemctl is-active "$timer"); next: $(systemctl show -P NextElapseUSecRealtime "$timer")"
 done
 echo "==> Tonight's run:"
-"$command" --check || echo "Needs attention: deploy the projects named above with setup 2.5.0+ (secret store; README, Kopijos)" >&2
+"$command" --check || echo "Needs attention: deploy the projects named above with setup 2.5.0+ (secret store; README "Steps", step 6)" >&2
 echo "==> Tonight's files run:"
-"$command" --check --files || echo "Needs attention: see the files backups named above (README, Failų kopijos)" >&2
+"$command" --check --files || echo "Needs attention: see the files backups named above (README "File backups")" >&2

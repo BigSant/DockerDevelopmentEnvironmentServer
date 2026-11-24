@@ -1,5 +1,5 @@
 """Preview bin/web-ui in a browser: the test worker tree (tests/test_ui.py) behind a proxy on 127.0.0.1:9178
-that adds the test login, so no password is typed. sudo is the tests' stub: "Vykdyti" runs nothing real.
+that adds the test login, so no password is typed. sudo is the tests' stub: "Run" runs nothing real.
 
 Usage: python3 tests/preview_ui.py [PORT]     (or the launch configuration "web-ui")
 Stopping it (Ctrl-C, SIGTERM) stops the UI and removes the temporary tree.
@@ -93,7 +93,7 @@ def fixture():
             git('tag', f'v{version}')
     git('update-ref', 'refs/remotes/origin/master', 'HEAD')
     git('checkout', '-q', '--detach', 'HEAD')
-    # "Vykdyti" of a key change writes the tree's authorized_keys for real (the test stub only records): the real
+    # "Run" of a key change writes the tree's authorized_keys for real (the test stub only records): the real
     # bin/add-backup-key, as this user, with its root checks answered.
     helper = case.root / 'preview-add-backup-key'
     helper.write_text(f"""#!{sys.executable}
