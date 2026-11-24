@@ -1976,43 +1976,34 @@ def e(text):
 # inline style and no script, so the pages are static HTML (a running job's page reloads itself).
 STYLE = """
 :root{color-scheme:dark;
---board:#10130e;--panel:#1a1f16;--panel-2:#232a1d;--field:#0d100b;--rule:#343d2b;--edge:#7a8566;
+--board:#0c0e0b;--panel:#13170f;--panel-2:#191e14;--field:#0f120c;--rule:#283022;--edge:#7a8566;
 --ink:#ece6d3;--dim:#b0b4a1;--faint:#969b88;
 --amber:#ffb22e;--amber-fill:#ffb22e;--amber-hover:#ffc75e;--amber-deep:#8a5c10;--on-accent:#1a1205;
---amber-glow:rgba(255,178,46,.35);--amber-tint:rgba(255,178,46,.22);--amber-line:#7a5a16;--wash:rgba(255,178,46,.06);
---go:#4fe08c;--go-glow:rgba(79,224,140,.55);--go-tint:rgba(79,224,140,.1);--go-on:rgba(79,224,140,.22);--go-line:rgba(79,224,140,.45);
---stop:#ff5b4f;--stop-glow:rgba(255,91,79,.6);--stop-line:rgba(255,91,79,.5);
---steel:#7b9dd0;--steel-ink:#c3d6f3;--steel-tint:rgba(111,147,201,.16);--steel-on:rgba(111,147,201,.32);--steel-line:rgba(111,147,201,.6);
+--amber-glow:rgba(255,178,46,.35);--amber-tint:rgba(255,178,46,.22);--amber-line:#99711c;--wash:rgba(255,178,46,.07);
+--amber-edge:#ffb22e;--fresh-edge:#e8c56b;
+--go:#4fe08c;--go-glow:rgba(79,224,140,.55);--go-tint:rgba(79,224,140,.1);--go-on:rgba(79,224,140,.22);--go-line:#378957;
+--stop:#ff5b4f;--stop-glow:rgba(255,91,79,.6);--stop-line:#c64c41;
+--steel:#7b9dd0;--steel-ink:#c3d6f3;--steel-tint:rgba(111,147,201,.16);--steel-on:rgba(111,147,201,.32);--steel-line:#5a769c;
 --tools-ink:#d3eed6;--tools-tint:rgba(108,178,122,.14);--tools-on:rgba(108,178,122,.3);--tools-line:rgba(108,178,122,.6);
 --fresh:#e8c56b;--fresh-fill:#e8c56b;
 --hazard:#f4c20d;--steel-fill:#3f67a8;--stage-fill:#8f5a0a;--prod-fill:#b3261e;
---top-1:#1d2318;--top-2:#141810;--lamp-off:#262d1f;--lamp-ring:#3d4733;--count-bg:#2e3726;--track:#262d1f;--seg-on:#3a4530;
+--top-1:#171c12;--top-2:#10130d;--lamp-off:#20261a;--count-bg:#2e3726;--track:#262d1f;--seg-on:#3a4530;
 --row-edge:#0a0c08;--scroll-thumb:#4a5540;
 --term-bg:#070806;--term-ink:#d8e8c8;--term-faint:#8d927f;--term-hover:#12170e;--term-amber:#ffb22e;--term-go:#4fe08c;
 --term-stop:#ff6a5f;--term-steel:#7d9fd2;
---sans:system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,"Liberation Sans",sans-serif;
 --mono:ui-monospace,"JetBrains Mono","Iosevka","IBM Plex Mono","SF Mono","Cascadia Code","DejaVu Sans Mono",Menlo,Consolas,monospace}
-@media (prefers-color-scheme:light){:root{color-scheme:light;
---board:#f3f0e6;--panel:#fcfaf4;--panel-2:#e9e5d8;--field:#ffffff;--rule:#d2cdbb;--edge:#858170;
---ink:#1b1f17;--dim:#4a5042;--faint:#616857;
---amber:#8a4f00;--amber-hover:#ffc24f;--amber-glow:rgba(138,79,0,.22);--amber-tint:#f7e2b8;--amber-line:#c99a4c;--wash:rgba(255,178,46,.1);
---go:#0d6a39;--go-glow:rgba(13,106,57,.35);--go-tint:#e0f1e6;--go-on:#c6e7d2;--go-line:#6cb285;
---stop:#b3261e;--stop-glow:rgba(179,38,30,.35);--stop-line:#e09a94;
---steel:#2c5596;--steel-ink:#1e447d;--steel-tint:#e3ebf7;--steel-on:#c9d9f1;--steel-line:#84a8d9;
---tools-ink:#145931;--tools-tint:#e1f3e7;--tools-on:#c8e6cf;--tools-line:#6cb285;
---fresh:#7a5600;
---top-1:#fcfaf4;--top-2:#ece8dc;--lamp-off:#d9d4c4;--lamp-ring:#a39e8a;--count-bg:#e0dbcc;--track:#ddd8c8;--seg-on:#d9d3c0;
---row-edge:#d9d4c4;--scroll-thumb:#b3ae9b}}
 *{box-sizing:border-box}
 html{background:var(--board);scrollbar-color:var(--scroll-thumb) var(--board)}
-body{margin:0;min-height:100vh;color:var(--ink);font:14px/1.55 var(--sans);font-variant-numeric:tabular-nums;
+body{margin:0;min-height:100vh;color:var(--ink);font:14px/1.55 var(--mono);font-variant-numeric:tabular-nums;
 background:radial-gradient(1200px 500px at 15% -10%,var(--wash),transparent 60%),var(--board)}
 a{color:var(--amber);text-decoration:none}a:hover{text-decoration:underline}
 :focus-visible{outline:2px solid var(--amber);outline-offset:2px}
 code{font-family:var(--mono);font-size:max(12px,.93em);color:var(--ink);background:var(--field);border:1px solid var(--rule);
-border-radius:3px;padding:1px 6px;overflow-wrap:anywhere}
+border-radius:3px;padding:1px 6px;overflow-wrap:anywhere;box-decoration-break:clone;-webkit-box-decoration-break:clone}
+small{font-size:12px}
 p{margin:0 0 12px}
 main>p,.note,.callout p,.step p,.form-foot .note{max-width:80ch}
+main>.note,main>p{margin-top:14px}
 .top{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:12px 28px;border-bottom:1px solid var(--rule);
 background:linear-gradient(180deg,var(--top-1),var(--top-2))}
 .mark{font:800 17px/1.2 var(--mono);letter-spacing:.08em;color:var(--amber)}
@@ -2021,12 +2012,12 @@ background:linear-gradient(180deg,var(--top-1),var(--top-2))}
 .spacer{flex:1}
 .nav{display:flex;gap:6px;flex-wrap:wrap}
 .nav .btn{white-space:nowrap}
-.btn,button{font:700 12px/1.2 var(--sans);cursor:pointer;color:var(--ink);background:var(--panel-2);border:1px solid var(--edge);
+.btn,button{font:700 12px/1.2 var(--mono);cursor:pointer;color:var(--ink);background:var(--panel-2);border:1px solid var(--edge);
 padding:8px 13px;min-height:32px;border-radius:3px;letter-spacing:.06em;text-transform:uppercase;overflow-wrap:normal;
 display:inline-flex;align-items:center;justify-content:center;vertical-align:middle}
 .btn:hover,button:hover{border-color:var(--amber);color:var(--amber);text-decoration:none}
 .nav .on{border-color:var(--amber);color:var(--amber);box-shadow:inset 0 -2px 0 var(--amber)}
-button.run{background:var(--amber-fill);border-color:var(--amber-fill);color:var(--on-accent)}
+button.run{background:var(--amber-fill);border-color:var(--amber-edge);color:var(--on-accent)}
 button.run:hover{background:var(--amber-hover);color:var(--on-accent);box-shadow:0 0 18px var(--amber-glow)}
 button.stop{color:var(--stop);border-color:var(--stop-line)}
 button.stop:hover{color:var(--stop);border-color:var(--stop)}
@@ -2035,21 +2026,21 @@ color:var(--amber);font-size:12px;letter-spacing:.06em;text-transform:uppercase;
 .who{text-align:right;color:var(--dim);font-size:12px;letter-spacing:.04em}
 .who b{display:block;color:var(--ink);font:600 15px/1.3 var(--mono);letter-spacing:.04em}
 main{padding:22px 28px 60px;max-width:1760px;margin:0 auto}
-h1{font:700 22px/1.25 var(--sans);letter-spacing:0;color:var(--ink);margin:0 0 16px}
-h2{display:flex;align-items:center;gap:12px;font:700 13px/1.3 var(--sans);letter-spacing:.1em;text-transform:uppercase;
+h1{font:700 20px/1.25 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--ink);margin:0 0 16px}
+h2{display:flex;align-items:center;gap:12px;font:700 13px/1.3 var(--mono);letter-spacing:.1em;text-transform:uppercase;
 color:var(--amber);margin:34px 0 12px}
 h2::after{content:"";flex:1;border-top:1px solid var(--rule)}
-h3{font:700 15px/1.3 var(--sans);letter-spacing:0;margin:0 0 12px;color:var(--ink)}
-h3 small{display:block;margin-top:3px;color:var(--faint);font:400 12px/1.4 var(--mono);overflow-wrap:anywhere}
+h3{font:700 14px/1.3 var(--mono);letter-spacing:.06em;text-transform:uppercase;margin:0 0 12px;color:var(--ink)}
+h3 small{display:block;margin-top:3px;color:var(--faint);font:400 12px/1.4 var(--mono);overflow-wrap:anywhere;text-transform:none;letter-spacing:0}
 .note{color:var(--dim);font-size:13px}
 .muted{color:var(--faint)}
 .chip{display:inline-block;padding:1px 7px;border-radius:2px;font:700 11.5px/1.5 var(--mono);letter-spacing:.06em;text-transform:uppercase;
 border:1px solid var(--edge);color:var(--dim);white-space:nowrap;vertical-align:1px}
 .chip.ok{color:var(--go);border-color:var(--go-line)}.chip.bad{color:var(--stop);border-color:var(--stop-line)}
-.chip.warn{color:var(--amber);border-color:var(--amber-line)}.chip.muted{color:var(--faint);border-color:var(--rule)}
-.chip.run{color:var(--on-accent);background:var(--amber-fill);border-color:var(--amber-fill)}
+.chip.warn{color:var(--amber);border-color:var(--amber-line)}.chip.muted{color:var(--faint);border-color:var(--edge)}
+.chip.run{color:var(--on-accent);background:var(--amber-fill);border-color:var(--amber-edge)}
 .lamp{display:inline-block;flex:none;width:11px;height:11px;border-radius:50%;background:var(--lamp-off);
-box-shadow:inset 0 0 0 1px var(--lamp-ring);vertical-align:-1px}
+box-shadow:inset 0 0 0 1.5px var(--edge);vertical-align:-1px}
 .lamp.ok{background:var(--go);box-shadow:0 0 8px var(--go-glow)}
 .lamp.bad{background:var(--stop);box-shadow:0 0 8px var(--stop-glow)}
 .lamp.warn{background:var(--amber-fill);box-shadow:0 0 8px var(--amber-glow),inset 0 0 0 1px var(--amber)}
@@ -2073,7 +2064,7 @@ background:repeating-linear-gradient(-45deg,var(--hazard) 0 18px,#111 18px 36px)
 .unit{display:flex;flex-direction:column;gap:6px;background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--faint);
 border-radius:4px;padding:12px 14px}
 .unit.is-ok{border-left-color:var(--go)}.unit.is-bad{border-left-color:var(--stop)}.unit.is-warn,.unit.is-run{border-left-color:var(--amber)}
-.unit .name{display:flex;align-items:center;gap:9px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);font-weight:700}
+.unit .name{display:flex;align-items:center;gap:9px;font-size:13px;letter-spacing:0;color:var(--ink);font-weight:700}
 .unit .state{font-size:14px}
 .unit .detail{color:var(--dim);font:12px/1.45 var(--mono);overflow-wrap:anywhere}
 .controls{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto;padding-top:6px}
@@ -2099,8 +2090,8 @@ font-family:var(--mono);font-size:13px}
 .board .line{display:block;white-space:nowrap}
 .board .line+.line{margin-top:4px}
 .board .line b{display:inline-block;min-width:5.4em;color:var(--dim);font-weight:600;font-size:11.5px;letter-spacing:.06em;text-transform:uppercase}
-.facts{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--rule);margin:0 0 12px}
-.facts th{width:16em;text-align:left;vertical-align:top;font-size:12px;letter-spacing:.08em;text-transform:uppercase;
+.facts{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--rule);margin:0 0 14px}
+.facts th{width:16em;text-align:left;vertical-align:top;font-size:13px;letter-spacing:0;
 color:var(--dim);font-weight:600;padding:10px 14px;border-bottom:1px solid var(--rule)}
 .facts td{padding:9px 14px;border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:13px;word-break:normal;overflow-wrap:anywhere}
 .facts tr:last-child th,.facts tr:last-child td{border-bottom:none}
@@ -2126,12 +2117,17 @@ padding:6px 10px;border-bottom:1px solid var(--rule)}
 form.action{margin:0;background:var(--panel);border:1px solid var(--rule);border-top:2px solid var(--amber);border-radius:4px;padding:14px 16px}
 form.action.danger{border-top:7px solid transparent;
 background:linear-gradient(var(--panel),var(--panel)) padding-box,repeating-linear-gradient(-45deg,var(--hazard) 0 10px,#111 10px 20px) border-box}
+.stats,.list,.facts,.deck,.bulkbox,main>form.action,.sections>form.action,.scroll{margin-bottom:14px}
+.board,.scroll:has(>.board){margin-bottom:8px}
+.scroll>.board,.scroll>.list,details .list{margin-bottom:0}
 label{display:grid;grid-template-columns:minmax(9em,14em) minmax(0,1fr);gap:10px;align-items:center;margin:0 0 8px;color:var(--dim);font-size:13px}
 label.check{display:flex;gap:9px;align-items:flex-start;color:var(--ink)}
-input[type=text],input[type=password],textarea,select{font:14px/1.4 var(--sans);color:var(--ink);background:var(--field);
+label.check small{color:var(--dim)}label.check small.muted{display:block;line-height:1.45}
+input[type=text],input[type=password],textarea,select{font:14px/1.4 var(--mono);color:var(--ink);background:var(--field);
 border:1px solid var(--edge);border-radius:3px;padding:7px 10px;min-height:36px;width:100%;caret-color:var(--amber)}
 textarea{font-family:var(--mono);font-size:13px}
-input[type=text]:focus,input[type=password]:focus,textarea:focus,select:focus{outline:none;border-color:var(--amber)}
+input[type=text]:focus,input[type=password]:focus,textarea:focus,select:focus{outline:none;border-color:var(--amber);
+box-shadow:0 0 0 1px var(--amber)}
 input[type=text]:focus-visible,input[type=password]:focus-visible,textarea:focus-visible,select:focus-visible
 {outline:2px solid var(--amber);outline-offset:1px;border-color:var(--amber)}
 input::placeholder,textarea::placeholder{color:var(--faint);opacity:1}
@@ -2140,7 +2136,7 @@ input[type=checkbox],input[type=radio]{accent-color:var(--amber-fill);width:16px
 .form-foot{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;margin-top:12px}
 .form-foot .note{margin:0}
 .form-foot button{flex:none}
-.form-foot button:not(.run):not(.go):not(.stop){border-color:var(--amber);color:var(--amber)}
+.form-foot button:not(.run):not(.go):not(.stop),form.bulk button{border-color:var(--amber);color:var(--amber)}
 .runs{list-style:none;margin:0;padding:0;border-top:1px solid var(--rule)}
 .runs li{display:grid;grid-template-columns:18px 150px minmax(0,1fr) 110px 150px;gap:14px;align-items:center;padding:9px 6px;
 border-bottom:1px solid var(--rule)}
@@ -2152,8 +2148,7 @@ border-bottom:1px solid var(--rule)}
 animation:march 1s linear infinite}
 @keyframes march{to{background-position:22px 0}}
 details{background:var(--panel);border:1px solid var(--rule);border-radius:4px;margin:0 0 10px}
-details>summary{cursor:pointer;padding:10px 14px;font:700 12px/1.4 var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--dim);
-list-style:none}
+details>summary{cursor:pointer;padding:10px 14px;font:600 13px/1.4 var(--mono);letter-spacing:0;color:var(--ink);list-style:none}
 details>summary::-webkit-details-marker{display:none}
 details>summary::before{content:"\\25B8  ";color:var(--amber)}
 details[open]>summary::before{content:"\\25BE  "}
@@ -2184,7 +2179,7 @@ font:13px/1.5 var(--mono);overflow:auto;white-space:pre}
 .nav i.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-left:7px;vertical-align:1px}
 .nav i.dot.warn{background:var(--amber-fill);box-shadow:0 0 8px var(--amber-glow),inset 0 0 0 1px var(--amber)}
 .nav i.dot.bad{background:var(--stop);box-shadow:0 0 8px var(--stop-glow);animation:pulse 1.6s ease-in-out infinite}
-button.go{background:var(--amber-fill);border-color:var(--amber-fill);color:var(--on-accent)}
+button.go{background:var(--amber-fill);border-color:var(--amber-edge);color:var(--on-accent)}
 button.go:hover{background:var(--amber-hover);color:var(--on-accent);box-shadow:0 0 18px var(--amber-glow)}
 h2[id]{scroll-margin-top:16px}
 .attention{margin:12px 0 0;background:var(--panel);border:1px solid var(--rule);border-left:4px solid var(--stop);border-radius:4px;
@@ -2196,9 +2191,9 @@ padding:10px 14px 6px}
 .attention a{display:flex;gap:10px;align-items:center;padding:4px 0;color:var(--ink)}
 .attention a:hover span{color:var(--amber)}
 .attention details{background:transparent;border:none;border-top:1px dashed var(--rule);border-radius:0;margin:4px 0 0}
-.attention details>summary{display:flex;gap:10px;align-items:center;padding:6px 0;font:400 14px/1.45 var(--sans);letter-spacing:0;
+.attention details>summary{display:flex;gap:10px;align-items:center;padding:6px 0;font:400 14px/1.45 var(--mono);letter-spacing:0;
 text-transform:none;color:var(--ink)}
-.attention details>summary::before{order:9;content:"\\25B8  show";font:700 12px/1 var(--sans);letter-spacing:.06em;text-transform:uppercase;
+.attention details>summary::before{order:9;content:"\\25B8  show";font:700 12px/1 var(--mono);letter-spacing:.06em;text-transform:uppercase;
 color:var(--amber)}
 .attention details[open]>summary::before{content:"\\25BE  hide"}
 .attention details>summary:hover span{color:var(--amber)}
@@ -2208,7 +2203,7 @@ text-transform:uppercase;border:1px solid transparent;white-space:nowrap}
 .lv-none{color:var(--faint);min-width:0}
 .lv.lv-phpfpm-readonly{color:var(--steel-ink);border-color:var(--steel-line);background:var(--steel-tint)}
 .lv.lv-phpfpm{color:var(--go);border-color:var(--go-line);background:var(--go-tint)}
-.lv.lv-docker{color:var(--on-accent);background:var(--amber-fill);border-color:var(--amber-fill)}
+.lv.lv-docker{color:var(--on-accent);background:var(--amber-fill);border-color:var(--amber-edge)}
 .lv.lv-full{color:#fff;background:var(--prod-fill);border:3px solid;padding:0 4px;
 border-image:repeating-linear-gradient(-45deg,var(--hazard) 0 4px,#111 4px 8px) 3}
 .ramp{list-style:none;margin:14px 0 0;padding:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));
@@ -2262,16 +2257,18 @@ padding:20px 22px 14px;overflow:hidden}
 .sections>h2:first-child{margin-top:0}
 .pointer{display:flex;flex-direction:column;gap:6px;align-items:flex-start;padding:14px 16px;border:1px dashed var(--edge);border-radius:4px}
 .pointer h3{margin:0}
-a.btn.go{background:var(--amber-fill);border-color:var(--amber-fill);color:var(--on-accent)}
+a.btn.go{background:var(--amber-fill);border-color:var(--amber-edge);color:var(--on-accent)}
 a.btn.go:hover{background:var(--amber-hover);color:var(--on-accent);box-shadow:0 0 18px var(--amber-glow)}
 .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0 6px}
-.toolbar .search,form.search{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0}
+.toolbar .search,form.search{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+form.search{margin:14px 0 8px}.toolbar .search{margin:0}
 .search input[type=text]{width:18em}
 .search label.check{margin:0;color:var(--dim)}
 .toolbar>a.btn{margin-left:auto}
 .board.keys td{vertical-align:middle}
 .board.keys td.keyname a{font-weight:700;font-size:14px}
-.board.keys td.keyname small{display:block;color:var(--faint);font-size:12px;max-width:15em;overflow:hidden;text-overflow:ellipsis}
+.board.keys td.keyname small{display:block;color:var(--faint);font-size:12px;max-width:26em;white-space:nowrap;overflow:hidden;
+text-overflow:ellipsis}
 .tallied{display:inline-block;white-space:nowrap;margin:0 6px 4px 0}
 .tally{display:inline-block;margin-right:4px;color:var(--ink);font-weight:700}
 .keyhead{display:grid;grid-template-columns:minmax(16em,1.3fr) minmax(0,.8fr) minmax(0,.8fr) minmax(0,1.4fr) minmax(0,1fr) minmax(0,1fr);gap:18px;padding:16px 20px;
@@ -2306,7 +2303,7 @@ border-bottom:1px dashed var(--rule);margin:0}
 .board.activity td.text small{display:block;margin-top:2px}
 .term.typed li::before{content:"$";color:var(--term-amber)}
 .lv.lv-db{color:var(--steel-ink);border-color:var(--steel-line);background:var(--steel-tint)}
-.lv.lv-fresh{color:var(--on-accent);background:var(--fresh-fill);border-color:var(--fresh-fill)}
+.lv.lv-fresh{color:var(--on-accent);background:var(--fresh-fill);border-color:var(--fresh-edge)}
 .ramp.backups{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:6px}
 .ramp .lv-db{border-top-color:var(--steel)}.ramp .lv-db b{color:var(--steel-ink)}
 .ramp .lv-fresh{border-top-color:var(--fresh-fill)}.ramp .lv-fresh b{color:var(--fresh)}
@@ -2317,7 +2314,7 @@ border-bottom:1px dashed var(--rule);margin:0}
 .tabs{display:flex;gap:4px;margin:26px 0 0;border-bottom:1px solid var(--rule);scroll-margin-top:16px}
 .tabs a{padding:9px 16px 8px;border:1px solid var(--rule);border-bottom:none;border-radius:4px 4px 0 0;color:var(--dim);
 font-size:12px;letter-spacing:.08em;text-transform:uppercase;font-weight:700;background:var(--panel);margin-bottom:-1px;white-space:nowrap}
-.tabs a small{letter-spacing:0;text-transform:none;font-weight:400;color:var(--faint);margin-left:6px}
+.tabs a small{letter-spacing:0;text-transform:none;font-weight:400;color:var(--dim);margin-left:6px}
 .tabs a.on{color:var(--amber);background:var(--panel-2);border-color:var(--amber);border-bottom:1px solid var(--panel-2);
 box-shadow:inset 0 2px 0 var(--amber)}
 .tabs a:hover{text-decoration:none;color:var(--ink)}
@@ -2328,18 +2325,21 @@ form.bulk.tools{grid-template-columns:5.5em auto auto;justify-content:start}
 .foot{margin-top:28px;color:var(--faint);font-size:12px}
 .who a{color:var(--ink)}.who a:hover{color:var(--amber)}
 .who form.logout{display:inline;margin-left:10px}.who form.logout button{padding:4px 9px;min-height:26px;font-size:11.5px}
-main.login{max-width:440px;margin:12vh auto 0;padding:0 16px}main.login .mark{display:block;margin:0 0 22px;text-align:center}
+main.login{max-width:440px;margin:0 auto;padding:12vh 16px 24px}main.login .mark{display:block;margin:0 0 22px;text-align:center}
 main.login form.action{padding:20px 22px}main.login label{grid-template-columns:7em minmax(0,1fr)}
 .list.runners{margin:0 0 18px}.list.runners td{word-break:normal;overflow-wrap:normal;vertical-align:middle}
 .list.runners .controls{padding-top:0;margin:0;flex-wrap:nowrap}
 .list.runners .controls button{padding:5px 10px;min-height:28px;font-size:11.5px}
 .scroll>.list.runners{margin:0}.scroll:has(>.list.runners){margin:0 0 18px}
-h3 a.muted{font:400 12px/1.4 var(--sans);margin-left:8px}
+h3 a.muted{font:400 12px/1.4 var(--mono);margin-left:8px;text-transform:none;letter-spacing:0}
 .steps-list{margin:0 0 14px;padding-left:22px;color:var(--dim)}.steps-list li{margin:0 0 4px}.steps-list b{color:var(--ink)}
 .matrix td{vertical-align:middle}.matrix td:first-child{width:14em}
 .seg .pm-view input:checked+span{background:var(--steel-on);color:var(--steel-ink);box-shadow:inset 0 -3px 0 var(--steel)}
 .seg .pm-manage input:checked+span{background:var(--amber-tint);color:var(--amber);box-shadow:inset 0 -3px 0 var(--amber)}
-.seg .pm-none input:checked+span{background:var(--seg-on);color:var(--ink)}
+.seg .lv-off input:checked+span,.seg .pm-none input:checked+span{background:transparent;color:var(--dim);
+box-shadow:inset 0 -2px 0 var(--edge)}
+.list th{white-space:nowrap}
+@media (min-width:901px){.grants:not(.projects) td:first-child{width:14em;white-space:nowrap}}
 """ + guide_css() + """
 @media (max-width:900px){.top{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px 12px;padding:10px 16px}
 .top .mark{grid-column:1;grid-row:1}.top .who{grid-column:2;grid-row:1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
@@ -2351,21 +2351,28 @@ main{padding:18px 16px}.deck,.deck.wide{grid-template-columns:1fr}
 .btn,button,.controls .btn,.controls button,.list.runners .controls button,.plate-actions button{min-height:40px;padding:9px 14px}
 .who form.logout button{min-height:36px}
 .stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 16px;padding:12px 14px}
-.stat{min-width:0;overflow-wrap:anywhere}.stat b{font-size:19px}
+.stat{min-width:0;overflow-wrap:anywhere}.stat b{font-size:19px}.stat:last-child:nth-child(odd){grid-column:1/-1}
 .form-foot{flex-direction:column;align-items:stretch}.form-foot button{align-self:flex-end}
-.split{grid-template-columns:1fr;gap:6px}.index{position:static;flex-direction:row;flex-wrap:wrap;gap:6px}.index .block-label,.index .note{display:none}
-.index a{border:1px solid var(--rule);border-radius:3px}.ramp{grid-template-columns:1fr 1fr}.ramp li:nth-child(3){border-left:none}
+.split{grid-template-columns:1fr;gap:16px}.index{position:static;flex-direction:row;flex-wrap:wrap;gap:6px}.index .block-label,.index .note{display:none}
+.index a{padding:10px 12px;border:1px solid var(--rule);border-radius:3px}.ramp{grid-template-columns:1fr 1fr}.ramp li:nth-child(3){border-left:none}
 .ramp li:not(:last-child)::after{display:none}
 .keyhead{grid-template-columns:1fr 1fr}form.bulk,form.bulk.tools,form.bulk.everything{grid-template-columns:1fr}
 .search input[type=text]{width:100%}
 label{grid-template-columns:1fr;gap:4px}.board thead{display:none}.board,.board tbody,.board tr,.board td{display:block;width:100%}
-.board tr{margin-bottom:10px}.board td{border-radius:0!important;border-top:none;border-bottom:none;padding:6px 14px}
+.board tr{margin-bottom:10px;background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--amber);border-radius:4px;
+overflow:hidden}
+.board tr.is-ok{border-left-color:var(--go)}.board tr.is-bad{border-left-color:var(--stop)}.board tr.is-idle{border-left-color:var(--faint)}
+.board td{background:transparent;border-radius:0!important;border-top:none;border-bottom:none;padding:6px 14px}
+.board td:first-child{border-left:none}
 .board td.project,.board td.target{max-width:none}.board .line{white-space:normal}
-.board td[data-label]::before{content:attr(data-label);display:block;margin-bottom:2px;font:600 12px/1.4 var(--sans);
+.board td[data-label]::before{content:attr(data-label);display:block;margin-bottom:2px;font:600 12px/1.4 var(--mono);
 letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
 .board td[data-label=""]::before{content:none}
 .board td:first-child{padding-top:12px}.board td:last-child{padding-bottom:12px}
 .board.activity td.when,.board.activity td.what{white-space:normal}
+.board.keys td.keyname small{max-width:none}
+.list:not(.matrix){display:block;overflow-x:auto;max-width:100%}
+.list.runners th,.list.runners td{white-space:nowrap}.list.runners td:first-child small{display:block}
 .facts,.facts tbody,.facts tr,.facts th,.facts td{display:block;width:100%}
 .facts th{padding:10px 12px 2px;border-bottom:none}.facts td{padding:2px 12px 10px}
 .grants.projects,.grants.projects tbody,.grants.projects tr,.grants.projects td{display:block;width:100%}
@@ -2828,15 +2835,18 @@ class Page:
                 runs = f'<a href="{e(link)}">GitHub Actions</a>' if link else '—'
             for index, (environment, state) in enumerate(environments.items()):
                 first = index == 0
-                cells = (f'<td class="project" data-label="Project · repo"><a href="/project/{e(entry["name"])}">{e(entry["name"])}</a>'
+                cells = (f'<td class="project" data-label="Project · repo"><a href="/project/{e(quote(entry["name"]))}">{e(entry["name"])}</a>'
                          f'<small>{e(entry.get("repository") or "?")}</small>'
                          f'{"<small>" + e(entry["code_repository"]) + "</small>" if entry.get("code_repository") else ""}</td>') if first \
-                    else '<td data-label="Project · repo"></td>'
+                    else f'<td class="project" data-label="Project · repo"><a href="/project/{e(quote(entry["name"]))}">{e(entry["name"])}</a></td>'
                 if state is None:
                     kind = 'idle'
                     cells += ('<td colspan="5" class="muted" data-label="Environment">not deployed from here '
                               '(no env/stage.env or env/prod.env)</td>')
                 else:
+                    if not self.registered(entry, environment):
+                        # No target: the "not registered" chip says it once; a missing backup or secrets is no alarm of its own.
+                        state = {**state, 'declared': False}
                     kind = environment_kind(state)
                     cells += (f'<td data-label="Environment"><span class="sign {e(environment)}">{e(environment)}</span></td>'
                               f'<td class="target" data-label="Target">{self.target(entry, environment)}</td>'
@@ -2850,6 +2860,14 @@ class Page:
         return ('<div class="scroll"><table class="board"><thead><tr><th scope="col">Project · repo</th><th scope="col">Environment</th>'
                 '<th scope="col">Target</th><th scope="col">Last deploy</th><th scope="col">Newest backup</th><th scope="col">Containers</th>'
                 '<th scope="col">Pipeline</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div>')
+
+    @staticmethod
+    def registered(entry, environment):
+        """Whether an environment deploys anywhere: a development one here, else a registered target."""
+        if (entry.get('environments', {}).get(environment) or {}).get('development'):
+            return True
+        targets = entry.get('targets', {})
+        return bool({**targets.get('all', {}), **targets.get(environment, {})})
 
     @staticmethod
     def target(entry, environment):
@@ -3310,9 +3328,11 @@ class Page:
     # --- Access: developer keys and what each may reach ---
     @staticmethod
     def seg(name, current, levels=LEVELS, none='—'):
-        """A segmented choice of a level (radios: no script needed); '' is none."""
+        """A segmented choice of a level (radios: no script needed); '' is none (lv-off: quiet when chosen, unless it
+        stands for a level every project inherits)."""
+        empty = 'lv-none lv-off' if none == '—' else 'lv-none'
         return '<div class="seg">' + ''.join(
-            f'<label class="lv-{level or "none"}"><input type="radio" name="{e(name)}" value="{e(level)}"'
+            f'<label class="{f"lv-{level}" if level else empty}"><input type="radio" name="{e(name)}" value="{e(level)}"'
             f'{" checked" if level == current else ""}><span>{e(LEVEL_LABELS.get(level, none))}</span></label>'
             for level in ('', *levels)) + '</div>'
 
@@ -3369,11 +3389,6 @@ class Page:
                  (len(project_rows(columns)), 'projects'), (len(columns), 'environments')]
         body = '<div class="stats">' + ''.join(f'<div class="stat"><b>{e(number)}</b><span>{e(label)}</span></div>'
                                                for number, label in stats) + '</div>'
-        body += ('<ol class="ramp">' + ''.join(f'<li class="lv-{level}"><b>{e(LEVEL_LABELS[level])}</b>'
-                                               f'<span>{e(LEVEL_NOTES[level])}</span></li>' for level in LEVELS) + '</ol>'
-                 '<ol class="ramp backups">' + ''.join(f'<li class="lv-{level}"><b>{e(LEVEL_LABELS[level])}</b>'
-                                                       f'<span>{e(LEVEL_NOTES[level])}</span></li>' for level in PULL_LEVELS) +
-                 '</ol>')
         body += ('<div class="toolbar"><form class="search" method="get" action="/access">'
                  f'<input type="text" name="q" value="{e(query)}" placeholder="person, key or project" autocomplete="off">'
                  '<button>Search</button></form><a class="btn go" href="/access/new">+ Add a key</a></div>')
@@ -3406,6 +3421,12 @@ class Page:
             if wanted:
                 body += (f'<p class="note">Showing where the keys reach "{e(query)}" (and the keys with every project\'s backups). '
                          '<a href="/access">All keys</a></p>')
+        # What the levels mean, after the keys: the search and the first key come first on a phone.
+        body += ('<h3>Access levels</h3><ol class="ramp">' + ''.join(f'<li class="lv-{level}"><b>{e(LEVEL_LABELS[level])}</b>'
+                                                                   f'<span>{e(LEVEL_NOTES[level])}</span></li>' for level in LEVELS) +
+                 '</ol><ol class="ramp backups">' + ''.join(f'<li class="lv-{level}"><b>{e(LEVEL_LABELS[level])}</b>'
+                                                            f'<span>{e(LEVEL_NOTES[level])}</span></li>' for level in PULL_LEVELS) +
+                 '</ol>')
         body += self.tools_section(data)
         body += '<h2>Recent activity</h2>' + self.activity_table(self.recent, keys=True, limit=25, people=people)
         body += '<p class="note"><a href="/logs#activity">All activity – Logs</a></p>'

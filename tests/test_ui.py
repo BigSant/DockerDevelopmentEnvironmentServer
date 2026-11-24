@@ -1249,6 +1249,36 @@ class WebUiTest(Worker):
         self.assertEqual(cache.get("status", 60, compute, since=time.time() + 1), 2, "an action that ended after it")
         self.assertEqual(cache.peek("status"), 2)
 
+    def test_every_environment_row_names_its_project_and_an_unregistered_one_stays_quiet(self):
+        module = load_web_ui()
+        page = module.Page("admin", "token", {})
+        entry = {"name": "shop one", "repository": "", "targets": {"prod": {"DEPLOY_CONTEXT": "default"}},
+                 "environments": {"prod": {"declared": True}, "stage": {"declared": True}}}
+        table = page.projects_table({"projects": [entry]})
+        self.assert_board_cells_labelled(table)
+        prod, stage = re.findall(r"<tr class=\"is-[a-z]+\">.*?</tr>", table.partition("<tbody>")[2])
+        self.assertEqual(len(re.findall(r'<a href="/project/shop%20one">shop one</a>', table)), 2, "the stage row names it too")
+        self.assertIn("<small>", prod, "the repository on the first row")
+        self.assertNotIn("<small>", stage, "and only there")
+        self.assertTrue(prod.startswith('<tr class="is-bad">'), "registered without a backup: still red")
+        self.assertIn('<span class="chip bad">none</span>', prod)
+        self.assertTrue(stage.startswith('<tr class="is-idle">'), stage)
+        self.assertIn('<span class="chip warn">not registered</span>', stage)
+        self.assertNotIn("chip bad", stage)
+        self.assertEqual(re.findall(r'<span class="chip ([a-z]+)">', stage), ["warn", "muted", "muted", "muted"],
+                         "only the not-registered chip stands out: nightly, full and secrets are muted")
+        failed = {**entry, "environments": {"stage": {"declared": True, "deploys": {"last": {
+            "ref": "main", "commit": "abc", "at": time.time(), "failed": "exit 2"}}}}}
+        self.assertIn('<tr class="is-bad">', page.projects_table({"projects": [failed]}), "a failed deploy is still a failure")
+
+    def test_the_empty_choice_of_a_level_is_marked_quiet_unless_it_stands_for_an_inherited_level(self):
+        seg = load_web_ui().Page.seg
+        self.assertIn('<label class="lv-none lv-off"><input type="radio" name="x" value="" checked><span>—</span>', seg("x", ""))
+        self.assertIn('<label class="lv-full">', seg("x", ""))
+        inherited = seg("x", "", none="all: db")
+        self.assertIn('<label class="lv-none"><input', inherited)
+        self.assertNotIn("lv-off", inherited)
+
     def test_needs_attention_folds_a_kind_repeated_across_environments_into_one_counted_group(self):
         page = load_web_ui().Page
         projects = [{"name": f"shop{number}", "environments": {"prod": {"declared": True}}} for number in range(5)]
@@ -1310,9 +1340,14 @@ class WebUiTest(Worker):
         self.assert_board_cells_labelled(page)
         self.assertIn('<td data-label="Last used">', page)
         self.assertIn('<td data-label="What">', page.replace(' class="what"', ''), "the activity table too")
+        # The search and the first key before the level legends, so a phone shows them on its first screen.
+        order = [page.index(mark) for mark in ('<div class="stats">', '<form class="search"', '<table class="board keys">',
+                                               "<h3>Access levels</h3>", '<ol class="ramp">', '<ol class="ramp backups">')]
+        self.assertEqual(order, sorted(order))
         self.assertIn("No key matches", self.request("GET", "/access?q=nothing")[2])
         status, _, key = self.request("GET", "/access/tomas")
         self.assertEqual(status, 200, key)
+        self.assertIn('<label class="lv-none lv-off"><input type="radio"', key, "no permission is the quiet choice")
         # Each environment slot says which it is, so prod and stage keep their own columns.
         slots = re.findall(r'<div class="env(?: ([^"]*))?">', key)
         self.assertIn("env-prod", slots)
