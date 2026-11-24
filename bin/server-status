@@ -361,13 +361,14 @@ def project(build_root, errors):
     name = build_root.name
     directory = environment_directory(build_root)
     entry = {'name': name, 'layout': None, 'repository': None, 'code_repository': None, 'branch': None,
-             'project_name': name, 'targets': {}, 'environments': {}}
+             'monorepo': False, 'project_name': name, 'targets': {}, 'target_files': [], 'environments': {}}
     if directory is None:
         errors.append(f'{name}: no environment repository (app/ with a Makefile and env/)')
         return entry
     entry['layout'] = str(directory.relative_to(build_root))
     # The environment repository's clone: app/, or the build root itself for bin/add-project --monorepo.
     monorepo = (build_root / '.git').is_dir() and not (build_root / 'app/.git').exists()
+    entry['monorepo'] = monorepo  # a rerun of bin/add-project (the UI's target change) needs --monorepo then
     checkout = development_checkout(build_root) or (build_root if monorepo else build_root / 'app')
     entry['repository'] = origin(checkout)
     entry['branch'] = default_branch(checkout)
@@ -377,7 +378,16 @@ def project(build_root, errors):
     # The deploy target bin/add-project registered: target.env for both, target.<env>.env for one.
     environments = registered_environments(build_root, directory)
     targets = {'': parse_env(read_text(build_root / 'target.env'))}
-    for environment in environments:
+    # The environments with a target file of their own (target.<env>.env), listed in STAGE_ENVIRONMENTS or not yet:
+    # what bin/add-project --remove-target can remove.
+    try:
+        own = sorted(path.name[len('target.'):-len('.env')] for path in build_root.glob('target.*.env')
+                     if path.is_file() and not path.is_symlink())
+    except OSError:
+        own = []
+    entry['target_files'] = [environment for environment in own
+                             if ENVIRONMENT.fullmatch(environment) and environment not in ('local', 'test')]
+    for environment in dict.fromkeys([*environments, *entry['target_files']]):
         targets[environment] = parse_env(read_text(build_root / f'target.{environment}.env'))
     entry['targets'] = {scope or 'all': {key: values[key] for key in TARGET_KEYS if key in values}
                         for scope, values in targets.items() if values}

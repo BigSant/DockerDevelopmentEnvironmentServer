@@ -12,7 +12,9 @@
 # every deploy) names DEPLOY_CONTEXT, DEPLOY_SSH, DEPLOY_PATH, APP_UID and APP_GID. It is always named:
 # --target local is this host, the build root itself and the account's ids; ssh://USER@HOST/PATH a remote server (a Docker
 # context setup-<name> of the account), ENV=... one environment only (target.<env>.env). A rerun keeps
-# the clones and the registered target unless --target is given.
+# the clones and the registered target unless --target is given. --remove-target ENV --name NAME deletes one
+# environment's own target.<env>.env (and its Docker context), which then deploys to the shared target.env;
+# it needs no URL and refuses to leave the environment without a target.
 # --monorepo: one repository holds both, app/ (the environment) and app/public/ (the code); it is cloned as the
 # build root itself, so $ROOT/projects/<name>/app is still the environment directory setup expects.
 set -euo pipefail
@@ -28,7 +30,8 @@ targets=()
 usage() {
     cat <<EOF
 Usage: sudo $0 [--check] [--shared-key] [--monorepo] [--target [ENV=]local|ssh://USER@HOST/PATH] [--name NAME|NAME] ENV_REPO_URL [CODE_REPO_URL]
-  NAME           directory under $ROOT/projects; defaults to the repository slug of ENV_REPO_URL,
+       sudo $0 [--check] --remove-target ENV --name NAME|NAME
+  NAME          directory under $ROOT/projects; defaults to the repository slug of ENV_REPO_URL,
                  which is what pipelines use (BITBUCKET_REPO_SLUG; on GitHub the repository name in
                  lower case) — give it only to deviate, or when the slug is no NAME (zarskis.lt: --name zarskis)
   --name NAME    the same as NAME in front of the URL
@@ -47,12 +50,18 @@ Usage: sudo $0 [--check] [--shared-key] [--monorepo] [--target [ENV=]local|ssh:/
                  of the project's STAGE_ENVIRONMENTS (e.g. mdv=...; without its own target an environment
                  deploys to target.env).
                  Repeatable. Without it a rerun keeps the registered target.
+  --remove-target ENV
+                 delete the environment's own target (target.<env>.env, and its Docker context setup-NAME-ENV) of
+                 the project NAME: ENV then deploys to the shared target.env, which must exist (it is never
+                 removed this way). No URLs; not with --target, --shared-key or --monorepo
 EOF
 }
 args=()
+remove_target=
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) check=1 ;;
+        --remove-target) remove_target=${2:?--remove-target needs ENV}; shift ;;
         --shared-key) shared_key=1 ;;
         --monorepo) monorepo=1 ;;
         --name) given_name=${2:?--name needs NAME}; shift ;;
@@ -64,6 +73,77 @@ while [ $# -gt 0 ]; do
     shift
 done
 is_url() { [[ "$1" == *:* || "$1" == */* ]]; }
+# Run from a directory the account can read: a caller's home (0750 on Ubuntu) makes git fail early.
+as_account() { if [ "$(id -u)" = 0 ]; then (cd "$ROOT" 2>/dev/null || cd /; sudo -u "$ACCOUNT" -H "$@"); else "$@"; fi; }
+target_summary() {  # target_summary FILE — the DEPLOY_*/APP_* lines of a target file, indented
+    sed -nE 's/^((DEPLOY_[A-Z_]+|APP_[UG]ID)=.*)/    \1/p' "$1" 2>/dev/null || echo "    (not readable without sudo)"
+}
+
+# --remove-target ENV: one environment's own target goes; the shared target.env stays and is then its target.
+if [ -n "$remove_target" ]; then
+    if [ ${#targets[@]} -gt 0 ] || [ "$shared_key" = 1 ] || [ "$monorepo" = 1 ]; then
+        echo "--remove-target removes a registered target: not with --target, --shared-key or --monorepo" >&2
+        exit 64
+    fi
+    for given in "${args[@]}"; do
+        ! is_url "$given" || { echo "--remove-target takes the project's NAME, no repository URL ($given)" >&2; exit 64; }
+    done
+    [ ${#args[@]} -le 1 ] || { usage >&2; exit 64; }
+    name=${args[0]:-$given_name}
+    [ -z "$given_name" ] || [ "$given_name" = "$name" ] || { echo "--name $given_name and NAME $name differ: give one" >&2; exit 64; }
+    [ -n "$name" ] || { echo "--remove-target $remove_target: give the project's NAME (--name NAME)" >&2; exit 64; }
+    [[ "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || { echo "NAME must be lowercase letters, digits, _ or -" >&2; exit 65; }
+    # The names --target ENV= accepts (split_target): stage, prod or one of the project's STAGE_ENVIRONMENTS.
+    [[ "$remove_target" =~ ^[a-z][a-z0-9]{1,15}$ ]] \
+        || { echo "--remove-target $remove_target: ENV is stage, prod or an extra environment (lowercase letters and digits, 2-16)" >&2; exit 64; }
+    case "$remove_target" in local|test) echo "--remove-target $remove_target: $remove_target is not a deploy environment" >&2; exit 64 ;; esac
+    if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
+        echo "Run with sudo (or use --check)" >&2
+        exit 77
+    fi
+    build_root="$ROOT/projects/$name"
+    if [ -L "$build_root" ] || [ ! -d "$build_root" ]; then
+        echo "No build root $build_root (projects: $(ls "$ROOT/projects" 2>/dev/null | tr '\n' ' '))" >&2
+        exit 65
+    fi
+    file="$build_root/target.$remove_target.env" shared="$build_root/target.env"
+    [ ! -L "$file" ] || { echo "$file is a symlink; not removed" >&2; exit 65; }
+    if [ ! -f "$file" ]; then
+        if [ -f "$shared" ] && [ ! -L "$shared" ]; then
+            echo "$remove_target has no target of its own ($file): it deploys to the shared $shared, which is not removed this way" >&2
+        else
+            echo "$remove_target has no target of its own ($file)" >&2
+        fi
+        exit 65
+    fi
+    if [ -L "$shared" ] || [ ! -f "$shared" ]; then
+        echo "$remove_target would have no target (there is no shared $shared); register another with --target $remove_target=… first" >&2
+        exit 65
+    fi
+    # The Docker context a remote target of this environment got (setup-<name>-<env>); the shared one's is setup-<name>.
+    context=$(sed -n 's/^DEPLOY_CONTEXT=//p' "$file" 2>/dev/null | tail -n 1)
+    [ "$context" = "setup-$name-$remove_target" ] && as_account docker context inspect "$context" >/dev/null 2>&1 || context=
+    if [ "$check" = 1 ]; then
+        echo "==> would remove the deploy target of $remove_target: $file"
+        target_summary "$file"
+        [ -z "$context" ] || echo "==> would remove the Docker context $context"
+        echo "==> $remove_target would then deploy to the shared $shared:"
+        target_summary "$shared"
+        exit 0
+    fi
+    summary=$(target_summary "$file")
+    as_account rm -f -- "$file"
+    echo "==> removed the deploy target of $remove_target: $file"
+    echo "$summary"
+    if [ -n "$context" ]; then
+        as_account docker context rm -f "$context" >/dev/null && echo "==> removed the Docker context $context" \
+            || echo "==> could not remove the Docker context $context (docker context rm $context)"
+    fi
+    echo "==> $remove_target now deploys to the shared $shared:"
+    target_summary "$shared"
+    exit 0
+fi
+
 if [ ${#args[@]} -ge 1 ] && ! is_url "${args[0]}"; then
     name=${args[0]}; args=("${args[@]:1}")
     [ -z "$given_name" ] || [ "$given_name" = "$name" ] || { echo "--name $given_name and NAME $name differ: give one" >&2; exit 64; }
@@ -96,8 +176,6 @@ if [ "$check" = 0 ] && [ "$(id -u)" != 0 ]; then
 fi
 
 build_root="$ROOT/projects/$name"
-# Run from a directory the account can read: a caller's home (0750 on Ubuntu) makes git fail early.
-as_account() { if [ "$(id -u)" = 0 ]; then (cd "$ROOT" 2>/dev/null || cd /; sudo -u "$ACCOUNT" -H "$@"); else "$@"; fi; }
 github_repository() {  # github_repository URL — "owner repository" of a github.com SSH URL
     [[ "$1" =~ ^(git@github\.com:|ssh://git@github\.com/)([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9._-]+)$ ]] || return 1
     echo "${BASH_REMATCH[2]} ${BASH_REMATCH[3]%.git}"

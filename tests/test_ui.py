@@ -245,6 +245,10 @@ class ServerStatusTest(Worker):
         self.assertEqual(project["targets"]["prod"]["DEPLOY_PATH"], "/home/tomas/Projects/runtime/zarskis/prod")
         self.assertEqual(project["targets"]["stage"]["DEPLOY_PATH"], "/home/tomas/Projects/runtime/zarskis/stage")
         self.assertNotIn("all", project["targets"])
+        self.assertTrue(project["monorepo"], "a rerun of bin/add-project needs --monorepo")
+        self.assertEqual(project["target_files"], ["prod", "stage"])
+        asana = next(p for p in json.loads(result.stdout)["projects"] if p["name"] == "asana_tracker")
+        self.assertEqual((asana["monorepo"], asana["target_files"]), (False, []), "target.env alone: no file of its own")
 
     def test_the_overview_comes_from_the_build_roots_docker_and_systemd(self):
         self.library.mkdir()
@@ -1111,6 +1115,131 @@ class WebUiTest(Worker):
         for sections in web_ui.ACTION_SECTIONS.values():
             self.assertTrue(set(sections) <= set(web_ui.MANAGED_SECTIONS))
 
+    def test_existing_groups_get_projects_at_their_actions_level_and_keep_seeing_the_project_pages(self):
+        web_ui = load_web_ui()
+        state = self.root / "accounts-before-projects"
+        state.mkdir()
+        known = [key for key, _, _ in web_ui.SECTIONS if key != "projects"]
+        (state / "accounts.json").write_text(json.dumps({
+            "env_hash": PASSWORD_HASH, "sections": known,
+            "groups": {"administrators": {"title": "Administrators", "sections": {}},
+                       "operators": {"title": "Operators", "sections": {"actions": "manage", "overview": "manage"}},
+                       "deployers": {"title": "Deployers", "sections": {"actions": "view", "overview": "manage"}},
+                       "watchers": {"title": "Watchers", "sections": {"overview": "view"}},
+                       "others": {"title": "Others", "sections": {"logs": "view"}}},
+            "users": {"admin": {"password": PASSWORD_HASH, "groups": ["administrators"]}}}))
+        groups = web_ui.Accounts(state, "admin", PASSWORD_HASH).snapshot()["groups"]
+        self.assertEqual(groups["operators"]["sections"]["projects"], "manage")
+        self.assertEqual(groups["deployers"]["sections"]["projects"], "view", "adding a project needed Actions")
+        self.assertEqual(groups["watchers"]["sections"]["projects"], "view", "the project pages were the overview's")
+        self.assertNotIn("projects", groups["others"]["sections"])
+        self.assertEqual(groups["administrators"]["sections"]["projects"], "manage")
+        self.assertEqual(web_ui.DEFAULT_GROUPS["operators"]["sections"]["projects"], "manage")
+        self.assertEqual(web_ui.DEFAULT_GROUPS["viewers"]["sections"]["projects"], "view")
+        # Once known, a group's choice stays.
+        web_ui.Accounts(state, "admin", PASSWORD_HASH).save_group("watchers", "Watchers", {"overview": "view", "projects": ""})
+        self.assertNotIn("projects", web_ui.Accounts(state, "admin", PASSWORD_HASH).snapshot()["groups"]["watchers"]["sections"])
+        for path, section in (("/projects", "projects"), ("/projects/new", "projects"), ("/project/shop", "projects"),
+                              ("/project/shop/logs", "projects"), ("/", None), ("/projectsx", None), ("/actions", "actions")):
+            with self.subTest(path=path):
+                self.assertEqual(web_ui.path_section(path), section)
+
+    def test_the_projects_tab_lists_adds_and_is_view_only_for_viewers(self):
+        status, _, page = self.request("GET", "/projects")
+        self.assertEqual(status, 200, page)
+        self.assertIn('<a class="btn on" href="/projects">Projects</a>', page)
+        self.assert_board_cells_labelled(page)
+        for text in ('<a href="/project/asana_tracker">asana_tracker</a>', '<a href="/project/forsena_docker">forsena_docker</a>',
+                     '<a href="/project/shop-two">shop-two</a>', "deploy@shop.example:/home/deploy/shop",
+                     '<b>3</b><span>projects</span>', '<a class="btn go" href="/projects/new">+ Add a project</a>',
+                     '<span class="note shown">3 of 3</span>'):
+            with self.subTest(text=text):
+                self.assertIn(text, page)
+        status, _, new = self.request("GET", "/projects/new")
+        self.assertEqual(status, 200, new)
+        for name in ("env_repo", "code_repo", "name", "monorepo", "shared_key", "target_all", "target_prod", "target_stage", "targets"):
+            with self.subTest(field=name):
+                self.assertIn(f'name="{name}"', new)
+        self.assertIn('name="action" value="add-project"', new)
+        actions = self.request("GET", "/actions")[2]
+        self.assertNotIn('value="add-project"', actions, "the form moved to Projects")
+        self.assertIn('<a class="btn" href="/projects">Projects →</a>', actions)
+        self.assertIn('No projects yet. <a href="/projects/new">', load_web_ui().Page("admin", "t", {}).projects_summary({"projects": []}))
+        # A monorepo: --monorepo, no code repo.
+        self.preview("add-project", env_repo="git@github.com:BigSant/zarskis.lt.git", name="zarskis", monorepo="yes",
+                     target_prod="local:/srv/runtime/zarskis/prod", target_stage="local:/srv/runtime/zarskis/stage",
+                     targets="mdv=ssh://deploy@mdv.example/home/deploy/mdv")
+        self.assertEqual(self.sudo_calls("add-project"), [
+            f"-n {self.library}/bin/add-project --check --monorepo --target prod=local:/srv/runtime/zarskis/prod "
+            "--target stage=local:/srv/runtime/zarskis/stage --target mdv=ssh://deploy@mdv.example/home/deploy/mdv "
+            "zarskis git@github.com:BigSant/zarskis.lt.git"])
+        # A viewer sees the list and a project's settings, without a single form; the add page is not theirs.
+        self.assertEqual(self.add_user("ziuri", "ziuri-slaptazodis", ["viewers"])[0], 303)
+        viewer = ("ziuri", "ziuri-slaptazodis")
+        status, _, page = self.request("GET", "/projects", login=viewer)
+        self.assertEqual(status, 200)
+        self.assertIn("asana_tracker", page)
+        self.assertIn("View only", page)
+        self.assertNotIn("/projects/new", page)
+        self.assertEqual(self.request("GET", "/projects/new", login=viewer)[0], 403)
+        project = self.request("GET", "/project/asana_tracker", login=viewer)[2]
+        self.assertIn('<h2 id="settings">Settings</h2>', project)
+        self.assertNotIn('action="/preview"', project)
+        token = re.search(r'name="csrf" value="([0-9a-f]+)"', page)[1]
+        status, _, body = self.request("POST", "/preview", {"csrf": token, "action": "project-target", "project": "asana_tracker",
+                                                            "environment": "prod", "target": "local"}, login=viewer)
+        self.assertEqual(status, 403, body)
+        # An operator manages them.
+        self.assertEqual(self.add_user("ops", "ops-slaptazodis-1", ["operators"])[0], 303)
+        page = self.request("GET", "/projects", login=("ops", "ops-slaptazodis-1"))[2]
+        self.assertIn('href="/projects/new"', page)
+        self.assertIn('value="project-target"', self.request("GET", "/project/asana_tracker", login=("ops", "ops-slaptazodis-1"))[2])
+
+    def test_a_projects_settings_change_add_and_remove_an_environments_target(self):
+        projects = self.tree.projects
+        (projects / "asana_tracker/target.prod.env").write_text(
+            "DEPLOY_CONTEXT=setup-asana_tracker-prod\nDEPLOY_SSH=deploy@asana.example\nDEPLOY_PATH=/home/deploy/asana\n")
+        (projects / "asana_tracker/app/public/.git").mkdir(parents=True)
+        self.origin(projects / "asana_tracker/app/public", "git@bitbucket.org:rsmaizys/asana_code.git")
+        mono = self.tree.project("zarskis", "stage", "prod")
+        self.origin(mono.parent, "git@github.com:BigSant/zarskis.lt.git")
+        (mono.parent / "target.prod.env").write_text("DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH=/srv/runtime/zarskis/prod\n")
+        page = self.request("GET", "/project/asana_tracker")[2]
+        self.assertIn('<a class="btn on" href="/projects">Projects</a>', page)
+        self.assertIn('<a href="/projects">← Projects</a>', page)
+        settings = page.split('<h2 id="settings">')[1].split('<h2 id="access">')[0]
+        self.assert_board_cells_labelled(settings)
+        for text in ("<code>target.env</code>", "<code>target.prod.env</code>", "deploy@asana.example:/home/deploy/asana",
+                     "Change the target", "Add an environment", "Remove an environment&#x27;s own target",
+                     '<option value="prod">prod – target.prod.env</option>'):
+            with self.subTest(text=text):
+                self.assertIn(text, settings)
+        self.assertLess(page.index('<h2 id="settings">'), page.index('<h2 id="access">'))
+        self.assertLess(page.index('<h2 id="pipelines">'), page.index('<h2 id="remove">'))
+        add = f"-n {self.library}/bin/add-project"
+        urls = "git@bitbucket.org:rsmaizys/asana_tracker.git git@bitbucket.org:rsmaizys/asana_code.git"
+        status, _, body = self.preview("project-target", project="asana_tracker", operation="set", environment="prod",
+                                       target="ssh://deploy@new.example/home/deploy/asana")
+        self.assertEqual(status, 200, body)
+        self.assertIn("Change the target of asana_tracker prod", body)
+        self.assertIn('href="/project/asana_tracker#settings">Cancel</a>', body)
+        self.preview("project-target", project="asana_tracker", operation="set", environment="mdv", target="local:/srv/mdv")
+        self.preview("project-target", project="asana_tracker", operation="remove", environment="prod")
+        self.preview("project-target", project="zarskis", operation="set", environment="stage", target="local:/srv/runtime/zarskis/stage")
+        self.assertEqual(self.sudo_calls("add-project"), [
+            f"{add} --check --target prod=ssh://deploy@new.example/home/deploy/asana asana_tracker {urls}",
+            f"{add} --check --target mdv=local:/srv/mdv asana_tracker {urls}",
+            f"{add} --check --remove-target prod --name asana_tracker",
+            f"{add} --check --monorepo --target stage=local:/srv/runtime/zarskis/stage zarskis git@github.com:BigSant/zarskis.lt.git"])
+        status, page = self.confirm(self.preview("project-target", project="asana_tracker", operation="remove", environment="prod")[2])
+        self.assertIn("finished, code 0", page)
+        self.assertIn(f"stub ran: {self.library}/bin/add-project --remove-target prod --name asana_tracker", page)
+        self.assertRegex(self.log.read_text(), r"run job=\S+ project-target: sudo .*add-project --remove-target prod --name asana_tracker")
+        # Only one target file and no target.env: nothing to remove it for.
+        forsena = self.request("GET", "/project/forsena_docker")[2]
+        self.assertIn("<code>target.stage.env</code>", forsena)
+        self.assertNotIn("Remove an environment", forsena)
+
     def test_a_new_ui_env_password_gives_the_first_administrator_back(self):
         web_ui = load_web_ui()
         state = self.root / "accounts-state"
@@ -1175,16 +1304,21 @@ class WebUiTest(Worker):
     def test_the_pages_show_the_status_helpers_view_of_the_worker(self):
         status, _, body = self.request("GET", "/")
         self.assertEqual(status, 200, body)
-        for text in ("asana_tracker", "git@bitbucket.org:rsmaizys/asana_tracker.git", "v1.0.0", "rollback",
-                     "3 kept", "2/3 running", "this server", "deploy@shop.example:/home/deploy/shop",
-                     "GitHub Actions", "v0.4.0", "failed (exit-code)", "Tue 2026-10-13 00:30:00 UTC",
-                     "Runners", "1 of 2 running", 'href="/runners"', "#41"):
+        for text in ("v0.4.0", "failed (exit-code)", "Tue 2026-10-13 00:30:00 UTC", "Runners", "1 of 2 running", 'href="/runners"',
+                     "forsena_docker", "3 projects, 3 environments: 1 needs a look", 'href="/projects">All projects →'):
             self.assertIn(text, body)
+        self.assertNotIn("asana_tracker", body.split("<h2>Projects</h2>")[1], "only the projects that need a look")
         self.assertNotIn("never-shown-password", body)
         self.assertIn(f"-n {self.library}/bin/server-status", self.sudo_calls())
+        projects = self.request("GET", "/projects")[2]
+        for text in ("asana_tracker", "git@bitbucket.org:rsmaizys/asana_tracker.git", "v1.0.0", "this server",
+                     "ssh deploy@shop.example", 'title="deploy@shop.example:/home/deploy/shop"'):
+            self.assertIn(text, projects)
+        self.assertNotIn("never-shown-password", projects)
         status, _, project = self.request("GET", "/project/asana_tracker")
         self.assertEqual(status, 200)
-        for text in ("asana-prod-php-fpm", "healthy", "asana-prod-cron", "asana-prod-secrets", "Deploy to prod", "Backup now"):
+        for text in ("asana-prod-php-fpm", "healthy", "asana-prod-cron", "asana-prod-secrets", "Deploy to prod", "Backup now",
+                     "rollback", "3 kept", "2/3 running", "#41"):
             self.assertIn(text, project)
         self.assertIn("https://github.com/BigSant/forsena_docker/actions", self.request("GET", "/project/forsena_docker")[2])
         self.assertEqual(self.request("GET", "/project/missing")[0], 404)
@@ -1197,10 +1331,10 @@ class WebUiTest(Worker):
     def test_an_action_runs_its_check_first_and_then_exactly_that_command(self):
         command = f"-n {self.library}/bin/add-project"
         status, _, body = self.preview("add-project", env_repo="git@bitbucket.org:rsmaizys/forsena_docker.git",
-                                       code_repo="git@bitbucket.org:rsmaizys/forsena.git",
-                                       targets="prod=ssh://deploy@shop.example/home/deploy/shop\nlocal")
+                                       code_repo="git@bitbucket.org:rsmaizys/forsena.git", target_all="local",
+                                       target_prod="ssh://deploy@shop.example/home/deploy/shop")
         self.assertEqual(status, 200, body)
-        arguments = ("--target prod=ssh://deploy@shop.example/home/deploy/shop --target local "
+        arguments = ("--target local --target prod=ssh://deploy@shop.example/home/deploy/shop "
                      "git@bitbucket.org:rsmaizys/forsena_docker.git git@bitbucket.org:rsmaizys/forsena.git")
         self.assertEqual(self.sudo_calls("add-project"), [f"{command} --check {arguments}"])
         self.assertIn(">Run</button>", body)
@@ -1249,27 +1383,67 @@ class WebUiTest(Worker):
         self.assertEqual(cache.get("status", 60, compute, since=time.time() + 1), 2, "an action that ended after it")
         self.assertEqual(cache.peek("status"), 2)
 
-    def test_every_environment_row_names_its_project_and_an_unregistered_one_stays_quiet(self):
+    def test_a_project_is_one_row_with_its_environments_side_by_side_and_an_unregistered_one_stays_quiet(self):
         module = load_web_ui()
         page = module.Page("admin", "token", {})
-        entry = {"name": "shop one", "repository": "", "targets": {"prod": {"DEPLOY_CONTEXT": "default"}},
-                 "environments": {"prod": {"declared": True}, "stage": {"declared": True}}}
-        table = page.projects_table({"projects": [entry]})
+        entry = {"name": "shop one", "repository": "git@x:ws/shop.git", "targets": {"prod": {"DEPLOY_CONTEXT": "default"}},
+                 "environments": {"prod": {"declared": True}, "stage": {"declared": True}, "mdv": {"declared": True}}}
+        rows = page.project_rows([entry])
+        self.assertEqual(len(rows), 1)
+        _, kind, problems, row = rows[0]
+        table = page.projects_board(rows)
         self.assert_board_cells_labelled(table)
-        prod, stage = re.findall(r"<tr class=\"is-[a-z]+\">.*?</tr>", table.partition("<tbody>")[2])
-        self.assertEqual(len(re.findall(r'<a href="/project/shop%20one">shop one</a>', table)), 2, "the stage row names it too")
-        self.assertIn("<small>", prod, "the repository on the first row")
-        self.assertNotIn("<small>", stage, "and only there")
-        self.assertTrue(prod.startswith('<tr class="is-bad">'), "registered without a backup: still red")
-        self.assertIn('<span class="chip bad">none</span>', prod)
-        self.assertTrue(stage.startswith('<tr class="is-idle">'), stage)
-        self.assertIn('<span class="chip warn">not registered</span>', stage)
-        self.assertNotIn("chip bad", stage)
-        self.assertEqual(re.findall(r'<span class="chip ([a-z]+)">', stage), ["warn", "muted", "muted", "muted"],
-                         "only the not-registered chip stands out: nightly, full and secrets are muted")
+        self.assertEqual(kind, "bad", "registered without a backup: still red")
+        self.assertEqual(problems, ["no backup"])
+        prod, stage, others = re.findall(r'<td class="envcell[^"]*" data-label="[^"]*">(.*?)</td>', row)
+        self.assertIn('<span class="chip bad">no backup</span>', prod)
+        self.assertIn("this server · no backup", prod)
+        self.assertEqual(stage, '<div class="env-list"><div class="env-item"><span class="envline"><span class="lamp muted"></span>'
+                                '<span class="muted">— no target</span></span></div></div>', "a quiet dash, no chips")
+        self.assertIn('<span class="sign mdv">mdv</span>', others, "the others are named")
         failed = {**entry, "environments": {"stage": {"declared": True, "deploys": {"last": {
             "ref": "main", "commit": "abc", "at": time.time(), "failed": "exit 2"}}}}}
-        self.assertIn('<tr class="is-bad">', page.projects_table({"projects": [failed]}), "a failed deploy is still a failure")
+        _, kind, problems, row = page.project_rows([failed])[0]
+        self.assertEqual((kind, problems), ("bad", ["deploy failed"]), "a failed deploy is still a failure")
+        self.assertIn('<td class="envcell none" data-label="Prod"></td>', row, "no prod: an empty cell, hidden on a phone")
+
+    def test_fifty_projects_are_fifty_rows_those_that_need_a_look_first_and_a_filter_counts(self):
+        module = load_web_ui()
+        page = module.Page("admin", "token", {"projects": "manage"})
+        now = time.time()
+        fine = lambda: {"declared": True, "deploys": {"last": {"ref": "v1.2.0", "commit": "abc", "at": now - 7200}},
+                        "backups": {"newest": {"time": now - 3600, "size": 1000}, "count": 3}, "containers": []}
+        projects = []
+        for number in range(50):
+            name = f"shop{number:02d}"
+            environments = {"prod": fine(), "stage": fine()}
+            if number in (7, 31):
+                environments["prod"]["deploys"]["last"]["failed"] = "exit 2"
+            projects.append({"name": name, "repository": f"git@ssh.bitbucket.org:ws/{name}_docker.git",
+                             "targets": {"all": {"DEPLOY_CONTEXT": "default", "DEPLOY_PATH": f"/srv/setup-server/projects/{name}"}},
+                             "environments": environments})
+        data = {"projects": projects, "generated": now}
+        body = page.projects(data, None, {})
+        self.assert_board_cells_labelled(body)
+        rows = re.findall(r'<tr class="is-([a-z]+)"><td class="project" data-label="Project"><a href="/project/([^"]+)">', body)
+        self.assertEqual(len(rows), 50, "one row per project, not one per environment")
+        self.assertEqual(rows[:2], [("bad", "shop07"), ("bad", "shop31")], "the ones that need a look first")
+        self.assertEqual([name for _, name in rows[2:]], sorted(name for _, name in rows[2:]), "then by name")
+        self.assertIn('<span class="note shown">50 of 50</span>', body)
+        for number, label in (("50", "projects"), ("100", "environments"), ("2", "failing")):
+            self.assertIn(f"<b>{number}</b><span>{label}</span>", body)
+        by_name = page.projects(data, None, {"sort": ["name"]})
+        self.assertEqual(re.findall(r'<a href="/project/([^"]+)">', by_name)[:8], [f"shop{number:02d}" for number in range(8)])
+        problems = page.projects(data, None, {"problems": ["1"]})
+        self.assertIn('<span class="note shown">2 of 50</span>', problems)
+        self.assertIn('name="problems" value="1" checked', problems, "the filter stays in the form")
+        searched = page.projects(data, None, {"q": ["SHOP1"]})
+        self.assertIn('<span class="note shown">10 of 50</span>', searched, "the name or the repo, any case")
+        self.assertIn('value="SHOP1"', searched)
+        self.assertIn("No project matches", page.projects(data, None, {"q": ["nothing"]}))
+        overview = page.projects_summary(data)
+        self.assertEqual(len(re.findall(r"<tr ", overview)), 2, "the overview lists only the two that need a look")
+        self.assertIn('href="/projects">All projects →', overview)
 
     def test_the_empty_choice_of_a_level_is_marked_quiet_unless_it_stands_for_an_inherited_level(self):
         seg = load_web_ui().Page.seg
@@ -1281,7 +1455,8 @@ class WebUiTest(Worker):
 
     def test_needs_attention_folds_a_kind_repeated_across_environments_into_one_counted_group(self):
         page = load_web_ui().Page
-        projects = [{"name": f"shop{number}", "environments": {"prod": {"declared": True}}} for number in range(5)]
+        target = {"all": {"DEPLOY_CONTEXT": "default"}}
+        projects = [{"name": f"shop{number}", "environments": {"prod": {"declared": True}}, "targets": target} for number in range(5)]
         projects.append({"name": "blog", "environments": {"stage": {"declared": True, "backups": {"newest": {"time": time.time()}},
                                                                      "deploys": {"last": {"failed": "exit 2"}}}}})
         data = {"units": {"setup-server-backup.service": {"ActiveState": "failed"}},
@@ -1300,6 +1475,8 @@ class WebUiTest(Worker):
         few = page.attention({"projects": projects[:3]})
         self.assertNotIn("<details", few, "three of a kind are still listed one by one")
         self.assertIn("Needs attention · 3", few)
+        idle = page.attention({"projects": [{"name": "draft", "environments": {"prod": {"declared": True}}}]})
+        self.assertNotIn("draft", idle, "an environment with no target deploys nowhere: no backup alarm")
 
     def assert_board_cells_labelled(self, page):
         """Every cell of a .board table names its column (data-label, from the header) for the stacked phone layout."""
@@ -1551,6 +1728,21 @@ class WebUiTest(Worker):
                  ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "ssh://u@h/p -oProxyCommand=x"}, "Invalid target"),
                  ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "test=local"}, "Invalid target"),
                  ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "targets": "Dev=local"}, "Invalid target"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "target_prod": "prod=local"}, "Invalid target"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "target_all": "local; id"}, "Invalid target"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "target_stage": "local",
+                                  "targets": "stage=local:/srv/x"}, "Two targets for stage"),
+                 ("add-project", {"env_repo": "git@bitbucket.org:ws/shop.git", "code_repo": "git@bitbucket.org:ws/code.git",
+                                  "monorepo": "yes"}, "leave &quot;Code repo URL&quot; empty"),
+                 ("project-target", {"project": "missing", "environment": "prod", "target": "local"}, "There is no project"),
+                 ("project-target", {"project": "asana_tracker", "environment": "test", "target": "local"}, "&quot;Environment&quot;"),
+                 ("project-target", {"project": "asana_tracker", "environment": "Dev", "target": "local"}, "&quot;Environment&quot;"),
+                 ("project-target", {"project": "asana_tracker", "environment": "prod", "target": "ftp://h/p"}, "Invalid target"),
+                 ("project-target", {"project": "asana_tracker", "environment": "prod", "target": "prod=local"}, "Invalid target"),
+                 ("project-target", {"project": "asana_tracker", "environment": "prod"}, "&quot;Target&quot;"),
+                 ("project-target", {"project": "asana_tracker", "environment": "prod", "operation": "remove"}, "no target of its own"),
+                 ("project-target", {"project": "forsena_docker", "environment": "stage", "operation": "remove"}, "no shared target.env"),
+                 ("project-target", {"project": "asana_tracker", "environment": "prod", "operation": "drop"}, "Unknown operation"),
                  ("remove-project", {"name": "../etc"}, "&quot;Project&quot;"),
                  ("install-backups", {"at": "25:00"}, "&quot;Time&quot;"),
                  ("install-backups", {"full_at": "Sunday 04:30"}, "Full backup day"),
@@ -1756,7 +1948,8 @@ class WebUiTest(Worker):
         self.assertNotIn('name="unit" value="metrics"', overview)
         self.assertIn('value="github-runner@bigsant"', self.request("GET", "/actions")[2])
         self.assert_board_cells_labelled(overview)
-        self.assertIn('<td data-label="Environment"><span class="sign prod">prod</span></td>', overview)
+        self.assertIn('<td class="envcell" data-label="Stage"><div class="env-list"><div class="env-item"><span class="envline"><span class="lamp bad">', overview,
+                      "forsena_docker's stage has no backup")
         project = self.request("GET", "/project/asana_tracker")[2]
         self.assert_board_cells_labelled(project)
         self.assertIn('<td data-label="Container">asana-prod-cron</td>', project)
@@ -1820,7 +2013,7 @@ class WebUiTest(Worker):
                      "LOCALHOST_PORT=80", "LOCALHOST_PORT_SSL=443", "\nALLOWED_IPS=&quot;OFFICE_IP&quot;", "Deployments → <code>Staging</code>",
                      "DATABASE_BUFFER_POOL=512M\nDATABASE_CPUS=…", "shop.example.lt   A  TARGET_IP",
                      "--target stage=ssh://shop@shop.example.lt/home/shop/site",
-                     "/actions?target=stage%3Dssh%3A%2F%2Fshop%40shop.example.lt%2Fhome%2Fshop%2Fsite#add-project"):
+                     "/projects/new?target=stage%3Dssh%3A%2F%2Fshop%40shop.example.lt%2Fhome%2Fshop%2Fsite#form-add-project"):
             with self.subTest(text=text):
                 self.assertIn(text, centos)
         self.assertNotIn("Custom HTTPD", centos)
@@ -1884,10 +2077,14 @@ class WebUiTest(Worker):
         self.assertNotIn("rm -rf", body.split("Invalid value", 1)[0] + body.split("</ol>")[0].split('class="steps"')[-1])
         self.assertIn("echo &#x27;ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKey setup@worker1&#x27; &gt;&gt; ~deploy/.ssh/authorized_keys", body)
         self.assertNotIn("Could not read the worker", body)
-        prefilled = self.request("GET", "/actions?target=" + urlencode({"": "prod=ssh://shop@shop.example.lt/home/shop/site"})[1:])[2]
-        self.assertIn(">prod=ssh://shop@shop.example.lt/home/shop/site</textarea>", prefilled)
-        refused = self.request("GET", "/actions?target=" + urlencode({"": "prod=ssh://u@h/p -oProxyCommand=x"})[1:])[2]
+        prefilled = self.request("GET", "/projects/new?target=" + urlencode({"": "prod=ssh://shop@shop.example.lt/home/shop/site"})[1:])[2]
+        self.assertIn('name="target_prod" value="ssh://shop@shop.example.lt/home/shop/site"', prefilled, "the prod field")
+        self.assertIn(">mdv=local:/srv/mdv</textarea>", self.request("GET", "/projects/new?target=mdv%3Dlocal%3A%2Fsrv%2Fmdv")[2])
+        refused = self.request("GET", "/projects/new?target=" + urlencode({"": "prod=ssh://u@h/p -oProxyCommand=x"})[1:])[2]
         self.assertNotIn("ProxyCommand", refused)
+        status, headers, _ = self.request("GET", "/actions?target=local")
+        self.assertEqual((status, headers.get("Location")), (303, "/projects/new?target=local#form-add-project"),
+                         "the old link of the form leads to where it is now")
 
     # --- Bitbucket -------------------------------------------------------------------------------
     def test_a_stage_class_environment_gets_its_deploy_its_grants_and_a_bulk_row(self):

@@ -232,6 +232,12 @@ and change nothing. Run them with `--check` first.
      prod would pick up the stage commit's files. With separate directories each environment gets its own copy of the deployed commit.
    - Run again without `--target` it does not change the target (neither `target.env` nor `target.<env>.env`); with `--target` –
      it overwrites it. `remove-project` removes both the build directory (with `target*.env`) and the project's Docker contexts.
+   - **One environment's own target goes** with `sudo bin/add-project [--check] --remove-target ENV --name NAME` (or
+     `--remove-target ENV NAME`; no URLs, not with `--target`/`--shared-key`/`--monorepo`): it deletes `target.<env>.env`
+     (and the Docker context `setup-<name>-<env>` of a remote one), and the environment then deploys to the shared `target.env`.
+     The shared `target.env` is never removed this way, and the command refuses when there is no shared `target.env` (the environment
+     would have no target – register another with `--target ENV=…` first), when the environment has no file of its own, or when it is
+     a symlink. `--check` shows the file with its `DEPLOY_*` values and the shared target that takes over; the UI's project page offers it too.
 
    **GitHub project:**
 
@@ -644,8 +650,9 @@ other environment:
 - **Access** – `--grant project:mdv=LEVEL` and the UI's *Access* (on the key page mdv stands next to prod and stage;
   "All at once" – the row "others"). `--grant project=LEVEL` without an environment – only stage and prod.
 - **When the environment is no longer needed** – on the setup side `make down ENV=mdv`, removing `data/mdv` and the name from `STAGE_ENVIRONMENTS`;
-  here – `target.mdv.env` and `app/.generated/backups/*-mdv-*` (if the backups are no longer needed) are deleted by hand, the keys' `…:mdv` permissions
-  are revoked in *Access* (the gate does not let anyone connect to an unlisted environment anyway).
+  here – the environment's own target goes with `sudo bin/add-project --remove-target mdv --name NAME` (the UI's project page also offers it;
+  it is refused when there is no shared `target.env` to fall back to), `app/.generated/backups/*-mdv-*` (if the backups are no longer needed)
+  are deleted by hand, the keys' `…:mdv` permissions are revoked in *Access* (the gate does not let anyone connect to an unlisted environment anyway).
 
 ## Bitbucket SSH address (since 2026-11-12)
 
@@ -1031,20 +1038,21 @@ user's name; the browser's pop-up dialog is gone.
 
 **Users and groups.** The *Users* section (`/users`): who signs in to the UI and what they can do there.
 
-- **A group** gives, for each section (Overview, Runners, Access, Files, Update, Actions, Instructions, Logs,
+- **A group** gives, for each section (Overview, Projects, Runners, Access, Files, Update, Actions, Instructions, Logs,
   Metrics, Users), "none", "view" (the section is shown) or "manage" (its actions as well: preview and run; Instructions,
   Logs and Metrics are only shown). An action is allowed if the user manages at least one section that contains its form
-  (e.g. "Backup now" – Overview, Files or Actions; starting, stopping, restarting a runner – Overview or
-  Runners). Where the user can only view, there are no buttons, and a direct POST gets `403`.
+  (e.g. "Backup now" – Overview, Projects, Files or Actions; starting, stopping, restarting a runner – Overview or
+  Runners; adding a project and its targets – Projects; removing a project – Projects or Overview). Where the user can only view, there are no buttons, and a direct POST gets `403`.
 - **A user** belongs to one or more groups; their permission for a section is the highest of them. They can (optionally) be linked
   to a person in *Access* (an SSH key and tools): this is only a link, signing in does not depend on the key. A disabled
   user cannot sign in, their sessions end immediately; a new password ends their other sessions.
-- **Default groups:** *Administrators* (manages everything, cannot be changed or deleted), *Operators* (manages Overview, Runners,
+- **Default groups:** *Administrators* (manages everything, cannot be changed or deleted), *Operators* (manages Overview, Projects, Runners,
   Files and Actions, views the other sections except Users), *Viewers* (views everything except Users). Their ids are
   `administrators`, `operators` and `viewers`; on start the UI automatically migrates the old Lithuanian group ids in an existing
   `accounts.json` (`administratoriai`, `operatoriai`, `stebetojai`) to them. At least
   one enabled administrator must remain: the UI does not allow the last one to be disabled, removed from the group or deleted. When a new
-  section appears, the existing groups get it at the level they have on the closest one (*Runners* – like *Actions*); later this
+  section appears, the existing groups get it at the level they have on the closest one (*Runners* and *Projects* – like
+  *Actions*; a group that sees the *Overview* also gets "view" on *Projects*, where the project pages moved); later this
   is changed like any other permission.
 - **The first administrator.** When the UI starts for the first time, it makes the `ui.env` name (`admin`) a member of the
   *Administrators* group. When the `ui.env` password is changed (`sudo bin/install-ui --new-password`) that user is
@@ -1076,12 +1084,21 @@ commit, red when setup is not on a release tag.
   (commit, whether it is a release tag, how far ahead origin/master is as of the last fetch), the runner summary, the nightly and weekly full backup timers (last run, result, next), the metrics service,
   the nightly file backup timer, the UI itself, the free space on the disk holding `/srv/setup-server`. Next to every installed service – its buttons
   (start, stop, restart; backups – "Start"), which lead to the same preview as the other actions.
-- *Projects* – every build directory: repo URL, environments (stage/prod), target (`target*.env`, not a secret),
+- *Overview → Projects* – every build directory: repo URL, environments (stage/prod), target (`target*.env`, not a secret),
   the last deploy (time, commit, success or not, rollback), the newest nightly and weekly full backup (age,
-  size, how many are kept; on the project page – also the last "fresh"),
-  whether `<PROJECT_NAME>-<env>-secrets` is running, the containers (state, health) and the latest Bitbucket pipelines.
-  On the project page – also all of the environment's backups (nightly, full, fresh, pre-deploy: file, time, size),
-  each container's `docker logs` (the last 200, 500 or 2000 lines) and "Backup now on the server".
+  size, how many are kept), whether `<PROJECT_NAME>-<env>-secrets` is running, the containers (state, health) and the latest
+  Bitbucket pipelines.
+- *Projects* (`/projects`) – where projects are managed. The list: how many projects and environments, how many have no target,
+  deploy to another server or failed their last deploy; per environment its target, the last deploy and its state, with a link to
+  the project's settings. *+ Add a project* (`/projects/new`) – the env repo URL, the code repo URL (optional), the name (optional),
+  *monorepo* (`--monorepo`), *the account key* (`--shared-key`) and the targets: one for every environment (`target.env`), prod's and
+  stage's own, and further `ENV=target` lines (`local`, `local:/PATH`, `ssh://USER@HOST/PATH`). The project page (`/project/<name>`)
+  shows each environment (the last successful deploy, all of its backups – nightly, full, fresh, pre-deploy –, each container's
+  `docker logs` – the last 200, 500 or 2000 lines – and "Backup now on the server"), then **Settings**: the layout and repos, every
+  environment with its target and target file (`target.env` shared or `target.<env>.env` its own), *Change the target* and
+  *Add an environment* (a name of lowercase letters and digits, 2–16, not `local`/`test`; it deploys once the project lists it in
+  `STAGE_ENVIRONMENTS`), and *Remove an environment's own target* (only when a shared `target.env` remains). Then who reaches the project
+  (*Access*), its pipelines and *Remove*.
 - *Access* – developer keys: for each – how many prod, stage and other environments it reaches and at what level (`make ssh`),
   backups (`make db-pull`: the all-projects level and the environments above it), networks and last use; search by key
   or project; the latest activity of all keys. "Add key" – public key, name, networks, initial backups (all
@@ -1130,7 +1147,7 @@ commit, red when setup is not on a release tag.
   shop's `parameters.php`), Access keys for both repos, registration, host key comparison, the workspace runner and
   the first deploy. Every step
   names its source; where setup does not describe anything yet (DirectAdmin proxy, a certificate without a panel, a non-Debian OS), this
-  is marked with a warning. The page runs nothing; the button opens "Add a project" with the target filled in.
+  is marked with a warning. The page runs nothing; the button opens *Projects → Add a project* with the target filled in.
   Next to it – an *example* (`/instructions/example`): the whole addition of a project with made-up names (PrestaShop with an environment
   repo and a separate code repo, stage on a DirectAdmin server, the website in a subfolder of a shared hostname) and what trips up a real
   addition: versions and disk space, Docker for the user, Access keys for both repos, the host key before `BatchMode`,
@@ -1142,7 +1159,9 @@ with an error, there is no "Run"). One action runs at a time; its page refreshes
 
 | Action | What it runs (`L` = `/usr/local/lib/setup-server/bin`) |
 | --- | --- |
-| Add a project | `sudo -n L/add-project [--shared-key] --target … [NAME] URL [CODE_URL]` (the target is required for a new project) |
+| Add a project (*Projects*) | `sudo -n L/add-project [--shared-key] [--monorepo] --target … [NAME] URL [CODE_URL]` (the target is required for a new project) |
+| Change the target, add an environment (project page) | `sudo -n L/add-project [--monorepo] --target ENV=TARGET NAME URL [CODE_URL]` – the project's own URLs, as the status reads them from its clones; the clones are kept |
+| Remove an environment's own target (project page) | `sudo -n L/add-project --remove-target ENV --name NAME` |
 | Remove project (on the project page) | `sudo -n L/remove-project [--with-backups] NAME` |
 | Install runner (*Runners*) | `sudo -n L/install-runner --provider bitbucket\|github [--name …] [--instance N] [--tarball URL\|FILE [--sha256 …]]`; the dialog text – via stdin |
 | Remove runner (*Runners*) | `sudo -n L/install-runner --provider github --remove --scope …` (the GitHub "Remove" command – via stdin, not shown) or `--remove` (Bitbucket) |

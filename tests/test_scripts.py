@@ -647,7 +647,7 @@ class AddProjectTargetTest(ScriptTest):
         self.stub("ssh", 'echo "$*" >> "$SSH_LOG"\n'
                          '[ -z "${FAKE_SSH_FAIL:-}" ] || { echo "Permission denied (publickey)." >&2; exit 255; }\n'
                          'printf "1012\\n1013\\n27.3.1\\nwritable\\n"\n')
-        self.stub("docker", 'echo "$*" >> "$DOCKER_LOG"\ncase "$1 $2" in "context inspect") exit 1;; esac\n')
+        self.stub("docker", 'echo "$*" >> "$DOCKER_LOG"\ncase "$1 $2" in "context inspect") [ -n "${FAKE_CONTEXT:-}" ] || exit 1;; esac\n')
         self.stub("ssh-keygen", 'echo "shop.example ssh-ed25519 AAAA"\n')
         (self.root / "srv/.ssh").mkdir(parents=True, exist_ok=True)
         (self.root / "srv/.ssh/id_ed25519.pub").write_text("ssh-ed25519 AAAAsetupkey setup@worker\n")
@@ -778,6 +778,74 @@ class AddProjectTargetTest(ScriptTest):
         for line in ("DEPLOY_CONTEXT=setup-forsena_docker-prod", "DEPLOY_SSH=deploy@shop.example",
                      "DEPLOY_PATH=/home/deploy/shop", "APP_UID=1012", "APP_GID=1013"):
             self.assertIn(line + "\n", text)
+
+    def registered(self, name, *environments, shared=True):
+        """A build root with target files as add-project writes them: target.env (local) and remote target.<env>.env."""
+        build_root = self.root / "srv/projects" / name
+        build_root.mkdir(parents=True)
+        if shared:
+            (build_root / "target.env").write_text(f"# bin/add-project\nDEPLOY_CONTEXT=default\nDEPLOY_SSH=\n"
+                                                   f"DEPLOY_PATH={build_root}\nAPP_UID=1000\nAPP_GID=1000\n")
+        for environment in environments:
+            (build_root / f"target.{environment}.env").write_text(
+                f"# bin/add-project\nDEPLOY_CONTEXT=setup-{name}-{environment}\nDEPLOY_SSH=deploy@{environment}.example\n"
+                f"DEPLOY_PATH=/home/deploy/{environment}\nAPP_UID=1012\nAPP_GID=1013\n")
+        return build_root
+
+    def test_remove_target_checks_then_removes_an_environments_own_target(self):
+        build_root = self.registered("shop", "mdv")
+        own, shared = build_root / "target.mdv.env", build_root / "target.env"
+        check = self.run_add("--check", "--remove-target", "mdv", "--name", "shop", FAKE_CONTEXT="1")
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn(f"==> would remove the deploy target of mdv: {own}\n    DEPLOY_CONTEXT=setup-shop-mdv\n"
+                      "    DEPLOY_SSH=deploy@mdv.example\n    DEPLOY_PATH=/home/deploy/mdv\n", check.stdout)
+        self.assertIn("would remove the Docker context setup-shop-mdv", check.stdout)
+        self.assertIn(f"==> mdv would then deploy to the shared {shared}:\n    DEPLOY_CONTEXT=default\n", check.stdout)
+        self.assertTrue(own.exists(), "--check changes nothing")
+        self.assertNotIn("context rm", self.docker_log.read_text())
+        if os.getuid() != 0:
+            self.assertEqual(self.run_script("add-project", "--remove-target", "mdv", "shop").returncode, 77, "a change needs root")
+        removed = self.run_add("--remove-target", "mdv", "shop", FAKE_CONTEXT="1")
+        self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+        self.assertFalse(own.exists())
+        self.assertTrue(shared.exists(), "the shared target stays")
+        self.assertIn(f"==> removed the deploy target of mdv: {own}\n    DEPLOY_CONTEXT=setup-shop-mdv\n", removed.stdout)
+        self.assertIn("context rm -f setup-shop-mdv", self.docker_log.read_text())
+        self.assertIn(f"==> mdv now deploys to the shared {shared}:", removed.stdout)
+        again = self.run_add("--remove-target", "mdv", "shop")
+        self.assertEqual(again.returncode, 65, again.stdout + again.stderr)
+        self.assertIn(f"mdv has no target of its own ({own}): it deploys to the shared {shared}", again.stderr)
+
+    def test_remove_target_refuses_what_it_cannot_remove_safely(self):
+        shop = self.registered("shop", "mdv")
+        split = self.registered("split", "stage", "prod", shared=False)
+        outside = self.root / "elsewhere.env"
+        outside.write_text("DEPLOY_PATH=/elsewhere\n")
+        (self.registered("linked") / "target.mdv.env").symlink_to(outside)
+        (self.root / "srv/projects/alias").symlink_to(shop)
+        for arguments, code, message in (
+                (("--remove-target", "mdv", "--name", "nosuch"), 65, "No build root"),
+                (("--remove-target", "mdv", "alias"), 65, "No build root"),
+                (("--remove-target", "prod", "shop"), 65, "prod has no target of its own"),
+                (("--remove-target", "prod", "split"), 65, "prod would have no target (there is no shared"),
+                (("--remove-target", "mdv", "linked"), 65, "is a symlink; not removed"),
+                (("--remove-target", "mdv", "--target", "local", "shop"), 64, "not with --target, --shared-key or --monorepo"),
+                (("--remove-target", "mdv", "--monorepo", "shop"), 64, "not with --target"),
+                (("--remove-target", "mdv", "shop", "git@bitbucket.org:rsmaizys/shop.git"), 64, "no repository URL"),
+                (("--remove-target", "mdv", "git@bitbucket.org:rsmaizys/shop.git"), 64, "no repository URL"),
+                (("--remove-target", "mdv"), 64, "give the project's NAME"),
+                (("--remove-target", "mdv", "--name", "shop", "other"), 64, "differ"),
+                (("--remove-target", "test", "shop"), 64, "test is not a deploy environment"),
+                (("--remove-target", "MDV", "shop"), 64, "ENV is stage, prod or an extra environment")):
+            for check in (("--check",), ()):
+                with self.subTest(arguments=arguments, check=check):
+                    refused = self.run_add(*check, *arguments)
+                    self.assertEqual(refused.returncode, code, refused.stdout + refused.stderr)
+                    self.assertIn(message, refused.stderr)
+        self.assertTrue((shop / "target.mdv.env").is_file())
+        self.assertTrue((split / "target.prod.env").is_file())
+        self.assertTrue((self.root / "srv/projects/linked/target.mdv.env").is_symlink())
+        self.assertTrue(outside.exists())
 
 
 class PipelineMakesTest(unittest.TestCase):

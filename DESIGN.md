@@ -176,7 +176,18 @@ With nothing to report it shows `.attention.calm`, with a green lamp and one sen
   `data-label=""` for a cell that needs no name. That is what labels the phone cards.
   `assert_board_cells_labelled` in `tests/test_ui.py` checks it.
 - `.line` with `<b>` gives a sub-label and value pair inside one cell. Modifiers are `td.project`, `td.target`,
-  `td.when`, `.board.keys` and `.board.activity`.
+  `td.when`, `.board.keys`, `.board.activity` and `.board.projects` (below).
+
+**Project board**: `self.project_rows(projects)` and `self.projects_board(rows)` give `.board.projects`, one row per
+project however many environments it has, so 50 projects fit in two or three screens (`/projects`, and on the
+Overview only the rows that need a look). The columns are fixed: Project, Prod, Stage, Others. Each `td.envcell`
+holds `.env-list` > `.env-item`s from `environment_summary()`: a first `.envline` with the lamp, the last deploy
+(ref and age) and a `bad` chip per problem, then a `small.envline` in faint with the short target and the newest
+backup's age. Lines never wrap: they end in an ellipsis, with the whole target in `title`. An environment without
+a target is a quiet `lamp muted` and "— no target", and a missing environment an empty `td.envcell.none`. Rows that
+need a look come first (`?sort=name` sorts by name), and a GET `form.search` filters by name or repo and to
+"only with problems", with "N of M" next to it. On a phone the card shows the name, then one line per environment
+(its label on the left, the faint second line and empty cells hidden).
 
 **List table**: `<table class="list">` is plain and dense, for many rows of the same kind (runners, users,
 sessions). Use 12 px uppercase dim heads with `white-space:nowrap`. On a phone it scrolls sideways inside

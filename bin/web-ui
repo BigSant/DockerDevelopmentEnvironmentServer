@@ -55,7 +55,7 @@ import sys
 import threading
 import time
 import urllib.error
-from urllib.parse import parse_qs, quote, unquote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 import urllib.request
 
 ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
@@ -79,8 +79,10 @@ TOKEN_VARIABLE = 'BITBUCKET_ACCESS_TOKEN'
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}')
 GIT_URL = re.compile(r'(?:git@[A-Za-z0-9.-]+:|ssh://git@[A-Za-z0-9.-]+(?::[0-9]{1,5})?/|https://[A-Za-z0-9.-]+/)'
                      r'[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*')
-# bin/add-project's own pattern of a target, with the optional ENV= of one environment.
-TARGET = re.compile(r'(?:(?!local=|test=)[a-z][a-z0-9]{1,15}=)?(?:local(?::/[A-Za-z0-9._/-]+)?|ssh://(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+)')
+# bin/add-project's own pattern of a target: where it deploys, and that with the optional ENV= of one environment.
+TARGET_PLACE = re.compile(r'local(?::/[A-Za-z0-9._/-]+)?|ssh://(?:[a-z_][a-z0-9_.-]*@)?[A-Za-z0-9.-]+/[A-Za-z0-9._/-]+')
+TARGET = re.compile(r'(?:(?!local=|test=)[a-z][a-z0-9]{1,15}=)?(?:' + TARGET_PLACE.pattern + ')')
+TARGET_HINT = 'local, local:/PATH or ssh://USER@SERVER/PATH'
 REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,99}')
 RUNNER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
 KEY_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
@@ -230,19 +232,22 @@ def installation():
 
 # --- Users, groups and sessions ------------------------------------------------------------------
 # The UI's sections, and whether one has anything to manage (a view-only section has no actions).
-SECTIONS = (('overview', 'Overview', True), ('runners', 'Runners', True), ('access', 'Access', True), ('files', 'Files', True),
+SECTIONS = (('overview', 'Overview', True), ('projects', 'Projects', True), ('runners', 'Runners', True), ('access', 'Access', True), ('files', 'Files', True),
             ('update', 'Update', True), ('actions', 'Actions', True), ('instructions', 'Instructions', False),
             ('logs', 'Logs', False), ('metrics', 'Metrics', False), ('users', 'Users', True))
 SECTION_TITLES = {key: title for key, title, _ in SECTIONS}
 MANAGED_SECTIONS = tuple(key for key, _, manage in SECTIONS if manage)
 PERMISSION_LEVELS = ('', 'view', 'manage')
 PERMISSION_LABELS = {'': 'none', 'view': 'view', 'manage': 'manage'}
-# A section added later starts, in each existing group, at the level that group has for this one.
-NEW_SECTIONS_FROM = {'runners': 'actions'}
+# A section added later starts, in each existing group, at the level that group has for this one. Projects took the
+# add form from Actions; it took the project pages from the Overview too, so a group that sees that sees them still.
+NEW_SECTIONS_FROM = {'runners': 'actions', 'projects': 'actions'}
+NEW_SECTIONS_VIEW_FROM = {'projects': 'overview'}
 # An action runs for a user who manages any one of its sections: the pages its form is on. A runner's
 # start, stop and restart (unit runner, github-runner@SCOPE) also count for "Runners" (unit_sections).
-ACTION_SECTIONS = {'pipeline': ('overview',), 'unit': ('overview',), 'remove-project': ('overview', 'actions'),
-                   'backup-local': ('overview', 'files', 'actions'), 'add-project': ('actions',),
+ACTION_SECTIONS = {'pipeline': ('overview',), 'unit': ('overview',), 'remove-project': ('projects', 'overview'),
+                   'backup-local': ('overview', 'projects', 'files', 'actions'), 'add-project': ('projects',),
+                   'project-target': ('projects',),
                    'install-runner': ('runners',), 'remove-runner': ('runners',), 'install-backups': ('actions',),
                    'install-metrics': ('actions',),
                    'prepare-host': ('actions',), 'install-ssh': ('actions',), 'move-bitbucket-ssh': ('actions',),
@@ -254,8 +259,8 @@ ADMINISTRATORS = 'administrators'
 VIEW_ALL = {key: 'view' for key, _, _ in SECTIONS if key != 'users'}
 DEFAULT_GROUPS = {
     ADMINISTRATORS: {'title': 'Administrators', 'sections': {key: 'manage' if manage else 'view' for key, _, manage in SECTIONS}},
-    'operators': {'title': 'Operators', 'sections': {**VIEW_ALL, 'overview': 'manage', 'runners': 'manage', 'files': 'manage',
-                                                     'actions': 'manage'}},
+    'operators': {'title': 'Operators', 'sections': {**VIEW_ALL, 'overview': 'manage', 'projects': 'manage', 'runners': 'manage',
+                                                     'files': 'manage', 'actions': 'manage'}},
     'viewers': {'title': 'Viewers', 'sections': dict(VIEW_ALL)}}
 # The default groups' ids and titles before they were English: old id -> (new id, old title), moved by Accounts.sync.
 RENAMED_GROUPS = {'administratoriai': ('administrators', 'Administratoriai'), 'operatoriai': ('operators', 'Operatoriai'),
@@ -348,7 +353,8 @@ class Accounts:
             for section, origin in NEW_SECTIONS_FROM.items():
                 if section not in known:
                     for group in data['groups'].values():
-                        level = (group.get('sections') or {}).get(origin)
+                        sections = group.get('sections') or {}
+                        level = sections.get(origin) or ('view' if sections.get(NEW_SECTIONS_VIEW_FROM.get(section)) else '')
                         if level:
                             group.setdefault('sections', {})[section] = level
             data['sections'] = [key for key, _, _ in SECTIONS]
@@ -622,28 +628,113 @@ def command(script, arguments):
     return base + ['--check'] + arguments, base + arguments
 
 
+def target_place(form, key, label, required=False):
+    """Where one environment deploys (bin/add-project's target after ENV=)."""
+    text = value(form, key, label=label, required=required)
+    if text and not TARGET_PLACE.fullmatch(text):
+        raise Invalid(f'Invalid target in the field "{label}": {text[:80]} ({TARGET_HINT}).')
+    return text
+
+
+def target_scope(target):
+    """The environment of a [ENV=]target, '' for the target every environment shares (target.env)."""
+    return target.split('=', 1)[0] if '=' in target else ''
+
+
 def plan_add_project(form, status):
     name = value(form, 'name', NAME, 'Name')
     env_repo = git_url(form, 'env_repo', 'Environment repo', required=True)
     code_repo = git_url(form, 'code_repo', 'Code repo')
-    targets = [line.strip() for line in form.get('targets', '').splitlines() if line.strip()]
-    if len(targets) > 3:
-        raise Invalid('At most three targets (shared, stage=, prod=).')
-    for target in targets:
-        if len(target) > 200 or not TARGET.fullmatch(target):
-            raise Invalid(f'Invalid target: {target[:80]} (local, local:/PATH or ssh://USER@SERVER/PATH, '
-                          'optionally preceded by stage= or prod=).')
-    arguments = (['--shared-key'] if flag(form, 'shared_key') else []) + [part for target in targets for part in ('--target', target)]
+    monorepo = flag(form, 'monorepo')
+    if monorepo and code_repo:
+        raise Invalid('A monorepo holds the code in app/public/ itself: leave "Code repo URL" empty.')
+    # The target every environment shares, prod's and stage's own, then any further ENV=target lines.
+    targets = [target_place(form, 'target_all', 'Every environment')]
+    targets += [f'{environment}={place}' if place else '' for environment in ('prod', 'stage')
+                for place in (target_place(form, f'target_{environment}', environment),)]
+    targets = [target for target in targets if target]
+    for line in [line.strip() for line in form.get('targets', '').splitlines() if line.strip()]:
+        if len(line) > 200 or not TARGET.fullmatch(line):
+            raise Invalid(f'Invalid target: {line[:80]} (ENV= in front of {TARGET_HINT}; ENV is lowercase letters and '
+                          'digits, 2–16, not local or test).')
+        targets.append(line)
+    if len(targets) > 10:
+        raise Invalid('At most ten targets.')
+    scopes = [target_scope(target) for target in targets]
+    for scope in scopes:
+        if scopes.count(scope) > 1:
+            raise Invalid(f'Two targets for {scope or "every environment"}: give one.')
+    arguments = (['--shared-key'] if flag(form, 'shared_key') else []) + (['--monorepo'] if monorepo else [])
+    arguments += [part for target in targets for part in ('--target', target)]
     arguments += ([name] if name else []) + [env_repo] + ([code_repo] if code_repo else [])
-    return Plan('add-project', 'Add a project', *command('add-project', arguments), timeout=1800)
+    plan = Plan('add-project', 'Add a project', *command('add-project', arguments), timeout=1800)
+    plan.back = ('/projects/new', 'projects')
+    return plan
+
+
+def project_entry(form, status, key='project', label='Project'):
+    """A project's name from the form and its entry in the status (what its repositories and targets are)."""
+    name = value(form, key, NAME, label, required=True)
+    if status is None:
+        raise Invalid('Could not read the status of the projects: try again.')
+    entry = next((item for item in status.get('projects', []) if item.get('name') == name), None)
+    if entry is None:
+        raise Invalid(f'There is no project {name}.')
+    return name, entry
+
+
+def status_url(entry, key, label):
+    """A repository URL as the status read it from a checkout, checked as a typed one would be."""
+    url = entry.get(key) or ''
+    if url and (len(url) > 300 or not GIT_URL.fullmatch(url) or url.endswith('.git.git')):
+        raise Invalid(f'{label} of {entry["name"]} ({url[:80]}) is not a URL the UI passes on: run bin/add-project by hand.')
+    return url
+
+
+def plan_project_target(form, status):
+    """A project environment's own target (target.<env>.env): set it (bin/add-project --target ENV=TARGET, a rerun with the
+    project's own repositories, which keeps the clones) or remove it (bin/add-project --remove-target ENV)."""
+    name, entry = project_entry(form, status)
+    if any((state or {}).get('development') for state in (entry.get('environments') or {}).values()):
+        raise Invalid(f'{name} is a development checkout: it has no deploy target.')
+    environment = value(form, 'environment', ENVIRONMENT, 'Environment', required=True, limit=16)
+    operation = form.get('operation', 'set')
+    if operation == 'remove':
+        if environment not in entry.get('target_files', []):
+            raise Invalid(f'{name} {environment} has no target of its own (target.{environment}.env) to remove.')
+        if 'all' not in (entry.get('targets') or {}):
+            raise Invalid(f'{name} has no shared target.env: without target.{environment}.env {environment} would have no target '
+                          'left. Change the target instead, or remove the project.')
+        plan = Plan('project-target', f'Remove the target of {name} {environment}',
+                    *command('add-project', ['--remove-target', environment, '--name', name]),
+                    danger=f'{environment} then deploys to the shared target.env; what runs on the old target stays there.')
+    elif operation == 'set':
+        place = target_place(form, 'target', 'Target', required=True)
+        repository = status_url(entry, 'repository', 'The environment repo')
+        if not repository:
+            raise Invalid(f'The status names no environment repo of {name}: run bin/add-project by hand.')
+        code = '' if entry.get('monorepo') else status_url(entry, 'code_repository', 'The code repo')
+        arguments = (['--monorepo'] if entry.get('monorepo') else []) + ['--target', f'{environment}={place}', name, repository]
+        arguments += [code] if code else []
+        known = environment in (entry.get('environments') or {}) or environment in (entry.get('targets') or {})
+        title = f'Change the target of {name} {environment}' if known else f'Add the environment {environment} to {name}'
+        plan = Plan('project-target', title, *command('add-project', arguments), timeout=1800,
+                    danger='The next prod deploy goes to the new target; the old one keeps running until it is stopped.'
+                    if environment == 'prod' and known else None)
+    else:
+        raise Invalid('Unknown operation: set or remove.')
+    plan.back = (f'/project/{quote(name)}#settings', 'projects')
+    return plan
 
 
 def plan_remove_project(form, status):
     name = value(form, 'name', NAME, 'Project', required=True)
     with_backups = flag(form, 'with_backups')
     arguments = (['--with-backups'] if with_backups else []) + [name]
-    return Plan('remove-project', f'Remove the project {name}', *command('remove-project', arguments),
+    plan = Plan('remove-project', f'Remove the project {name}', *command('remove-project', arguments),
                 danger='The build directory is deleted' + (' together with the DB backups and the deploy history.' if with_backups else '.'))
+    plan.back = ('/projects', 'projects')
+    return plan
 
 
 def plan_install_runner(form, status):
@@ -1118,7 +1209,7 @@ def plan_pipeline(form, status):
     return PipelinePlan(name, *repository, pipeline, branch, variables)
 
 
-ACTIONS = {'add-project': plan_add_project, 'remove-project': plan_remove_project,
+ACTIONS = {'add-project': plan_add_project, 'remove-project': plan_remove_project, 'project-target': plan_project_target,
            'install-runner': plan_install_runner, 'remove-runner': plan_remove_runner, 'install-backups': plan_install_backups,
            'install-metrics': plan_install_metrics, 'add-backup-key': plan_add_backup_key, 'key-bulk': plan_key_bulk,
            'remove-backup-key': plan_remove_backup_key, 'list-backup-keys': plan_list_backup_keys,
@@ -2269,6 +2360,16 @@ form.search{margin:14px 0 8px}.toolbar .search{margin:0}
 .board.keys td.keyname a{font-weight:700;font-size:14px}
 .board.keys td.keyname small{display:block;color:var(--faint);font-size:12px;max-width:26em;white-space:nowrap;overflow:hidden;
 text-overflow:ellipsis}
+.board.projects{table-layout:fixed;min-width:980px}
+.board.projects th:first-child{width:22%}.board.projects th:nth-child(2),.board.projects th:nth-child(3){width:29%}
+.board.projects td{padding:7px 10px;vertical-align:middle}
+.board.projects td.project{max-width:none;min-width:0}
+.board.projects td.project small,.envline{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.board.projects td.project small{margin-top:1px}
+.envline .lamp{margin-right:7px}.envline .sign{margin-right:4px}
+small.envline{margin-top:2px;color:var(--faint);font-size:12px}
+.env-item+.env-item{margin-top:5px}
+.toolbar .note.shown{margin:0;white-space:nowrap}.search select{width:auto}
 .tallied{display:inline-block;white-space:nowrap;margin:0 6px 4px 0}
 .tally{display:inline-block;margin-right:4px;color:var(--ink);font-weight:700}
 .keyhead{display:grid;grid-template-columns:minmax(16em,1.3fr) minmax(0,.8fr) minmax(0,.8fr) minmax(0,1.4fr) minmax(0,1fr) minmax(0,1fr);gap:18px;padding:16px 20px;
@@ -2371,6 +2472,10 @@ letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
 .board td:first-child{padding-top:12px}.board td:last-child{padding-bottom:12px}
 .board.activity td.when,.board.activity td.what{white-space:normal}
 .board.keys td.keyname small{max-width:none}
+.board.projects{min-width:0;table-layout:auto}.board.projects td.project::before{content:none}.board.projects td.envcell.none,.board.projects small.envline{display:none}
+.board.projects td.envcell{display:flex;gap:10px;align-items:baseline;padding:3px 14px}
+.board.projects td.envcell::before{flex:none;width:4.6em;margin:0}.board.projects .env-list{min-width:0;flex:1}
+.board.projects tr{padding-bottom:9px}
 .list:not(.matrix){display:block;overflow-x:auto;max-width:100%}
 .list.runners th,.list.runners td{white-space:nowrap}.list.runners td:first-child small{display:block}
 .facts,.facts tbody,.facts tr,.facts th,.facts td{display:block;width:100%}
@@ -2387,7 +2492,7 @@ letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
 input[type=text],input[type=password],textarea,select{font-size:16px}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 """
-NAVIGATION = (('overview', '/', 'Overview'), ('runners', '/runners', 'Runners'), ('access', '/access', 'Access'),
+NAVIGATION = (('overview', '/', 'Overview'), ('projects', '/projects', 'Projects'), ('runners', '/runners', 'Runners'), ('access', '/access', 'Access'),
               ('files', '/files', 'Files'),
               ('update', '/update', 'Update'),
               ('actions', '/actions', 'Actions'), ('instructions', '/instructions', 'Instructions'),
@@ -2584,6 +2689,20 @@ def git_line(state, tag_word=True):
     return text
 
 
+def target_values(entry, environment):
+    """The target an environment deploys to: its own target.<env>.env over the shared target.env."""
+    targets = entry.get('targets') or {}
+    return {**targets.get('all', {}), **targets.get(environment, {})}
+
+
+def target_place_text(values):
+    """Where one target file deploys: this server and its directory, or user@host:path over SSH."""
+    if values.get('DEPLOY_CONTEXT', 'default') == 'default':
+        return f'this server <code>{e(values["DEPLOY_PATH"])}</code>' if values.get('DEPLOY_PATH') else 'this server'
+    return e(f'{values.get("DEPLOY_SSH", "?")}:{values.get("DEPLOY_PATH", "?")}') + \
+        f' <span class="muted">(Docker context {e(values.get("DEPLOY_CONTEXT"))})</span>'
+
+
 class Page:
     """Renders the pages; `token` is the CSRF token of the logged-in user, `permissions` what their groups give
     (section -> 'view' or 'manage'): the navigation shows what they see, the forms what they may run."""
@@ -2738,7 +2857,7 @@ class Page:
                                    badge(f'{size(disk["available"])} free of {size(disk["size"])} ({share:.0%})',
                                          'ok' if share > 0.15 else 'bad')))
         body += '<h2>Server</h2><div class="units">' + ''.join(tiles) + '</div>'
-        body += '<h2>Projects</h2>' + self.projects_table(data)
+        body += '<h2>Projects</h2>' + self.projects_summary(data)
         if data.get('errors'):
             body += '<h2>What could not be read</h2><div class="callout warn">' + \
                 ''.join(f'<p>{e(item)}</p>' for item in data['errors']) + '</div>'
@@ -2791,12 +2910,15 @@ class Page:
                 unhealthy = [item['name'] for item in state.get('containers', []) if item.get('health') == 'unhealthy']
                 if unhealthy:
                     found.append(('unhealthy', f'{where}: unhealthy {e(", ".join(unhealthy))}', link))
+                # An environment with no target deploys nowhere: nothing to back up, so no alarm (the Projects page shows it quietly).
+                registered = Page.registered(entry, environment)
                 newest = (state.get('backups') or {}).get('newest')
-                if state.get('declared') and not state.get('development') and (not newest or time.time() - newest['time'] >= 26 * 3600):
+                if registered and state.get('declared') and not state.get('development') and \
+                        (not newest or time.time() - newest['time'] >= 26 * 3600):
                     found.append(('old-backup' if newest else 'no-backup',
                                   f'{where}: newest backup ' + (e(ago(newest['time'])) if newest else 'none'), link))
                 newest = (state.get('files_backups') or {}).get('newest')
-                if state.get('declared') and state.get('file_paths') and installed(units, 'setup-server-backup-files.timer') and \
+                if registered and state.get('declared') and state.get('file_paths') and installed(units, 'setup-server-backup-files.timer') and \
                         (not newest or time.time() - newest['time'] >= 26 * 3600):
                     found.append(('old-files-backup' if newest else 'no-files-backup',
                                   f'{where}: newest files backup ' + (e(ago(newest['time'])) if newest else 'none'),
@@ -2818,48 +2940,101 @@ class Page:
                      '</summary><ul>' + ''.join(line(*item) for item in members) + '</ul></details>')
         return body + '</div>'
 
-    def projects_table(self, data):
+    # One compact row per project, its environments side by side: readable with 50 projects (Projects, Overview).
+    PROJECT_COLUMNS = (('prod', 'Prod'), ('stage', 'Stage'), ('', 'Others'))
+
+    def project_environment(self, entry, environment):
+        """(kind, problems) of one project environment: kind as environment_kind, problems the words that made it bad."""
+        state = dict((entry.get('environments') or {}).get(environment) or {})
+        if not self.registered(entry, environment):
+            state['declared'] = False  # no target: "no target" says it once; no backup or secrets is no alarm of its own
+        last = (state.get('deploys') or {}).get('last') or {}
+        newest = (state.get('backups') or {}).get('newest')
+        problems = [word for word, wrong in (
+            ('deploy failed', last.get('failed')), ('secrets stopped', state.get('secrets') == 'stopped'),
+            ('unhealthy', any(item.get('health') == 'unhealthy' for item in state.get('containers', []))),
+            ('no backup' if not newest else 'old backup',
+             state.get('declared') and not state.get('development') and (not newest or time.time() - newest['time'] >= 26 * 3600)))
+            if wrong]
+        return environment_kind(state), problems
+
+    @staticmethod
+    def project_kind(kinds):
+        """A project's stripe from its environments': bad wins, then ok, else idle."""
+        return 'bad' if 'bad' in kinds else 'ok' if 'ok' in kinds else 'idle'
+
+    @staticmethod
+    def target_short(entry, environment):
+        """(a few words, the whole target) of where an environment deploys; None when it has no target."""
+        state = (entry.get('environments') or {}).get(environment) or {}
+        if state.get('development'):
+            return 'this server · development', ''
+        values = target_values(entry, environment)
+        if not values:
+            return None
+        if values.get('DEPLOY_CONTEXT', 'default') == 'default':
+            path = values.get('DEPLOY_PATH') or ''
+            return ('this server', path) if not path or path.endswith(f'/projects/{entry["name"]}') else (f'local:{path}', path)
+        return f'ssh {values.get("DEPLOY_SSH") or "?"}', f'{values.get("DEPLOY_SSH", "?")}:{values.get("DEPLOY_PATH", "?")}'
+
+    def environment_summary(self, entry, environment, kind, problems, named=False):
+        """An environment in two short lines: a lamp, the last deploy and what is wrong; then the target and the newest backup."""
+        state = (entry.get('environments') or {}).get(environment) or {}
+        sign = f'<span class="sign {e(environment)}">{e(environment)}</span> ' if named else ''
+        target = self.target_short(entry, environment)
+        if target is None:
+            return f'<span class="envline">{sign}{lamp("muted")}<span class="muted">— no target</span></span>'
+        last = (state.get('deploys') or {}).get('last')
+        deploy = (f'<b>{e(last.get("ref") or "?")}</b> <span class="muted">{e(ago(last["at"]))}</span>' if last and last.get('at')
+                  else '<span class="muted">not deployed yet</span>')
+        chips = ''.join(' ' + badge(word, 'bad') for word in problems)
+        newest = (state.get('backups') or {}).get('newest')
+        backup = '' if state.get('development') else f' · backup {e(ago(newest["time"]))}' if newest else ' · no backup'
+        title = f' title="{e(target[1])}"' if target[1] else ''
+        return (f'<span class="envline">{sign}{lamp(kind if kind != "idle" else "muted")}{deploy}{chips}</span>'
+                f'<small class="envline"{title}>{e(target[0])}{backup}</small>')
+
+    def project_rows(self, projects):
+        """(project, kind, problems, row) for each project: its compact row and whether it needs a look."""
+        found = []
+        for entry in projects:
+            environments = entry.get('environments') or {}
+            states = {environment: self.project_environment(entry, environment) for environment in environments}
+            kind = self.project_kind([item[0] for item in states.values()])
+            problems = [word for item in states.values() for word in item[1]]
+            link = f'/project/{e(quote(entry["name"]))}'
+            repos = ' · '.join(item for item in (entry.get('repository'), entry.get('code_repository')) if item)
+            cells = (f'<td class="project" data-label="Project"><a href="{link}">{e(entry["name"])}</a>' +
+                     (f'<small title="{e(repos)}">{e(repos)}</small>' if repos else '') + '</td>')
+            if not environments:
+                cells += ('<td class="envcell none" data-label="Prod"></td><td class="envcell none" data-label="Stage"></td>'
+                          '<td class="envcell muted" data-label="Others">not deployed from here (no env/stage.env or env/prod.env)</td>')
+            for key, label in self.PROJECT_COLUMNS if environments else ():
+                members = [key] if key else sorted((name for name in environments if name not in ('prod', 'stage')), key=environment_order)
+                members = [name for name in members if name in environments]
+                summary = ''.join(f'<div class="env-item">{self.environment_summary(entry, name, *states[name], named=not key)}</div>'
+                                  for name in members)
+                summary = f'<div class="env-list">{summary}</div>' if summary else ''
+                cells += f'<td class="envcell{"" if members else " none"}" data-label="{label}">{summary}</td>'
+            found.append((entry, kind, problems, f'<tr class="is-{kind}">{cells}</tr>'))
+        return found
+
+    def projects_board(self, rows):
+        return ('<div class="scroll"><table class="board projects"><thead><tr><th scope="col">Project</th>' +
+                ''.join(f'<th scope="col">{label}</th>' for _, label in self.PROJECT_COLUMNS) +
+                '</tr></thead><tbody>' + ''.join(row for *_, row in rows) + '</tbody></table></div>')
+
+    def projects_summary(self, data):
+        """The Overview's part: the counts, only the projects that need a look, and the way to all of them."""
         projects = data.get('projects', [])
         if not projects:
-            return '<div class="empty">No projects yet. <a href="/actions#add-project">Add a project</a></div>'
-        rows = []
-        for entry in projects:
-            environments = entry.get('environments', {}) or {'': None}
-            repository = bitbucket_repository(entry.get('repository') or '')
-            runs = ''
-            if repository:
-                found, error = pipeline_runs(entry['name'], repository)
-                runs = self.run_cell(found[0], repository) if found else e(error) if error else 'none yet'
-            elif entry.get('repository'):
-                link = github_actions_link(entry)
-                runs = f'<a href="{e(link)}">GitHub Actions</a>' if link else '—'
-            for index, (environment, state) in enumerate(environments.items()):
-                first = index == 0
-                cells = (f'<td class="project" data-label="Project · repo"><a href="/project/{e(quote(entry["name"]))}">{e(entry["name"])}</a>'
-                         f'<small>{e(entry.get("repository") or "?")}</small>'
-                         f'{"<small>" + e(entry["code_repository"]) + "</small>" if entry.get("code_repository") else ""}</td>') if first \
-                    else f'<td class="project" data-label="Project · repo"><a href="/project/{e(quote(entry["name"]))}">{e(entry["name"])}</a></td>'
-                if state is None:
-                    kind = 'idle'
-                    cells += ('<td colspan="5" class="muted" data-label="Environment">not deployed from here '
-                              '(no env/stage.env or env/prod.env)</td>')
-                else:
-                    if not self.registered(entry, environment):
-                        # No target: the "not registered" chip says it once; a missing backup or secrets is no alarm of its own.
-                        state = {**state, 'declared': False}
-                    kind = environment_kind(state)
-                    cells += (f'<td data-label="Environment"><span class="sign {e(environment)}">{e(environment)}</span></td>'
-                              f'<td class="target" data-label="Target">{self.target(entry, environment)}</td>'
-                              f'<td data-label="Last deploy">{self.deploy_cell(state)}</td>'
-                              f'<td data-label="Newest backup"><span class="line"><b>nightly</b> {self.backup_cell(state)}</span>'
-                              f'<span class="line"><b>full</b> {self.full_backup_cell(state)}</span></td>'
-                              f'<td data-label="Containers"><span class="line"><b>secrets</b> {self.secrets_cell(state)}</span>'
-                              f'<span class="line"><b>all</b> {self.containers_cell(state)}</span></td>')
-                cells += f'<td data-label="Pipeline">{runs if first else ""}</td>'
-                rows.append(f'<tr class="is-{kind}">{cells}</tr>')
-        return ('<div class="scroll"><table class="board"><thead><tr><th scope="col">Project · repo</th><th scope="col">Environment</th>'
-                '<th scope="col">Target</th><th scope="col">Last deploy</th><th scope="col">Newest backup</th><th scope="col">Containers</th>'
-                '<th scope="col">Pipeline</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div>')
+            return '<div class="empty">No projects yet. <a href="/projects/new">Add a project</a></div>'
+        rows = sorted((row for row in self.project_rows(projects) if row[1] == 'bad'), key=lambda row: row[0]['name'])
+        count = sum(len(entry.get('environments') or {}) for entry in projects)
+        body = (f'<p class="note">{len(projects)} projects, {count} environments: ' +
+                (f'{len(rows)} need{"s" if len(rows) == 1 else ""} a look.</p>' + self.projects_board(rows) if rows else
+                 'nothing needs a look.</p>'))
+        return body + '<p><a class="btn" href="/projects">All projects →</a></p>'
 
     @staticmethod
     def registered(entry, environment):
@@ -2955,6 +3130,162 @@ class Page:
         return (f'<a href="{e(link)}">#{e(run.get("build_number", "?"))}</a> {e(pattern)} {badge(result, kind)} '
                 f'<span class="muted when">{e((run.get("created_on") or "")[:16].replace("T", " "))}</span>')
 
+    # --- Projects ---
+    def projects(self, data, error, query=None):
+        """Every project, one row each, those that need a look first; filtered by name or repo, or to the problems only."""
+        if data is None:
+            return self.layout('Projects', f'<div class="callout bad"><p>Could not get the status: {e(error)}</p></div>',
+                               section='projects')
+        query = query or {}
+        wanted = query.get('q', [''])[0].strip()[:64]
+        only_problems = query.get('problems') == ['1']
+        by_name = query.get('sort') == ['name']
+        projects = data.get('projects', [])
+        rows = self.project_rows(projects)
+        environments = [(entry, environment) for entry in projects for environment in (entry.get('environments') or {})]
+        problems = [set(self.project_environment(entry, environment)[1]) for entry, environment in environments]
+        stats = [(len(projects), 'projects'), (len(environments), 'environments'),
+                 (sum(1 for words in problems if words - {'no backup', 'old backup'}), 'failing'),
+                 (sum(1 for words in problems if words & {'no backup', 'old backup'}), 'without a recent backup'),
+                 (sum(1 for entry, environment in environments if not self.registered(entry, environment)), 'without a target')]
+        body = '<div class="stats">' + ''.join(f'<div class="stat"><b>{e(number)}</b><span>{e(label)}</span></div>'
+                                               for number, label in stats) + '</div>'
+        text = wanted.lower()
+        shown = [row for row in rows if (not text or any(text in (item or '').lower() for item in (
+            row[0]['name'], row[0].get('repository'), row[0].get('code_repository')))) and (not only_problems or row[1] == 'bad')]
+        shown.sort(key=lambda row: row[0]['name'] if by_name else (row[1] != 'bad', row[0]['name']))
+        body += ('<div class="toolbar"><form class="search" method="get" action="/projects">'
+                 f'<input type="text" name="q" value="{e(wanted)}" placeholder="project or repo" autocomplete="off">'
+                 '<label class="check"><input type="checkbox" name="problems" value="1"' + (' checked' if only_problems else '') +
+                 '> only with problems</label><select name="sort"><option value="state">problems first</option>'
+                 '<option value="name"' + (' selected' if by_name else '') + '>by name</option></select>'
+                 f'<button>Filter</button></form><span class="note shown">{len(shown)} of {len(projects)}</span>' +
+                 ('<a class="btn go" href="/projects/new">+ Add a project</a>' if self.may('add-project') else '') + '</div>')
+        if not projects:
+            body += '<div class="empty">No projects yet.' + (' <a href="/projects/new">Add a project</a>' if self.may('add-project') else '') + '</div>'
+        elif not shown:
+            body += '<div class="empty">No project matches. <a href="/projects">All projects</a></div>'
+        else:
+            body += self.projects_board(shown)
+            body += ('<p class="note">Each environment: a lamp, the last deploy and what is wrong; below it where it deploys and the '
+                     'newest backup. A project\'s page has its settings: each environment\'s target, a new environment, removing.</p>')
+        if data.get('errors'):
+            body += '<h2>What could not be read</h2><div class="callout warn">' + \
+                ''.join(f'<p>{e(item)}</p>' for item in data['errors']) + '</div>'
+        body += (f'<p class="foot">Status: {e(local_time(data.get("generated", time.time())))} · '
+                 '<a href="/projects?fresh=1">Refresh</a></p>')
+        return self.layout('Projects', body, section='projects')
+
+    @staticmethod
+    def text_field(key, label, placeholder='', current=''):
+        # autocomplete off: a browser must not fill in a value typed for another project (a build root name).
+        return (f'<label><span>{e(label)}</span><input type="text" name="{key}" value="{e(current)}" '
+                f'placeholder="{e(placeholder)}" autocomplete="off" spellcheck="false"></label>')
+
+    def project_new(self, target=''):
+        """The add form; target ([ENV=]TARGET, from the instructions) fills the field it belongs to."""
+        given = {'all': '', 'prod': '', 'stage': '', 'more': ''}
+        if target:
+            scope = target_scope(target)
+            if scope in ('prod', 'stage'):
+                given[scope] = target.split('=', 1)[1]
+            else:
+                given['all' if not scope else 'more'] = target
+        text = self.text_field
+        steps = ('<ol class="steps-list"><li>The <b>env repo</b> (app/: Makefile, env/) is cloned into the build root; a separate '
+                 '<b>code repo</b> into app/public/. A <b>monorepo</b> holds both (app/ and app/public/).</li>'
+                 '<li>Bitbucket: the account\'s key reads the repos (add it to each, read-only). GitHub: each repo gets a deploy key of '
+                 'its own; the preview shows it when GitHub does not accept it yet.</li>'
+                 f'<li>Name where it deploys: <b>a target</b> for every environment, or one per environment ({e(TARGET_HINT)}). '
+                 'A remote server must be prepared first: <a href="/instructions">Instructions</a>.</li></ol>')
+        fields = (text('env_repo', 'Env repo URL', 'git@ssh.bitbucket.org:workspace/shop_docker.git') +
+                  text('code_repo', 'Code repo URL (optional)', 'git@ssh.bitbucket.org:workspace/shop.git') +
+                  text('name', 'Name (optional)', 'default – the repo name') +
+                  '<label class="check"><input type="checkbox" name="monorepo" value="yes"> monorepo – the env repo holds '
+                  'app/ and app/public/ (--monorepo; no code repo, a target per environment, not local)</label>'
+                  '<label class="check"><input type="checkbox" name="shared_key" value="yes"> GitHub: the account key instead of a '
+                  'deploy key per repo (--shared-key)</label>'
+                  '<p class="block-label">Targets</p>' +
+                  text('target_all', 'Every environment', 'local, local:/PATH or ssh://USER@HOST/PATH', given['all']) +
+                  text('target_prod', 'prod (its own)', 'e.g. ssh://deploy@shop.example/home/deploy/prod', given['prod']) +
+                  text('target_stage', 'stage (its own)', 'e.g. local:/home/shop/stage', given['stage']) +
+                  '<label><span>Other environments (ENV=target, one per line)</span><textarea name="targets" autocomplete="off" '
+                  f'spellcheck="false" placeholder="mdv=local:/home/shop/mdv">{e(given["more"])}</textarea></label>')
+        body = steps + '<div class="deck">' + self.form(
+            'add-project', 'Add a project', fields,
+            note='A new project needs a target: local – this server, the build root; local:/PATH – this server, another '
+                 'directory; ssh://USER@HOST/PATH – another server. An environment\'s own target wins over the shared one. '
+                 'For an existing project the fields left empty keep its targets.',
+            command='bin/add-project') + '</div>'
+        body += '<p><a href="/projects">← Projects</a></p>'
+        return self.layout('Add a project', body, section='projects')
+
+    def project_settings(self, entry):
+        """Where each environment of a project deploys, and the forms that change it (bin/add-project)."""
+        name, targets = entry['name'], entry.get('targets') or {}
+        states = entry.get('environments') or {}
+        if any((state or {}).get('development') for state in states.values()):
+            return ('<p class="note">A development checkout: its environment is local, on this server, and has no deploy '
+                    'target to set.</p>')
+        # An environment's own target file may go when the shared target.env remains to deploy to (bin/add-project --remove-target).
+        removable = entry.get('target_files', []) if 'all' in targets else []
+        known = sorted({*states, *(key for key in targets if key != 'all'), *entry.get('target_files', [])}, key=environment_order)
+        rows = []
+        if 'all' in targets:
+            rows.append('<tr class="is-idle"><td data-label="Environment"><span class="muted">every environment</span></td>'
+                        f'<td class="target" data-label="Target">{target_place_text(targets["all"])}</td>'
+                        '<td data-label="Target file"><code>target.env</code></td></tr>')
+        for environment in known:
+            values = targets.get(environment) or {}
+            file = (f'<code>target.{e(environment)}.env</code>' if environment in entry.get('target_files', [])
+                    else '<span class="muted">shares target.env</span>' if 'all' in targets else '<span class="muted">none</span>')
+            if environment not in states:
+                file += ' ' + badge('not in STAGE_ENVIRONMENTS', 'muted')
+            shown = target_place_text(values) if values else self.target(entry, environment)
+            kind = 'ok' if values or 'all' in targets else 'idle'
+            rows.append(f'<tr class="is-{kind}"><td data-label="Environment"><span class="sign {e(environment)}">{e(environment)}</span></td>'
+                        f'<td class="target" data-label="Target">{shown}</td><td data-label="Target file">{file}</td></tr>')
+        body = facts([('Layout', ('monorepo: the env repo is the build root (app/, app/public/)' if entry.get('monorepo') else
+                                  'separate repos: app/' + (' and app/public/' if entry.get('code_repository') else '')) +
+                       ' <span class="muted">· a change reruns bin/add-project with the repos above</span>')])
+        if rows:
+            body += ('<div class="scroll"><table class="board"><thead><tr><th scope="col">Environment</th><th scope="col">Target</th>'
+                     '<th scope="col">Target file</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div>')
+        else:
+            body += '<div class="empty">No environment and no target yet. Add one below.</div>'
+        hidden = f'<input type="hidden" name="project" value="{e(name)}"><input type="hidden" name="operation" value="set">'
+        target_field = self.text_field('target', 'Target', 'local:/PATH or ssh://USER@HOST/PATH')
+        rerun = f'bin/add-project {"--monorepo " if entry.get("monorepo") else ""}--target ENV=TARGET {name} ENV_REPO_URL' + \
+            (' CODE_REPO_URL' if entry.get('code_repository') and not entry.get('monorepo') else '')
+        monorepo = ' A monorepo\'s target lies outside its checkout: not local.' if entry.get('monorepo') else ''
+        forms = ''
+        if known:
+            forms += self.form('project-target', 'Change the target',
+                               hidden + '<label><span>Environment</span><select name="environment">' +
+                               ''.join(f'<option value="{e(environment)}">{e(environment)}</option>' for environment in known) +
+                               '</select></label>' + target_field,
+                               note='Writes the environment\'s own target.ENV.env; the clones stay as they are. The next deploy goes '
+                                    'there, and what runs on the old target stays until it is stopped.' + monorepo,
+                               command=rerun)
+        forms += self.form('project-target', 'Add an environment',
+                           hidden + self.text_field('environment', 'Environment', 'mdv – lowercase letters and digits, 2–16') +
+                           target_field,
+                           note='Not local or test. Besides stage and prod an environment deploys once the project lists it in '
+                                'STAGE_ENVIRONMENTS (env/common.env) and has env/ENV.env.' + monorepo,
+                           command=rerun)
+        if removable:
+            forms += self.form('project-target', 'Remove an environment\'s own target',
+                               f'<input type="hidden" name="project" value="{e(name)}"><input type="hidden" name="operation" value="remove">'
+                               '<label><span>Environment</span><select name="environment">' +
+                               ''.join(f'<option value="{e(environment)}">{e(environment)} – target.{e(environment)}.env</option>'
+                                       for environment in removable) + '</select></label>',
+                               note='Deletes target.ENV.env (and the Docker context of a remote one); the environment then '
+                                    'deploys to the shared target.env. What runs on the old target stays there.',
+                               command=f'bin/add-project --remove-target ENV --name {name}', danger=True)
+        if forms:
+            body += '<div class="deck">' + forms + '</div>'
+        return body
+
     # --- One project ---
     def project(self, data, name):
         entry = next((item for item in (data or {}).get('projects', []) if item.get('name') == name), None)
@@ -2965,9 +3296,9 @@ class Page:
                       ('Build directory', f'{e(data.get("root", ""))}/projects/{e(name)}/{e(entry.get("layout") or "")}'),
                       ('PROJECT_NAME', e(entry.get('project_name')))])
         for environment, state in entry.get('environments', {}).items():
-            body += f'<h2><span class="sign {e(environment)}">{e(environment)}</span> environment</h2>'
+            body += f'<h2 id="env-{e(environment)}"><span class="sign {e(environment)}">{e(environment)}</span> environment</h2>'
             rows = [('Target', f'{self.target(entry, environment)} <span class="muted">(Docker context {e(state["context"])})</span>'),
-                    ('Last deploy', self.deploy_cell(state))]
+                    ('Last deploy', self.deploy_cell(state)), ('Containers', self.containers_cell(state))]
             success = (state.get('deploys') or {}).get('last_success')
             if success and success != state['deploys']['last']:
                 rows.append(('Last successful', f'{e(success["ref"])} {e(success["commit"])} {e(ago(success["at"]))}'))
@@ -3001,16 +3332,18 @@ class Page:
                 '<label class="check"><input type="checkbox" name="full" value="yes"> full – the data of every table (--full)</label>',
                 note='Without Bitbucket: works for GitHub projects too. The preview shows the secret store and what the rotation would delete.',
                 command=f'setup-server-backup [--full] {name} {environment}') + '</div>'
-        body += '<h2>Access</h2>' + self.project_access(data, name)
-        body += '<h2>Pipelines</h2>' + self.pipelines(entry)
-        body += '<h2>Remove</h2><div class="deck">' + self.form(
+        body += '<h2 id="settings">Settings</h2>' + self.project_settings(entry)
+        body += '<h2 id="access">Access</h2>' + self.project_access(data, name)
+        body += '<h2 id="pipelines">Pipelines</h2>' + self.pipelines(entry)
+        body += '<h2 id="remove">Remove</h2><div class="deck">' + self.form(
             'remove-project', f'Remove the build directory {name}',
             f'<input type="hidden" name="name" value="{e(name)}">'
             '<label class="check"><input type="checkbox" name="with_backups" value="yes"> together with the DB backups and '
             'the deploy history (no rollback afterwards)</label>',
             note='The preview (--check) shows the size, the backups and whether a container uses the directory.',
             command=f'bin/remove-project {name}', danger=True) + '</div>'
-        return self.layout(f'Project {name}', body, section='overview')
+        body += '<p><a href="/projects">← Projects</a></p>'
+        return self.layout(f'Project {name}', body, section='projects')
 
     @staticmethod
     def backup_list(state):
@@ -3079,7 +3412,7 @@ class Page:
             body += f'<div class="callout bad"><p>{e(problem)}</p></div>'
         else:
             body += term('\n'.join(data.get('lines', [])))
-        return self.layout(f'Logs: {container}', body, section='overview')
+        return self.layout(f'Logs: {container}', body, section='projects')
 
     def worker_metrics(self, data, error):
         problem = error or (data or {}).get('error')
@@ -3312,7 +3645,7 @@ class Page:
             if step.link and complete:
                 target = f'{choice["env"]}=ssh://{values["user"]}@{values["host"]}{values["path"]}'
                 if TARGET.fullmatch(target):
-                    link = (f'<p><a class="btn" href="/actions?target={e(quote(target, safe=""))}#add-project">'
+                    link = (f'<p><a class="btn" href="/projects/new?target={e(quote(target, safe=""))}#form-add-project">'
                             'Open the form with this target</a></p>')
             body += guide_step(step, values, link)
         return self.layout('Instructions: preparing a server', body + '</ol>', section='instructions')
@@ -3818,7 +4151,7 @@ class Page:
                 '</tr>' + ''.join(rows) + '</table><p class="note"><a href="/access">Change – Access</a></p>')
 
     # --- Actions ---
-    def actions(self, scopes=(), target=''):
+    def actions(self, scopes=()):
         def text(name, label, placeholder='', value=''):
             # autocomplete off: a browser must not fill in a value typed for another project (a build root name).
             return (f'<label><span>{e(label)}</span><input type="text" name="{name}" value="{e(value)}" '
@@ -3827,19 +4160,13 @@ class Page:
                     ('access', 'SSH and metrics'), ('units', 'Services'), ('server', 'Server'))
         index = ('<nav class="index"><p class="block-label">Sections</p>' +
                  ''.join(f'<a href="#{key}">{e(label)}</a>' for key, label in sections) +
-                 '<p class="block-label">On other pages</p><a href="/runners">Runners →</a><a href="/access">Keys and access →</a>'
+                 '<p class="block-label">On other pages</p><a href="/projects">Projects →</a><a href="/runners">Runners →</a>'
+                 '<a href="/access">Keys and access →</a>'
                  '<a href="/update">Update →</a><p class="note">Every action first runs with --check: '
                  'you see what it would do, and only then press "Run".</p></nav>')
-        body = '<h2 id="add-project">Projects</h2><div class="deck">' + self.form(
-            'add-project', 'Add a project',
-            text('env_repo', 'Env repo URL', 'git@ssh.bitbucket.org:workspace/project.git') +
-            text('code_repo', 'Code repo URL (optional)', 'git@ssh.bitbucket.org:workspace/code.git') +
-            text('name', 'Name (optional)', 'default – the repo name') +
-            '<label><span>Target (one per line)</span><textarea name="targets" placeholder="local&#10;local:/home/user/project&#10;prod=ssh://deploy@shop.example/home/deploy/shop">'
-            f'{e(target)}</textarea></label>'
-            '<label class="check"><input type="checkbox" name="shared_key" value="yes"> GitHub: the account key (--shared-key)</label>',
-            note='A new project needs a target (local – this server). For an existing one an empty field leaves the target as it is. '
-                 'Removing – on the project\'s page.', command='bin/add-project') + '</div>'
+        body = ('<h2 id="add-project">Projects</h2><div class="pointer"><h3>Projects – on their own page</h3>'
+                '<p class="note">The list of projects and their environments, adding a project, each environment\'s target, '
+                'and removing.</p><a class="btn" href="/projects">Projects →</a></div>')
         body += ('<h2 id="runners">Runners</h2><div class="pointer"><h3>Runners – on their own page</h3>'
                  '<p class="note">The list of GitHub and Bitbucket runners, adding, extra instances, starting, '
                  'stopping and removing.</p><a class="btn go" href="/runners">Runners →</a></div>')
@@ -4290,7 +4617,7 @@ class Page:
             body += (f'<form class="action" method="post" action="/run"><input type="hidden" name="csrf" value="{e(self.token)}">'
                      f'<input type="hidden" name="pending" value="{e(pending)}"><div class="form-foot">'
                      f'<a class="btn" href="/project/{e(plan.project)}">Cancel</a><button class="run">Run</button></div></form>')
-        return self.layout(f'Preview: {plan.title}', body, section='overview')
+        return self.layout(f'Preview: {plan.title}', body, section='projects')
 
     def pipeline_result(self, plan, code, data, error):
         if error or code != 201 or not isinstance(data, dict):
@@ -4301,7 +4628,7 @@ class Page:
             body = (f'<div class="callout"><p>Started: <a href="{e(link)}">#{e(number)}</a> ({e(plan.pipeline)}, '
                     f'branch {e(plan.branch)}).</p></div>')
         body += f'<p><a href="/project/{e(plan.project)}">← Back to the project</a></p>'
-        return self.layout(plan.title, body, section='overview')
+        return self.layout(plan.title, body, section='projects')
 
     def job(self, identifier, meta, result, running, output):
         if running:
@@ -4384,7 +4711,7 @@ def tail(path, limit=200):
 
 def path_section(path):
     """The section a GET path belongs to (its "view" is needed), or None (checked where it is served)."""
-    for prefix, section in (('/project/', 'overview'), ('/runners', 'runners'), ('/access', 'access'), ('/files', 'files'),
+    for prefix, section in (('/projects', 'projects'), ('/project/', 'projects'), ('/runners', 'runners'), ('/access', 'access'), ('/files', 'files'),
                             ('/update', 'update'),
                             ('/actions', 'actions'), ('/instructions', 'instructions'), ('/logs', 'logs'),
                             ('/worker-metrics', 'metrics'), ('/users', 'users'), ('/groups', 'users')):
@@ -4627,9 +4954,9 @@ def handler(accounts):
             if match:
                 data, error = status(fresh='fresh' in query)
                 rendered = page.project(data, match[1]) if data else \
-                    page.layout('Project', f'<div class="callout bad"><p>{e(error)}</p></div>')
+                    page.layout('Project', f'<div class="callout bad"><p>{e(error)}</p></div>', section='projects')
                 return self.reply(200, rendered) if rendered else \
-                    self.reply(404, page.layout('No such project', '<p><a href="/">← To the overview</a></p>'))
+                    self.reply(404, page.layout('No such project', '<p><a href="/projects">← Projects</a></p>', section='projects'))
             if path == '/access':
                 data, error = status(fresh='fresh' in query)
                 page.recent = (helper('--activity')[0] or {}).get('events')
@@ -4695,10 +5022,18 @@ def handler(accounts):
                 data, error = status(fresh='fresh' in query)
                 return self.reply(200, page.update_page(data, error, installation()))
             if path == '/actions':
+                if 'target' in query:  # the instructions' old link: the add form moved to Projects
+                    return self.redirect('/projects/new?' + urlencode({'target': query['target'][0][:200]}) + '#form-add-project')
                 data, _ = status()
+                return self.reply(200, page.actions((data or {}).get('github_runners', [])))
+            if path == '/projects':
+                data, error = status(fresh='fresh' in query)
+                return self.reply(200, page.projects(data, error, query))
+            if path == '/projects/new':
+                if not self.allowed(page, 'projects', 'manage'):
+                    return
                 target = query.get('target', [''])[0]
-                target = target if len(target) <= 200 and TARGET.fullmatch(target) else ''
-                return self.reply(200, page.actions((data or {}).get('github_runners', []), target))
+                return self.reply(200, page.project_new(target if len(target) <= 200 and TARGET.fullmatch(target) else ''))
             if path == '/instructions':
                 data, _ = status()
                 return self.reply(200, page.instructions(*guide_values(query, data)))
@@ -4896,7 +5231,7 @@ def handler(accounts):
             if not page.may(form['action'], form):
                 return self.reply(403, page.invalid('Your groups do not give the permission "manage" for this action.'))
             try:
-                plan = builder(form, status()[0] if form.get('action') in ('pipeline', 'add-backup-key', 'key-bulk', 'tool-access', 'remove-runner',
+                plan = builder(form, status()[0] if form.get('action') in ('pipeline', 'project-target', 'add-backup-key', 'key-bulk', 'tool-access', 'remove-runner',
                                                                            'tool-bulk', 'tool-password', 'tool-person') else None)
             except Invalid as error:
                 return self.reply(400, page.invalid(str(error)))
