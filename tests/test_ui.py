@@ -182,6 +182,23 @@ class ServerStatusTest(Worker):
                                      "SETUP_SERVER_ROOT": str(self.tree.root), "SETUP_SERVER_LIBRARY": str(self.library)})
         return result
 
+    def test_each_environment_has_its_backup_policy(self):
+        config = self.root / "host" / self.HOST_PATHS["SETUP_SERVER_CONFIG"]  # SETUP_SERVER_CONFIG (ScriptTest)
+        config.mkdir(parents=True, exist_ok=True)
+        (config / "backup-policy.conf").write_text("# test\nalpha_shop prod db=off full=daily  # full only\n"
+                                                   "beta_docker stage files=never\n")
+        result = self.status()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        projects = {item["name"]: item for item in json.loads(result.stdout)["projects"]}
+        self.assertEqual(projects["alpha_shop"]["environments"]["prod"]["backup_policy"],
+                         {"db": "off", "full": "daily", "files": "daily"})
+        self.assertEqual(projects["beta_docker"]["environments"]["stage"]["backup_policy"],
+                         {"db": "daily", "full": "weekly", "files": "daily"}, "an invalid item keeps the default")
+        (config / "backup-policy.conf").unlink()
+        projects = json.loads(self.status().stdout)["projects"]
+        self.assertTrue(all(state["backup_policy"] == {"db": "daily", "full": "weekly", "files": "daily"}
+                            for item in projects for state in item["environments"].values()), "always present")
+
     def test_each_github_runner_shows_its_registration_version_and_job(self):
         data = json.loads(self.status().stdout)
         self.assertEqual(data["github_runner_details"]["bigsant"],
@@ -1541,7 +1558,7 @@ class WebUiTest(Worker):
             self.assertIn(text, top, "a distinct alert stays a line of its own, before the groups")
         self.assertIn("<span>5 environments have no backup</span></summary>", folded)
         for number in range(5):
-            self.assertIn(f'href="/project/shop{number}"', folded)
+            self.assertIn(f'href="/project/shop{number}#backup-prod"', folded, "the alarm leads to the backup forms")
             self.assertIn(f"shop{number} prod: newest backup none", folded)
         self.assertNotIn("shop0", top)
         few = page.attention({"projects": projects[:3]})
@@ -1549,6 +1566,262 @@ class WebUiTest(Worker):
         self.assertIn("Needs attention · 3", few)
         idle = page.attention({"projects": [{"name": "draft", "environments": {"prod": {"declared": True}}}]})
         self.assertNotIn("draft", idle, "an environment with no target deploys nowhere: no backup alarm")
+
+    # --- Backup policy ---------------------------------------------------------------------------
+    def test_a_backup_policy_is_checked_against_the_project_and_set_through_its_preview(self):
+        backup = f"-n {self.library}/bin/backup-projects"
+        status, _, body = self.preview("backup-policy", project="alpha_shop", environment="prod", db="off", full="daily", files="daily")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.sudo_calls("backup-projects"),
+                         [f"{backup} --set alpha_shop prod db=off full=daily files=daily --check"])
+        for text in ("Backup policy of alpha_shop prod", '<li class="is-bad">db: daily → off</li>',
+                     '<li class="is-warn">full: weekly → daily</li>', 'href="/project/alpha_shop#backup-prod">Cancel</a>',
+                     '<a class="btn on" href="/projects">Projects</a>'):
+            with self.subTest(text=text):
+                self.assertIn(text, body)
+        self.assertNotIn("files:", body.split('class="changes"')[1].split("</ul>")[0], "files stays daily")
+        self.assertNotIn('class="tape"', body, "a full backup still runs: nothing to warn about")
+        status, page = self.confirm(body)
+        self.assertIn("finished, code 0", page)
+        self.assertIn(f"stub ran: {self.library}/bin/backup-projects --set alpha_shop prod db=off full=daily files=daily", page)
+        self.assertRegex(self.log.read_text(), r"run job=\S+ backup-policy: sudo .*backup-projects --set alpha_shop prod db=off")
+        unchanged = self.preview("backup-policy", project="alpha_shop", environment="prod", db="daily", full="weekly", files="daily")[2]
+        self.assertIn('<li class="is-muted">nothing changes</li>', unchanged)
+        off = self.preview("backup-policy", project="alpha_shop", environment="prod", db="off", full="off", files="off")[2]
+        self.assertIn('<div class="tape"><span>alpha_shop prod gets no DB backups any more', off)
+        calls = len(self.sudo_calls("backup-projects"))
+        for fields, message in (({"project": "nope"}, "There is no project nope"),
+                                ({"environment": "stage"}, "alpha_shop has no environment stage"),
+                                ({"environment": "Prod"}, "Environment"), ({"environment": ""}, "Environment"),
+                                ({"db": "monthly"}, "Short backup (db): daily, weekly, off"),
+                                ({"full": "hourly"}, "Full backup (full): daily, weekly, monthly, off"),
+                                ({"files": ""}, "Files backup (files)"), ({"db": "off; rm -rf /"}, "Short backup (db)")):
+            with self.subTest(fields=fields):
+                form = {"project": "alpha_shop", "environment": "prod", "db": "daily", "full": "weekly", "files": "daily", **fields}
+                status, _, body = self.preview("backup-policy", **form)
+                self.assertEqual(status, 400, body)
+                self.assertIn(message, body)
+        self.assertEqual(len(self.sudo_calls("backup-projects")), calls, "nothing ran for a refused form")
+        web_ui = load_web_ui()
+        development = {"projects": [{"name": "app", "environments": {"devel": {"development": True}}}]}
+        with self.assertRaisesRegex(web_ui.Invalid, "development checkout"):
+            web_ui.plan_backup_policy({"project": "app", "environment": "devel", "db": "off", "full": "off", "files": "off"},
+                                      development)
+        self.assertEqual(web_ui.ACTION_SECTIONS["backup-policy"], ("projects",))
+        # A viewer sees the policy but has no form and cannot post one; an operator manages it.
+        self.assertEqual(self.add_user("ziuri", "ziuri-slaptazodis", ["viewers"])[0], 303)
+        viewer = ("ziuri", "ziuri-slaptazodis")
+        project = self.request("GET", "/project/alpha_shop", login=viewer)[2]
+        self.assertIn("<th>Backup policy</th><td>short daily · full weekly", project)
+        self.assertNotIn('value="backup-policy"', project)
+        token = re.search(r'name="csrf" value="([0-9a-f]+)"', project)[1]
+        status, _, body = self.request("POST", "/preview", {"csrf": token, "action": "backup-policy", "project": "alpha_shop",
+                                                            "environment": "prod", "db": "off", "full": "off", "files": "off"},
+                                       login=viewer)
+        self.assertEqual(status, 403, body)
+        self.assertEqual(len(self.sudo_calls("backup-projects")), calls)
+        self.assertEqual(self.add_user("ops", "ops-slaptazodis-1", ["operators"])[0], 303)
+        self.assertIn('value="backup-policy"', self.request("GET", "/project/alpha_shop", login=("ops", "ops-slaptazodis-1"))[2])
+
+    def test_web_uis_policy_choices_are_those_of_backup_projects(self):
+        import ast
+        web_ui = load_web_ui()
+        found = {}
+        for node in ast.parse((ROOT / "bin/backup-projects").read_text()).body:
+            if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) in ("BACKUP_POLICY", "BACKUP_DEFAULT"):
+                found[node.targets[0].id] = ast.literal_eval(node.value)
+        if not found:
+            self.skipTest("bin/backup-projects has no backup policy yet")
+        self.assertEqual(found, {"BACKUP_POLICY": web_ui.BACKUP_POLICY, "BACKUP_DEFAULT": web_ui.BACKUP_DEFAULT})
+
+    def policy_page_data(self):
+        """A project with every kind of policy on its environments, as server-status gives them."""
+        now = time.time()
+        newest = lambda hours: {"newest": {"time": now - hours * 3600, "size": 1000, "name": "x.sql.gz"}, "count": 2}
+        state = lambda policy=None, **values: {"declared": True, "context": "default", "compose_project": "shop-prod",
+                                               "containers": [], **({"backup_policy": policy} if policy else {}), **values}
+        environments = {"prod": state({"db": "off", "full": "daily", "files": "daily"}, full_backups=newest(3),
+                                      file_paths=["modules/*/translations/"], files_backups=newest(5)),
+                        "stage": state({"db": "off", "full": "off", "files": "off"}),
+                        "demo": state({"db": "weekly", "full": "monthly", "files": "daily"}, backups=newest(5 * 24))}
+        return {"projects": [{"name": "shop", "repository": "git@github.com:example/shop.git", "layout": "app",
+                              "targets": {"all": {"DEPLOY_CONTEXT": "default"}}, "environments": environments}],
+                "generated": now}
+
+    def test_the_project_page_shows_each_environments_policy_and_its_form(self):
+        page = self.request("GET", "/project/alpha_shop")[2]
+        self.assert_board_cells_labelled(page)
+        self.assertIn('<th>Backup policy</th><td><a href="#backup-prod">short daily · full weekly</a> '
+                      '<span class="muted">(default)</span>', page, "an older server-status: the defaults")
+        form = page.split('<div class="deck" id="backup-prod">')[1].split("</form>")[0]
+        for text in ('name="action" value="backup-policy"', '<input type="hidden" name="project" value="alpha_shop">',
+                     '<input type="hidden" name="environment" value="prod">', '<option value="daily" selected>daily (default)</option>',
+                     '<option value="weekly" selected>weekly (default)</option>', '<option value="monthly">monthly – every 4 weeks</option>',
+                     '<input type="hidden" name="files" value="daily">', "bin/backup-projects --set alpha_shop prod"):
+            with self.subTest(text=text):
+                self.assertIn(text, form)
+        self.assertNotIn('<select name="files">', form, "no BACKUP_FILE_PATHS: the files series keeps its value unseen")
+        web_ui = load_web_ui()
+        page = web_ui.Page("admin", "token", {"projects": "manage"}).project(self.policy_page_data(), "shop")
+        prod = page.split('<h2 id="env-prod">')[1].split("<h2 ")[0]
+        self.assertIn('<a href="#backup-prod">full only, daily · files daily</a></td>', prod)
+        self.assertIn('<span class="chip muted">off</span>', prod, "the short series is off")
+        self.assertIn('<select name="files">', prod, "BACKUP_FILE_PATHS: the files series has its select")
+        self.assertRegex(prod, r'<select name="db"><option value="daily">daily \(default\)</option>'
+                               r'<option value="weekly">weekly</option><option value="off" selected>off – none</option>')
+        self.assertIn('<option value="daily" selected>daily</option><option value="weekly">weekly (default)</option>', prod)
+        stage = page.split('<h2 id="env-stage">')[1].split("<h2 ")[0]
+        self.assertIn('<a href="#backup-stage">off</a></td>', stage)
+        demo = page.split('<h2 id="env-demo">')[1].split("<h2 ")[0]
+        self.assertIn(">short weekly · full monthly</a>", demo)
+        self.assertIn('<span class="chip ok">5 d ago</span>', demo, "weekly: 5 days is fine")
+        self.assertIn('id="backup-demo"', demo)
+        viewer = web_ui.Page("ziuri", "token", {"projects": "view"}).project(self.policy_page_data(), "shop")
+        self.assertIn("<th>Backup policy</th><td>full only, daily · files daily</td>", viewer, "no link to a form that is not there")
+
+    def test_alarms_and_the_board_follow_each_environments_backup_policy(self):
+        page = load_web_ui().Page("admin", "token", {"projects": "manage"})
+        now = time.time()
+        newest = lambda hours: {"newest": {"time": now - hours * 3600, "size": 1000}, "count": 2}
+        target = {"all": {"DEPLOY_CONTEXT": "default"}}
+        project = lambda name, policy=None, **state: {"name": name, "targets": target, "environments": {"prod": {
+            "declared": True, **({"backup_policy": policy} if policy is not None else {}), **state}}}
+        full_only = {"db": "off", "full": "daily", "files": "daily"}
+        projects = [project("plain", backups=newest(2)), project("stale", backups=newest(30)),
+                    project("weekly", {"db": "weekly", "full": "weekly", "files": "daily"}, backups=newest(5 * 24)),
+                    project("weekly-late", {"db": "weekly", "full": "weekly", "files": "daily"}, backups=newest(9 * 24)),
+                    project("fullonly", full_only, full_backups=newest(3)),
+                    project("fullonly-late", full_only, full_backups=newest(30), backups=newest(1)),
+                    project("monthly", {"db": "off", "full": "monthly", "files": "off"}, full_backups=newest(20 * 24)),
+                    project("nothing", {"db": "off", "full": "off", "files": "off"}),
+                    project("older", {}), project("junk", {"db": "hourly", "full": None})]
+        expected = {"plain": [], "stale": ["old backup"], "weekly": [], "weekly-late": ["old backup"], "fullonly": [],
+                    "fullonly-late": ["old full backup"], "monthly": [], "nothing": [], "older": ["no backup"], "junk": ["no backup"]}
+        for entry in projects:
+            with self.subTest(project=entry["name"]):
+                self.assertEqual(page.project_environment(entry, "prod")[1], expected[entry["name"]])
+        rows = {entry["name"]: (kind, row) for entry, kind, _, row in page.project_rows(projects)}
+        for name, text in (("plain", "this server · backup 2 h ago"), ("fullonly", "this server · full 3 h ago"),
+                           ("fullonly-late", "this server · full 30 h ago"), ("nothing", "this server · backups off"),
+                           ("older", "this server · no backup"), ("monthly", "this server · full 20 d ago")):
+            with self.subTest(board=name):
+                self.assertIn(text, rows[name][1])
+        self.assertEqual(rows["nothing"][0], "ok", "all off: quiet, not an alarm")
+        self.assertNotIn("chip bad", rows["nothing"][1])
+        self.assertIn('<span class="chip bad">old full backup</span>', rows["fullonly-late"][1])
+        box = page.attention({"projects": projects})
+        for text in ("stale prod: newest backup 30 h ago", "weekly-late prod: newest backup 9 d ago",
+                     "fullonly-late prod: newest full backup 30 h ago", "older prod: newest backup none",
+                     'href="/project/fullonly-late#backup-prod"'):
+            with self.subTest(alarm=text):
+                self.assertIn(text, box)
+        for name in ("plain", "weekly", "fullonly", "monthly", "nothing"):
+            with self.subTest(quiet=name):
+                self.assertNotIn(f"{name} prod:", box)
+        listing = page.projects({"projects": projects, "generated": now}, None, {})
+        self.assertIn("<b>5</b><span>without a recent backup</span>", listing)
+        self.assertIn("<b>0</b><span>failing</span>", listing)
+        self.assertIn('<a class="btn" href="/projects/backups">Backups →</a>', listing)
+        # The files backup: its own frequency, only while the files timer runs, never when off.
+        timer = {"setup-server-backup-files.timer": {"LoadState": "loaded", "ActiveState": "active"}}
+        paths = {"file_paths": ["modules/*/translations/"], "backups": newest(1)}
+        files = [project("files-weekly", {"db": "daily", "full": "weekly", "files": "weekly"}, files_backups=newest(5 * 24), **paths),
+                 project("files-off", {"db": "daily", "full": "weekly", "files": "off"}, **paths),
+                 project("files-late", None, files_backups=newest(30), **paths)]
+        box = page.attention({"projects": files, "units": timer})
+        self.assertIn("files-late prod: newest files backup 30 h ago", box)
+        self.assertIn('href="/files/files-late/prod"', box)
+        self.assertNotIn("files-weekly prod", box)
+        self.assertNotIn("files-off prod", box)
+        self.assertNotIn("files-late", page.attention({"projects": files}), "no files timer: no files alarm")
+        cells = page.files_cell(files[1]["environments"]["prod"]), page.files_cell(files[0]["environments"]["prod"])
+        self.assertEqual(cells[0], '<span class="chip muted">off</span>')
+        self.assertTrue(cells[1].startswith('<span class="chip ok">5 d ago</span>'))
+
+    def test_the_backups_page_lists_every_environment_late_ones_first_and_filters(self):
+        page = load_web_ui().Page("admin", "token", {"projects": "manage"})
+        now = time.time()
+        newest = lambda hours: {"newest": {"time": now - hours * 3600, "size": 1000}, "count": 2}
+        target = {"all": {"DEPLOY_CONTEXT": "default"}}
+        projects = []
+        for number in range(50):
+            name = f"shop{number:02d}"
+            environments = {environment: {"declared": True, "backups": newest(2), "full_backups": newest(48)}
+                            for environment in ("prod", "stage")}
+            projects.append({"name": name, "repository": f"git@ssh.bitbucket.org:ws/{name}_docker.git", "targets": target,
+                             "environments": environments})
+        projects[3]["environments"]["prod"].update(backup_policy={"db": "off", "full": "daily", "files": "daily"},
+                                                   full_backups=newest(3))
+        projects[5]["environments"]["stage"].update(backup_policy={"db": "off", "full": "off", "files": "off"})
+        projects[10]["environments"]["prod"].update(backups=newest(30))
+        projects[20]["environments"]["stage"].update(backup_policy={"db": "off", "full": "daily", "files": "daily"},
+                                                     full_backups=newest(30))
+        projects.append({"name": "devapp", "environments": {"local": {"development": True}}})
+        data = {"projects": projects, "generated": now}
+        body = page.backups_page(data, None, {})
+        self.assert_board_cells_labelled(body)
+        self.assertIn('<a class="btn on" href="/projects">Projects</a>', body)
+        rows = re.findall(r'<tr class="is-([a-z]+)"><td class="project" data-label="Project">'
+                          r'<a href="/project/([^"#]+)#backup-([a-z]+)">', body)
+        self.assertEqual(len(rows), 100, "every environment but a development one")
+        self.assertEqual(rows[:2], [("bad", "shop10", "prod"), ("bad", "shop20", "stage")], "late ones first")
+        self.assertEqual(rows[2:6], [("ok", "shop00", "prod"), ("ok", "shop00", "stage"), ("ok", "shop01", "prod"),
+                                     ("ok", "shop01", "stage")], "then by name, prod before stage")
+        self.assertIn(("idle", "shop05", "stage"), rows, "all off: quiet")
+        for number, label in (("100", "environments"), ("2", "late or missing"), ("3", "not the default"), ("2", "full only"),
+                              ("1", "DB off")):
+            with self.subTest(stat=label):
+                self.assertIn(f"<b>{number}</b><span>{label}</span>", body)
+        shop10 = body.split('href="/project/shop10#backup-prod"')[1].split("</tr>")[0]
+        self.assertIn('<td data-label="Short"><span>30 h ago <span class="chip bad">late</span></span></td>', shop10)
+        shop20 = body.split('href="/project/shop20#backup-stage"')[1].split("</tr>")[0]
+        self.assertIn('<td data-label="Policy"><span>full only, daily</span></td>', shop20)
+        self.assertIn('<td data-label="Full"><span>30 h ago <span class="chip bad">late</span></span></td>', shop20)
+        self.assertIn('<td data-label="Short"><span><span class="muted">off · newest 2 h ago</span></span></td>', shop20)
+        shop05 = body.split('href="/project/shop05#backup-stage"')[1].split("</tr>")[0]
+        self.assertIn('<td data-label="Policy"><span>off</span></td>', shop05)
+        self.assertIn('<td data-label="Policy"><span>short daily · full weekly <span class="muted">· default</span></span></td>', body)
+        self.assertIn('<td data-label="Files"><span><span class="muted" title="no BACKUP_FILE_PATHS">—</span></span></td>', body)
+        self.assertIn('<span class="note shown">100 of 100</span>', body)
+        self.assertIn('<span class="note shown">2 of 100</span>', page.backups_page(data, None, {"problems": ["1"]}))
+        self.assertIn('<span class="note shown">2 of 100</span>', page.backups_page(data, None, {"policy": ["full-only"]}))
+        off = page.backups_page(data, None, {"policy": ["off"]})
+        self.assertIn('<span class="note shown">1 of 100</span>', off)
+        self.assertIn('<option value="off" selected>DB off</option>', off, "the filter stays in the form")
+        self.assertIn('<span class="note shown">3 of 100</span>', page.backups_page(data, None, {"policy": ["custom"]}))
+        self.assertIn('<span class="note shown">100 of 100</span>', page.backups_page(data, None, {"policy": ["<x>"]}))
+        searched = page.backups_page(data, None, {"q": ["SHOP0"]})
+        self.assertIn('<span class="note shown">20 of 100</span>', searched, "the name or the repo, any case")
+        by_name = page.backups_page(data, None, {"sort": ["name"]})
+        self.assertEqual(re.findall(r'<a href="/project/([^"]+)">', by_name)[:3],
+                         ["shop00#backup-prod", "shop00#backup-stage", "shop01#backup-prod"])
+        self.assertIn("No environment matches", page.backups_page(data, None, {"q": ["nothing"]}))
+        self.assertIn("Could not get the status: boom", page.backups_page(None, "boom"))
+        self.assertIn("No project environment is backed up here yet", page.backups_page({"projects": []}, None))
+
+    def test_the_backups_page_is_part_of_projects_and_linked_from_projects_and_actions(self):
+        status, _, body = self.request("GET", "/projects/backups")
+        self.assertEqual(status, 200, body)
+        self.assert_board_cells_labelled(body)
+        for text in ('<a class="btn on" href="/projects">Projects</a>', 'href="/project/alpha_shop#backup-prod"',
+                     'href="/project/beta_docker#backup-stage"', '<span class="note shown">3 of 3</span>'):
+            with self.subTest(text=text):
+                self.assertIn(text, body)
+        self.assertIn('href="/projects/backups"', self.request("GET", "/projects")[2])
+        actions = self.request("GET", "/actions")[2]
+        self.assertIn('<a class="btn" href="/projects/backups">Backups →</a>', actions)
+        self.assertIn("is its backup policy: on its project page or on", actions.split('id="form-install-backups"')[1])
+        self.assertEqual(load_web_ui().path_section("/projects/backups"), "projects")
+        # A group that sees the projects sees it, without forms; one that does not, does not.
+        self.assertEqual(self.add_user("ziuri", "ziuri-slaptazodis", ["viewers"])[0], 303)
+        status, _, body = self.request("GET", "/projects/backups", login=("ziuri", "ziuri-slaptazodis"))
+        self.assertEqual(status, 200, body)
+        self.assertIn("View only", body)
+        self.assertNotIn('action="/preview"', body)
+        form = {"csrf": self.csrf(), "group": "", "title": "Loggers", "level:logs": "view"}
+        self.assertEqual(self.request("POST", "/groups/save", form)[0], 303)
+        self.assertEqual(self.add_user("jonas", "jono-slaptazodis-1", ["loggers"])[0], 303)
+        self.assertEqual(self.request("GET", "/projects/backups", login=("jonas", "jono-slaptazodis-1"))[0], 403)
 
     def assert_board_cells_labelled(self, page):
         """Every cell of a .board table names its column (data-label, from the header) for the stacked phone layout."""

@@ -446,7 +446,7 @@ chown -R "$ACCOUNT:$ACCOUNT" "$release"
 ln -sfn "$release" "$ROOT/runner/current"
 
 # --- Credentials and service ------------------------------------------------------------------
-install -d -m 0700 "$CONFIG"
+install -d -m 0711 "$CONFIG"  # others pass through only; runner.env stays 0600
 umask 077
 printf 'RUNNER_ARGS="%s"\n' "${kept[*]}" > "$CONFIG/runner.env"
 chmod 0600 "$CONFIG/runner.env"

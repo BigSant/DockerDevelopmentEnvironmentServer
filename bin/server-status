@@ -119,6 +119,32 @@ def server_environments(directory):
     return ENVIRONMENTS + tuple(dict.fromkeys(extra))
 
 
+# BACKUP_POLICY, BACKUP_DEFAULT and backup_policy are identical in bin/backup-projects, bin/server-status and
+# bin/worker-metrics (tests/test_metrics.py).
+# How often each backup series of a project environment is made (bin/backup-projects --set writes it; README: DB backups).
+BACKUP_POLICY = {'db': ('daily', 'weekly', 'off'), 'full': ('daily', 'weekly', 'monthly', 'off'),
+                 'files': ('daily', 'weekly', 'off')}
+BACKUP_DEFAULT = {'db': 'daily', 'full': 'weekly', 'files': 'daily'}
+
+
+def backup_policy(config, project, environment):
+    """{'db': …, 'full': …, 'files': …} of one project environment: backup-policy.conf in the config directory,
+    the defaults for whatever it does not set (or when it cannot be read)."""
+    policy = dict(BACKUP_DEFAULT)
+    try:
+        text = (config / 'backup-policy.conf').read_text(errors='replace')
+    except OSError:
+        return policy
+    for line in text.splitlines():
+        words = line.split('#', 1)[0].split()
+        if words[:2] == [project, environment]:
+            for item in words[2:]:
+                series, _, frequency = item.partition('=')
+                if frequency in BACKUP_POLICY.get(series, ()):
+                    policy[series] = frequency
+    return policy
+
+
 def development_checkout(build_root):
     """An explicitly registered monorepo; never infer local access from an arbitrary symlink."""
     try:
@@ -491,7 +517,9 @@ def project(build_root, errors):
                  'file_paths': list(dict.fromkeys([*(PRESTASHOP_FILE_PATHS if values.get('PROFILE') == 'prestashop' else ()),
                                                    *(item for item in (values.get('BACKUP_FILE_PATHS') or '').split()
                                                      if FILE_PATH.fullmatch(item))]))[:50],
-                 'containers': [], 'secrets': None}
+                 'containers': [], 'secrets': None,
+                 # How often the timers back it up (bin/backup-projects --set); root fills it in again below.
+                 'backup_policy': backup_policy(CONFIG, name, environment)}
         try:
             state['deploys'] = deploys(directory, environment, code_checkout(checkout))
         except (OSError, ValueError, KeyError, TypeError) as error:
@@ -852,10 +880,15 @@ def as_account(arguments, failed, timeout=120):
 
 
 def projects_as_account():
-    """The projects part, as the setup account when this runs as root."""
+    """The projects part, as the setup account when this runs as root; the backup policy of each environment then
+    read here: backup-policy.conf lies in the root-only configuration directory."""
     if os.geteuid() != 0:
         return projects()
-    return as_account(['--projects'], lambda error: {'projects': [], 'errors': [f'projects: {error}']})
+    part = as_account(['--projects'], lambda error: {'projects': [], 'errors': [f'projects: {error}']})
+    for entry in part.get('projects') or []:
+        for environment, state in (entry.get('environments') or {}).items():
+            state['backup_policy'] = backup_policy(CONFIG, entry['name'], environment)
+    return part
 
 
 def container_logs(name, environment, container, lines):

@@ -64,9 +64,12 @@ fi
 settings="$CONFIG/metrics.env"
 command="$SBIN/$NAME"
 stage_command() {  # stage_command TARGET — bin/worker-metrics with this host's root
-    sed "s|os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server')|os.environ.get('SETUP_SERVER_ROOT', '$ROOT')|" \
+    sed -e "s|os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server')|os.environ.get('SETUP_SERVER_ROOT', '$ROOT')|" \
+        -e "s|os.environ.get('SETUP_SERVER_CONFIG', '/etc/setup-server')|os.environ.get('SETUP_SERVER_CONFIG', '$CONFIG')|" \
         "$here/worker-metrics" > "$1"
-    grep -qF "SETUP_SERVER_ROOT', '$ROOT'" "$1" || { echo "bin/worker-metrics no longer has the default of SETUP_SERVER_ROOT" >&2; exit 70; }
+    for setting in "SETUP_SERVER_ROOT', '$ROOT'" "SETUP_SERVER_CONFIG', '$CONFIG'"; do
+        grep -qF "$setting" "$1" || { echo "bin/worker-metrics no longer has the default of ${setting%%\'*}" >&2; exit 70; }
+    done
 }
 if [ "$refresh" = 1 ]; then
     [ -e "$command" ] || { echo "==> $command is not installed; nothing to refresh"; exit 0; }
@@ -202,7 +205,7 @@ if [ -n "$token" ]; then
 else
     cp "$staging/settings" "$staging/settings.shown"
 fi
-[ "$check" = 1 ] || install -d -o root -g root -m 0700 "$CONFIG"
+[ "$check" = 1 ] || install -d -o root -g root -m 0711 "$CONFIG"  # others pass through only: backup-policy.conf (0644) is read by the setup account
 place "$staging/command" "$command" 0755 quiet  # a copy of bin/worker-metrics
 place "$staging/settings" "$settings" 0600 "$staging/settings.shown"
 place "$staging/service" "$SYSTEMD/$NAME.service" 0644

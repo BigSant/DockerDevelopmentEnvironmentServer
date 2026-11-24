@@ -128,6 +128,20 @@ class SharedHelpersTest(unittest.TestCase):
         self.assertTrue(found[0])
         self.assertEqual(found, [found[0]] * 3)
 
+    def test_backups_metrics_and_the_status_page_read_the_backup_policy_alike(self):
+        names = ("BACKUP_POLICY", "BACKUP_DEFAULT", "backup_policy")
+        saved = self.SHARED
+        self.SHARED = names
+        try:
+            found = {command: self.definitions(command) for command in ("backup-projects", "worker-metrics", "server-status")}
+        finally:
+            self.SHARED = saved
+        self.assertEqual(sorted(found["backup-projects"]), sorted(names))
+        for command, definitions in found.items():
+            for name in names:
+                with self.subTest(command=command, name=name):
+                    self.assertEqual(definitions.get(name), found["backup-projects"][name])
+
     def test_the_access_command_reads_build_roots_and_env_files_as_the_others(self):
         saved = self.SHARED
         self.SHARED = self.ENV_HELPERS + ("environment_directory", "NAME")
@@ -344,6 +358,42 @@ class EndpointTest(ScriptTest):
         samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
         self.assertEqual(value(samples, "setup_worker_files_backups", project="shop", environment="prod"), 0,
                          "a PrestaShop project expects its translations backed up without BACKUP_FILE_PATHS")
+
+    def test_the_backup_policy_sets_the_interval_gauge_and_which_series_are_expected(self):
+        self.fixtures()
+        self.tree.project("full_only", "prod")
+        archived = self.tree.project("archived", "prod")
+        (archived / "env/common.env").write_text("BACKUP_FILE_PATHS=modules/*/translations/\n")
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - 40 * 86400))
+        self.tree.backup(archived, f"worker-prod-{stamp}Z.sql.gz", 40 * 86400, 10)
+        config = Path(os.environ["SETUP_SERVER_CONFIG"])
+        config.mkdir(parents=True, exist_ok=True)
+        (config / "backup-policy.conf").write_text("# test\nfull_only prod db=off full=daily\n"
+                                                   "archived prod db=off full=off files=off\nbeta_docker stage full=monthly\n")
+        systemd = self.root / "systemd"
+        systemd.mkdir()
+        samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
+        interval = "setup_worker_backup_policy_interval_seconds"
+        for project, environment, series, seconds in (("alpha_shop", "prod", "db", 86400), ("alpha_shop", "prod", "full", 604800),
+                                                      ("alpha_shop", "prod", "files", 86400), ("beta_docker", "stage", "full", 2419200),
+                                                      ("full_only", "prod", "db", 0), ("full_only", "prod", "full", 86400),
+                                                      ("archived", "prod", "files", 0)):
+            with self.subTest(project=project, series=series):
+                self.assertEqual(value(samples, interval, project=project, environment=environment, series=series), seconds)
+        self.assertFalse([key for key in samples if key[0] == interval and ("project", "not_deployed") in key[1]])
+        full_only = (("environment", "prod"), ("project", "full_only"))
+        self.assertNotIn(("setup_worker_backups", full_only), samples, "db=off expects no short backups")
+        self.assertEqual(samples[("setup_worker_full_backups", full_only)], 0, "full=daily: the nightly run makes it, no timer needed")
+        self.assertEqual(value(samples, "setup_worker_backups", project="archived", environment="prod"), 1,
+                         "a backup that exists keeps its metrics")
+        # With both timers installed: archived (everything off) still expects nothing.
+        (systemd / "setup-server-backup-full.timer").write_text("[Timer]\n")
+        (systemd / "setup-server-backup-files.timer").write_text("[Timer]\n")
+        samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
+        archived_labels = (("environment", "prod"), ("project", "archived"))
+        self.assertNotIn(("setup_worker_full_backups", archived_labels), samples)
+        self.assertNotIn(("setup_worker_files_backups", archived_labels), samples)
+        self.assertEqual(value(samples, "setup_worker_full_backups", project="beta_docker", environment="stage"), 0)
 
     def test_a_stage_class_environment_the_project_lists_has_its_backups_and_deploys(self):
         shop = self.tree.project("shop", "prod", "demo", "old")

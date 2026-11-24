@@ -316,7 +316,7 @@ if [ ! -e "$log" ]; then
     fi
 fi
 
-[ "$check" = 1 ] || install -d -o root -g root -m 0700 "$CONFIG"
+[ "$check" = 1 ] || install -d -o root -g root -m 0711 "$CONFIG"  # others pass through only (bin/backup-projects --set)
 place "$staging/command" "$command" 0755 quiet  # a copy of bin/web-ui
 place_library
 place "$staging/install.env" "$LIBRARY/install.env" 0644

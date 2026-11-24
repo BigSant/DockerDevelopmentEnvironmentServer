@@ -7,10 +7,10 @@ round=${1:?round name}
 out="$(cd "$(dirname "$0")/.." && pwd)/.design-review/$round"
 mkdir -p "$out"
 base=http://127.0.0.1:9178
-desktop=(/ /projects /projects/new /runners /runners/new /runners/github/bigsant /access /access/tomas /access/new /files /files/alpha_shop/prod
+desktop=(/ /projects /projects/backups /projects/new /runners /runners/new /runners/github/bigsant /access /access/tomas /access/new /files /files/alpha_shop/prod
          /update /actions /instructions /instructions/example /logs /worker-metrics /users /users/new /groups/operators
          /account /project/alpha_shop /login)
-phone=(/ /projects /runners /actions /users/new /access)
+phone=(/ /projects /projects/backups /project/alpha_shop /runners /actions /users/new /access)
 shot() {  # width height path file
     local profile; profile=$(mktemp -d)
     # Reduced motion, and a dark system theme (the UI is dark only; this keeps native controls dark too).

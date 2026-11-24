@@ -11,7 +11,8 @@ under $SETUP_SERVER_ROOT/projects, asks systemd for the runners' state and the f
 Groups (setup_metrics_group_up{group} is 0 when a part of the group could not be read; details in the journal):
   backups  per project and ENV: age and size of the newest worker-<env>-…Z.sql.gz backup, how many are kept,
            and the same of the weekly full-<env>-…Z.sql.gz series (setup_worker_full_backup*) and of the nightly
-           files-<env>-…Z.tar.gz series of BACKUP_FILE_PATHS (setup_worker_files_backup*)
+           files-<env>-…Z.tar.gz series of BACKUP_FILE_PATHS (setup_worker_files_backup*); the interval the backup
+           policy sets for each series (setup_worker_backup_policy_interval_seconds, 0 when it is off)
   deploys  per project and ENV: the last entry of .generated/release/<env>/deployments.json
   runner   the systemd state of setup-server-runner.service (Bitbucket)
   github_runner  per registered GitHub runner ($SETUP_SERVER_ROOT/github-runner/<scope>): the systemd state of
@@ -40,6 +41,8 @@ from urllib.parse import urlsplit
 
 ROOT = Path(os.environ.get('SETUP_SERVER_ROOT', '/srv/setup-server'))
 PROJECTS = ROOT / 'projects'
+# backup-policy.conf (bin/backup-projects --set): how often each backup series of an environment is made.
+CONFIG = Path(os.environ.get('SETUP_SERVER_CONFIG', '/etc/setup-server'))
 RUNNER_UNIT = os.environ.get('SETUP_SERVER_RUNNER_UNIT', 'setup-server-runner.service')
 # One GitHub runner per organization or repository (bin/install-runner --provider github).
 GITHUB_RUNNERS = ROOT / 'github-runner'
@@ -119,6 +122,32 @@ def server_environments(directory):
     return ENVIRONMENTS + tuple(dict.fromkeys(extra))
 
 
+# BACKUP_POLICY, BACKUP_DEFAULT and backup_policy are identical in bin/backup-projects, bin/server-status and
+# bin/worker-metrics (tests/test_metrics.py).
+# How often each backup series of a project environment is made (bin/backup-projects --set writes it; README: DB backups).
+BACKUP_POLICY = {'db': ('daily', 'weekly', 'off'), 'full': ('daily', 'weekly', 'monthly', 'off'),
+                 'files': ('daily', 'weekly', 'off')}
+BACKUP_DEFAULT = {'db': 'daily', 'full': 'weekly', 'files': 'daily'}
+
+
+def backup_policy(config, project, environment):
+    """{'db': …, 'full': …, 'files': …} of one project environment: backup-policy.conf in the config directory,
+    the defaults for whatever it does not set (or when it cannot be read)."""
+    policy = dict(BACKUP_DEFAULT)
+    try:
+        text = (config / 'backup-policy.conf').read_text(errors='replace')
+    except OSError:
+        return policy
+    for line in text.splitlines():
+        words = line.split('#', 1)[0].split()
+        if words[:2] == [project, environment]:
+            for item in words[2:]:
+                series, _, frequency = item.partition('=')
+                if frequency in BACKUP_POLICY.get(series, ()):
+                    policy[series] = frequency
+    return policy
+
+
 def development_checkout(build_root):
     """An explicitly registered monorepo; never infer local access from an arbitrary symlink."""
     try:
@@ -161,8 +190,10 @@ def backups(metrics, found, now):
     """Nightly and "backup now" backups (worker-<env>-…Z.sql.gz); pre-deploy and fresh backups do not count,
     so neither hides a stopped timer. An ENV deployed from here (env/<env>.env) without any backup gets a
     count of 0 and no age. The weekly full series (full-<env>-…Z.sql.gz) has metrics of its own, with a
-    count of 0 only once its timer is installed, so a worker without weekly backups raises no alert. So has the
-    files series (files-<env>-…Z.tar.gz): a count of 0 for an ENV with BACKUP_FILE_PATHS once its timer is installed."""
+    count of 0 only once its timer is installed (or the policy makes it nightly: full=daily), so a worker without
+    weekly backups raises no alert. So has the files series (files-<env>-…Z.tar.gz): a count of 0 for an ENV with
+    BACKUP_FILE_PATHS once its timer is installed. A series the backup policy switches off expects nothing (its
+    backups that exist still have their metrics); the policy's interval of each series is a gauge of its own."""
     complete = True
     systemd = Path(os.environ.get('SETUP_SERVER_SYSTEMD', '/etc/systemd/system'))
     full_timer = (systemd / 'setup-server-backup-full.timer').is_file()
@@ -184,7 +215,17 @@ def backups(metrics, found, now):
             log(f'backups {name}: {error}')
             complete = False
             continue
-        expected = {'worker': declared, 'full': declared if full_timer else set(), 'files': with_files}
+        policies = {env: backup_policy(CONFIG, name, env) for env in declared}
+        for environment in sorted(declared):
+            for kind in BACKUP_POLICY:
+                metrics.add('setup_worker_backup_policy_interval_seconds',
+                            'How often the backup policy backs the series up (db: the registry backups, full, files), '
+                            'in seconds; 0 when it is off', POLICY_INTERVAL[policies[environment][kind]],
+                            {'project': name, 'environment': environment, 'series': kind})
+        expected = {'worker': {env for env in declared if policies[env]['db'] != 'off'},
+                    'full': {env for env in declared if policies[env]['full'] != 'off'
+                             and (full_timer or policies[env]['full'] == 'daily')},
+                    'files': {env for env in with_files if policies[env]['files'] != 'off'}}
         for prefix, metric, what in (('worker', 'setup_worker_backup', 'nightly and "backup now"'),
                                      ('full', 'setup_worker_full_backup', 'weekly full'),
                                      ('files', 'setup_worker_files_backup', 'nightly files (BACKUP_FILE_PATHS)')):
@@ -201,6 +242,10 @@ def backups(metrics, found, now):
                                 round(max(0.0, now - modified)), labels)
                     metrics.add(f'{metric}_newest_size_bytes', f'Size of the newest {what} backup in bytes', size, labels)
     return complete
+
+
+# Seconds between two backups of a series at each backup policy frequency (monthly: every 4 weeks).
+POLICY_INTERVAL = {'daily': 86400, 'weekly': 7 * 86400, 'monthly': 28 * 86400, 'off': 0}
 
 
 # The paths setup's PrestaShop profile always backs up (setup 4.0.0+), before a project's BACKUP_FILE_PATHS.

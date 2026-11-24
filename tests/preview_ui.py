@@ -45,8 +45,23 @@ def fixture():
                                                    'modules/ps_banner/translations/lt.php': b'<?php\n$_MODULE = array();\n',
                                                    'themes/classic/lang/flag.png': b'\x89PNG\r\n\x1a\n\0\0'})
     # More projects, most with prod and stage, as a worker with many shops has them.
+    # Deployed here, each with a nightly and a weekly full backup, but flowers (none yet) and books (no target).
     for shop in ('wellness', 'amber', 'coffee', 'supplements', 'beta', 'pharmacy', 'pet-shop', 'furniture', 'books', 'flowers'):
-        case.tree.project(shop, 'prod', 'stage')
+        directory = case.tree.project(shop, 'prod', 'stage')
+        if shop != 'books':
+            (directory.parent / 'target.env').write_text(f'DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH={directory.parent}\n')
+        for environment in ('prod', 'stage') if shop not in ('books', 'flowers') else ():
+            # coffee prod is backed up weekly (below): its newest short one is 4 days old.
+            age = 4 * 86400 if (shop, environment) == ('coffee', 'prod') else 3 * 3600
+            case.tree.backup(directory, f'worker-{environment}-{stamp(age)}Z.sql.gz', age, 240_000)
+            case.tree.backup(directory, f'full-{environment}-{stamp(2 * 86400)}Z.sql.gz', 2 * 86400, 980_000)
+    # Backup policies (bin/backup-projects --set): full only, daily; nothing at all; weekly and monthly; a late full-only one.
+    case.tree.backup(case.tree.projects / 'wellness/app', f'full-prod-{stamp(5 * 3600)}Z.sql.gz', 5 * 3600, 1_010_000)
+    (case.root / 'config').mkdir(exist_ok=True)
+    (case.root / 'config/backup-policy.conf').write_text(
+        '# bin/backup-projects --set: how often each series of a project environment is backed up (README: DB backups).\n'
+        'wellness prod db=off full=daily\nbeta stage db=off full=off files=off\ncoffee prod db=weekly full=monthly\n'
+        'pharmacy stage db=off full=daily\nalpha_shop prod files=weekly\n')
     # Developer keys with grants (bin/add-backup-key), their requests, and a setup checkout past its release tag.
     def blob(seed):  # a well-formed ssh-ed25519 public key of its own for each developer
         return base64.b64encode(b'\0\0\0\x0bssh-ed25519\0\0\0\x20' + hashlib.sha256(seed.encode()).digest()).decode()

@@ -32,6 +32,15 @@ Kinds (one series each, rotated on its own; anything else in .generated/backups 
 One database backup per project and ENV runs at a time (a lock in .generated/backups); the others wait for it, and
 so does a second files backup. A fresh backup is not made again when one with the same content (registry or full)
 is younger than 30 minutes. A files backup needs no secret store, only the target the deploy reaches.
+
+Backup policy: how often the timers back up each series of a project environment, in the root-owned
+$SETUP_SERVER_CONFIG/backup-policy.conf (not in a build root: a pipeline cannot switch its backups off), written by
+    backup-projects --set PROJECT ENV db=daily|weekly|off full=daily|weekly|monthly|off files=daily|weekly|off [--check]
+(SERIES=default drops back to the default; series not given keep their value). The default is db=daily full=weekly
+files=daily. Only the timers' runs (no PROJECT) follow it: daily backs up every run; weekly when the newest backup of
+that series is older than 6.5 days (or there is none), monthly older than 27.5 days; off never. The nightly run makes
+the full backup of an environment with full=daily (its full series then keeps 7 daily + 4 weekly, not 2); the weekly
+run backs up full=weekly and full=monthly when due. "Backup now" (PROJECT [ENV]) and --fresh ignore the policy.
 """
 
 from datetime import datetime, timezone
@@ -43,6 +52,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -65,9 +75,11 @@ SERIES = re.compile(r'(?=files-.*\.tar\.gz$|(?!files-).*\.sql\.gz$)(worker|full|
                     r'([a-z][a-z0-9]{1,15})-(\d{8}T\d{6})Z\.(?:sql|tar)\.gz')
 STAMP = '%Y%m%dT%H%M%S'
 USAGE = f"""Usage: {Path(sys.argv[0]).name} [--check] [--full | --files] [--fresh] [--progress] [PROJECT [ENV]]
+       {Path(sys.argv[0]).name} --set PROJECT ENV SERIES=FREQUENCY ... [--check]
   (none)      every project under {PROJECTS} with env/stage.env, env/prod.env or the env file of an environment its
-              env/common.env lists in STAGE_ENVIRONMENTS (the nightly timer)
-  PROJECT     one project: its name or build root, e.g. "$BUILD_ROOT" in a pipeline ("backup now")
+              env/common.env lists in STAGE_ENVIRONMENTS (the timers), as its backup policy says (--set)
+  PROJECT     one project: its name or build root, e.g. "$BUILD_ROOT" in a pipeline ("backup now"); the policy
+              does not apply: a person asked for it
   ENV         stage, prod or a STAGE_ENVIRONMENTS one (e.g. demo); by default every one the project has
   --full      every table's data, the full-<env> series (the weekly timer); keeps {KEEP_FULL}
   --fresh     the fresh-<env> series a developer asked for (bin/backup-pull); with --full fresh-full-<env>.
@@ -76,9 +88,17 @@ USAGE = f"""Usage: {Path(sys.argv[0]).name} [--check] [--full | --files] [--fres
               (the files timer), of every environment that has the setting; 7 daily + 4 weekly kept. With --fresh
               (bin/backup-pull) not made again while one is younger than {FRESH_REUSE // 60} minutes
   --progress  machine-readable progress on stderr ("progress backup BYTES EXPECTED"); a terminal gets a bar
-  --check     show what would be backed up and which old backups rotation would delete; change nothing
+  --check     show what would be backed up (and what the policy skips) and which old backups rotation would
+              delete; change nothing
+  --set       how often the timers back up one project environment, in {CONFIG}/backup-policy.conf (as root):
+              db=daily|weekly|off (the short registry series), full=daily|weekly|monthly|off, files=daily|weekly|off;
+              SERIES=default drops back to the default (db=daily full=weekly files=daily), series not given keep
+              their value. With --check it shows the change and writes nothing
+The timers follow the policy: daily backs up every run, weekly when the newest backup of the series is older than
+6.5 days, monthly older than 27.5 days, off never; the nightly run makes the full backups of full=daily.
 The nightly series keeps the newest backup of each of the last {KEEP_DAILY} days that have one and of
-{KEEP_WEEKLY} more weeks; pre-deploy backups and other files in .generated/backups are not touched."""
+{KEEP_WEEKLY} more weeks (so does the full series of full=daily); pre-deploy backups and other files in
+.generated/backups are not touched."""
 
 
 class Refused(Exception):
@@ -128,6 +148,32 @@ def server_environments(directory):
             extra = [name for name in re.split(r'[\s,]+', match[2])
                      if ENVIRONMENT.fullmatch(name) and name not in ('local', 'test', *ENVIRONMENTS)]
     return ENVIRONMENTS + tuple(dict.fromkeys(extra))
+
+
+# BACKUP_POLICY, BACKUP_DEFAULT and backup_policy are identical in bin/backup-projects, bin/server-status and
+# bin/worker-metrics (tests/test_metrics.py).
+# How often each backup series of a project environment is made (bin/backup-projects --set writes it; README: DB backups).
+BACKUP_POLICY = {'db': ('daily', 'weekly', 'off'), 'full': ('daily', 'weekly', 'monthly', 'off'),
+                 'files': ('daily', 'weekly', 'off')}
+BACKUP_DEFAULT = {'db': 'daily', 'full': 'weekly', 'files': 'daily'}
+
+
+def backup_policy(config, project, environment):
+    """{'db': …, 'full': …, 'files': …} of one project environment: backup-policy.conf in the config directory,
+    the defaults for whatever it does not set (or when it cannot be read)."""
+    policy = dict(BACKUP_DEFAULT)
+    try:
+        text = (config / 'backup-policy.conf').read_text(errors='replace')
+    except OSError:
+        return policy
+    for line in text.splitlines():
+        words = line.split('#', 1)[0].split()
+        if words[:2] == [project, environment]:
+            for item in words[2:]:
+                series, _, frequency = item.partition('=')
+                if frequency in BACKUP_POLICY.get(series, ()):
+                    policy[series] = frequency
+    return policy
 
 
 def environment_directory(build_root):
@@ -192,10 +238,11 @@ def series(backups, environment, kind='daily'):
     return names
 
 
-def rotate(names, kind):
-    """(keep, remove) of one series: daily + weekly for the nightly one, the newest N for the others."""
+def rotate(names, kind, keep_daily=False):
+    """(keep, remove) of one series: daily + weekly for the nightly one (and, keep_daily, for the full series of
+    an environment whose policy makes a full backup every night), the newest N for the others."""
     count = KINDS[kind][2]
-    if count is None:
+    if count is None or keep_daily:
         return rotation(names)
     stamped = sorted(names, key=lambda name: SERIES.fullmatch(name)[3], reverse=True)
     return stamped[:count], stamped[count:]
@@ -415,7 +462,9 @@ def say(text, error=False):
 
 
 # --- One backup, run as the setup account --------------------------------------------------------
-def job(name, environment, kind='daily', progress=False):
+def job(name, environment, kind='daily', progress=False, keep_daily=False):
+    """keep_daily: rotate the full series daily + weekly (its policy is full=daily). The caller decides: it reads
+    backup-policy.conf as root, where this account may not."""
     if os.geteuid() == 0:
         raise Refused('--job runs as the setup account, not as root')
     if kind not in KINDS:
@@ -451,7 +500,7 @@ def job(name, environment, kind='daily', progress=False):
         if progress:
             size = target.stat().st_size
             print(f'progress backup {size} {size}', file=sys.stderr, flush=True)
-        keep, remove = rotate(series(backups, environment, kind), kind)
+        keep, remove = rotate(series(backups, environment, kind), kind, keep_daily)
         for old in remove:
             (backups / old).unlink()
         say(f'    {name} {environment}: kept {len(keep)}, removed {len(remove)}' + (f': {" ".join(remove)}' if remove else ''))
@@ -502,10 +551,80 @@ def plan(arguments, kind='daily'):
     return jobs
 
 
-def check(jobs, kind='daily'):
+# How old the newest backup of a series may be before a weekly or monthly one is due again (a timer run a little
+# earlier or later than last time must not skip a whole period).
+DUE_AFTER = {'weekly': 6.5 * 86400, 'monthly': 27.5 * 86400}
+
+
+def age_text(seconds):
+    return f'{int(seconds // 86400)} d' if seconds >= 86400 else f'{int(seconds // 3600)} h'
+
+
+def due(name, environment, kind, frequency):
+    """(whether a timer run backs the series up now, why not) under its policy frequency."""
+    if frequency == 'off':
+        return False, 'off'
+    if frequency == 'daily':
+        return True, ''
+    try:
+        names = series(environment_directory(PROJECTS / name) / '.generated/backups', environment, kind)
+    except Refused:
+        return True, ''  # the backup itself reports it
+    if not names:
+        return True, ''
+    newest = datetime.strptime(max(SERIES.fullmatch(item)[3] for item in names), STAMP)
+    age = (datetime.strptime(stamp(), STAMP) - newest).total_seconds()
+    if age > DUE_AFTER[frequency]:
+        return True, ''
+    return False, f'{frequency}, newest {age_text(max(age, 0))} ago'
+
+
+def scheduled(candidates, kind):
+    """[(name, environment, kind)] a timer run makes, by each environment's backup policy: the nightly run its
+    registry backup (db) and, for full=daily, its full one; the weekly run the full backups of full=weekly and,
+    when due, full=monthly; the files run the files backups. What the policy skips is said."""
+    jobs = []
+    for name, environment in candidates:
+        policy = backup_policy(CONFIG, name, environment)
+        skipped = []
+        if kind == 'daily':
+            go, why = due(name, environment, 'daily', policy['db'])
+            if go:
+                jobs.append((name, environment, 'daily'))
+            else:
+                skipped.append(f'{"skipped" if why == "off" else "not due"}: db {why}')
+            if policy['full'] == 'daily':
+                jobs.append((name, environment, 'full'))
+        elif kind == 'full':
+            if policy['full'] in ('daily', 'off'):
+                skipped.append(f'skipped: full {policy["full"]}' +
+                               (' (the nightly run makes it)' if policy['full'] == 'daily' else ''))
+            else:  # weekly: every run of the weekly timer; monthly: when due
+                go, why = due(name, environment, 'full', 'daily' if policy['full'] == 'weekly' else 'monthly')
+                if go:
+                    jobs.append((name, environment, 'full'))
+                else:
+                    skipped.append(f'not due: full {why}')
+        else:
+            go, why = due(name, environment, 'files', policy['files'])
+            if go:
+                jobs.append((name, environment, kind))
+            else:
+                skipped.append(f'{"skipped" if why == "off" else "not due"}: files {why}')
+        for text in skipped:
+            say(f'==> {name} {environment}: {text}')
+    return jobs
+
+
+def keeps_daily(name, environment, kind):
+    """Whether the series is rotated daily + weekly instead of the newest N: the full series of full=daily."""
+    return kind == 'full' and backup_policy(CONFIG, name, environment)['full'] == 'daily'
+
+
+def check(jobs):
     """--check: what tonight's run would do; nothing is written or deleted."""
     problems = 0
-    for name, environment in jobs:
+    for name, environment, kind in jobs:
         directory = environment_directory(PROJECTS / name)
         backups = directory / '.generated/backups'
         new = file_name(kind, environment, stamp())
@@ -528,7 +647,7 @@ def check(jobs, kind='daily'):
             legacy = CONFIG / 'projects' / name / f'{environment}.env'
             if os.geteuid() == 0 and legacy.exists():
                 say(f'    note: {legacy} is not used any more; remove it: sudo rm {legacy}')
-            _, remove = rotate(series(backups, environment, kind) + [new], kind)
+            _, remove = rotate(series(backups, environment, kind) + [new], kind, keeps_daily(name, environment, kind))
         except Refused as error:
             say(f'    {error}', error=True)
             problems += 1
@@ -556,20 +675,21 @@ def child_environment(name, environment, kind='daily'):
     return env
 
 
-def run(jobs, kind='daily', progress=False):
+def run(jobs, progress=False):
     failed = []
-    for name, environment in jobs:
+    for name, environment, kind in jobs:
         try:
             env = child_environment(name, environment, kind)
         except Refused as error:
             say(f'{name} {environment}: {error}', error=True)
-            failed.append(f'{name}/{environment}')
+            failed.append(f'{name}/{environment}' + (f'/{kind}' if len({job[2] for job in jobs}) > 1 else ''))
             continue
         options = {}
         if os.geteuid() == 0:
             options = {key: value for key, value in as_account().items() if key in ('user', 'group', 'extra_groups')}
-        command = [sys.executable, os.path.realpath(__file__), '--job', name, environment, kind]
-        process = subprocess.Popen(command + (['--progress'] if progress else []), env=env, cwd=str(PROJECTS / name),
+        command = [sys.executable, os.path.realpath(__file__), '--job', name, environment, kind,
+                   *(['--progress'] if progress else []), *(['--keep-daily'] if keeps_daily(name, environment, kind) else [])]
+        process = subprocess.Popen(command, env=env, cwd=str(PROJECTS / name),
                                    start_new_session=True, stdout=sys.stderr if progress else None, **options)
         timeout = FULL_TIMEOUT if 'full=1' in KINDS[kind][1] else JOB_TIMEOUT
         try:
@@ -584,16 +704,125 @@ def run(jobs, kind='daily', progress=False):
             say(f'{name} {environment}: stopped after {timeout // 3600} h', error=True)
             code = 1
         if code:
-            failed.append(f'{name}/{environment}')
+            # A nightly run with full=daily mixes the kinds: name the full one.
+            failed.append(f'{name}/{environment}' + (f'/{kind}' if len({job[2] for job in jobs}) > 1 else ''))
     say(f'==> Backups: {len(jobs) - len(failed)} ok, {len(failed)} failed' + (f': {" ".join(failed)}' if failed else ''))
     return 1 if failed else 0
+
+
+# --- The backup policy (--set) ---------------------------------------------------------------------
+POLICY_FILE = 'backup-policy.conf'
+POLICY_HEADER = ('# bin/backup-projects --set: how often each series of a project environment is backed up '
+                 '(README: DB backups).\n')
+
+
+def project_environments(name):
+    """The environments a project has: the stage-class ones of its env repository and those with a target file."""
+    if not NAME.fullmatch(name):
+        raise Refused('NAME must be lowercase letters, digits, _ or -')
+    build_root = PROJECTS / name
+    if build_root.is_symlink() or not build_root.is_dir():
+        names = ' '.join(sorted(path.name for path in PROJECTS.iterdir())) if PROJECTS.is_dir() else ''
+        raise Refused(f'No build root {build_root} (projects: {names})')
+    targets = [path.name[len('target.'):-len('.env')] for path in sorted(build_root.glob('target.*.env'))]
+    return tuple(dict.fromkeys([*server_environments(environment_directory(build_root)),
+                                *(env for env in targets if ENVIRONMENT.fullmatch(env) and env not in ('local', 'test'))]))
+
+
+def policy_line(name, environment, policy):
+    """The line of backup-policy.conf for a policy, or None when it is the default (no line needed)."""
+    items = [f'{series}={policy[series]}' for series in BACKUP_POLICY if policy[series] != BACKUP_DEFAULT[series]]
+    return f'{name} {environment} {" ".join(items)}' if items else None
+
+
+def set_policy(arguments, checking):
+    """--set PROJECT ENV SERIES=FREQUENCY …: change how often the timers back up one project environment."""
+    if len(arguments) < 3:
+        say(USAGE, error=True)
+        return 64
+    name, environment, *items = arguments
+    given = {}
+    for item in items:
+        series_name, _, frequency = item.partition('=')
+        if series_name not in BACKUP_POLICY or frequency not in (*BACKUP_POLICY[series_name], 'default'):
+            say(f'{item}: SERIES=FREQUENCY with ' + '; '.join(f'{key}={"|".join(choices)}|default'
+                                                               for key, choices in BACKUP_POLICY.items()), error=True)
+            return 64
+        given[series_name] = frequency
+    environments = project_environments(name)
+    if environment not in environments:
+        raise Refused(f'{name} has no environment {environment} (it has: {" ".join(environments)})')
+    if os.geteuid() != 0 and not checking and 'SETUP_SERVER_CONFIG' not in os.environ:
+        say(f'Run as root (sudo): {CONFIG / POLICY_FILE} is root-owned', error=True)
+        return 77
+    if checking:
+        return change_policy(name, environment, given, write=False)
+    CONFIG.mkdir(mode=0o711, parents=True, exist_ok=True)
+    # The directory only lets others through (its secrets are 0600 files): bin/worker-metrics and bin/server-status run
+    # as the setup account and read this world-readable file. Older installers made it 0700.
+    if os.geteuid() == 0 and not CONFIG.is_symlink() and not CONFIG.stat().st_mode & 0o001:
+        os.chmod(CONFIG, (CONFIG.stat().st_mode & 0o7777) | 0o011)
+    with open(CONFIG / f'.{POLICY_FILE}.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # two changes at once (two UI jobs) would lose one
+        return change_policy(name, environment, given, write=True)
+
+
+def change_policy(name, environment, given, write):
+    """Say what changes in backup-policy.conf and, write, write the whole file anew (atomically, 0644): this
+    environment's line replaced (or dropped when the policy is the default), other lines and comments kept."""
+    path = CONFIG / POLICY_FILE
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        text = ''
+    except OSError as error:
+        raise Refused(f'Cannot read {path}: {error.strerror}; run as root (sudo)') from None
+    before = backup_policy(CONFIG, name, environment)
+    after = {key: BACKUP_DEFAULT[key] if given.get(key) == 'default' else given.get(key, before[key])
+             for key in BACKUP_POLICY}
+    changes = [f'{key} {before[key]} → {after[key]}' for key in BACKUP_POLICY if before[key] != after[key]]
+    say(f'{name} {environment}: ' + (', '.join(changes) or 'no change'))
+    if not write or not changes:
+        return 0
+    lines, placed = [], False
+    new = policy_line(name, environment, after)
+    for line in text.splitlines():
+        if line.split('#', 1)[0].split()[:2] != [name, environment]:
+            lines.append(line)
+        elif not placed:  # the first line of the environment becomes the new one (its comment kept), others go
+            placed = True
+            comment = line.partition('#')[2]
+            if new:
+                lines.append(new + (f'  #{comment}' if comment else ''))
+    if new and not placed:
+        lines.append(new)
+    if not text:
+        lines.insert(0, POLICY_HEADER.rstrip('\n'))
+    handle, temporary = tempfile.mkstemp(dir=CONFIG, prefix=f'.{POLICY_FILE}.')
+    try:
+        with os.fdopen(handle, 'w') as output:
+            output.write('\n'.join(lines) + '\n')
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, path)
+    except BaseException:
+        os.unlink(temporary)
+        raise
+    say(f'    written to {path}')
+    return 0
 
 
 def main(arguments):
     checking = full = fresh = files = progress = False
     positional = []
-    if arguments[:1] == ['--job'] and len(arguments) in (4, 5) and arguments[4:] in ([], ['--progress']):
-        return job(*arguments[1:4], progress=arguments[4:] == ['--progress'])
+    if arguments[:1] == ['--job'] and len(arguments) >= 4 and len(set(arguments[4:])) == len(arguments[4:]) \
+            and set(arguments[4:]) <= {'--progress', '--keep-daily'}:
+        return job(*arguments[1:4], progress='--progress' in arguments[4:], keep_daily='--keep-daily' in arguments[4:])
+    if '--set' in arguments:
+        rest = [argument for argument in arguments if argument not in ('--set', '--check')]
+        if arguments.count('--set') > 1 or any(argument.startswith('-') for argument in rest):
+            say(USAGE, error=True)
+            return 64
+        return set_policy(rest, '--check' in arguments)
     for argument in arguments:
         if argument == '--check':
             checking = True
@@ -627,12 +856,20 @@ def main(arguments):
         kind = ('fresh-full' if full else 'fresh') if fresh else ('full' if full else 'daily')
     if progress:
         sys.stdout = sys.stderr  # bin/backup-pull keeps stdout for its answer
-    jobs = plan(positional, kind)
-    if not jobs:
+    candidates = plan(positional, kind)
+    if not candidates:
         say(f'==> No project under {PROJECTS} has an env/<env>.env of stage, prod or STAGE_ENVIRONMENTS' +
             (' with BACKUP_FILE_PATHS' if files else '') + '; nothing to back up')
         return 0
-    return check(jobs, kind) if checking else run(jobs, kind, progress)
+    # The timers follow each environment's backup policy; "backup now" (PROJECT) and --fresh: a person asked for it.
+    if positional or fresh:
+        jobs = [(name, environment, kind) for name, environment in candidates]
+    else:
+        jobs = scheduled(candidates, kind)
+    if not jobs:
+        say('==> Nothing to back up in this run: the backup policy skips every environment or none is due')
+        return 0
+    return check(jobs) if checking else run(jobs, progress)
 
 
 if __name__ == '__main__':
