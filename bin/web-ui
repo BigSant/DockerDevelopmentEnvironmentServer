@@ -1975,150 +1975,185 @@ def e(text):
 # for states, hazard tape where something is lost. Served as /ui.css: the Content-Security-Policy allows no
 # inline style and no script, so the pages are static HTML (a running job's page reloads itself).
 STYLE = """
-:root{--board:#0c0e0b;--panel:#13170f;--panel-2:#191e14;--rule:#283022;--ink:#ece6d3;--dim:#8d917f;--faint:#5c6152;
---amber:#ffb22e;--amber-glow:rgba(255,178,46,.35);--go:#4fe08c;--stop:#ff5b4f;--hazard:#f4c20d;--steel:#6f93c9;
+:root{color-scheme:dark;
+--board:#10130e;--panel:#1a1f16;--panel-2:#232a1d;--field:#0d100b;--rule:#343d2b;--edge:#7a8566;
+--ink:#ece6d3;--dim:#b0b4a1;--faint:#969b88;
+--amber:#ffb22e;--amber-fill:#ffb22e;--amber-hover:#ffc75e;--amber-deep:#8a5c10;--on-accent:#1a1205;
+--amber-glow:rgba(255,178,46,.35);--amber-tint:rgba(255,178,46,.22);--amber-line:#7a5a16;--wash:rgba(255,178,46,.06);
+--go:#4fe08c;--go-glow:rgba(79,224,140,.55);--go-tint:rgba(79,224,140,.1);--go-on:rgba(79,224,140,.22);--go-line:rgba(79,224,140,.45);
+--stop:#ff5b4f;--stop-glow:rgba(255,91,79,.6);--stop-line:rgba(255,91,79,.5);
+--steel:#7b9dd0;--steel-ink:#c3d6f3;--steel-tint:rgba(111,147,201,.16);--steel-on:rgba(111,147,201,.32);--steel-line:rgba(111,147,201,.6);
+--tools-ink:#d3eed6;--tools-tint:rgba(108,178,122,.14);--tools-on:rgba(108,178,122,.3);--tools-line:rgba(108,178,122,.6);
+--fresh:#e8c56b;--fresh-fill:#e8c56b;
+--hazard:#f4c20d;--steel-fill:#3f67a8;--stage-fill:#8f5a0a;--prod-fill:#b3261e;
+--top-1:#1d2318;--top-2:#141810;--lamp-off:#262d1f;--lamp-ring:#3d4733;--count-bg:#2e3726;--track:#262d1f;--seg-on:#3a4530;
+--row-edge:#0a0c08;--scroll-thumb:#4a5540;
+--term-bg:#070806;--term-ink:#d8e8c8;--term-faint:#8d927f;--term-hover:#12170e;--term-amber:#ffb22e;--term-go:#4fe08c;
+--term-stop:#ff6a5f;--term-steel:#7d9fd2;
+--sans:system-ui,-apple-system,"Segoe UI",Roboto,Ubuntu,"Liberation Sans",sans-serif;
 --mono:ui-monospace,"JetBrains Mono","Iosevka","IBM Plex Mono","SF Mono","Cascadia Code","DejaVu Sans Mono",Menlo,Consolas,monospace}
+@media (prefers-color-scheme:light){:root{color-scheme:light;
+--board:#f3f0e6;--panel:#fcfaf4;--panel-2:#e9e5d8;--field:#ffffff;--rule:#d2cdbb;--edge:#858170;
+--ink:#1b1f17;--dim:#4a5042;--faint:#616857;
+--amber:#8a4f00;--amber-hover:#ffc24f;--amber-glow:rgba(138,79,0,.22);--amber-tint:#f7e2b8;--amber-line:#c99a4c;--wash:rgba(255,178,46,.1);
+--go:#0d6a39;--go-glow:rgba(13,106,57,.35);--go-tint:#e0f1e6;--go-on:#c6e7d2;--go-line:#6cb285;
+--stop:#b3261e;--stop-glow:rgba(179,38,30,.35);--stop-line:#e09a94;
+--steel:#2c5596;--steel-ink:#1e447d;--steel-tint:#e3ebf7;--steel-on:#c9d9f1;--steel-line:#84a8d9;
+--tools-ink:#145931;--tools-tint:#e1f3e7;--tools-on:#c8e6cf;--tools-line:#6cb285;
+--fresh:#7a5600;
+--top-1:#fcfaf4;--top-2:#ece8dc;--lamp-off:#d9d4c4;--lamp-ring:#a39e8a;--count-bg:#e0dbcc;--track:#ddd8c8;--seg-on:#d9d3c0;
+--row-edge:#d9d4c4;--scroll-thumb:#b3ae9b}}
 *{box-sizing:border-box}
-html{background:var(--board);scrollbar-color:#3a4430 var(--board)}
-body{margin:0;min-height:100vh;color:var(--ink);font:13px/1.5 var(--mono);font-variant-numeric:tabular-nums;
-background:radial-gradient(1200px 500px at 15% -10%,rgba(255,178,46,.07),transparent 60%),
-repeating-linear-gradient(0deg,rgba(255,255,255,.012) 0 1px,transparent 1px 3px),var(--board)}
+html{background:var(--board);scrollbar-color:var(--scroll-thumb) var(--board)}
+body{margin:0;min-height:100vh;color:var(--ink);font:14px/1.55 var(--sans);font-variant-numeric:tabular-nums;
+background:radial-gradient(1200px 500px at 15% -10%,var(--wash),transparent 60%),var(--board)}
 a{color:var(--amber);text-decoration:none}a:hover{text-decoration:underline}
 :focus-visible{outline:2px solid var(--amber);outline-offset:2px}
-code{font:inherit;color:var(--ink);background:#0f120c;border:1px solid var(--rule);border-radius:3px;padding:1px 6px;word-break:break-word}
+code{font-family:var(--mono);font-size:max(12px,.93em);color:var(--ink);background:var(--field);border:1px solid var(--rule);
+border-radius:3px;padding:1px 6px;overflow-wrap:anywhere}
 p{margin:0 0 12px}
-.top{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:14px 28px;border-bottom:1px solid var(--rule);
-background:linear-gradient(180deg,#171c12,#10130d)}
-.mark{font-weight:800;letter-spacing:.32em;font-size:15px;color:var(--amber);text-shadow:0 0 14px var(--amber-glow)}
+main>p,.note,.callout p,.step p,.form-foot .note{max-width:80ch}
+.top{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:12px 28px;border-bottom:1px solid var(--rule);
+background:linear-gradient(180deg,var(--top-1),var(--top-2))}
+.mark{font:800 17px/1.2 var(--mono);letter-spacing:.08em;color:var(--amber)}
 .mark:hover{text-decoration:none}
-.mark small{display:block;letter-spacing:.18em;font-size:10px;color:var(--dim);font-weight:400;text-shadow:none}
+.mark small{display:block;letter-spacing:.04em;font-size:12px;color:var(--dim);font-weight:400}
 .spacer{flex:1}
 .nav{display:flex;gap:6px;flex-wrap:wrap}
-.btn,button{font:inherit;cursor:pointer;color:var(--ink);background:var(--panel-2);border:1px solid var(--rule);
-padding:6px 12px;border-radius:3px;letter-spacing:.06em;text-transform:uppercase;font-size:11px;font-weight:700;display:inline-block}
+.nav .btn{white-space:nowrap}
+.btn,button{font:700 12px/1.2 var(--sans);cursor:pointer;color:var(--ink);background:var(--panel-2);border:1px solid var(--edge);
+padding:8px 13px;min-height:32px;border-radius:3px;letter-spacing:.06em;text-transform:uppercase;overflow-wrap:normal;
+display:inline-flex;align-items:center;justify-content:center;vertical-align:middle}
 .btn:hover,button:hover{border-color:var(--amber);color:var(--amber);text-decoration:none}
 .nav .on{border-color:var(--amber);color:var(--amber);box-shadow:inset 0 -2px 0 var(--amber)}
-button.run{background:var(--amber);border-color:var(--amber);color:#1a1205}
-button.run:hover{background:#ffc75e;color:#1a1205;box-shadow:0 0 18px var(--amber-glow)}
-button.stop{color:var(--stop);border-color:rgba(255,91,79,.45)}
+button.run{background:var(--amber-fill);border-color:var(--amber-fill);color:var(--on-accent)}
+button.run:hover{background:var(--amber-hover);color:var(--on-accent);box-shadow:0 0 18px var(--amber-glow)}
+button.stop{color:var(--stop);border-color:var(--stop-line)}
 button.stop:hover{color:var(--stop);border-color:var(--stop)}
 .busy{display:flex;align-items:center;gap:8px;padding:5px 12px;border:1px solid var(--amber);border-radius:3px;
-color:var(--amber);font-size:11px;letter-spacing:.06em;text-transform:uppercase;font-weight:700}
-.who{text-align:right;color:var(--dim);font-size:11px;letter-spacing:.08em}
-.who b{display:block;color:var(--ink);font-size:20px;letter-spacing:.06em;font-weight:600}
+color:var(--amber);font-size:12px;letter-spacing:.06em;text-transform:uppercase;font-weight:700}
+.who{text-align:right;color:var(--dim);font-size:12px;letter-spacing:.04em}
+.who b{display:block;color:var(--ink);font:600 15px/1.3 var(--mono);letter-spacing:.04em}
 main{padding:22px 28px 60px;max-width:1760px;margin:0 auto}
-h1{font-size:12px;letter-spacing:.3em;text-transform:uppercase;color:var(--dim);margin:0 0 16px;font-weight:600}
-h2{display:flex;align-items:center;gap:12px;font-size:11px;letter-spacing:.28em;text-transform:uppercase;color:var(--amber);
-margin:34px 0 12px;font-weight:700}
+h1{font:700 22px/1.25 var(--sans);letter-spacing:0;color:var(--ink);margin:0 0 16px}
+h2{display:flex;align-items:center;gap:12px;font:700 13px/1.3 var(--sans);letter-spacing:.1em;text-transform:uppercase;
+color:var(--amber);margin:34px 0 12px}
 h2::after{content:"";flex:1;border-top:1px solid var(--rule)}
-h3{font-size:12px;letter-spacing:.12em;text-transform:uppercase;margin:0 0 12px;color:var(--ink)}
-h3 small{display:block;margin-top:2px;color:var(--faint);font-weight:400;letter-spacing:0;text-transform:none}
-.note{color:var(--dim);font-size:12px}
+h3{font:700 15px/1.3 var(--sans);letter-spacing:0;margin:0 0 12px;color:var(--ink)}
+h3 small{display:block;margin-top:3px;color:var(--faint);font:400 12px/1.4 var(--mono);overflow-wrap:anywhere}
+.note{color:var(--dim);font-size:13px}
 .muted{color:var(--faint)}
-.chip{display:inline-block;padding:1px 7px;border-radius:2px;font-size:10px;letter-spacing:.12em;text-transform:uppercase;
-font-weight:700;border:1px solid var(--rule);color:var(--dim);white-space:nowrap;vertical-align:1px}
-.chip.ok{color:var(--go);border-color:rgba(79,224,140,.4)}.chip.bad{color:var(--stop);border-color:rgba(255,91,79,.45)}
-.chip.warn{color:var(--amber);border-color:#6b4e12}.chip.muted{color:var(--faint)}
-.chip.run{color:#1a1205;background:var(--amber);border-color:var(--amber)}
-.lamp{display:inline-block;flex:none;width:11px;height:11px;border-radius:50%;background:#20261a;box-shadow:inset 0 0 0 1px #2c3324;
-vertical-align:-1px}
-.lamp.ok{background:var(--go);box-shadow:0 0 8px rgba(79,224,140,.55)}
-.lamp.bad{background:var(--stop);box-shadow:0 0 8px rgba(255,91,79,.6)}
-.lamp.warn{background:var(--amber);box-shadow:0 0 8px var(--amber-glow)}
-.lamp.run{background:var(--amber);box-shadow:0 0 10px var(--amber-glow);animation:pulse 1.2s ease-in-out infinite}
+.chip{display:inline-block;padding:1px 7px;border-radius:2px;font:700 11.5px/1.5 var(--mono);letter-spacing:.06em;text-transform:uppercase;
+border:1px solid var(--edge);color:var(--dim);white-space:nowrap;vertical-align:1px}
+.chip.ok{color:var(--go);border-color:var(--go-line)}.chip.bad{color:var(--stop);border-color:var(--stop-line)}
+.chip.warn{color:var(--amber);border-color:var(--amber-line)}.chip.muted{color:var(--faint);border-color:var(--rule)}
+.chip.run{color:var(--on-accent);background:var(--amber-fill);border-color:var(--amber-fill)}
+.lamp{display:inline-block;flex:none;width:11px;height:11px;border-radius:50%;background:var(--lamp-off);
+box-shadow:inset 0 0 0 1px var(--lamp-ring);vertical-align:-1px}
+.lamp.ok{background:var(--go);box-shadow:0 0 8px var(--go-glow)}
+.lamp.bad{background:var(--stop);box-shadow:0 0 8px var(--stop-glow)}
+.lamp.warn{background:var(--amber-fill);box-shadow:0 0 8px var(--amber-glow),inset 0 0 0 1px var(--amber)}
+.lamp.run{background:var(--amber-fill);box-shadow:0 0 10px var(--amber-glow),inset 0 0 0 1px var(--amber);
+animation:pulse 1.2s ease-in-out infinite}
 @keyframes pulse{50%{opacity:.3}}
-.sign{display:inline-block;padding:3px 10px 2px;font-weight:800;letter-spacing:.24em;text-transform:uppercase;font-size:11px;
-color:#fff;border-radius:3px;background:var(--steel);box-shadow:inset 0 0 0 2px rgba(255,255,255,.25)}
-.sign.stage{background:#b8740f}
-.sign.prod{background:#b3261e;border:4px solid;border-image:repeating-linear-gradient(-45deg,var(--hazard) 0 5px,#111 5px 10px) 4}
+.sign{display:inline-block;padding:3px 9px 4px;font:800 11.5px/1.3 var(--mono);letter-spacing:.08em;text-transform:uppercase;
+color:#fff;border-radius:3px;background:var(--steel-fill)}
+.sign.stage{background:var(--stage-fill)}
+.sign.prod{background:repeating-linear-gradient(-45deg,var(--hazard) 0 4px,#111 4px 8px) left bottom/100% 3px no-repeat,var(--prod-fill)}
 .callout{border:1px solid var(--rule);border-left:4px solid var(--go);background:var(--panel);padding:10px 14px;margin:0 0 16px;border-radius:3px}
 .callout.bad{border-left-color:var(--stop)}.callout.warn{border-left-color:var(--amber)}
 .callout p:last-child{margin:0}
 .tape{margin:0 0 16px;padding:12px 16px;color:#111;font-weight:800;letter-spacing:.04em;border-radius:3px;
-background:repeating-linear-gradient(-45deg,var(--hazard) 0 18px,#171717 18px 36px)}
+background:repeating-linear-gradient(-45deg,var(--hazard) 0 18px,#111 18px 36px)}
 .tape span{background:var(--hazard);padding:3px 10px;line-height:2;box-decoration-break:clone;-webkit-box-decoration-break:clone}
-.stats{display:flex;gap:34px;flex-wrap:wrap;padding:14px 18px;background:var(--panel);border:1px solid var(--rule);border-radius:4px}
-.stat b{display:block;font-size:22px;color:var(--ink);font-weight:700}
-.stat span{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--faint)}
+.stats{display:flex;gap:14px 34px;flex-wrap:wrap;padding:14px 18px;background:var(--panel);border:1px solid var(--rule);border-radius:4px}
+.stat b{display:block;font:700 22px/1.3 var(--mono);color:var(--ink)}
+.stat span{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
 .units{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:10px}
 .unit{display:flex;flex-direction:column;gap:6px;background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--faint);
-border-radius:4px;padding:12px 14px;animation:arrive .5s cubic-bezier(.2,.8,.2,1) both}
+border-radius:4px;padding:12px 14px}
 .unit.is-ok{border-left-color:var(--go)}.unit.is-bad{border-left-color:var(--stop)}.unit.is-warn,.unit.is-run{border-left-color:var(--amber)}
-.unit .name{display:flex;align-items:center;gap:9px;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);font-weight:700}
-.unit .state{font-size:13px}
-.unit .detail{color:var(--dim);font-size:11px}
+.unit .name{display:flex;align-items:center;gap:9px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);font-weight:700}
+.unit .state{font-size:14px}
+.unit .detail{color:var(--dim);font:12px/1.45 var(--mono);overflow-wrap:anywhere}
 .controls{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto;padding-top:6px}
 .controls form{margin:0}
-.controls .btn,.controls button{padding:3px 9px;font-size:10px}
+.controls .btn,.controls button{padding:5px 10px;min-height:28px;font-size:11.5px}
 .board{width:100%;border-collapse:separate;border-spacing:0 6px}
-.board th{white-space:nowrap;text-align:left;font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--faint);
+.board th{white-space:nowrap;text-align:left;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);
 font-weight:600;padding:0 12px 2px}
-.board td{background:var(--panel);padding:10px;vertical-align:top;border-top:1px solid var(--rule);border-bottom:1px solid #0a0c08}
+.board td{background:var(--panel);padding:10px;vertical-align:top;border-top:1px solid var(--rule);border-bottom:1px solid var(--row-edge);
+font-family:var(--mono);font-size:13px}
+.board td[data-label]::before{content:none}
 .board td:first-child{border-radius:4px 0 0 4px;border-left:3px solid var(--amber)}
 .board td:last-child{border-radius:0 4px 4px 0}
 .board tr.is-ok td:first-child{border-left-color:var(--go)}.board tr.is-bad td:first-child{border-left-color:var(--stop)}
 .board tr.is-idle td:first-child{border-left-color:var(--faint)}
 .board td.project{min-width:12em;max-width:20em}
 .board td.project a{font-weight:700;font-size:14px}
-.board td.project small{display:block;margin-top:3px;color:var(--faint);font-size:11px;word-break:break-all}
-.when{display:block;font-size:11px}
-.board td.target{max-width:18em;word-break:break-all}
-.scroll{overflow-x:auto;scrollbar-color:#3a4430 transparent}
+.board td.project small{display:block;margin-top:3px;color:var(--faint);font-size:12px;word-break:normal;overflow-wrap:anywhere}
+.when{display:block;font-size:12px}
+.board td.when,td.when{display:table-cell}
+.board td.target{max-width:18em;word-break:normal;overflow-wrap:anywhere}
+.scroll{overflow-x:auto;max-width:100%;scrollbar-color:var(--scroll-thumb) transparent}
 .board .line{display:block;white-space:nowrap}
 .board .line+.line{margin-top:4px}
-.board .line b{display:inline-block;min-width:4.6em;color:var(--faint);font-weight:400;font-size:10px;letter-spacing:.12em;text-transform:uppercase}
-.board tbody tr{animation:arrive .5s cubic-bezier(.2,.8,.2,1) both}
-@keyframes arrive{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+.board .line b{display:inline-block;min-width:5.4em;color:var(--dim);font-weight:600;font-size:11.5px;letter-spacing:.06em;text-transform:uppercase}
 .facts{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--rule);margin:0 0 12px}
-.facts th{width:16em;text-align:left;vertical-align:top;font-size:10px;letter-spacing:.18em;text-transform:uppercase;
-color:var(--faint);font-weight:600;padding:10px 14px;border-bottom:1px solid var(--rule)}
-.facts td{padding:9px 14px;border-bottom:1px solid var(--rule);word-break:break-word}
+.facts th{width:16em;text-align:left;vertical-align:top;font-size:12px;letter-spacing:.08em;text-transform:uppercase;
+color:var(--dim);font-weight:600;padding:10px 14px;border-bottom:1px solid var(--rule)}
+.facts td{padding:9px 14px;border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:13px;word-break:normal;overflow-wrap:anywhere}
 .facts tr:last-child th,.facts tr:last-child td{border-bottom:none}
-.term{background:#070806;border:1px solid var(--rule);border-radius:4px;overflow:auto;max-height:70vh;margin:0 0 16px;
-box-shadow:inset 0 0 40px rgba(0,0,0,.6)}
+.term{background:var(--term-bg);border:1px solid var(--rule);border-radius:4px;overflow:auto;max-height:70vh;margin:0 0 16px;
+font:13px/1.5 var(--mono)}
 .term ol{margin:0;padding:12px 0;counter-reset:l;list-style:none}
-.term li{counter-increment:l;display:grid;grid-template-columns:56px 1fr;min-height:1.5em;white-space:pre-wrap;word-break:break-all;color:#d8e8c8}
-.term li::before{content:counter(l);text-align:right;padding-right:14px;color:var(--faint);user-select:none}
-.term li:hover{background:#10140c}
-.term.diff li.add{color:var(--go)}
-.term.diff li.del{color:var(--stop)}
-.term.diff li.hunk{color:var(--steel)}
-pre.json{margin:0 0 16px;padding:12px 16px;background:#070806;border:1px solid var(--rule);border-radius:4px;color:#d8e8c8;
-font:inherit;overflow:auto;max-height:60vh}
+.term li{counter-increment:l;display:grid;grid-template-columns:56px 1fr;min-height:1.5em;white-space:pre-wrap;word-break:break-all;color:var(--term-ink)}
+.term li::before{content:counter(l);text-align:right;padding-right:14px;color:var(--term-faint);user-select:none}
+.term li:hover{background:var(--term-hover)}
+.term.diff li.add{color:var(--term-go)}
+.term.diff li.del{color:var(--term-stop)}
+.term.diff li.hunk{color:var(--term-steel)}
+pre.json{margin:0 0 16px;padding:12px 16px;background:var(--term-bg);border:1px solid var(--rule);border-radius:4px;color:var(--term-ink);
+font:13px/1.5 var(--mono);overflow:auto;max-height:60vh}
 .subnav{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
 .subnav select{width:auto}
 .list{width:100%;border-collapse:collapse}
-.list th{text-align:left;font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);font-weight:600;
+.list th{text-align:left;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);font-weight:600;
 padding:6px 10px;border-bottom:1px solid var(--rule)}
-.list td{padding:7px 10px;border-bottom:1px solid var(--rule);word-break:break-all}
+.list td{padding:7px 10px;border-bottom:1px solid var(--rule);font-family:var(--mono);font-size:13px;word-break:normal;overflow-wrap:anywhere}
+.grants td,.grants td.id{font-family:var(--mono);font-size:13px}
 .deck{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr));gap:12px;align-items:start}
 form.action{margin:0;background:var(--panel);border:1px solid var(--rule);border-top:2px solid var(--amber);border-radius:4px;padding:14px 16px}
 form.action.danger{border-top:7px solid transparent;
-background:linear-gradient(var(--panel),var(--panel)) padding-box,repeating-linear-gradient(-45deg,var(--hazard) 0 10px,#171717 10px 20px) border-box}
-label{display:grid;grid-template-columns:minmax(9em,14em) minmax(0,1fr);gap:10px;align-items:center;margin:0 0 8px;color:var(--dim);font-size:12px}
+background:linear-gradient(var(--panel),var(--panel)) padding-box,repeating-linear-gradient(-45deg,var(--hazard) 0 10px,#111 10px 20px) border-box}
+label{display:grid;grid-template-columns:minmax(9em,14em) minmax(0,1fr);gap:10px;align-items:center;margin:0 0 8px;color:var(--dim);font-size:13px}
 label.check{display:flex;gap:9px;align-items:flex-start;color:var(--ink)}
-input[type=text],input[type=password],textarea,select{font:inherit;color:var(--ink);background:#0f120c;border:1px solid var(--rule);border-radius:3px;
-padding:6px 9px;width:100%;caret-color:var(--amber)}
+input[type=text],input[type=password],textarea,select{font:14px/1.4 var(--sans);color:var(--ink);background:var(--field);
+border:1px solid var(--edge);border-radius:3px;padding:7px 10px;min-height:36px;width:100%;caret-color:var(--amber)}
+textarea{font-family:var(--mono);font-size:13px}
 input[type=text]:focus,input[type=password]:focus,textarea:focus,select:focus{outline:none;border-color:var(--amber)}
-input::placeholder,textarea::placeholder{color:var(--faint)}
+input[type=text]:focus-visible,input[type=password]:focus-visible,textarea:focus-visible,select:focus-visible
+{outline:2px solid var(--amber);outline-offset:1px;border-color:var(--amber)}
+input::placeholder,textarea::placeholder{color:var(--faint);opacity:1}
 textarea{min-height:7em;resize:vertical}
-input[type=checkbox]{accent-color:var(--amber);width:15px;height:15px;margin:1px 0 0}
+input[type=checkbox],input[type=radio]{accent-color:var(--amber-fill);width:16px;height:16px;margin:2px 0 0;flex:none}
 .form-foot{display:flex;justify-content:space-between;align-items:flex-end;gap:14px;margin-top:12px}
 .form-foot .note{margin:0}
 .form-foot button{flex:none}
+.form-foot button:not(.run):not(.go):not(.stop){border-color:var(--amber);color:var(--amber)}
 .runs{list-style:none;margin:0;padding:0;border-top:1px solid var(--rule)}
 .runs li{display:grid;grid-template-columns:18px 150px minmax(0,1fr) 110px 150px;gap:14px;align-items:center;padding:9px 6px;
 border-bottom:1px solid var(--rule)}
 .runs li:hover{background:var(--panel)}
-.bar{height:6px;background:#1c2217;border-radius:3px;overflow:hidden;margin:0 0 16px}
+.bar{height:6px;background:var(--track);border-radius:3px;overflow:hidden;margin:0 0 16px}
 .bar i{display:block;height:100%;background:var(--go)}
 .bar.bad i{background:var(--stop)}
-.bar.run i{background:repeating-linear-gradient(-45deg,var(--amber) 0 8px,#8a5c10 8px 16px);background-size:22px 22px;
+.bar.run i{background:repeating-linear-gradient(-45deg,var(--amber-fill) 0 8px,var(--amber-deep) 8px 16px);background-size:22px 22px;
 animation:march 1s linear infinite}
 @keyframes march{to{background-position:22px 0}}
 details{background:var(--panel);border:1px solid var(--rule);border-radius:4px;margin:0 0 10px}
-details>summary{cursor:pointer;padding:10px 14px;font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);
-font-weight:700;list-style:none}
+details>summary{cursor:pointer;padding:10px 14px;font:700 12px/1.4 var(--sans);letter-spacing:.08em;text-transform:uppercase;color:var(--dim);
+list-style:none}
 details>summary::-webkit-details-marker{display:none}
 details>summary::before{content:"\\25B8  ";color:var(--amber)}
 details[open]>summary::before{content:"\\25BE  "}
@@ -2126,49 +2161,55 @@ details>.inner{padding:0 14px 12px}
 details .term{margin:0}
 .guide{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:4px 20px}
 .guide label{grid-template-columns:1fr;gap:4px;align-content:start}
-.guide label small{color:var(--faint);font-size:11px;line-height:1.35}
+.guide label small{color:var(--faint);font-size:12px;line-height:1.4}
 details.more{margin:12px 0 0;background:transparent}
 details.more .inner{padding-top:4px}
 .chosen{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:22px 0 14px}
 .steps{list-style:none;margin:0;padding:0;counter-reset:step}
 .step{counter-increment:step;display:grid;grid-template-columns:52px minmax(0,1fr);column-gap:14px;margin:0 0 10px;padding:14px 16px;
-background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--amber);border-radius:4px;
-animation:arrive .5s cubic-bezier(.2,.8,.2,1) both}
-.step::before{content:counter(step,decimal-leading-zero);grid-row:1/span 20;font-size:26px;font-weight:800;line-height:1.1;
-color:var(--amber);text-shadow:0 0 12px var(--amber-glow)}
+background:var(--panel);border:1px solid var(--rule);border-left:3px solid var(--amber);border-radius:4px}
+.step::before{content:counter(step,decimal-leading-zero);grid-row:1/span 20;font:800 26px/1.1 var(--mono);color:var(--amber)}
 .step.is-warn{border-left-color:var(--hazard)}
 .step h3{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 6px}
 .step p{margin:0 0 8px}
 .step .tape{margin:4px 0 10px;padding:8px 12px}
-.step .source{margin:8px 0 0;color:var(--faint);font-size:11px}
-.block-label{margin:8px 0 4px;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint)}
-pre.cmd{margin:0;padding:10px 14px;background:#070806;border:1px solid var(--rule);border-radius:4px;color:#d8e8c8;font:inherit;
-overflow:auto;white-space:pre}
-.empty{padding:30px;text-align:center;color:var(--dim);border:1px dashed var(--rule);border-radius:4px}
+.step .source{margin:8px 0 0;color:var(--faint);font:12px/1.4 var(--mono);overflow-wrap:anywhere}
+.block-label{margin:8px 0 4px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);font-weight:600}
+pre.cmd{margin:0;padding:10px 14px;background:var(--term-bg);border:1px solid var(--rule);border-radius:4px;color:var(--term-ink);
+font:13px/1.5 var(--mono);overflow:auto;white-space:pre}
+.empty{padding:30px;text-align:center;color:var(--dim);border:1px dashed var(--edge);border-radius:4px}
 .nav i{font-style:normal}
-.nav i.count{margin-left:7px;padding:0 5px;border-radius:2px;background:#20261a;color:var(--dim);font-size:10px}
-.nav .on i.count{background:var(--amber);color:#1a1205}
+.nav i.count{margin-left:7px;padding:0 5px;border-radius:2px;background:var(--count-bg);color:var(--dim);font:700 11.5px/1.5 var(--mono)}
+.nav .on i.count{background:var(--amber-fill);color:var(--on-accent)}
 .nav i.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-left:7px;vertical-align:1px}
-.nav i.dot.warn{background:var(--amber);box-shadow:0 0 8px var(--amber-glow)}
-.nav i.dot.bad{background:var(--stop);box-shadow:0 0 8px rgba(255,91,79,.6);animation:pulse 1.6s ease-in-out infinite}
-button.go{background:var(--amber);border-color:var(--amber);color:#1a1205}
-button.go:hover{background:#ffc75e;color:#1a1205;box-shadow:0 0 18px var(--amber-glow)}
+.nav i.dot.warn{background:var(--amber-fill);box-shadow:0 0 8px var(--amber-glow),inset 0 0 0 1px var(--amber)}
+.nav i.dot.bad{background:var(--stop);box-shadow:0 0 8px var(--stop-glow);animation:pulse 1.6s ease-in-out infinite}
+button.go{background:var(--amber-fill);border-color:var(--amber-fill);color:var(--on-accent)}
+button.go:hover{background:var(--amber-hover);color:var(--on-accent);box-shadow:0 0 18px var(--amber-glow)}
 h2[id]{scroll-margin-top:16px}
 .attention{margin:12px 0 0;background:var(--panel);border:1px solid var(--rule);border-left:4px solid var(--stop);border-radius:4px;
 padding:10px 14px 6px}
 .attention.calm{display:flex;gap:10px;align-items:center;border-left-color:var(--go);color:var(--dim);padding:10px 14px}
-.attention-title{margin:0 0 4px;font-size:10px;letter-spacing:.24em;text-transform:uppercase;color:var(--stop);font-weight:700}
+.attention-title{margin:0 0 4px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--stop);font-weight:700}
 .attention ul{list-style:none;margin:0;padding:0;columns:2 420px;column-gap:28px}
 .attention li{break-inside:avoid}
 .attention a{display:flex;gap:10px;align-items:center;padding:4px 0;color:var(--ink)}
 .attention a:hover span{color:var(--amber)}
-.lv{display:inline-block;min-width:6.2em;text-align:center;padding:2px 6px;border-radius:2px;font-size:10px;letter-spacing:.1em;
-text-transform:uppercase;font-weight:800;border:1px solid transparent;white-space:nowrap}
+.attention details{background:transparent;border:none;border-top:1px dashed var(--rule);border-radius:0;margin:4px 0 0}
+.attention details>summary{display:flex;gap:10px;align-items:center;padding:6px 0;font:400 14px/1.45 var(--sans);letter-spacing:0;
+text-transform:none;color:var(--ink)}
+.attention details>summary::before{order:9;content:"\\25B8  show";font:700 12px/1 var(--sans);letter-spacing:.06em;text-transform:uppercase;
+color:var(--amber)}
+.attention details[open]>summary::before{content:"\\25BE  hide"}
+.attention details>summary:hover span{color:var(--amber)}
+.attention details ul{padding:0 0 6px 21px}
+.lv{display:inline-block;min-width:6.2em;text-align:center;padding:2px 6px;border-radius:2px;font:800 11.5px/1.5 var(--mono);letter-spacing:.06em;
+text-transform:uppercase;border:1px solid transparent;white-space:nowrap}
 .lv-none{color:var(--faint);min-width:0}
-.lv.lv-phpfpm-readonly{color:#b7cdf0;border-color:rgba(111,147,201,.6);background:rgba(111,147,201,.14)}
-.lv.lv-phpfpm{color:var(--go);border-color:rgba(79,224,140,.5);background:rgba(79,224,140,.1)}
-.lv.lv-docker{color:#1a1205;background:var(--amber);border-color:var(--amber)}
-.lv.lv-full{color:#fff;background:#b3261e;border:3px solid;padding:0 4px;
+.lv.lv-phpfpm-readonly{color:var(--steel-ink);border-color:var(--steel-line);background:var(--steel-tint)}
+.lv.lv-phpfpm{color:var(--go);border-color:var(--go-line);background:var(--go-tint)}
+.lv.lv-docker{color:var(--on-accent);background:var(--amber-fill);border-color:var(--amber-fill)}
+.lv.lv-full{color:#fff;background:var(--prod-fill);border:3px solid;padding:0 4px;
 border-image:repeating-linear-gradient(-45deg,var(--hazard) 0 4px,#111 4px 8px) 3}
 .ramp{list-style:none;margin:14px 0 0;padding:0;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));
 border:1px solid var(--rule);border-radius:4px;background:var(--panel)}
@@ -2176,55 +2217,53 @@ border:1px solid var(--rule);border-radius:4px;background:var(--panel)}
 .ramp li+li{border-left:1px solid var(--rule)}
 .ramp li:not(:last-child)::after{content:"\\25B8";position:absolute;right:-6px;top:38%;color:var(--faint);background:var(--panel);
 font-size:12px;line-height:1;z-index:1}
-.ramp b{display:block;font-size:11px;letter-spacing:.16em;text-transform:uppercase;margin-bottom:3px}
-.ramp span{display:block;font-size:11px;color:var(--dim);line-height:1.4}
-.ramp .lv-phpfpm-readonly{border-top-color:var(--steel)}.ramp .lv-phpfpm-readonly b{color:#b7cdf0}
+.ramp b{display:block;font:700 12px/1.4 var(--mono);letter-spacing:.08em;text-transform:uppercase;margin-bottom:3px}
+.ramp span{display:block;font-size:13px;color:var(--dim);line-height:1.45}
+.ramp .lv-phpfpm-readonly{border-top-color:var(--steel)}.ramp .lv-phpfpm-readonly b{color:var(--steel-ink)}
 .ramp .lv-phpfpm{border-top-color:var(--go)}.ramp .lv-phpfpm b{color:var(--go)}
 .ramp .lv-docker{border-top-color:var(--amber)}.ramp .lv-docker b{color:var(--amber)}
 .ramp .lv-full{border-top-color:transparent;border-image:repeating-linear-gradient(-45deg,var(--hazard) 0 6px,#111 6px 12px) 3 0 0 0}
 .ramp .lv-full b{color:var(--stop)}
 .deck.wide{grid-template-columns:minmax(0,1fr)}
 .grants{width:100%;border-collapse:collapse;margin:0 0 4px}
-.grants th{text-align:left;font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--faint);font-weight:600;
+.grants th{text-align:left;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);font-weight:600;
 padding:6px 8px;border-bottom:1px solid var(--rule)}
 .grants td{padding:6px 8px;border-bottom:1px solid var(--rule);vertical-align:middle}
 .grants tr:hover td{background:var(--panel-2)}
-.seg{display:inline-flex;flex-wrap:wrap;border:1px solid var(--rule);border-radius:3px;overflow:hidden;background:#0f120c}
+.seg{display:inline-flex;flex-wrap:wrap;border:1px solid var(--edge);border-radius:3px;overflow:hidden;background:var(--field)}
 .seg label{display:block;margin:0;position:relative}
 .seg input{position:absolute;opacity:0;width:1px;height:1px;margin:0}
-.seg span{display:block;padding:5px 11px;font-size:10px;letter-spacing:.1em;text-transform:uppercase;font-weight:700;color:var(--faint);
+.seg span{display:block;padding:6px 12px;font:700 11.5px/1.4 var(--mono);letter-spacing:.06em;text-transform:uppercase;color:var(--dim);
 cursor:pointer;border-left:1px solid var(--rule);transition:background .15s,color .15s}
 .seg label:first-child span{border-left:none}
 .seg span:hover{color:var(--ink);background:var(--panel-2)}
 .seg input:focus-visible+span{outline:2px solid var(--amber);outline-offset:-2px}
-.seg input:checked+span{color:var(--ink);background:#232a1c}
-.seg .lv-phpfpm-readonly input:checked+span{background:rgba(111,147,201,.3);color:#d6e4fa}
-.seg .lv-phpfpm input:checked+span{background:rgba(79,224,140,.22);color:var(--go)}
-.seg .lv-docker input:checked+span{background:var(--amber);color:#1a1205}
-.seg .lv-full input:checked+span{background:#b3261e;color:#fff;box-shadow:inset 0 -3px 0 var(--hazard)}
+.seg input:checked+span{color:var(--ink);background:var(--seg-on);box-shadow:inset 0 -3px 0 var(--ink)}
+.seg .lv-phpfpm-readonly input:checked+span{background:var(--steel-on);color:var(--steel-ink);box-shadow:inset 0 -3px 0 var(--steel)}
+.seg .lv-phpfpm input:checked+span{background:var(--go-on);color:var(--go);box-shadow:inset 0 -3px 0 var(--go)}
+.seg .lv-docker input:checked+span{background:var(--amber-fill);color:var(--on-accent);box-shadow:inset 0 -3px 0 var(--on-accent)}
+.seg .lv-full input:checked+span{background:var(--prod-fill);color:#fff;box-shadow:inset 0 -3px 0 var(--hazard)}
 .plates{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,420px),1fr));gap:14px;margin:0 0 14px}
 .plate{position:relative;background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--rule);border-radius:4px;
-padding:20px 22px 14px;overflow:hidden;animation:arrive .5s cubic-bezier(.2,.8,.2,1) both}
-.plate+.plate{animation-delay:70ms}
-.plate::before{content:"";position:absolute;inset:0 0 auto 0;height:3px;background:var(--amber);box-shadow:0 0 18px var(--amber-glow)}
-.plate-name{margin:0;font-size:10px;letter-spacing:.28em;text-transform:uppercase;color:var(--dim);font-weight:700}
-.plate-version{margin:6px 0 10px;font-size:34px;line-height:1.1;font-weight:800;color:var(--ink);text-shadow:0 0 22px rgba(255,178,46,.18);
-word-break:break-all}
-.plate-line{margin:0 0 6px;color:var(--dim);font-size:12px}
+padding:20px 22px 14px;overflow:hidden}
+.plate::before{content:"";position:absolute;inset:0 0 auto 0;height:3px;background:var(--amber-fill);box-shadow:0 0 18px var(--amber-glow)}
+.plate-name{margin:0;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--dim);font-weight:700}
+.plate-version{margin:6px 0 10px;font:800 34px/1.1 var(--mono);color:var(--ink);word-break:normal;overflow-wrap:anywhere}
+.plate-line{margin:0 0 6px;color:var(--dim);font-size:13px}
 .plate-actions{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 10px}
 .plate-actions form{margin:0}
 .plate-actions button{padding:9px 16px;font-size:12px}
 .split{display:grid;grid-template-columns:200px minmax(0,1fr);gap:30px;align-items:start}
 .index{position:sticky;top:16px;display:flex;flex-direction:column;gap:2px}
-.index a{padding:5px 12px;border-left:2px solid var(--rule);color:var(--dim);font-size:12px}
+.index a{padding:5px 12px;border-left:2px solid var(--rule);color:var(--dim);font-size:13px}
 .index a:hover{color:var(--amber);border-left-color:var(--amber);text-decoration:none}
 .index .block-label{margin:4px 0 6px}.index .block-label~.block-label{margin-top:18px}
-.index .note{margin-top:16px;font-size:11px;line-height:1.45}
+.index .note{margin-top:16px;font-size:12px;line-height:1.45}
 .sections>h2:first-child{margin-top:0}
-.pointer{display:flex;flex-direction:column;gap:6px;align-items:flex-start;padding:14px 16px;border:1px dashed #3a4430;border-radius:4px}
+.pointer{display:flex;flex-direction:column;gap:6px;align-items:flex-start;padding:14px 16px;border:1px dashed var(--edge);border-radius:4px}
 .pointer h3{margin:0}
-a.btn.go{background:var(--amber);border-color:var(--amber);color:#1a1205}
-a.btn.go:hover{background:#ffc75e;color:#1a1205;box-shadow:0 0 18px var(--amber-glow)}
+a.btn.go{background:var(--amber-fill);border-color:var(--amber-fill);color:var(--on-accent)}
+a.btn.go:hover{background:var(--amber-hover);color:var(--on-accent);box-shadow:0 0 18px var(--amber-glow)}
 .toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0 6px}
 .toolbar .search,form.search{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0}
 .search input[type=text]{width:18em}
@@ -2232,25 +2271,28 @@ a.btn.go:hover{background:#ffc75e;color:#1a1205;box-shadow:0 0 18px var(--amber-
 .toolbar>a.btn{margin-left:auto}
 .board.keys td{vertical-align:middle}
 .board.keys td.keyname a{font-weight:700;font-size:14px}
-.board.keys td.keyname small{display:block;color:var(--faint);font-size:10px;max-width:15em;overflow:hidden;text-overflow:ellipsis}
+.board.keys td.keyname small{display:block;color:var(--faint);font-size:12px;max-width:15em;overflow:hidden;text-overflow:ellipsis}
 .tallied{display:inline-block;white-space:nowrap;margin:0 6px 4px 0}
 .tally{display:inline-block;margin-right:4px;color:var(--ink);font-weight:700}
 .keyhead{display:grid;grid-template-columns:minmax(16em,1.3fr) minmax(0,.8fr) minmax(0,.8fr) minmax(0,1.4fr) minmax(0,1fr) minmax(0,1fr);gap:18px;padding:16px 20px;
 background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--rule);border-top:3px solid var(--amber);border-radius:4px}
 .keyhead p{margin:0}
-.keyhead code{font-size:10px;word-break:break-all;color:var(--dim)}
+.keyhead code{font-size:12px;word-break:normal;overflow-wrap:anywhere;color:var(--dim)}
 .keyhead .plate-name{margin-bottom:6px}
-.keytitle{font-size:26px;font-weight:800;line-height:1.1;margin:0 0 6px!important;color:var(--amber);text-shadow:0 0 16px var(--amber-glow)}
+.keytitle{font:800 26px/1.1 var(--mono);margin:0 0 6px!important;color:var(--amber);overflow-wrap:anywhere}
 .bulkbox{background:var(--panel);border:1px solid var(--rule);border-radius:4px;padding:6px 16px 10px}
 form.bulk{display:grid;grid-template-columns:5.5em auto minmax(0,1fr) auto;gap:14px;align-items:center;padding:8px 0;
 border-bottom:1px dashed var(--rule);margin:0}
 .bulk-only{display:flex;gap:14px;flex-wrap:wrap}
-.bulk-only label.check{margin:0;color:var(--dim);font-size:12px}
+.bulk-only label.check{margin:0;color:var(--dim);font-size:13px}
 .bulkbox .note{margin:8px 0 0}
 .grants.projects td{padding:7px 10px}
 .grants.projects td.id{width:14em;font-weight:700}
-.envs{display:grid;grid-template-columns:repeat(auto-fill,minmax(29em,max-content));gap:8px 22px}
-.env{display:flex;gap:8px;align-items:center}
+.envs{display:grid;grid-template-columns:minmax(0,max-content);gap:8px 22px}
+.env{display:flex;gap:8px;align-items:center;min-width:0}
+.env:empty{display:none}
+@media (min-width:1180px){.envs{grid-template-columns:repeat(auto-fill,minmax(32em,max-content))}
+.env:empty{display:flex}.envs .env-prod{grid-column:1}.envs .env-stage{grid-column:2}}
 .env .sign{min-width:5.4em;text-align:center}
 .changes{background:var(--panel);border:1px solid var(--rule);border-left:4px solid var(--amber);border-radius:4px;padding:8px 16px;margin:0 0 14px}
 .changes ul{list-style:none;margin:0;padding:0;columns:2 380px;column-gap:28px}
@@ -2258,23 +2300,23 @@ border-bottom:1px dashed var(--rule);margin:0}
 .changes li.is-ok{color:var(--go)}.changes li.is-bad{color:var(--stop)}.changes li.is-warn{color:var(--amber)}.changes li.is-muted{color:var(--dim)}
 .board.activity td{vertical-align:middle;padding:8px 10px}
 .board.activity td.when{white-space:nowrap}
-.board.activity td.when small{display:block;color:var(--faint);font-size:10px}
+.board.activity td.when small{display:block;color:var(--faint);font-size:12px}
 .board.activity td.what{white-space:nowrap;color:var(--dim)}
 .board.activity td.text code{margin-left:4px}
 .board.activity td.text small{display:block;margin-top:2px}
-.term.typed li::before{content:"$";color:var(--amber)}
-.lv.lv-db{color:#cfe0fa;border-color:rgba(111,147,201,.6);background:rgba(111,147,201,.14)}
-.lv.lv-fresh{color:#1a1205;background:#e8c56b;border-color:#e8c56b}
+.term.typed li::before{content:"$";color:var(--term-amber)}
+.lv.lv-db{color:var(--steel-ink);border-color:var(--steel-line);background:var(--steel-tint)}
+.lv.lv-fresh{color:var(--on-accent);background:var(--fresh-fill);border-color:var(--fresh-fill)}
 .ramp.backups{grid-template-columns:repeat(2,minmax(0,1fr));margin-top:6px}
-.ramp .lv-db{border-top-color:var(--steel)}.ramp .lv-db b{color:#cfe0fa}
-.ramp .lv-fresh{border-top-color:#e8c56b}.ramp .lv-fresh b{color:#e8c56b}
-.seg .lv-db input:checked+span{background:rgba(111,147,201,.3);color:#d6e4fa}
-.seg .lv-fresh input:checked+span{background:#e8c56b;color:#1a1205}
-.lv.lv-tools{color:#d3eed6;border-color:rgba(108,178,122,.6);background:rgba(108,178,122,.14)}
-.seg .lv-tools input:checked+span{background:rgba(108,178,122,.3);color:#e0f4e3}
+.ramp .lv-db{border-top-color:var(--steel)}.ramp .lv-db b{color:var(--steel-ink)}
+.ramp .lv-fresh{border-top-color:var(--fresh-fill)}.ramp .lv-fresh b{color:var(--fresh)}
+.seg .lv-db input:checked+span{background:var(--steel-on);color:var(--steel-ink);box-shadow:inset 0 -3px 0 var(--steel)}
+.seg .lv-fresh input:checked+span{background:var(--fresh-fill);color:var(--on-accent);box-shadow:inset 0 -3px 0 var(--on-accent)}
+.lv.lv-tools{color:var(--tools-ink);border-color:var(--tools-line);background:var(--tools-tint)}
+.seg .lv-tools input:checked+span{background:var(--tools-on);color:var(--tools-ink);box-shadow:inset 0 -3px 0 var(--go)}
 .tabs{display:flex;gap:4px;margin:26px 0 0;border-bottom:1px solid var(--rule);scroll-margin-top:16px}
 .tabs a{padding:9px 16px 8px;border:1px solid var(--rule);border-bottom:none;border-radius:4px 4px 0 0;color:var(--dim);
-font-size:11px;letter-spacing:.14em;text-transform:uppercase;font-weight:700;background:var(--panel);margin-bottom:-1px}
+font-size:12px;letter-spacing:.08em;text-transform:uppercase;font-weight:700;background:var(--panel);margin-bottom:-1px;white-space:nowrap}
 .tabs a small{letter-spacing:0;text-transform:none;font-weight:400;color:var(--faint);margin-left:6px}
 .tabs a.on{color:var(--amber);background:var(--panel-2);border-color:var(--amber);border-bottom:1px solid var(--panel-2);
 box-shadow:inset 0 2px 0 var(--amber)}
@@ -2283,31 +2325,60 @@ form.bulk.everything{grid-template-columns:9.5em auto minmax(0,1fr) auto;backgro
 border-top:none;padding:10px 16px;margin:0 0 12px}
 form.bulk.tools{grid-template-columns:5.5em auto auto;justify-content:start}
 .tabs+.bulkbox,.tabs+form+.bulkbox,.tabs+form+.callout+.bulkbox{border-top:none;border-radius:0 0 4px 4px}
-.foot{margin-top:28px;color:var(--faint);font-size:11px}
+.foot{margin-top:28px;color:var(--faint);font-size:12px}
 .who a{color:var(--ink)}.who a:hover{color:var(--amber)}
-.who form.logout{display:inline;margin-left:10px}.who form.logout button{padding:3px 8px;font-size:10px}
+.who form.logout{display:inline;margin-left:10px}.who form.logout button{padding:4px 9px;min-height:26px;font-size:11.5px}
 main.login{max-width:440px;margin:12vh auto 0;padding:0 16px}main.login .mark{display:block;margin:0 0 22px;text-align:center}
 main.login form.action{padding:20px 22px}main.login label{grid-template-columns:7em minmax(0,1fr)}
-.list.runners{margin:0 0 18px}.list.runners td{word-break:normal;vertical-align:middle}
-.list.runners .controls{padding-top:0;margin:0;flex-wrap:nowrap}.list.runners .controls button{padding:4px 8px;font-size:10px}
-h3 a.muted{font-size:11px;font-weight:400;margin-left:8px}
+.list.runners{margin:0 0 18px}.list.runners td{word-break:normal;overflow-wrap:normal;vertical-align:middle}
+.list.runners .controls{padding-top:0;margin:0;flex-wrap:nowrap}
+.list.runners .controls button{padding:5px 10px;min-height:28px;font-size:11.5px}
+.scroll>.list.runners{margin:0}.scroll:has(>.list.runners){margin:0 0 18px}
+h3 a.muted{font:400 12px/1.4 var(--sans);margin-left:8px}
 .steps-list{margin:0 0 14px;padding-left:22px;color:var(--dim)}.steps-list li{margin:0 0 4px}.steps-list b{color:var(--ink)}
 .matrix td{vertical-align:middle}.matrix td:first-child{width:14em}
-.seg .pm-view input:checked+span{background:rgba(111,147,201,.3);color:#d6e4fa}
-.seg .pm-manage input:checked+span{background:rgba(255,178,46,.25);color:var(--amber)}
-.seg .pm-none input:checked+span{background:var(--panel-2);color:var(--ink)}
-""" + ''.join(f'.unit:nth-child({index}),.board tbody tr:nth-child({index}),.step:nth-child({index}){{animation-delay:{(index - 1) * 45}ms}}'
-              for index in range(2, 21)) + """
+.seg .pm-view input:checked+span{background:var(--steel-on);color:var(--steel-ink);box-shadow:inset 0 -3px 0 var(--steel)}
+.seg .pm-manage input:checked+span{background:var(--amber-tint);color:var(--amber);box-shadow:inset 0 -3px 0 var(--amber)}
+.seg .pm-none input:checked+span{background:var(--seg-on);color:var(--ink)}
 """ + guide_css() + """
-@media (max-width:900px){.top{padding:12px 16px}main{padding:18px 16px}.deck,.deck.wide{grid-template-columns:1fr}
+@media (max-width:900px){.top{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px 12px;padding:10px 16px}
+.top .mark{grid-column:1;grid-row:1}.top .who{grid-column:2;grid-row:1;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+justify-content:flex-end}
+.who b{display:inline;font-size:14px}.who form.logout{margin-left:0}.top .spacer{display:none}
+.top .nav,.top .busy{grid-column:1/-1}.top .busy{justify-self:start}
+.nav{flex-wrap:nowrap;overflow-x:auto;padding-bottom:4px;scrollbar-width:thin}.nav .btn{flex:none}
+main{padding:18px 16px}.deck,.deck.wide{grid-template-columns:1fr}
+.btn,button,.controls .btn,.controls button,.list.runners .controls button,.plate-actions button{min-height:40px;padding:9px 14px}
+.who form.logout button{min-height:36px}
+.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 16px;padding:12px 14px}
+.stat{min-width:0;overflow-wrap:anywhere}.stat b{font-size:19px}
+.form-foot{flex-direction:column;align-items:stretch}.form-foot button{align-self:flex-end}
 .split{grid-template-columns:1fr;gap:6px}.index{position:static;flex-direction:row;flex-wrap:wrap;gap:6px}.index .block-label,.index .note{display:none}
 .index a{border:1px solid var(--rule);border-radius:3px}.ramp{grid-template-columns:1fr 1fr}.ramp li:nth-child(3){border-left:none}
 .ramp li:not(:last-child)::after{display:none}
-.keyhead{grid-template-columns:1fr 1fr}form.bulk,form.bulk.tools{grid-template-columns:1fr}.search input[type=text]{width:100%}
+.keyhead{grid-template-columns:1fr 1fr}form.bulk,form.bulk.tools,form.bulk.everything{grid-template-columns:1fr}
+.search input[type=text]{width:100%}
 label{grid-template-columns:1fr;gap:4px}.board thead{display:none}.board,.board tbody,.board tr,.board td{display:block;width:100%}
 .board tr{margin-bottom:10px}.board td{border-radius:0!important;border-top:none;border-bottom:none;padding:6px 14px}
-.board td:first-child{padding-top:12px}.runs li{grid-template-columns:18px 1fr 100px}.runs li .hide{display:none}}
-@media (prefers-reduced-motion:reduce){*{animation:none!important}}
+.board td.project,.board td.target{max-width:none}.board .line{white-space:normal}
+.board td[data-label]::before{content:attr(data-label);display:block;margin-bottom:2px;font:600 12px/1.4 var(--sans);
+letter-spacing:.08em;text-transform:uppercase;color:var(--dim)}
+.board td[data-label=""]::before{content:none}
+.board td:first-child{padding-top:12px}.board td:last-child{padding-bottom:12px}
+.board.activity td.when,.board.activity td.what{white-space:normal}
+.facts,.facts tbody,.facts tr,.facts th,.facts td{display:block;width:100%}
+.facts th{padding:10px 12px 2px;border-bottom:none}.facts td{padding:2px 12px 10px}
+.grants.projects,.grants.projects tbody,.grants.projects tr,.grants.projects td{display:block;width:100%}
+.grants.projects td.id{width:auto;padding:10px 0 4px;border-bottom:none}.grants.projects td:last-child{padding:0 0 10px}
+.matrix td:first-child{width:auto}
+.envs{grid-template-columns:minmax(0,1fr)}.env{flex-wrap:wrap}
+.tabs{overflow-x:auto;flex-wrap:nowrap}
+.toolbar>a.btn{margin-left:0}
+.runs li{grid-template-columns:18px minmax(0,1fr);gap:2px 10px}.runs li>:nth-child(n+3){grid-column:2}.runs li .hide{display:none}}
+@media (max-width:600px){.ramp,.ramp.backups,.keyhead{grid-template-columns:1fr}.ramp li+li{border-left:none}
+.plate-version{font-size:28px}.keytitle{font-size:22px}h1{font-size:20px}
+input[type=text],input[type=password],textarea,select{font-size:16px}}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 """
 NAVIGATION = (('overview', '/', 'Overview'), ('runners', '/runners', 'Runners'), ('access', '/access', 'Access'),
               ('files', '/files', 'Files'),
@@ -2442,6 +2513,11 @@ def level_chip(level):
 def environment_order(name):
     """prod first, then stage, then any other environment by name."""
     return (('prod', 'stage').index(name) if name in ('prod', 'stage') else 2, name)
+
+
+def env_class(name):
+    """The class that keeps an environment in its own column: env-prod, env-stage or env-other."""
+    return f'env-{name}' if name in ('prod', 'stage') else 'env-other'
 
 
 def access_columns(data):
@@ -2663,9 +2739,17 @@ class Page:
                  '<a href="/?fresh=1">Refresh</a></p>')
         return self.layout('Overview', body, section='overview')
 
+    # What a folded group of per-environment alerts says after its count.
+    ATTENTION_GROUPS = {'deploy-failed': 'environments: the last deploy failed', 'secrets-stopped': 'environments: secret store stopped',
+                        'unhealthy': 'environments have unhealthy containers', 'no-backup': 'environments have no backup',
+                        'old-backup': 'environments have an old backup', 'no-files-backup': 'environments have no files backup',
+                        'old-files-backup': 'environments have an old files backup'}
+    ATTENTION_FOLD = 3  # more of one kind than this – folded
+
     @staticmethod
     def attention(data):
         """What needs a look, gathered from the whole status: each with where to act on it."""
+        ATTENTION_GROUPS, ATTENTION_FOLD = Page.ATTENTION_GROUPS, Page.ATTENTION_FOLD
         items = []
         units = data.get('units', {})
         for name, unit in sorted(units.items()):
@@ -2684,30 +2768,48 @@ class Page:
         disk = data.get('disk') or {}
         if disk.get('size') and disk['available'] / disk['size'] <= 0.15:
             items.append(('bad', f'Only {size(disk["available"])} free on the disk', '/'))
+        # Per environment: the same kind may repeat for many projects; a kind repeated more than ATTENTION_FOLD
+        # times folds into one counted <details> (its summary says how many), below the distinct alerts.
+        grouped, ordered = {}, []
         for entry in data.get('projects', []):
             link = f'/project/{quote(entry["name"])}'
             for environment, state in entry.get('environments', {}).items():
                 where = f'{e(entry["name"])} {e(environment)}'
+                found = []
                 last = ((state.get('deploys') or {}).get('last') or {})
                 if last.get('failed'):
-                    items.append(('bad', f'{where}: the deploy failed ({e(last["failed"])})', link))
+                    found.append(('deploy-failed', f'{where}: the deploy failed ({e(last["failed"])})', link))
                 if state.get('secrets') == 'stopped':
-                    items.append(('bad', f'{where}: secret store stopped', link))
+                    found.append(('secrets-stopped', f'{where}: secret store stopped', link))
                 unhealthy = [item['name'] for item in state.get('containers', []) if item.get('health') == 'unhealthy']
                 if unhealthy:
-                    items.append(('bad', f'{where}: unhealthy {e(", ".join(unhealthy))}', link))
+                    found.append(('unhealthy', f'{where}: unhealthy {e(", ".join(unhealthy))}', link))
                 newest = (state.get('backups') or {}).get('newest')
                 if state.get('declared') and not state.get('development') and (not newest or time.time() - newest['time'] >= 26 * 3600):
-                    items.append(('bad', f'{where}: newest backup ' + (e(ago(newest['time'])) if newest else 'none'), link))
+                    found.append(('old-backup' if newest else 'no-backup',
+                                  f'{where}: newest backup ' + (e(ago(newest['time'])) if newest else 'none'), link))
                 newest = (state.get('files_backups') or {}).get('newest')
                 if state.get('declared') and state.get('file_paths') and installed(units, 'setup-server-backup-files.timer') and \
                         (not newest or time.time() - newest['time'] >= 26 * 3600):
-                    items.append(('bad', f'{where}: newest files backup ' + (e(ago(newest['time'])) if newest else 'none'),
+                    found.append(('old-files-backup' if newest else 'no-files-backup',
+                                  f'{where}: newest files backup ' + (e(ago(newest['time'])) if newest else 'none'),
                                   f'/files/{quote(entry["name"])}/{quote(environment)}'))
-        if not items:
+                for group, text, href in found:
+                    grouped.setdefault(group, []).append(('bad', text, href))
+                    ordered.append((group, ('bad', text, href)))
+        if not items and not grouped:
             return f'<div class="attention calm">{lamp("ok")}<span>All is well: nothing needs attention.</span></div>'
-        return ('<div class="attention"><p class="attention-title">Needs attention · ' + str(len(items)) + '</p><ul>' +
-                ''.join(f'<li><a href="{e(href)}">{lamp(kind)}<span>{text}</span></a></li>' for kind, text, href in items) + '</ul></div>')
+        items += [item for group, item in ordered if len(grouped[group]) <= ATTENTION_FOLD]
+        folded = [(group, members) for group, members in grouped.items() if len(members) > ATTENTION_FOLD]
+        line = lambda kind, text, href: f'<li><a href="{e(href)}">{lamp(kind)}<span>{text}</span></a></li>'
+        total = len(items) + sum(len(members) for _, members in folded)
+        body = '<div class="attention"><p class="attention-title">Needs attention · ' + str(total) + '</p>'
+        if items:
+            body += '<ul>' + ''.join(line(*item) for item in items) + '</ul>'
+        for group, members in folded:
+            body += (f'<details class="attention-group"><summary>{lamp("bad")}<span>{len(members)} {e(ATTENTION_GROUPS[group])}</span>'
+                     '</summary><ul>' + ''.join(line(*item) for item in members) + '</ul></details>')
+        return body + '</div>'
 
     def projects_table(self, data):
         projects = data.get('projects', [])
@@ -2726,26 +2828,28 @@ class Page:
                 runs = f'<a href="{e(link)}">GitHub Actions</a>' if link else '—'
             for index, (environment, state) in enumerate(environments.items()):
                 first = index == 0
-                cells = (f'<td class="project"><a href="/project/{e(entry["name"])}">{e(entry["name"])}</a>'
+                cells = (f'<td class="project" data-label="Project · repo"><a href="/project/{e(entry["name"])}">{e(entry["name"])}</a>'
                          f'<small>{e(entry.get("repository") or "?")}</small>'
                          f'{"<small>" + e(entry["code_repository"]) + "</small>" if entry.get("code_repository") else ""}</td>') if first \
-                    else '<td></td>'
+                    else '<td data-label="Project · repo"></td>'
                 if state is None:
                     kind = 'idle'
-                    cells += '<td colspan="5" class="muted">not deployed from here (no env/stage.env or env/prod.env)</td>'
+                    cells += ('<td colspan="5" class="muted" data-label="Environment">not deployed from here '
+                              '(no env/stage.env or env/prod.env)</td>')
                 else:
                     kind = environment_kind(state)
-                    cells += (f'<td><span class="sign {e(environment)}">{e(environment)}</span></td>'
-                              f'<td class="target">{self.target(entry, environment)}</td><td>{self.deploy_cell(state)}</td>'
-                              f'<td><span class="line"><b>nightly</b> {self.backup_cell(state)}</span>'
+                    cells += (f'<td data-label="Environment"><span class="sign {e(environment)}">{e(environment)}</span></td>'
+                              f'<td class="target" data-label="Target">{self.target(entry, environment)}</td>'
+                              f'<td data-label="Last deploy">{self.deploy_cell(state)}</td>'
+                              f'<td data-label="Newest backup"><span class="line"><b>nightly</b> {self.backup_cell(state)}</span>'
                               f'<span class="line"><b>full</b> {self.full_backup_cell(state)}</span></td>'
-                              f'<td><span class="line"><b>secrets</b> {self.secrets_cell(state)}</span>'
+                              f'<td data-label="Containers"><span class="line"><b>secrets</b> {self.secrets_cell(state)}</span>'
                               f'<span class="line"><b>all</b> {self.containers_cell(state)}</span></td>')
-                cells += f'<td>{runs if first else ""}</td>'
+                cells += f'<td data-label="Pipeline">{runs if first else ""}</td>'
                 rows.append(f'<tr class="is-{kind}">{cells}</tr>')
-        return ('<div class="scroll"><table class="board"><thead><tr><th>Project · repo</th><th>Environment</th><th>Target</th>'
-                '<th>Last deploy</th><th>Newest backup</th><th>Containers</th>'
-                '<th>Pipeline</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div>')
+        return ('<div class="scroll"><table class="board"><thead><tr><th scope="col">Project · repo</th><th scope="col">Environment</th>'
+                '<th scope="col">Target</th><th scope="col">Last deploy</th><th scope="col">Newest backup</th><th scope="col">Containers</th>'
+                '<th scope="col">Pipeline</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div>')
 
     @staticmethod
     def target(entry, environment):
@@ -2860,13 +2964,14 @@ class Page:
                      ('Secret store', f'{self.secrets_cell(state)} <span class="muted">{e(state["compose_project"])}-secrets</span>')]
             body += facts(rows)
             if state.get('containers'):
-                body += ('<table class="board"><thead><tr><th>Container</th><th>State</th><th>Health</th><th>Status</th>'
-                         '<th>Logs</th></tr></thead><tbody>' + ''.join(
+                body += ('<table class="board"><thead><tr><th scope="col">Container</th><th scope="col">State</th>'
+                         '<th scope="col">Health</th><th scope="col">Status</th><th scope="col">Logs</th></tr></thead><tbody>' + ''.join(
                              f'<tr class="is-{"ok" if item["state"] == "running" and item.get("health") != "unhealthy" else "bad"}">'
-                             f'<td>{e(item["name"])}</td><td>{badge(item["state"], "ok" if item["state"] == "running" else "warn")}</td>'
-                             f'<td>{badge(item.get("health") or "—", {"healthy": "ok", "unhealthy": "bad"}.get(item.get("health"), "muted"))}</td>'
-                             f'<td class="muted">{e(item["status"])}</td>'
-                             f'<td><a class="btn" href="/project/{e(name)}/logs?env={e(quote(environment))}&amp;container={e(quote(item["name"]))}">'
+                             f'<td data-label="Container">{e(item["name"])}</td>'
+                             f'<td data-label="State">{badge(item["state"], "ok" if item["state"] == "running" else "warn")}</td>'
+                             f'<td data-label="Health">{badge(item.get("health") or "—", {"healthy": "ok", "unhealthy": "bad"}.get(item.get("health"), "muted"))}</td>'
+                             f'<td class="muted" data-label="Status">{e(item["status"])}</td>'
+                             f'<td data-label="Logs"><a class="btn" href="/project/{e(name)}/logs?env={e(quote(environment))}&amp;container={e(quote(item["name"]))}">'
                              'Show</a></td></tr>' for item in state['containers']) + '</tbody></table>')
             if state.get('development'):
                 body += '<p class="note">The application manages a development environment\'s backups; the server\'s DB backup roles do not apply here.</p>'
@@ -2914,9 +3019,10 @@ class Page:
         if error:
             body += f'<div class="callout warn"><p>Bitbucket: {e(error)}</p></div>'
         elif found:
-            body += '<table class="board"><thead><tr><th>No. · pipeline · result</th><th>Who</th></tr></thead><tbody>' + ''.join(
-                f'<tr class="is-idle"><td>{self.run_cell(run, repository)}</td>'
-                f'<td>{e(((run.get("creator") or {}).get("display_name")) or "")}</td></tr>' for run in found) + '</tbody></table>'
+            body += ('<table class="board"><thead><tr><th scope="col">No. · pipeline · result</th><th scope="col">Who</th></tr></thead>'
+                     '<tbody>') + ''.join(
+                f'<tr class="is-idle"><td data-label="No. · pipeline · result">{self.run_cell(run, repository)}</td>'
+                f'<td data-label="Who">{e(((run.get("creator") or {}).get("display_name")) or "")}</td></tr>' for run in found) + '</tbody></table>'
         name, branch = e(entry['name']), e(entry.get('branch') or 'master')
         hidden = f'<input type="hidden" name="project" value="{name}">'
         branch_field = f'<label><span>Branch (the pipeline definition)</span><input type="text" name="branch" value="{branch}"></label>'
@@ -3007,13 +3113,15 @@ class Page:
             return self.layout('File backups', body, section='files')
         rows = ''.join(
             f'<tr class="is-{"ok" if (state.get("files_backups") or {}).get("newest") else "idle"}">'
-            f'<td class="project"><a href="/project/{e(quote(name))}">{e(name)}</a></td>'
-            f'<td><span class="sign {e(environment)}">{e(environment)}</span></td><td>{self.file_paths(state)}</td>'
-            f'<td>{self.files_cell(state)}</td>'
+            f'<td class="project" data-label="Project"><a href="/project/{e(quote(name))}">{e(name)}</a></td>'
+            f'<td data-label="Environment"><span class="sign {e(environment)}">{e(environment)}</span></td>'
+            f'<td data-label="Paths">{self.file_paths(state)}</td>'
+            f'<td data-label="Newest backup">{self.files_cell(state)}</td>'
             f'<td><a class="btn" href="/files/{e(quote(name))}/{e(environment)}">Backups</a></td></tr>'
             for name, environment, state in found)
-        body += ('<div class="scroll"><table class="board"><thead><tr><th>Project</th><th>Environment</th><th>Paths</th>'
-                 '<th>Newest backup</th><th></th></tr></thead><tbody>' + rows + '</tbody></table></div>')
+        body += ('<div class="scroll"><table class="board"><thead><tr><th scope="col">Project</th><th scope="col">Environment</th>'
+                 '<th scope="col">Paths</th><th scope="col">Newest backup</th><th scope="col"></th></tr></thead><tbody>' +
+                 rows + '</tbody></table></div>')
         return self.layout('File backups', body, section='files')
 
     @staticmethod
@@ -3281,16 +3389,19 @@ class Page:
                     granted = {item: level for item, level in granted.items() if wanted in item[0]}
                     pulls = {item: level for item, level in pulls.items() if wanted in item[0]}
                 rows.append(f'<tr class="is-{"ok" if key.get("grants") or key.get("pulls") or key.get("pull_all", "none") != "none" else "idle"}">'
-                            f'<td class="keyname"><a href="/access/{e(quote(key["name"]))}">{e(people.get(key["name"]) or key["name"])}</a>'
+                            f'<td class="keyname" data-label="Key"><a href="/access/{e(quote(key["name"]))}">'
+                            f'{e(people.get(key["name"]) or key["name"])}</a>'
                             f'<small>{e(key["name"] + " · " if key["name"] in people else "")}{e(key.get("fingerprint", ""))}</small></td>'
-                            f'<td>{self.summary(granted, lambda name: name == "prod")}</td>'
-                            f'<td>{self.summary(granted, lambda name: name == "stage")}</td>'
-                            f'<td>{self.summary(granted, lambda name: name not in ("prod", "stage"))}</td>'
-                            f'<td>{self.backups_summary(key, pulls)}</td><td>{self.tools_summary(data, key["name"])}</td>'
-                            f'<td>{" ".join(badge(source, "muted") for source in key.get("sources", []))}</td>'
-                            f'<td>{self.last_use(key)}</td></tr>')
-            body += ('<div class="scroll"><table class="board keys"><thead><tr><th>Key</th><th>access prod</th>'
-                     '<th>stage</th><th>other</th><th>Backups (db-pull)</th><th>Tools</th><th>From</th><th>Last used</th></tr></thead>'
+                            f'<td data-label="access prod">{self.summary(granted, lambda name: name == "prod")}</td>'
+                            f'<td data-label="stage">{self.summary(granted, lambda name: name == "stage")}</td>'
+                            f'<td data-label="other">{self.summary(granted, lambda name: name not in ("prod", "stage"))}</td>'
+                            f'<td data-label="Backups (db-pull)">{self.backups_summary(key, pulls)}</td>'
+                            f'<td data-label="Tools">{self.tools_summary(data, key["name"])}</td>'
+                            f'<td data-label="From">{" ".join(badge(source, "muted") for source in key.get("sources", []))}</td>'
+                            f'<td data-label="Last used">{self.last_use(key)}</td></tr>')
+            body += ('<div class="scroll"><table class="board keys"><thead><tr><th scope="col">Key</th><th scope="col">access prod</th>'
+                     '<th scope="col">stage</th><th scope="col">other</th><th scope="col">Backups (db-pull)</th><th scope="col">Tools</th>'
+                     '<th scope="col">From</th><th scope="col">Last used</th></tr></thead>'
                      '<tbody>' + ''.join(rows) + '</tbody></table></div>')
             if wanted:
                 body += (f'<p class="note">Showing where the keys reach "{e(query)}" (and the keys with every project\'s backups). '
@@ -3449,8 +3560,8 @@ class Page:
             def slot(project, environment, environments):
                 # prod and stage keep their place in every row, so the levels line up down the list.
                 if environment not in environments:
-                    return '<div class="env"></div>'
-                return (f'<div class="env"><span class="sign {e(environment)}">{e(environment)}</span>'
+                    return f'<div class="env {env_class(environment)}"></div>'
+                return (f'<div class="env {env_class(environment)}"><span class="sign {e(environment)}">{e(environment)}</span>'
                         f'{self.seg(f"{field}:{project}:{environment}", granted.get((project, environment), ""), levels, inherited)}</div>')
             lines = ''.join(
                 f'<tr><td class="id">{e(project)}</td><td><div class="envs {e(tab)}">' +
@@ -3545,7 +3656,7 @@ class Page:
 
         def slot(project, environment, environments):
             if environment not in environments:
-                return '<div class="env"></div>'
+                return f'<div class="env {env_class(environment)}"></div>'
             item = f'{project}:{environment}'
             result = applied.get(item) or {}
             mark = ''
@@ -3553,7 +3664,7 @@ class Page:
                 mark = f' <span class="chip bad" title="{e(result.get("note", ""))}">not applied</span>'
             elif item in granted and result.get('ok') is None and result:
                 mark = f' <span class="chip warn" title="{e(result.get("note", ""))}">waiting for a deploy</span>'
-            return (f'<div class="env"><span class="sign {e(environment)}">{e(environment)}</span>'
+            return (f'<div class="env {env_class(environment)}"><span class="sign {e(environment)}">{e(environment)}</span>'
                     f'{self.seg(f"tool:{project}:{environment}", "tools" if item in granted else "", ("tools",))}{mark}</div>')
         lines = ''.join(
             f'<tr><td class="id">{e(project)}</td><td><div class="envs tools">' +
@@ -3591,16 +3702,18 @@ class Page:
                        if event.get('session') else '')
             person = (people or {}).get(event['key'])
             title = f' title="{e(event["key"])}"' if person else ''
-            who = (f'<td><a href="/access/{e(quote(event["key"]))}#activity"{title}>{e(person or event["key"])}</a></td>'
+            who = (f'<td data-label="Key"><a href="/access/{e(quote(event["key"]))}#activity"{title}>{e(person or event["key"])}</a></td>'
                    if keys else '')
             rows.append(f'<tr class="is-{"bad" if event["state"] in ("failed", "refused") else "idle"}">'
-                        f'<td class="when">{e(local_time(event["at"]))}<small>{e(ago(event["at"]))}</small></td>{who}'
-                        f'<td class="what">{e(what)}{" " + level_chip(event["level"]) if event.get("level") else ""}</td>'
-                        f'<td class="text">{e(target)}{f" <code>{e(detail)}</code>" if detail else ""}{reason}</td>'
-                        f'<td>{state}</td><td class="num">{e(took)}</td><td>{session}</td>'
-                        f'<td class="muted">{e(event["from"])}</td></tr>')
-        return ('<div class="scroll"><table class="board activity"><thead><tr><th>Time</th>' + ('<th>Key</th>' if keys else '') +
-                '<th>What</th><th>Where · command</th><th>Result</th><th>Took</th><th></th><th>From</th></tr></thead><tbody>' +
+                        f'<td class="when" data-label="Time">{e(local_time(event["at"]))}<small>{e(ago(event["at"]))}</small></td>{who}'
+                        f'<td class="what" data-label="What">{e(what)}{" " + level_chip(event["level"]) if event.get("level") else ""}</td>'
+                        f'<td class="text" data-label="Where · command">{e(target)}{f" <code>{e(detail)}</code>" if detail else ""}{reason}</td>'
+                        f'<td data-label="Result">{state}</td><td class="num" data-label="Took">{e(took)}</td><td>{session}</td>'
+                        f'<td class="muted" data-label="From">{e(event["from"])}</td></tr>')
+        return ('<div class="scroll"><table class="board activity"><thead><tr><th scope="col">Time</th>' +
+                ('<th scope="col">Key</th>' if keys else '') +
+                '<th scope="col">What</th><th scope="col">Where · command</th><th scope="col">Result</th><th scope="col">Took</th>'
+                '<th scope="col"></th><th scope="col">From</th></tr></thead><tbody>' +
                 ''.join(rows) + '</tbody></table></div>')
 
     def session_page(self, name, data, error, event):
@@ -3814,16 +3927,16 @@ class Page:
                          f'<td>{e(info.get("version") or "?")}</td><td>{e(boot)}</td><td>{e(restarts)}</td>'
                          f'<td><div class="controls">{self.unit_controls(f"github-runner@{scope}", ("start", "stop", "restart"))}</div></td></tr>')
             body += (f'<h3>{e(label)} <small>{len(members)} runner{"" if len(members) == 1 else "s"}</small>{link}</h3>'
-                     '<table class="list runners"><tr><th>Runner</th><th>State</th><th>Job</th><th>Version</th>'
-                     f'<th>On boot</th><th>Restarts</th><th>Control</th></tr>{rows}</table>')
+                     '<div class="scroll"><table class="list runners"><tr><th>Runner</th><th>State</th><th>Job</th><th>Version</th>'
+                     f'<th>On boot</th><th>Restarts</th><th>Control</th></tr>{rows}</table></div>')
         body += '<h2>Bitbucket Pipelines</h2>'
         if bitbucket_installed:
             job, boot, restarts = self.runner_facts(bitbucket)
-            body += ('<table class="list runners"><tr><th>Runner</th><th>State</th><th>On boot</th><th>Restarts</th>'
+            body += ('<div class="scroll"><table class="list runners"><tr><th>Runner</th><th>State</th><th>On boot</th><th>Restarts</th>'
                      f'<th>Control</th></tr><tr><td><a href="/runners/bitbucket">Bitbucket runner</a>'
                      f'<small class="muted"> setup-server-runner</small></td><td>{unit_state(units, "setup-server-runner.service")}</td>'
                      f'<td>{e(boot)}</td><td>{e(restarts)}</td><td><div class="controls">'
-                     f'{self.unit_controls("runner", UNIT_OPERATIONS["runner"])}</div></td></tr></table>')
+                     f'{self.unit_controls("runner", UNIT_OPERATIONS["runner"])}</div></td></tr></table></div>')
         else:
             body += '<div class="empty">The Bitbucket runner is not installed. <a href="/runners/new#bitbucket">Install</a></div>'
         body += ('<p class="note">Job – whether the runner is running a GitHub job right now (its Runner.Worker process). On boot – '

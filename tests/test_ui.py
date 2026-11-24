@@ -981,6 +981,8 @@ class WebUiTest(Worker):
                      'href="https://github.com/organizations/BigSant/settings/actions/runners"', 'href="/runners/bitbucket"',
                      'name="unit" value="github-runner@bigsant"', 'name="unit" value="runner"', 'href="/runners/new"'):
             self.assertIn(text, page)
+        self.assertEqual(page.count('<div class="scroll"><table class="list runners">'), 2, "GitHub and Bitbucket: both scroll")
+        self.assertEqual(page.count('class="list runners"'), 2)
         status, _, runner = self.request("GET", "/runners/github/bigsant")
         self.assertEqual(status, 200, runner)
         self.assertIn('href="https://github.com/organizations/BigSant/settings/actions/runners/7"', runner)
@@ -1247,6 +1249,43 @@ class WebUiTest(Worker):
         self.assertEqual(cache.get("status", 60, compute, since=time.time() + 1), 2, "an action that ended after it")
         self.assertEqual(cache.peek("status"), 2)
 
+    def test_needs_attention_folds_a_kind_repeated_across_environments_into_one_counted_group(self):
+        page = load_web_ui().Page
+        projects = [{"name": f"shop{number}", "environments": {"prod": {"declared": True}}} for number in range(5)]
+        projects.append({"name": "blog", "environments": {"stage": {"declared": True, "backups": {"newest": {"time": time.time()}},
+                                                                     "deploys": {"last": {"failed": "exit 2"}}}}})
+        data = {"units": {"setup-server-backup.service": {"ActiveState": "failed"}},
+                "versions": {"setup_git": {"branch": "master"}}, "projects": projects}
+        box = page.attention(data)
+        self.assertIn("Needs attention · 8", box)
+        top, _, folded = box.partition("<details")
+        for text in ("setup-server-backup.service: failed", "setup is not on a release tag", 'href="/update"',
+                     'href="/project/blog"', "blog stage: the deploy failed (exit 2)"):
+            self.assertIn(text, top, "a distinct alert stays a line of its own, before the groups")
+        self.assertIn("<span>5 environments have no backup</span></summary>", folded)
+        for number in range(5):
+            self.assertIn(f'href="/project/shop{number}"', folded)
+            self.assertIn(f"shop{number} prod: newest backup none", folded)
+        self.assertNotIn("shop0", top)
+        few = page.attention({"projects": projects[:3]})
+        self.assertNotIn("<details", few, "three of a kind are still listed one by one")
+        self.assertIn("Needs attention · 3", few)
+
+    def assert_board_cells_labelled(self, page):
+        """Every cell of a .board table names its column (data-label, from the header) for the stacked phone layout."""
+        tables = re.findall(r'<table class="board[^"]*">(.*?)</table>', page, re.S)
+        self.assertTrue(tables, "a board table on the page")
+        for table in tables:
+            head, _, body = table.partition("</thead>")
+            self.assertNotIn("<th>", head, "every column header has scope=\"col\"")
+            headers = re.findall(r'<th scope="col">(.*?)</th>', head)
+            for cell in re.findall(r"<td[^>]*>", body):
+                label = re.search(r'data-label="([^"]*)"', cell)
+                if label:
+                    self.assertIn(label.group(1), headers, cell)
+                else:
+                    self.assertIn("", headers, f"only a column without a name goes unlabelled: {cell}")
+
     def write_keys(self):
         ssh = self.tree.root / ".ssh"
         ssh.mkdir(exist_ok=True)
@@ -1268,9 +1307,18 @@ class WebUiTest(Worker):
         self.assertEqual(status, 200, page)
         for text in ("tomas", "lv-full", "lv-docker", "/access/new", "shell"):
             self.assertIn(text, page)
+        self.assert_board_cells_labelled(page)
+        self.assertIn('<td data-label="Last used">', page)
+        self.assertIn('<td data-label="What">', page.replace(' class="what"', ''), "the activity table too")
         self.assertIn("No key matches", self.request("GET", "/access?q=nothing")[2])
         status, _, key = self.request("GET", "/access/tomas")
         self.assertEqual(status, 200, key)
+        # Each environment slot says which it is, so prod and stage keep their own columns.
+        slots = re.findall(r'<div class="env(?: ([^"]*))?">', key)
+        self.assertIn("env-prod", slots)
+        self.assertIn("env-stage", slots)
+        self.assertLessEqual(set(slots), {"env-prod", "env-stage", "env-other"})
+        self.assertIn('<div class="env env-prod"><span class="sign prod">prod</span>', key)
         self.assertRegex(key, r'name="grant:asana_tracker:prod" value="full" checked')
         self.assertIn('name="action" value="key-bulk"', key)
         self.assertIn("/access/tomas/session/20261021T093000Z-7.log", key)
@@ -1672,7 +1720,11 @@ class WebUiTest(Worker):
         self.assertNotIn('name="unit" value="ui"', overview, "no controls for a unit that is not installed")
         self.assertNotIn('name="unit" value="metrics"', overview)
         self.assertIn('value="github-runner@bigsant"', self.request("GET", "/actions")[2])
+        self.assert_board_cells_labelled(overview)
+        self.assertIn('<td data-label="Environment"><span class="sign prod">prod</span></td>', overview)
         project = self.request("GET", "/project/asana_tracker")[2]
+        self.assert_board_cells_labelled(project)
+        self.assertIn('<td data-label="Container">asana-prod-cron</td>', project)
         self.assertIn("All backups (3)", project)
         self.assertIn("/project/asana_tracker/logs?env=prod&amp;container=asana-prod-cron", project)
         self.assertIn('name="action" value="backup-local"', project)

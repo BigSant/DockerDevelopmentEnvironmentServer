@@ -1000,6 +1000,9 @@ Also worth having: `up{job="setup-worker"} == 0` or "no data" (the VPN or the se
 The server status and the same `bin/` actions in a browser. The UI listens only on `127.0.0.1` (default port `9102`),
 so from a computer it is reachable only through an SSH tunnel.
 
+The pages follow the device's light or dark setting (`prefers-color-scheme`): dark by default, light when the system asks
+for it; log and command blocks stay dark in both. Every text colour keeps at least 4.5:1 contrast in both themes.
+
 ```bash
 cd ~/setup-server
 sudo bin/install-ui --check        # account, unit, sudo rule, settings (secrets hidden); changes nothing
