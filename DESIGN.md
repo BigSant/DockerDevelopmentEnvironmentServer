@@ -182,7 +182,9 @@ With nothing to report it shows `.attention.calm`, with a green lamp and one sen
 project however many environments it has, so 50 projects fit in two or three screens (`/projects`, and on the
 Overview only the rows that need a look). The columns are fixed: Project, Prod, Stage, Others. Each `td.envcell`
 holds `.env-list` > `.env-item`s from `environment_summary()`: a first `.envline` with the lamp, the last deploy
-(ref and age) and a `bad` chip per problem, then a `small.envline` in faint with the short target and the newest
+(`master · <b>v1.2.0</b> 2 h ago · 3 behind`: the branch in plain ink and as written, never a chip; the ref bold, a
+commit ref once and short via `deployed_ref()`; age and "N behind" faint, never amber — trailing a branch is normal,
+not an alarm; the full sentence in `title`) and a `bad` chip per problem, then a `small.envline` in faint with the short target and the newest
 backup's age. Lines never wrap: they end in an ellipsis, with the whole target in `title`. An environment without
 a target is a quiet `lamp muted` and "— no target", and a missing environment an empty `td.envcell.none`. Rows that
 need a look come first (`?sort=name` sorts by name), and a GET `form.search` filters by name or repo and to

@@ -1090,7 +1090,9 @@ commit, red when setup is not on a release tag.
   Bitbucket pipelines.
 - *Projects* (`/projects`) – where projects are managed. The list: how many projects and environments, how many have no target,
   deploy to another server or failed their last deploy; per environment its target, the last deploy and its state, with a link to
-  the project's settings. *+ Add a project* (`/projects/new`) – the env repo URL, the code repo URL (optional), the name (optional),
+  the project's settings. A deploy names the branch its commit comes from (`master · v1.2.0 · 2 h ago · 3 behind`; on the project
+  page `branch master (3 commits behind origin/master)`), read from the code clone's already fetched `origin/*` branches – the
+  server fetches nothing for it, and git runs there without hooks, fsmonitor or system config; unknown, it is left out. *+ Add a project* (`/projects/new`) – the env repo URL, the code repo URL (optional), the name (optional),
   *monorepo* (`--monorepo`), *the account key* (`--shared-key`) and the targets: one for every environment (`target.env`), prod's and
   stage's own, and further `ENV=target` lines (`local`, `local:/PATH`, `ssh://USER@HOST/PATH`). The project page (`/project/<name>`)
   shows each environment (the last successful deploy, all of its backups – nightly, full, fresh, pre-deploy –, each container's

@@ -2523,6 +2523,40 @@ def badge(text, kind):
     return f'<span class="chip {kind}">{e(text)}</span>'
 
 
+def deployed_ref(deploy):
+    """The ref of a deploy as shown: a tag or branch as it was given; a commit once, as its short commit."""
+    ref, commit = str(deploy.get('ref') or ''), str(deploy.get('commit') or '')
+    if commit and re.fullmatch(r'[0-9a-f]{7,64}', ref) and (ref.startswith(commit) or commit.startswith(ref)):
+        return commit
+    return ref or '?'
+
+
+def branch_note(branch):
+    """How a deployed commit stands on its branch (server-status' deployed_branch), in words; '' when unknown."""
+    if not isinstance(branch, dict) or not branch.get('name'):
+        return ''
+    behind = branch.get('behind')
+    if branch.get('exact') or behind == 0:
+        return f'the tip of origin/{branch["name"]}'
+    if isinstance(behind, int):
+        return f'{behind} commit{"" if behind == 1 else "s"} behind origin/{branch["name"]}'
+    return f'on origin/{branch["name"]}'
+
+
+def deploy_branch(deploy):
+    """The project page's branch of a deploy: 'branch master (3 commits behind origin/master) · ', or ''."""
+    branch = deploy.get('branch')
+    note = branch_note(branch)
+    return f'branch {e(branch["name"])} <span class="muted">({e(note)})</span> · ' if note else ''
+
+
+def deploy_shown(deploy):
+    """A deploy on the project page: 'branch master (…) · v1.2.0 abc123def456 2 h ago' (a commit ref once)."""
+    ref, commit = deployed_ref(deploy), str(deploy.get('commit') or '')
+    plain = f' <span class="muted">{e(commit)}</span>' if commit and commit != ref else ''
+    return f'{deploy_branch(deploy)}{e(ref)}{plain} {e(ago(deploy["at"]))}'
+
+
 def lamp(kind):
     return f'<span class="lamp {kind}"></span>'
 
@@ -2985,13 +3019,20 @@ class Page:
         if target is None:
             return f'<span class="envline">{sign}{lamp("muted")}<span class="muted">— no target</span></span>'
         last = (state.get('deploys') or {}).get('last')
-        deploy = (f'<b>{e(last.get("ref") or "?")}</b> <span class="muted">{e(ago(last["at"]))}</span>' if last and last.get('at')
-                  else '<span class="muted">not deployed yet</span>')
+        deploy, note = '<span class="muted">not deployed yet</span>', ''
+        if last and last.get('at'):
+            # The branch first (once: not when the ref is that branch), then the ref, its age and how far behind.
+            ref, branch = deployed_ref(last), last.get('branch') or {}
+            name = branch.get('name') if branch_note(branch) else None
+            behind = branch.get('behind') if name and isinstance(branch.get('behind'), int) else 0
+            deploy = (f'{e(name) + " · " if name and name != ref else ""}<b>{e(ref)}</b> '
+                      f'<span class="muted">{e(ago(last["at"]))}{f" · {behind} behind" if behind else ""}</span>')
+            note = f' title="{e(f"branch {name}: {branch_note(branch)}")}"' if name else ''
         chips = ''.join(' ' + badge(word, 'bad') for word in problems)
         newest = (state.get('backups') or {}).get('newest')
         backup = '' if state.get('development') else f' · backup {e(ago(newest["time"]))}' if newest else ' · no backup'
         title = f' title="{e(target[1])}"' if target[1] else ''
-        return (f'<span class="envline">{sign}{lamp(kind if kind != "idle" else "muted")}{deploy}{chips}</span>'
+        return (f'<span class="envline"{note}>{sign}{lamp(kind if kind != "idle" else "muted")}{deploy}{chips}</span>'
                 f'<small class="envline"{title}>{e(target[0])}{backup}</small>')
 
     def project_rows(self, projects):
@@ -3058,11 +3099,12 @@ class Page:
 
     @staticmethod
     def deploy_cell(state):
+        """The project page's last deploy: its branch, ref, commit (once), age and outcome."""
         deploys = state.get('deploys')
         if not deploys:
             return '<span class="muted">none yet</span>'
         last = deploys['last']
-        text = f'{e(last["ref"] or "?")} <span class="muted">{e(last["commit"])}</span> {e(ago(last["at"]))}'
+        text = deploy_shown(last)
         if last.get('failed'):
             text += ' ' + badge(f'failed ({last["failed"]})', 'bad')
         else:
@@ -3301,7 +3343,7 @@ class Page:
                     ('Last deploy', self.deploy_cell(state)), ('Containers', self.containers_cell(state))]
             success = (state.get('deploys') or {}).get('last_success')
             if success and success != state['deploys']['last']:
-                rows.append(('Last successful', f'{e(success["ref"])} {e(success["commit"])} {e(ago(success["at"]))}'))
+                rows.append(('Last successful', deploy_shown(success)))
             newest = lambda key: (f' <span class="muted">{e(state[key]["newest"]["name"])}</span>'
                                   if (state.get(key) or {}).get('newest') else '')
             rows += [('Newest backup', self.backup_cell(state) + newest('backups')),

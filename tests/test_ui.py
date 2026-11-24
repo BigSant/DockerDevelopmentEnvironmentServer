@@ -264,7 +264,7 @@ class ServerStatusTest(Worker):
         self.assertEqual(asana["targets"]["all"]["DEPLOY_CONTEXT"], "default")
         prod = asana["environments"]["prod"]
         self.assertEqual(prod["deploys"]["last"], {"ref": "v1.0.0", "commit": "a" * 12, "at": 1791275400,
-                                                   "rollback": True, "failed": None})
+                                                   "rollback": True, "failed": None, "branch": None})
         self.assertEqual(prod["deploys"]["count"], 2)
         self.assertEqual((prod["backups"]["count"], prod["backups"]["newest"]["size"]), (3, 4096))
         self.assertEqual(prod["secrets"], "running")
@@ -333,6 +333,49 @@ class ServerStatusTest(Worker):
         git("-C", str(setup), "checkout", "-q", "--detach", "refs/remotes/origin/master")
         data = json.loads(self.status().stdout)["versions"]["setup_git"]
         self.assertEqual((data["tag"], data["behind"]), (None, 0))
+
+    def test_each_deploy_names_the_branch_its_commit_comes_from_in_the_code_clone(self):
+        git = lambda *arguments: subprocess.run(["git", *arguments], env={**os.environ, "GIT_AUTHOR_NAME": "t",
+                                                "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+                                                check=True, capture_output=True, text=True).stdout.strip()
+        # An environment repository with its code in a clone of its own (app/public/), detached as setup leaves it.
+        app = self.tree.project("codeshop", "stage", "prod")
+        self.origin(app, "git@github.com:BigSant/codeshop_docker.git")
+        code = app / "public"
+        git("init", "-q", "-b", "master", str(code))
+        commits = []
+        for message in ("one", "two", "three", "four", "five"):
+            (code / "file").write_text(message)
+            git("-C", str(code), "add", "-A")
+            git("-C", str(code), "commit", "-q", "-m", message)
+            commits.append(git("-C", str(code), "rev-parse", "HEAD"))
+        first, second, third, fourth, fifth = commits
+        for name, commit in (("master", second), ("hotfix", second), ("feature/a", fourth), ("feature/b", fifth)):
+            git("-C", str(code), "update-ref", f"refs/remotes/origin/{name}", commit)
+        git("-C", str(code), "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master")
+        git("-C", str(code), "checkout", "-q", "--detach", first)
+        git("-C", str(code), "branch", "-q", "-D", "master")  # only the remote branches count
+        self.tree.deployments(app, "prod", [entry("v1.0.0", first, "2026-10-05T10:00:00+00:00"),
+                                            entry(second, second, "2026-10-06T10:00:00+00:00", failed="health")])
+        self.tree.deployments(app, "stage", [entry(third, third, "2026-10-07T10:00:00+00:00")])
+        environments = lambda: next(p for p in json.loads(self.status().stdout)["projects"]
+                                    if p["name"] == "codeshop")["environments"]
+        found = environments()
+        # The tip of master and of hotfix: exact, the default branch named.
+        self.assertEqual(found["prod"]["deploys"]["last"]["branch"], {"name": "master", "behind": 0, "exact": True})
+        # Contained in master (and both features): master, one commit behind.
+        self.assertEqual(found["prod"]["deploys"]["last_success"]["branch"], {"name": "master", "behind": 1, "exact": False})
+        # Only on feature branches: the closest one.
+        self.assertEqual(found["stage"]["deploys"]["last"]["branch"], {"name": "feature/a", "behind": 1, "exact": False})
+        # A commit the clone never fetched: unknown.
+        self.tree.deployments(app, "stage", [entry("f" * 40, "f" * 40, "2026-10-07T10:00:00+00:00")])
+        self.assertIsNone(environments()["stage"]["deploys"]["last"]["branch"])
+        # A .git planted as a symlink is not read through.
+        (code / ".git").rename(self.root / "elsewhere.git")
+        (code / ".git").symlink_to(self.root / "elsewhere.git", target_is_directory=True)
+        found = environments()
+        self.assertIsNone(found["prod"]["deploys"]["last"]["branch"])
+        self.assertIsNone(found["prod"]["deploys"]["last_success"]["branch"])
 
     def test_activity_joins_a_shells_start_and_exit_and_a_session_reads_as_typed_lines(self):
         (self.tree.root / "backup-pulls.log").write_text(
@@ -1406,6 +1449,35 @@ class WebUiTest(Worker):
         _, kind, problems, row = page.project_rows([failed])[0]
         self.assertEqual((kind, problems), ("bad", ["deploy failed"]), "a failed deploy is still a failure")
         self.assertIn('<td class="envcell none" data-label="Prod"></td>', row, "no prod: an empty cell, hidden on a phone")
+
+    def test_an_environment_names_the_branch_its_deploy_comes_from_and_how_far_behind(self):
+        module = load_web_ui()
+        page = module.Page("admin", "token", {})
+        now = time.time()
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        deploy = lambda ref, commit, branch: {"ref": ref, "commit": commit, "at": now - 7200, "branch": branch}
+        state = lambda last, success=None: {"declared": True, "deploys": {"last": last, "last_success": success or last, "count": 2},
+                                            "backups": {"newest": {"time": now - 3600, "size": 1000}, "count": 1}, "containers": []}
+        entry = {"name": "shop", "targets": {"all": {"DEPLOY_CONTEXT": "default"}}, "environments": {
+            "prod": state(deploy("v1.2.0", sha[:12], {"name": "master", "behind": 3, "exact": False})),
+            "stage": state(deploy(sha, sha[:12], {"name": "feature/Blog", "behind": 0, "exact": True})),
+            "mdv": state(deploy("master", sha[:12], None))}}
+        _, _, _, row = page.project_rows([entry])[0]
+        self.assert_board_cells_labelled(page.projects_board(page.project_rows([entry])))
+        prod, stage, others = re.findall(r'<td class="envcell[^"]*" data-label="[^"]*">(.*?)</td>', row)
+        self.assertIn('master · <b>v1.2.0</b> <span class="muted">2 h ago · 3 behind</span>', prod)
+        self.assertIn('title="branch master: 3 commits behind origin/master"', prod)
+        # A commit ref is shown once, short; at the tip nothing is behind; the branch keeps its case.
+        self.assertIn(f'feature/Blog · <b>{sha[:12]}</b> <span class="muted">2 h ago</span>', stage)
+        self.assertNotIn(sha, stage)
+        self.assertIn('<b>master</b> <span class="muted">2 h ago</span>', others, "unknown branch: the ref alone")
+        cell = page.deploy_cell(entry["environments"]["prod"])
+        self.assertIn('branch master <span class="muted">(3 commits behind origin/master)</span> · v1.2.0 '
+                      f'<span class="muted">{sha[:12]}</span> 2 h ago', cell)
+        cell = page.deploy_cell(entry["environments"]["stage"])
+        self.assertIn(f'branch feature/Blog <span class="muted">(the tip of origin/feature/Blog)</span> · {sha[:12]} 2 h ago', cell)
+        self.assertEqual(cell.count(sha[:12]), 1)
+        self.assertTrue(page.deploy_cell(entry["environments"]["mdv"]).startswith('master <span class="muted">'))
 
     def test_fifty_projects_are_fifty_rows_those_that_need_a_look_first_and_a_filter_counts(self):
         module = load_web_ui()

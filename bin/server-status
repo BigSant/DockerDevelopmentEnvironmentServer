@@ -267,6 +267,86 @@ def default_branch(checkout):
     return match[1] if match else None
 
 
+COMMIT = re.compile(r'[0-9a-f]{7,40}')
+BRANCH = re.compile(r'[A-Za-z0-9._/-]{1,100}')
+# Every git this helper runs over a project's clone reads that clone's refs only: no system or global config, no
+# fsmonitor or hooks, no prompt, no network, no replace objects and no optional locks (nothing is written).
+GIT_HARDENING = ('-c', 'safe.directory=*', '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null')
+GIT_ENVIRONMENT = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0',
+                   'GIT_NO_REPLACE_OBJECTS': '1', 'GIT_OPTIONAL_LOCKS': '0', 'GIT_ASKPASS': '/bin/false',
+                   'GIT_SSH_COMMAND': '/bin/false', 'GIT_PAGER': 'cat'}
+BRANCHES = {}  # (clone, commit): what deployed_branch found, once per run
+
+
+def code_checkout(checkout):
+    """The clone the deployed commits come from: public/ when it is a code repository of its own, else the
+    environment repository's clone itself (a monorepo's build root, or app/ holding public/)."""
+    return checkout / 'public' if (checkout / 'public/.git').exists() else checkout
+
+
+def deployed_branch(clone, commit):
+    """The remote branch a deployed commit comes from, from what the clone already fetched (nothing is fetched):
+    {'name', 'behind', 'exact'}. A branch whose tip is the commit wins (the default branch among them), then the
+    default branch when it contains it, then the containing branch with the fewest commits beyond it; behind is
+    how many commits that branch has beyond the deployed one. None when it cannot be told (no clone, a .git that
+    is a symlink or no directory, an unknown commit, a git error). git runs as the clone's owner (as describe())."""
+    if not isinstance(commit, str) or not COMMIT.fullmatch(commit):
+        return None
+    key = (str(clone), commit)
+    if key not in BRANCHES:
+        BRANCHES[key] = find_branch(clone, commit)
+    return BRANCHES[key]
+
+
+def find_branch(clone, commit):
+    git_directory = clone / '.git'
+    try:
+        if clone.is_symlink() or git_directory.is_symlink() or not git_directory.is_dir():
+            return None
+        owner = pwd.getpwuid(git_directory.stat().st_uid).pw_name
+        options = as_user(owner)
+    except (KeyError, OSError):
+        return None
+    options.setdefault('cwd', '/')
+    options['env'] = {**(options.get('env') or {'PATH': PATH, 'LANG': 'C.UTF-8'}), 'HOME': '/nonexistent',
+                      **GIT_ENVIRONMENT}
+
+    def git(*arguments):
+        code, output, _ = run(['git', *GIT_HARDENING, f'--git-dir={git_directory}', *arguments], timeout=10, **options)
+        return output if code == 0 else None
+
+    found = git('for-each-ref', f'--contains={commit}', '--format=%(objectname) %(refname)', '--end-of-options',
+                'refs/remotes/origin/')
+    if found is None:
+        return None
+    tips = {}
+    for line in found.splitlines():
+        tip, _, reference = line.partition(' ')
+        name = reference[len('refs/remotes/origin/'):] if reference.startswith('refs/remotes/origin/') else ''
+        if name != 'HEAD' and BRANCH.fullmatch(name) and re.fullmatch(r'[0-9a-f]{40,64}', tip):
+            tips[name] = tip
+    if not tips:
+        return None
+    default = default_branch(clone)
+    exact = sorted(name for name, tip in tips.items() if tip.startswith(commit))
+    if exact:
+        return {'name': default if default in exact else exact[0], 'behind': 0, 'exact': True}
+
+    def behind(name):
+        count = git('rev-list', '--count', '--end-of-options', f'{commit}..refs/remotes/origin/{name}')
+        return int(count) if count is not None and count.strip().isdigit() else None
+    if default in tips:
+        counted = behind(default)
+        return {'name': default, 'behind': counted, 'exact': False} if counted is not None else None
+    # Only feature branches hold it: the closest one (at most 20 counted, by name).
+    best = None
+    for name in sorted(tips)[:20]:
+        counted = behind(name)
+        if counted is not None and (best is None or counted < best[1]):
+            best = (name, counted)
+    return {'name': best[0], 'behind': best[1], 'exact': False} if best else None
+
+
 def timestamp(text):
     """Unix time of a deployments.json "at" (ISO 8601 with an offset), as bin/worker-metrics reads it."""
     moment = datetime.fromisoformat(text[:-1] + '+00:00' if text.endswith('Z') else text)
@@ -275,8 +355,9 @@ def timestamp(text):
     return int(moment.timestamp())
 
 
-def deploys(directory, environment):
-    """The last deploy, the last completed one and how many there were (setup's deployments.json)."""
+def deploys(directory, environment, clone=None):
+    """The last deploy, the last completed one and how many there were (setup's deployments.json); each with
+    the branch its commit comes from in the code clone (deployed_branch), when one is given."""
     text = read_text(directory / f'.generated/release/{environment}/deployments.json')
     if text is None:
         return None
@@ -289,7 +370,15 @@ def deploys(directory, environment):
     def shown(entry):
         return {'ref': str(entry.get('ref') or '')[:64], 'commit': str(entry.get('commit') or '')[:12],
                 'at': timestamp(str(entry['at'])), 'rollback': bool(entry.get('rollback')),
-                'failed': str(entry['failed'])[:40] if entry.get('failed') else None}
+                'failed': str(entry['failed'])[:40] if entry.get('failed') else None,
+                'branch': deployed_branch(clone, commit(entry)) if clone is not None else None}
+
+    def commit(entry):
+        """The full commit of a deploy: its commit, else its ref when that is a commit."""
+        for value in (entry.get('commit'), entry.get('ref')):
+            if isinstance(value, str) and COMMIT.fullmatch(value):
+                return value
+        return None
     completed = [entry for entry in entries if not entry.get('failed')]
     return {'last': shown(entries[-1]), 'last_success': shown(completed[-1]) if completed else None,
             'count': len(entries)}
@@ -404,7 +493,7 @@ def project(build_root, errors):
                                                      if FILE_PATH.fullmatch(item))]))[:50],
                  'containers': [], 'secrets': None}
         try:
-            state['deploys'] = deploys(directory, environment)
+            state['deploys'] = deploys(directory, environment, code_checkout(checkout))
         except (OSError, ValueError, KeyError, TypeError) as error:
             errors.append(f'{name} {environment}: deployments.json: {type(error).__name__}')
         try:
