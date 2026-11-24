@@ -340,16 +340,24 @@ else
     systemctl start "$NAME.service"
 fi
 echo "==> $NAME: $(systemctl is-active "$NAME.service" || true); listening on $listen"
-# Without the login it must answer 401.
+# Without the login a page must not answer: a browser is sent to the login page (303), a script gets 401.
 status=$(python3 - "http://$ADDRESS:$port/" <<'PYTHON' || true
 import sys, time, urllib.error, urllib.request
+
+
+class Stay(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
+
+
 for attempt in range(20):
     try:
-        urllib.request.urlopen(sys.argv[1], timeout=3)
+        urllib.request.build_opener(Stay).open(sys.argv[1], timeout=3)
         print('200 (without the login!)')
         break
     except urllib.error.HTTPError as error:
-        print(error.code)
+        target = error.headers.get('Location', '')
+        print(f'{error.code} -> {target}' if target else error.code)
         break
     except OSError:
         time.sleep(0.5)
