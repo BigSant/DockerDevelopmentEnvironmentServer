@@ -149,6 +149,8 @@ the "View only" callout for viewers. A new section needs entries in `NAVIGATION`
 
 **Section rule**: `<h2 id="anchor">Backups</h2>` is amber, uppercase and extends a line to the right. It is the
 main way to break up a page. Do not use it inside cards; use `h3` there.
+An `h3` straight in `main` (a smaller heading between page blocks, e.g. "Access levels") gets 28 px above it
+(`main>:not(h2)+h3`; right under an `h2` it keeps the h2's own spacing); don't add your own margin.
 
 **Stats strip**: `<div class="stats"><div class="stat"><b>13</b><span>projects</span></div>…</div>`. Use it for
 3–6 headline numbers at the top of a page. On a phone it becomes two columns, and an odd last stat spans both.
