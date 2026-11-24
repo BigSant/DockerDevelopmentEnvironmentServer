@@ -102,9 +102,9 @@ LEVEL_NOTES = {'phpfpm-readonly': 'php-fpm as nobody: cannot change files, can u
 PULL_LEVELS = ('db', 'fresh')
 PULL = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}(?::(?!local=|test=)[a-z][a-z0-9]{1,15})?=(?:db|fresh)')
 # The levels keep their add-backup-key names (db, fresh); the UI says what they let a key do.
-LEVEL_LABELS.update({'db': 'download', 'fresh': 'download + new'})
+LEVEL_LABELS.update({'db': 'download', 'fresh': 'download + fresh'})
 LEVEL_NOTES.update({'db': 'download the backups this server keeps: DB short, DB full and files (make db-pull, make files-pull)',
-                    'fresh': "and order a new backup now (make db-pull fresh=1; a DB one loads the project's DB)"})
+                    'fresh': "and order a fresh backup now (make db-pull fresh=1, make files-pull fresh=1; a DB one loads the project's DB)"})
 # The two kinds of what a key may do: its field prefix in the forms, its levels, add-backup-key's option.
 KINDS = {'access': ('grant', LEVELS, '--grant', 'Access', 'make ssh'),
          'backups': ('pull', PULL_LEVELS, '--pull', 'Backups', 'make db-pull')}

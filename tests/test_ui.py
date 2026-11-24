@@ -1913,7 +1913,7 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
                          f"{library} --name tomas --pull-all none --pull alpha_shop:prod=db --pull beta_docker:stage=fresh "
                          "--grant alpha_shop:prod=full --grant beta_docker:stage=docker")
-        self.assertIn("+ backups: beta_docker stage: download + new", body)
+        self.assertIn("+ backups: beta_docker stage: download + fresh", body)
         status, _, body = self.preview("add-backup-key", key_name="tomas", merge="yes", pull_all="db",
                                        **{"pull:alpha_shop:prod": "", "pull:shop-two:prod": "fresh"})
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
