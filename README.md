@@ -11,7 +11,7 @@ releases) and the **target** (the project containers run there). Deploys are con
 while the work is done by the runner on this server, so no cloud build minutes are used. Both runners can
 run on the same server together.
 
-The first server is the VPN server (Ubuntu Desktop), the first project is asana.local.
+The first server is the VPN server (Ubuntu Desktop), the first project is alpha.local.
 
 ## What it sets up
 
@@ -186,11 +186,11 @@ and change nothing. Run them with `--check` first.
 4. **Project:**
 
    ```bash
-   sudo bin/add-project --target local git@ssh.bitbucket.org:rsmaizys/asana_tracker.git
-   sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@ssh.bitbucket.org:rsmaizys/forsena_docker.git git@ssh.bitbucket.org:rsmaizys/forsena.git
+   sudo bin/add-project --target local git@ssh.bitbucket.org:example-team/alpha_shop.git
+   sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@ssh.bitbucket.org:example-team/beta_docker.git git@ssh.bitbucket.org:example-team/beta.git
    ```
 
-   The build directory is named after the repo (`/srv/setup-server/projects/asana_tracker`), so
+   The build directory is named after the repo (`/srv/setup-server/projects/alpha_shop`), so
    the pipeline finds it by itself: `BUILD_ROOT=${BUILD_ROOT:-$SETUP_SERVER_ROOT/projects/$BITBUCKET_REPO_SLUG}`
    (`SETUP_SERVER_ROOT` is passed by the runner service, `BITBUCKET_REPO_SLUG` – by Bitbucket). The repository
    variable `BUILD_ROOT` is needed only when another name is given (`add-project NAME URL`). Put the passwords
@@ -206,14 +206,14 @@ and change nothing. Run them with `--check` first.
    rejects such an example):
 
    ```bash
-   sudo bin/add-project --target local git@ssh.bitbucket.org:rsmaizys/asana_tracker.git   # this server
-   sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@ssh.bitbucket.org:rsmaizys/forsena_docker.git
+   sudo bin/add-project --target local git@ssh.bitbucket.org:example-team/alpha_shop.git   # this server
+   sudo bin/add-project --target prod=ssh://deploy@shop.example/home/deploy/shop git@ssh.bitbucket.org:example-team/beta_docker.git
    ```
 
    - **The target is always given:** a new project without `--target` is not created (nothing is cloned).
    - **`local`** – this server (`DEPLOY_CONTEXT=default`), the project root is the build directory,
      the containers run as the `setup` account (its `APP_UID`/`APP_GID`).
-   - **`local:/PATH`** – this server, but the project root is in another directory (e.g. `local:/home/name/Projects/asana`),
+   - **`local:/PATH`** – this server, but the project root is in another directory (e.g. `local:/home/name/Projects/alpha`),
      not inside `SETUP_SERVER_ROOT` (checked after resolving symlinks).
      The script creates a missing directory for the `setup` account (0750); an existing one must be writable by it. Files and containers –
      belong to the `setup` account. The deploy copies the code there, and setup 2.7.0+ also the environment files the containers mount
@@ -224,7 +224,7 @@ and change nothing. Run them with `--check` first.
      `USER`'s `authorized_keys`, and stops), checks Docker and whether `PATH` is writable, takes over the user's
      `id -u`/`id -g` and creates the Docker context `setup-<name>[-<env>]`. A new host key is written
      on the first connection (it is shown).
-   - **`stage=…` / `prod=…` / `mdv=…`** – one environment only (`target.<env>.env`, wins over the shared `target.env`),
+   - **`stage=…` / `prod=…` / `demo=…`** – one environment only (`target.<env>.env`, wins over the shared `target.env`),
      when stage and prod are on different servers, or for an extra environment (see "Extra environments"). `--target` can be repeated.
    - **Stage and prod on the same server – each in its own directory:** `--target stage=local:/PATH/stage --target
      prod=local:/PATH/prod`. With a single `local` both environments use the build directory, and its containers mount the environment
@@ -259,24 +259,24 @@ and change nothing. Run them with `--check` first.
    Under another name – the Actions variable `BUILD_ROOT`. Passwords – GitHub environment secrets. The job must have
    `runs-on: [self-hosted, linux, setup.build]`. `unset DOCKER_HOST` is not needed: GitHub does not set it.
 
-   **A repo name with a dot** (`zarskis.lt`) is not a valid NAME (only `a-z`, `0-9`, `_`, `-`): the script stops and
-   suggests a name. Give it as `--name zarskis` (or `zarskis` before the URL). The build directory then does not match the repo
-   name: the workflow writes it itself (`${SETUP_SERVER_ROOT}/projects/zarskis`) or gets it through the Actions variable `BUILD_ROOT`.
+   **A repo name with a dot** (`gamma.example`) is not a valid NAME (only `a-z`, `0-9`, `_`, `-`): the script stops and
+   suggests a name. Give it as `--name gamma` (or `gamma` before the URL). The build directory then does not match the repo
+   name: the workflow writes it itself (`${SETUP_SERVER_ROOT}/projects/gamma`) or gets it through the Actions variable `BUILD_ROOT`.
 
    **A monorepo GitHub project** – one repo containing both the DDE environment `app/` and the code `app/public/` (e.g.
-   `BigSant/zarskis.lt`). On this server (`SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server`, account
+   `example-team/gamma.example`). On this server (`SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server`, account
    `tomas`):
 
    ```bash
    sudo SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server SETUP_SERVER_USER=tomas \
        bin/add-project --check --monorepo \
-       --target stage=local:/home/tomas/Projects/runtime/zarskis/stage \
-       --target prod=local:/home/tomas/Projects/runtime/zarskis/prod \
-       --name zarskis git@github.com:BigSant/zarskis.lt.git
+       --target stage=local:/home/tomas/Projects/runtime/gamma/stage \
+       --target prod=local:/home/tomas/Projects/runtime/gamma/prod \
+       --name gamma git@github.com:example-team/gamma.example.git
    # then the same without --check: the first time it stops at the deploy key (see above), after adding it – once more
    ```
 
-   - `--monorepo` clones the repo **as the build directory** (`projects/zarskis/`), not into `app/` (otherwise it would be `app/app/`).
+   - `--monorepo` clones the repo **as the build directory** (`projects/gamma/`), not into `app/` (otherwise it would be `app/app/`).
      The repo must have `app/Makefile`; any other repo is rejected and nothing is left behind. No code repo URL is given – the code is already in
      `app/public/`. `--check` shows the clone and the targets without changing anything.
    - **The target – its own `local:/PATH` (or `ssh://`) for each environment.** `local` (the build directory itself) is
@@ -298,22 +298,22 @@ and change nothing. Run them with `--check` first.
      accepted without `--monorepo`.
    - Then in the project: `app/env/stage.env.example`, `app/env/prod.env.example` (without `DEPLOY_*`), GitHub environments
      `staging`/`production` with secrets and a runner for this repo (`bin/install-runner --provider github`, scope
-     `bigsant.zarskis.lt`). Backups, metrics, the overview and `remove-project` read a monorepo build directory like any
+     `example-team.gamma.example`). Backups, metrics, the overview and `remove-project` read a monorepo build directory like any
      other (the environment – `app/`).
 
-   **AI OS deployments** (AI OS `docs/development-delivery-contract.md`) go only through GitHub: AI OS runs the project's
+   **example-app deployments** (example-app's `docs/development-delivery-contract.md`) go only through GitHub: example-app runs the project's
    `deploy.yml` (`workflow_dispatch` with `operation` `deploy|status`, `environment` `stage|prod`, `sha`, `attempt_id`,
-   `request_id`, `expected_live`, `health_paths`; name `aios <operation> <environment> <request_id>`), the job on this
+   `request_id`, `expected_live`, `health_paths`; name `example-app <operation> <environment> <request_id>`), the job on this
    server's runner runs `make -C <build directory>/app pipeline-deploy`, and returns the status as the artifact
-   `aios-<request_id>` (`dde-deploy-status/v1`, setup's `make deploy-status`). Server OPS gives it only the build
-   directory, the targets and the runner; AI OS gets no server, SSH or Docker access.
+   `example-app-<request_id>` (`dde-deploy-status/v1`, setup's `make deploy-status`). Server OPS gives it only the build
+   directory, the targets and the runner; example-app gets no server, SSH or Docker access.
 
 5. **Removing a project:**
 
    ```bash
    ls /srv/setup-server/projects/
-   sudo bin/remove-project --check asana_tracker    # shows the size, backups, deploy history
-   sudo bin/remove-project asana_tracker
+   sudo bin/remove-project --check alpha_shop    # shows the size, backups, deploy history
+   sudo bin/remove-project alpha_shop
    ```
 
    If the directory holds DB backups or deploy history (`app/.generated` or in the older layout
@@ -336,7 +336,7 @@ and change nothing. Run them with `--check` first.
    Each series is rotated separately, rotation does not touch other files. One backup at a time is made for a project and
    environment (lock `.generated/backups/.lock-<env>`): if the nightly one is still running, the weekly or "fresh" one
    waits for it. A full backup may take up to 8 h, the others – up to 4. In a terminal (`sudo setup-server-backup --full
-   asana_tracker prod`) a bar is shown: the bytes written, compared with the size of the previous backup of the same kind.
+   alpha_shop prod`) a bar is shown: the bytes written, compared with the size of the previous backup of the same kind.
 
    **Which projects and environments.** Every environment of `/srv/setup-server/projects/<name>` is backed up
    for which the environment repo (`app/`, in the older layout `app/docker/`) has `env/stage.env`, `env/prod.env` or
@@ -344,7 +344,7 @@ and change nothing. Run them with `--check` first.
    This file is created by the project's deploy pipeline (`cp env/prod.env.example env/prod.env`), so what is backed up is
    what is deployed from this server. `local` and `test` are not backed up. The backup is setup's `make db-backup
    ENV=<env>`: stage/prod according to the table registry, with `DATABASE_EXTRA_SCHEMAS` – all schemas in one dump
-   (asana.local). Only the database is backed up: `data/` directories (search indexes and the like) are not backed up,
+   (alpha.local). Only the database is backed up: `data/` directories (search indexes and the like) are not backed up,
    and which schemas and tables go into the dump is decided by the project's `DATABASE_EXTRA_SCHEMAS` and the registry.
 
    **Passwords live only in Bitbucket.** The server has no copy of them. The timer runs without Bitbucket, so
@@ -440,9 +440,9 @@ and change nothing. Run them with `--check` first.
    ```bash
    sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --pull shop=db --check   # shows what it would change
    sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --pull shop=db           # shop stage and prod backups
-   sudo bin/add-backup-key --name tomas --pull shop:prod=fresh --pull forsena:stage=db         # an existing one – just the name
+   sudo bin/add-backup-key --name tomas --pull shop:prod=fresh --pull beta:stage=db         # an existing one – just the name
    sudo bin/add-backup-key --name qa --pull-all db                    # backups of all projects (including new ones)
-   sudo bin/add-backup-key --list          # tomas  from 10.8.0.0/24  backups all=none forsena:stage=db shop:prod=fresh
+   sudo bin/add-backup-key --list          # tomas  from 10.8.0.0/24  backups all=none beta:stage=db shop:prod=fresh
    sudo bin/add-backup-key --remove tomas                                        # revokes the permission
    ```
 
@@ -477,7 +477,7 @@ and change nothing. Run them with `--check` first.
    is younger than 30 min., that one is returned; if a backup is being made at that moment, it waits for it to finish (lock). It needs
    the installed `/usr/local/sbin/setup-server-backup` (`sudo bin/install-backups`). Every request (including rejected ones)
    is written to `/srv/setup-server/backup-pulls.log`: time, key name, address, request, result. The project
-   name is the build directory name (`projects/<name>`, e.g. `asana_tracker`).
+   name is the build directory name (`projects/<name>`, e.g. `alpha_shop`).
 
    The backups contain real customer data (stage/prod according to the table registry): allow them only to those who need them,
    and revoke the permission (`--remove`) when it is no longer needed. The installed copy of the command is updated by `bin/update`.
@@ -489,17 +489,17 @@ and change nothing. Run them with `--check` first.
 
    ```bash
    sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 \
-       --grant forsena:prod=phpfpm-readonly --grant forsena:stage=docker --check     # shows what it would change
+       --grant beta:prod=phpfpm-readonly --grant beta:stage=docker --check     # shows what it would change
    sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 \
-       --grant forsena:prod=phpfpm-readonly --grant forsena:stage=docker             # writes it
-   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --grant asana_tracker=full   # both environments
-   sudo bin/add-backup-key --list          # tomas  from 10.8.0.0/24  access forsena:prod=phpfpm-readonly …
+       --grant beta:prod=phpfpm-readonly --grant beta:stage=docker             # writes it
+   sudo bin/add-backup-key ~/tomas.pub --name tomas --from 10.8.0.0/24 --grant alpha_shop=full   # both environments
+   sudo bin/add-backup-key --list          # tomas  from 10.8.0.0/24  access beta:prod=phpfpm-readonly …
    ```
 
    `--grant` can be repeated or comma-separated; without `:stage`/`:prod` – both environments. Run again with the same
    name, the whole entry is replaced: list all permissions (without `--grant` – only backups remain). For an existing key
    the key file and `--from` are not needed – the written key, networks and backup permissions stay: `sudo bin/add-backup-key --name
-   tomas --grant forsena=docker` changes only the access permissions. The project is the build directory name (`projects/<name>`);
+   tomas --grant beta=docker` changes only the access permissions. The project is the build directory name (`projects/<name>`);
    for a project that does not exist yet the permission is written with a note. Most convenient – the UI's *Access* page (see "Web UI").
 
    | Level | What it allows | What it does not allow |
@@ -510,7 +510,7 @@ and change nothing. Run them with `--check` first.
    | `full` | a target shell: the `DEPLOY_SSH` user on the target, in the `DEPLOY_PATH` directory | – (as much as that user can). **For a `--target local` project this is the `setup` account on this server:** all projects, their secrets and Docker, i.e. root |
 
    Each level includes the lower ones. A key with permissions is written as
-   `from="10.8.0.0/24",command="/usr/local/sbin/setup-server-access --key tomas --grant forsena:prod=phpfpm-readonly …",restrict,pty`:
+   `from="10.8.0.0/24",command="/usr/local/sbin/setup-server-access --key tomas --grant beta:prod=phpfpm-readonly …",restrict,pty`:
    only from the VPN, only this command, with a terminal (`pty`), but without port, agent and X11 forwarding, so neither `ProxyJump`
    nor a tunnel to LIVE works. Backup requests (`latest`, `info`, `get`, `fresh`) are passed by the command to
    `setup-server-backup-pull`, so `make db-pull` works as before.
@@ -528,7 +528,7 @@ and change nothing. Run them with `--check` first.
    | `docker PROJECT ENV exec [--root\|-u USER] [-w DIRECTORY] CONTAINER [COMMAND …]` | a shell or a command in the container |
    | `docker PROJECT ENV start\|stop\|restart CONTAINER …`, `top`, `stats`, `inspect` | management |
 
-   A container is a name (`forsena-prod-php-fpm-1`) or a service (`php-fpm`, `database`). The target, the Docker context and
+   A container is a name (`beta-prod-php-fpm-1`) or a service (`php-fpm`, `database`). The target, the Docker context and
    `APP_UID` are taken from the build directory (`target*.env`, `env/<env>.env`), like the deploy's. The command gives a terminal when
    the SSH session has one (`ssh -t`); without it – stdin is passed through, so `… exec … -- mysqldump … > file` works too.
    Every request (including rejected ones) and its end (exit code) are written to `/srv/setup-server/access.log`: time,
@@ -613,7 +613,7 @@ sudo bin/tool-access --allowed-ips 198.51.100.7                 # the VPN server
 sudo bin/tool-access --name tomas --password - < password.txt    # 12+ characters, via stdin; only the hash is stored
 sudo bin/tool-access --name tomas --tools shop:prod,blog         # without :ENV – stage and prod; the list is replaced
 sudo bin/tool-access --name tomas --no-tools                     # revokes all
-sudo bin/tool-access --name tomas --full-name 'Tomas Žarskis' --login tomas@imone.lt  # the person; '' – none / the key name
+sudo bin/tool-access --name jane --full-name 'Jane Doe' --login jane@example.com  # the person; '' – none / the key name
 sudo bin/tool-access --apply                                     # sends all files again (e.g. after an error)
 sudo bin/tool-access --show                                      # the state as JSON, without hashes
 ```
@@ -631,33 +631,33 @@ sudo bin/tool-access --show                                      # the state as 
   `*.<domain>` – then the individual tool names do not show up in the Certificate Transparency logs. Protection comes not from the names but from the IP list
   and the password.
 
-## Extra environments (e.g. a temporary `mdv`)
+## Extra environments (e.g. a temporary `demo`)
 
 For a bigger piece of work a project can have more environments than stage and prod. The project's `env/common.env` lists them:
-`STAGE_ENVIRONMENTS="mdv"` (setup; the name is lowercase letters and digits, 2–16 characters, not `local`/`test`/`stage`/`prod`).
+`STAGE_ENVIRONMENTS="demo"` (setup; the name is lowercase letters and digits, 2–16 characters, not `local`/`test`/`stage`/`prod`).
 Each such environment behaves like stage in setup (see setup `doc/lt/09-aplinkos.md`), and on this server – like any
 other environment:
 
-- **Target** – the shared `target.env` or its own: `sudo bin/add-project --target mdv=ssh://deploy@mdv.example/home/deploy/shop NAME URL`
-  (`target.mdv.env`). On the same target as stage or prod the environment needs its own ports or address (setup checks this).
-- **Deploy** – the project's `bitbucket-pipelines.yml` custom pipeline `deploy-mdv` with `deployment: mdv` (Bitbucket
-  deployment environment `mdv`, type Staging) or the GitHub environment `mdv`; on the project page in the UI – "Deploy to mdv"
+- **Target** – the shared `target.env` or its own: `sudo bin/add-project --target demo=ssh://deploy@demo.example/home/deploy/shop NAME URL`
+  (`target.demo.env`). On the same target as stage or prod the environment needs its own ports or address (setup checks this).
+- **Deploy** – the project's `bitbucket-pipelines.yml` custom pipeline `deploy-demo` with `deployment: demo` (Bitbucket
+  deployment environment `demo`, type Staging) or the GitHub environment `demo`; on the project page in the UI – "Deploy to demo"
   (shown once the environment is listed, even before the first deploy).
-- **Backups** – nightly, weekly full and "backup now" (`… setup-server-backup "$BUILD_ROOT" mdv`), when
-  `env/mdv.env` exists; `make db-pull from=mdv`. The "backup now" sudo rule also accepts an extra environment's name: after updating
+- **Backups** – nightly, weekly full and "backup now" (`… setup-server-backup "$BUILD_ROOT" demo`), when
+  `env/demo.env` exists; `make db-pull from=demo`. The "backup now" sudo rule also accepts an extra environment's name: after updating
   Server OPS repeat `sudo bin/install-backups` (`bin/update` shows that the rule differs).
-- **Metrics** – the same lines with `environment="mdv"`.
-- **Access** – `--grant project:mdv=LEVEL` and the UI's *Access* (on the key page mdv stands next to prod and stage;
+- **Metrics** – the same lines with `environment="demo"`.
+- **Access** – `--grant project:demo=LEVEL` and the UI's *Access* (on the key page demo stands next to prod and stage;
   "All at once" – the row "others"). `--grant project=LEVEL` without an environment – only stage and prod.
-- **When the environment is no longer needed** – on the setup side `make down ENV=mdv`, removing `data/mdv` and the name from `STAGE_ENVIRONMENTS`;
-  here – the environment's own target goes with `sudo bin/add-project --remove-target mdv --name NAME` (the UI's project page also offers it;
-  it is refused when there is no shared `target.env` to fall back to), `app/.generated/backups/*-mdv-*` (if the backups are no longer needed)
-  are deleted by hand, the keys' `…:mdv` permissions are revoked in *Access* (the gate does not let anyone connect to an unlisted environment anyway).
+- **When the environment is no longer needed** – on the setup side `make down ENV=demo`, removing `data/demo` and the name from `STAGE_ENVIRONMENTS`;
+  here – the environment's own target goes with `sudo bin/add-project --remove-target demo --name NAME` (the UI's project page also offers it;
+  it is refused when there is no shared `target.env` to fall back to), `app/.generated/backups/*-demo-*` (if the backups are no longer needed)
+  are deleted by hand, the keys' `…:demo` permissions are revoked in *Access* (the gate does not let anyone connect to an unlisted environment anyway).
 
 ## Bitbucket SSH address (since 2026-11-12)
 
 Since 2026-11-12 Bitbucket answers git over SSH only on `ssh.bitbucket.org` (`git@ssh.bitbucket.org:workspace/repo.git`);
-`bitbucket.org` will no longer accept SSH connections. HTTPS (API, the asana.local git mirror) does not change. The new name has the same
+`bitbucket.org` will no longer accept SSH connections. HTTPS (API, the alpha.local git mirror) does not change. The new name has the same
 host keys (ED25519 `SHA256:ybgmFkzwOSotHTHLJgHO0QN8L0xErw6vd0VhFA9m3SM`), but a `known_hosts` entry is bound to the
 name, and the build directories' `origin` stays the one they were cloned with. So on the server, before that date:
 
@@ -1204,7 +1204,7 @@ with an error, there is no "Run"). One action runs at a time; its page refreshes
   `bin/update` (see "Manual recovery") stay in the terminal: they change the UI itself or are needed when it is not working.
 
 **Deploys through Bitbucket.** On the project page – "Deploy to stage", "Deploy to prod" and for every extra environment
-"Deploy to mdv" (custom pipelines `deploy-stage`, `deploy-<env>`,
+"Deploy to demo" (custom pipelines `deploy-stage`, `deploy-<env>`,
 `deploy-production` with the variables `REF`, `IMAGES`, `BACKUP`, `ROLLBACK`; with CACHE checked – also `CACHE=yes`, and
 unchecked it is not sent, and the setup 5.2.0+ pipeline clears the cache only when the deploy changes it), "Backup now" (`backup-now`, with
 FULL checked – with the variable `FULL=yes`; unchecked the variable is not sent) and "Runner
@@ -1219,7 +1219,7 @@ sudo systemctl restart setup-server-ui    # the service reads the tokens when it
 ```
 
 ```ini
-BITBUCKET_ACCESS_TOKEN_ASANA_TRACKER=…    # for one build directory: the name in uppercase, - replaced with _
+BITBUCKET_ACCESS_TOKEN_ALPHA_SHOP=…    # for one build directory: the name in uppercase, - replaced with _
 BITBUCKET_ACCESS_TOKEN=…                  # for all others (e.g. a workspace access token)
 ```
 
@@ -1297,7 +1297,7 @@ sudo tail -n 20 /srv/setup-server/ui-actions.log
   because the server is both the build server and the target. For remote targets this question is solved
   separately.
 - The existing Docker is never replaced or restarted, so the containers already running
-  (the current asana.local) keep running.
+  (the current alpha.local) keep running.
 - The runner's OAuth credentials are kept only in `/etc/setup-server/runner.env` (root, 0600), but on the running runner's
   command line they are visible to all accounts on the server, and in its environment – to the `setup` account's processes and pipeline
   steps (see "Steps", step 3).
@@ -1357,10 +1357,10 @@ SETUP_PROMTOOL_IMAGE=prom/prometheus:latest python3 -m unittest discover -s test
 When the DDE files are in the monorepo's `app/` and the code in `app/public/`, do not use `add-project` to clone into an already working directory (for a server stage/prod build directory of a monorepo – `add-project --monorepo`, see "GitHub project"). Run as its owner:
 
 ```sh
-SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server bin/register-development-project ai-os /home/tomas/Projects/ai-os
+SETUP_SERVER_ROOT=/home/tomas/Projects/runtime/setup-server bin/register-development-project example-app /home/tomas/Projects/example-app
 ```
 
-Registration creates the `projects/ai-os/app` link and `development.json`; the code, private env files and the DB are not moved. The web overview shows the `local` containers, their logs, the DDE-format deployment history and a link to GitHub Actions; deployment metrics are read too. This grants no server SSH, DB copy or backup permissions for the `local` environment. AI OS uses its own encrypted recovery backups. CI/CD is run by this repo's separate GitHub runner (`bin/install-runner --provider github`); the deployment of a specific product is described by the product's pipeline and its DDE commands.
+Registration creates the `projects/example-app/app` link and `development.json`; the code, private env files and the DB are not moved. The web overview shows the `local` containers, their logs, the DDE-format deployment history and a link to GitHub Actions; deployment metrics are read too. This grants no server SSH, DB copy or backup permissions for the `local` environment. example-app uses its own encrypted recovery backups. CI/CD is run by this repo's separate GitHub runner (`bin/install-runner --provider github`); the deployment of a specific product is described by the product's pipeline and its DDE commands.
 
 The automatic update systemd service uses `--wait-lock`: an active DDE CI or deployment lock postpones the update until the jobs finish. A plain `bin/auto-update` without this option stays non-blocking. If a local `ExecStartPost` is used to update the installed copies, its `flock` must also wait for the lock rather than use `-n`.
 

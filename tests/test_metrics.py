@@ -201,25 +201,25 @@ class EndpointTest(ScriptTest):
 
     def fixtures(self):
         hour = 3600
-        asana = self.tree.project("asana_tracker", "prod")
+        alpha = self.tree.project("alpha_shop", "prod")
         for age, size in ((2 * hour, 4096), (26 * hour, 3000), (50 * hour, 2000)):
             stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - age))
-            self.tree.backup(asana, f"worker-prod-{stamp}Z.sql.gz", age, size)
+            self.tree.backup(alpha, f"worker-prod-{stamp}Z.sql.gz", age, size)
         # A pre-deploy backup is newer but not the nightly series: it never hides a stopped timer.
-        self.tree.backup(asana, "asana-prod-20261009T120000000000.sql.gz", 60, 99)
-        self.tree.deployments(asana, "prod", [
+        self.tree.backup(alpha, "alpha-prod-20261009T120000000000.sql.gz", 60, 99)
+        self.tree.deployments(alpha, "prod", [
             entry("v1.0.0", "a" * 40, "2026-10-01T10:00:00+00:00"),
             entry("v1.1.0", "b" * 40, "2026-10-05T10:00:00+00:00"),
             entry("v1.0.0", "a" * 40, "2026-10-06T08:30:00+00:00", rollback=True),
         ])
-        forsena = self.tree.project("forsena_docker", "stage", layout="app/docker")
-        self.tree.deployments(forsena, "stage", [
+        beta = self.tree.project("beta_docker", "stage", layout="app/docker")
+        self.tree.deployments(beta, "stage", [
             entry("v3.2.0", "c" * 40, "2026-10-07T09:00:00+00:00"),
             entry("v3.3.0", "d" * 40, "2026-10-08T09:00:00+00:00", failed="after-rsync"),
         ])
         self.tree.project("not_deployed")
         self.github_runner("bigsant")
-        return asana, forsena
+        return alpha, beta
 
     def github_runner(self, scope, registered=True):
         directory = self.tree.root / "github-runner" / scope
@@ -281,63 +281,63 @@ class EndpointTest(ScriptTest):
     def test_backup_age_size_and_count_come_from_the_newest_nightly_backup(self):
         self.fixtures()
         samples = parse(self.scrape())
-        age = value(samples, "setup_worker_backup_newest_age_seconds", project="asana_tracker", environment="prod")
+        age = value(samples, "setup_worker_backup_newest_age_seconds", project="alpha_shop", environment="prod")
         self.assertAlmostEqual(age, 7200, delta=60)
-        self.assertEqual(value(samples, "setup_worker_backup_newest_size_bytes", project="asana_tracker",
+        self.assertEqual(value(samples, "setup_worker_backup_newest_size_bytes", project="alpha_shop",
                                environment="prod"), 4096)
-        self.assertEqual(value(samples, "setup_worker_backups", project="asana_tracker", environment="prod"), 3)
+        self.assertEqual(value(samples, "setup_worker_backups", project="alpha_shop", environment="prod"), 3)
         # Deployed to stage from here but never backed up: no age, a zero count the alert sees.
-        self.assertEqual(value(samples, "setup_worker_backups", project="forsena_docker", environment="stage"), 0)
+        self.assertEqual(value(samples, "setup_worker_backups", project="beta_docker", environment="stage"), 0)
         self.assertNotIn(("setup_worker_backup_newest_age_seconds",
-                          (("environment", "stage"), ("project", "forsena_docker"))), samples)
+                          (("environment", "stage"), ("project", "beta_docker"))), samples)
         self.assertFalse([key for key in samples if ("project", "not_deployed") in key[1]])
 
     def test_the_weekly_full_series_has_metrics_of_its_own_and_fresh_backups_count_nowhere(self):
         self.fixtures()
-        asana = self.tree.projects / "asana_tracker/app"
+        alpha = self.tree.projects / "alpha_shop/app"
         day = 24 * 3600
         for age, size in ((2 * day, 9000), (9 * day, 8000)):
             stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - age))
-            self.tree.backup(asana, f"full-prod-{stamp}Z.sql.gz", age, size)
-        self.tree.backup(asana, "fresh-prod-20261013T120000Z.sql.gz", 60, 5)
+            self.tree.backup(alpha, f"full-prod-{stamp}Z.sql.gz", age, size)
+        self.tree.backup(alpha, "fresh-prod-20261013T120000Z.sql.gz", 60, 5)
         samples = parse(self.scrape())
-        labels = {"project": "asana_tracker", "environment": "prod"}
+        labels = {"project": "alpha_shop", "environment": "prod"}
         self.assertEqual(value(samples, "setup_worker_full_backups", **labels), 2)
         self.assertEqual(value(samples, "setup_worker_full_backup_newest_size_bytes", **labels), 9000)
         self.assertAlmostEqual(value(samples, "setup_worker_full_backup_newest_age_seconds", **labels), 2 * day, delta=60)
         self.assertEqual(value(samples, "setup_worker_backups", **labels), 3, "fresh and full backups are not nightly ones")
         self.assertEqual(value(samples, "setup_worker_backup_newest_size_bytes", **labels), 4096)
         # Without the weekly timer an ENV with no full backup has no full metrics (no alert on a worker without them).
-        self.assertFalse([key for key in samples if key[0] == "setup_worker_full_backups" and ("project", "forsena_docker") in key[1]])
+        self.assertFalse([key for key in samples if key[0] == "setup_worker_full_backups" and ("project", "beta_docker") in key[1]])
         systemd = self.root / "systemd"
         systemd.mkdir()
         (systemd / "setup-server-backup-full.timer").write_text("[Timer]\n")
         samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
-        self.assertEqual(value(samples, "setup_worker_full_backups", project="forsena_docker", environment="stage"), 0)
+        self.assertEqual(value(samples, "setup_worker_full_backups", project="beta_docker", environment="stage"), 0)
 
     def test_the_files_series_has_metrics_of_its_own_and_counts_zero_only_where_paths_are_set(self):
         self.fixtures()
-        asana = self.tree.projects / "asana_tracker/app"
-        (asana / "env/common.env").write_text('BACKUP_FILE_PATHS="modules/*/translations/"\n')
+        alpha = self.tree.projects / "alpha_shop/app"
+        (alpha / "env/common.env").write_text('BACKUP_FILE_PATHS="modules/*/translations/"\n')
         stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - 3600))
-        self.tree.backup(asana, f"files-prod-{stamp}Z.tar.gz", 3600, 700)
-        self.tree.backup(asana, f"files-prod-{stamp}Z.sql.gz", 60, 5)  # not of the series
-        forsena = self.tree.projects / "forsena_docker/app/docker"
-        (forsena / "env/stage.env").write_text("BACKUP_FILE_PATHS=themes/*/lang/  # translations\n")
+        self.tree.backup(alpha, f"files-prod-{stamp}Z.tar.gz", 3600, 700)
+        self.tree.backup(alpha, f"files-prod-{stamp}Z.sql.gz", 60, 5)  # not of the series
+        beta = self.tree.projects / "beta_docker/app/docker"
+        (beta / "env/stage.env").write_text("BACKUP_FILE_PATHS=themes/*/lang/  # translations\n")
         self.tree.project("shop", "prod")
         samples = parse(self.scrape())
-        labels = {"project": "asana_tracker", "environment": "prod"}
+        labels = {"project": "alpha_shop", "environment": "prod"}
         self.assertEqual(value(samples, "setup_worker_files_backups", **labels), 1)
         self.assertEqual(value(samples, "setup_worker_files_backup_newest_size_bytes", **labels), 700)
         self.assertAlmostEqual(value(samples, "setup_worker_files_backup_newest_age_seconds", **labels), 3600, delta=60)
         self.assertEqual(value(samples, "setup_worker_backups", **labels), 3, "files backups are not database ones")
-        self.assertFalse([key for key in samples if key[0] == "setup_worker_files_backups" and ("project", "forsena_docker") in key[1]],
+        self.assertFalse([key for key in samples if key[0] == "setup_worker_files_backups" and ("project", "beta_docker") in key[1]],
                          "without the files timer an ENV without files backups raises no alert")
         systemd = self.root / "systemd"
         systemd.mkdir()
         (systemd / "setup-server-backup-files.timer").write_text("[Timer]\n")
         samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
-        self.assertEqual(value(samples, "setup_worker_files_backups", project="forsena_docker", environment="stage"), 0)
+        self.assertEqual(value(samples, "setup_worker_files_backups", project="beta_docker", environment="stage"), 0)
         self.assertFalse([key for key in samples if key[0] == "setup_worker_files_backups" and ("project", "shop") in key[1]],
                          "an ENV without BACKUP_FILE_PATHS expects no files backups")
         (self.tree.projects / "shop/app/env/common.env").write_text("PROFILE=prestashop\n")
@@ -346,57 +346,57 @@ class EndpointTest(ScriptTest):
                          "a PrestaShop project expects its translations backed up without BACKUP_FILE_PATHS")
 
     def test_a_stage_class_environment_the_project_lists_has_its_backups_and_deploys(self):
-        shop = self.tree.project("shop", "prod", "mdv", "old")
-        (shop / "env/common.env").write_text('STAGE_ENVIRONMENTS="mdv"\n')
+        shop = self.tree.project("shop", "prod", "demo", "old")
+        (shop / "env/common.env").write_text('STAGE_ENVIRONMENTS="demo"\n')
         stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - 3600))
-        self.tree.backup(shop, f"worker-mdv-{stamp}Z.sql.gz", 3600, 777)
-        self.tree.deployments(shop, "mdv", [entry("feature/x", "c" * 40, "2026-10-07T10:00:00+00:00")])
+        self.tree.backup(shop, f"worker-demo-{stamp}Z.sql.gz", 3600, 777)
+        self.tree.deployments(shop, "demo", [entry("feature/x", "c" * 40, "2026-10-07T10:00:00+00:00")])
         samples = parse(self.scrape())
-        self.assertEqual(value(samples, "setup_worker_backup_newest_size_bytes", project="shop", environment="mdv"), 777)
+        self.assertEqual(value(samples, "setup_worker_backup_newest_size_bytes", project="shop", environment="demo"), 777)
         self.assertEqual(value(samples, "setup_worker_backups", project="shop", environment="prod"), 0)
         self.assertNotIn(("setup_worker_backups", (("environment", "old"), ("project", "shop"))), samples, "not listed")
-        self.assertEqual(value(samples, "setup_worker_deploy_last_success", project="shop", environment="mdv"), 1)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_success", project="shop", environment="demo"), 1)
 
     def test_a_monorepo_build_root_has_its_backups_and_deploys(self):
         # bin/add-project --monorepo: the repository is the build root; app/ is the environment as in any other.
-        zarskis = self.tree.project("zarskis", "stage", "prod")
-        (zarskis.parent / ".git").mkdir()
+        gamma = self.tree.project("gamma", "stage", "prod")
+        (gamma.parent / ".git").mkdir()
         stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(time.time() - 3600))
-        self.tree.backup(zarskis, f"worker-prod-{stamp}Z.sql.gz", 3600, 512)
-        self.tree.deployments(zarskis, "stage", [entry("master", "d" * 40, "2026-11-05T10:00:00+00:00")])
+        self.tree.backup(gamma, f"worker-prod-{stamp}Z.sql.gz", 3600, 512)
+        self.tree.deployments(gamma, "stage", [entry("master", "d" * 40, "2026-11-05T10:00:00+00:00")])
         samples = parse(self.scrape())
-        self.assertEqual(value(samples, "setup_worker_backup_newest_size_bytes", project="zarskis", environment="prod"), 512)
-        self.assertEqual(value(samples, "setup_worker_backups", project="zarskis", environment="stage"), 0)
-        self.assertEqual(value(samples, "setup_worker_deploy_last_success", project="zarskis", environment="stage"), 1)
+        self.assertEqual(value(samples, "setup_worker_backup_newest_size_bytes", project="gamma", environment="prod"), 512)
+        self.assertEqual(value(samples, "setup_worker_backups", project="gamma", environment="stage"), 0)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_success", project="gamma", environment="stage"), 1)
 
     def test_the_last_deploy_tells_a_rollback_and_a_failed_deploy_apart(self):
         self.fixtures()
         samples = parse(self.scrape())
-        asana = dict(project="asana_tracker", environment="prod")
-        self.assertEqual(value(samples, "setup_worker_deploy_last_timestamp_seconds", **asana), 1791275400)
-        self.assertEqual(value(samples, "setup_worker_deploy_last_success", **asana), 1)
-        self.assertEqual(value(samples, "setup_worker_deploy_last_rollback", **asana), 1)
-        self.assertEqual(value(samples, "setup_worker_deploy_last_success_timestamp_seconds", **asana), 1791275400)
-        self.assertEqual(value(samples, "setup_worker_deploy_last_info", ref="v1.0.0", commit="a" * 12, **asana), 1)
-        forsena = dict(project="forsena_docker", environment="stage")
-        self.assertEqual(value(samples, "setup_worker_deploy_last_timestamp_seconds", **forsena), 1791450000)
-        self.assertEqual(value(samples, "setup_worker_deploy_last_success", **forsena), 0)
-        self.assertEqual(value(samples, "setup_worker_deploy_last_rollback", **forsena), 0)
+        alpha = dict(project="alpha_shop", environment="prod")
+        self.assertEqual(value(samples, "setup_worker_deploy_last_timestamp_seconds", **alpha), 1791275400)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_success", **alpha), 1)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_rollback", **alpha), 1)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_success_timestamp_seconds", **alpha), 1791275400)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_info", ref="v1.0.0", commit="a" * 12, **alpha), 1)
+        beta = dict(project="beta_docker", environment="stage")
+        self.assertEqual(value(samples, "setup_worker_deploy_last_timestamp_seconds", **beta), 1791450000)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_success", **beta), 0)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_rollback", **beta), 0)
         # The last deploy that completed is the one before the failure.
-        self.assertEqual(value(samples, "setup_worker_deploy_last_success_timestamp_seconds", **forsena), 1791363600)
-        self.assertEqual(value(samples, "setup_worker_deploy_last_info", ref="v3.3.0", commit="d" * 12, **forsena), 1)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_success_timestamp_seconds", **beta), 1791363600)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_info", ref="v3.3.0", commit="d" * 12, **beta), 1)
         for group in ("backups", "deploys", "runner", "github_runner", "disk"):
             self.assertEqual(value(samples, "setup_metrics_group_up", group=group), 1, group)
 
     def test_a_broken_history_clears_only_its_group_and_keeps_the_other_projects(self):
-        asana, forsena = self.fixtures()
-        (forsena / ".generated/release/stage/deployments.json").write_text("{not json")
+        alpha, beta = self.fixtures()
+        (beta / ".generated/release/stage/deployments.json").write_text("{not json")
         samples = parse(self.scrape())
         self.assertEqual(value(samples, "setup_metrics_group_up", group="deploys"), 0)
         self.assertEqual(value(samples, "setup_metrics_group_up", group="backups"), 1)
-        self.assertEqual(value(samples, "setup_worker_deploy_last_success", project="asana_tracker", environment="prod"), 1)
+        self.assertEqual(value(samples, "setup_worker_deploy_last_success", project="alpha_shop", environment="prod"), 1)
         self.assertFalse([key for key in samples if key[0].startswith("setup_worker_deploy")
-                          and ("project", "forsena_docker") in key[1]])
+                          and ("project", "beta_docker") in key[1]])
 
     def test_long_refs_are_cut_and_label_values_escaped(self):
         directory = self.tree.project("odd", "prod")
@@ -432,22 +432,22 @@ class EndpointTest(ScriptTest):
 
     def test_each_registered_github_runner_is_read_from_systemd_beside_the_bitbucket_one(self):
         self.github_runner("bigsant")
-        self.github_runner("bigsant.forsena_docker")
+        self.github_runner("bigsant.beta_docker")
         self.github_runner("half_done", registered=False)  # unpacked, never registered: not a runner yet
         self.github_runner("Not-A-Scope")
         self.stub("systemctl", 'echo "$*" >> "$SYSTEMCTL_LOG"\nfor unit; do :; done\ncase "$unit" in\n'
-                               '  *@bigsant.forsena_docker.service) printf "LoadState=not-found\\nActiveState=inactive\\nNRestarts=0\\n";;\n'
+                               '  *@bigsant.beta_docker.service) printf "LoadState=not-found\\nActiveState=inactive\\nNRestarts=0\\n";;\n'
                                '  *@bigsant.service) printf "LoadState=loaded\\nActiveState=active\\nNRestarts=2\\n";;\n'
                                '  *) printf "LoadState=loaded\\nActiveState=failed\\nNRestarts=7\\n";;\nesac\n')
         samples = parse(self.scrape())
         self.assertEqual(value(samples, "setup_worker_github_runner_up", scope="bigsant"), 1)
         self.assertEqual(value(samples, "setup_worker_github_runner_state", scope="bigsant", state="active"), 1)
         self.assertEqual(value(samples, "setup_worker_github_runner_restarts", scope="bigsant"), 2)
-        self.assertEqual(value(samples, "setup_worker_github_runner_up", scope="bigsant.forsena_docker"), 0)
-        self.assertEqual(value(samples, "setup_worker_github_runner_state", scope="bigsant.forsena_docker",
+        self.assertEqual(value(samples, "setup_worker_github_runner_up", scope="bigsant.beta_docker"), 0)
+        self.assertEqual(value(samples, "setup_worker_github_runner_state", scope="bigsant.beta_docker",
                                state="not-found"), 1)
         self.assertEqual({dict(key[1]).get("scope") for key in samples if key[0].startswith("setup_worker_github")},
-                         {"bigsant", "bigsant.forsena_docker"})
+                         {"bigsant", "bigsant.beta_docker"})
         # The Bitbucket runner keeps its own unlabelled series.
         self.assertEqual(value(samples, "setup_worker_runner_up"), 0)
         self.assertEqual(value(samples, "setup_worker_runner_state", state="failed"), 1)
@@ -483,7 +483,7 @@ class EndpointTest(ScriptTest):
                                 env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
                                      "SETUP_SERVER_ROOT": str(self.tree.root), "SYSTEMCTL_LOG": str(self.systemctl_log)})
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('setup_worker_backups{project="asana_tracker",environment="prod"} 3', result.stdout)
+        self.assertIn('setup_worker_backups{project="alpha_shop",environment="prod"} 3', result.stdout)
 
     def test_promtool_accepts_the_exposition_with_its_naming_lint(self):
         if not (shutil.which("promtool") or PROMTOOL):
@@ -572,7 +572,7 @@ chmod +x /stubs/systemctl
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null && apt-get install -y -qq systemd python3 curl >/dev/null
 useradd --system --create-home --home-dir /srv/setup-server --shell /bin/bash setup
-app=/srv/setup-server/projects/asana_tracker/app
+app=/srv/setup-server/projects/alpha_shop/app
 mkdir -p $app/env $app/.generated/backups $app/.generated/release/prod
 touch $app/Makefile $app/env/prod.env
 printf 'dump' > $app/.generated/backups/worker-prod-20261009T013000Z.sql.gz
@@ -604,8 +604,8 @@ curl -sf -H "Authorization: Bearer $METRICS_TOKEN" http://127.0.0.1:9101/metrics
         self.assertIn("root 600 /etc/setup-server/metrics.env", result.stdout)
         self.assertIn("root 755 /usr/local/sbin/setup-server-metrics", result.stdout)
         self.assertIn("without: 401", result.stdout)
-        self.assertIn('setup_worker_backups{project="asana_tracker",environment="prod"} 1', result.stdout)
-        self.assertIn('setup_worker_deploy_last_success{project="asana_tracker",environment="prod"} 1', result.stdout)
+        self.assertIn('setup_worker_backups{project="alpha_shop",environment="prod"} 1', result.stdout)
+        self.assertIn('setup_worker_deploy_last_success{project="alpha_shop",environment="prod"} 1', result.stdout)
         self.assertIn('setup_metrics_group_up{group="backups"} 1', result.stdout)
 
 

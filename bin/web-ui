@@ -88,7 +88,7 @@ RUNNER_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}')
 KEY_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._@-]{0,63}')
 # What a developer key may reach through this worker (bin/add-backup-key --grant, bin/server-access).
 GRANT = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}(?::(?!local=|test=)[a-z][a-z0-9]{1,15})?=(?:phpfpm-readonly|phpfpm|docker|full)')
-# An environment name: stage, prod or a stage-class one a project lists in STAGE_ENVIRONMENTS (setup), e.g. mdv.
+# An environment name: stage, prod or a stage-class one a project lists in STAGE_ENVIRONMENTS (setup), e.g. demo.
 ENVIRONMENT = re.compile(r'(?!local$|test$)[a-z][a-z0-9]{1,15}')
 # The levels, each with everything before it, and what each lets a developer do (make ssh).
 LEVELS = ('phpfpm-readonly', 'phpfpm', 'docker', 'full')
@@ -825,7 +825,7 @@ def plan_backup_local(form, status):
     name = value(form, 'project', NAME, 'Project')
     environment = form.get('environment', '')
     if environment and not ENVIRONMENT.fullmatch(environment):
-        raise Invalid('Environment: stage, prod or one of the project\'s STAGE_ENVIRONMENTS (e.g. mdv).')
+        raise Invalid('Environment: stage, prod or one of the project\'s STAGE_ENVIRONMENTS (e.g. demo).')
     if environment and not name:
         raise Invalid('An environment is given only together with a project.')
     full, files = flag(form, 'full'), flag(form, 'files')
@@ -878,7 +878,7 @@ def text_grants(form, kind='access'):
     found = {}
     for grant in form.get(f'{field}s', '').replace(',', ' ').split():
         if not (GRANT if kind == 'access' else PULL).fullmatch(grant):
-            raise Invalid(f'"{title}": {grant} – write PROJECT[:ENV]=LEVEL (environment stage, prod, mdv…; without it '
+            raise Invalid(f'"{title}": {grant} – write PROJECT[:ENV]=LEVEL (environment stage, prod, demo…; without it '
                           f'stage and prod), level {", ".join(levels)}.')
         target, level = grant.split('=')
         project, _, environment = target.partition(':')
@@ -3252,7 +3252,7 @@ class Page:
                   text('target_prod', 'prod (its own)', 'e.g. ssh://deploy@shop.example/home/deploy/prod', given['prod']) +
                   text('target_stage', 'stage (its own)', 'e.g. local:/home/shop/stage', given['stage']) +
                   '<label><span>Other environments (ENV=target, one per line)</span><textarea name="targets" autocomplete="off" '
-                  f'spellcheck="false" placeholder="mdv=local:/home/shop/mdv">{e(given["more"])}</textarea></label>')
+                  f'spellcheck="false" placeholder="demo=local:/home/shop/demo">{e(given["more"])}</textarea></label>')
         body = steps + '<div class="deck">' + self.form(
             'add-project', 'Add a project', fields,
             note='A new project needs a target: local – this server, the build root; local:/PATH – this server, another '
@@ -3310,7 +3310,7 @@ class Page:
                                     'there, and what runs on the old target stays until it is stopped.' + monorepo,
                                command=rerun)
         forms += self.form('project-target', 'Add an environment',
-                           hidden + self.text_field('environment', 'Environment', 'mdv – lowercase letters and digits, 2–16') +
+                           hidden + self.text_field('environment', 'Environment', 'demo – lowercase letters and digits, 2–16') +
                            target_field,
                            note='Not local or test. Besides stage and prod an environment deploys once the project lists it in '
                                 'STAGE_ENVIRONMENTS (env/common.env) and has env/ENV.env.' + monorepo,

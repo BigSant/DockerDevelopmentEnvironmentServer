@@ -6,7 +6,7 @@ Every night setup-server-backup.timer runs this as root (installed by bin/instal
 /usr/local/sbin/setup-server-backup). A project's environment is backed up when its environment
 repository in the build root ($ROOT/projects/<name>/app, or app/docker) has env/stage.env, env/prod.env or
 the env file of an environment its env/common.env lists in STAGE_ENVIRONMENTS (setup's stage-class ones, e.g. a
-temporary mdv): the file its deploy pipeline writes, so "deployed from here" is the declaration. Each
+temporary demo): the file its deploy pipeline writes, so "deployed from here" is the declaration. Each
 backup is `make db-backup ENV=<env>` (setup: every schema of DATABASE_EXTRA_SCHEMAS in one dump), run as
 the setup account and written to .generated/backups/worker-<env>-<UTC time>Z.sql.gz. No secret is kept
 here: setup takes the Deployment variables from the stack's secret store (<PROJECT_NAME>-<env>-secrets,
@@ -68,7 +68,7 @@ USAGE = f"""Usage: {Path(sys.argv[0]).name} [--check] [--full | --files] [--fres
   (none)      every project under {PROJECTS} with env/stage.env, env/prod.env or the env file of an environment its
               env/common.env lists in STAGE_ENVIRONMENTS (the nightly timer)
   PROJECT     one project: its name or build root, e.g. "$BUILD_ROOT" in a pipeline ("backup now")
-  ENV         stage, prod or a STAGE_ENVIRONMENTS one (e.g. mdv); by default every one the project has
+  ENV         stage, prod or a STAGE_ENVIRONMENTS one (e.g. demo); by default every one the project has
   --full      every table's data, the full-<env> series (the weekly timer); keeps {KEEP_FULL}
   --fresh     the fresh-<env> series a developer asked for (bin/backup-pull); with --full fresh-full-<env>.
               Not made again while a backup with the same content is younger than {FRESH_REUSE // 60} minutes
@@ -116,7 +116,7 @@ ENVIRONMENT = re.compile(r'[a-z][a-z0-9]{1,15}')
 
 def server_environments(directory):
     """stage, prod and the stage-class environments env/common.env lists (setup's STAGE_ENVIRONMENTS, e.g. a
-    temporary mdv): every environment a deploy from here may have. None (no environment repository): stage, prod."""
+    temporary demo): every environment a deploy from here may have. None (no environment repository): stage, prod."""
     extra = []
     try:
         text = (directory / 'env/common.env').read_text(errors='replace') if directory else ''
@@ -312,7 +312,7 @@ def env_closing(text, quote):
 
 def env_entries(text):
     """(line number, NAME, value) of an env file, read as setup reads it (project_env_files.parse_dotenv):
-    a quoted value may run over several lines (asana.local's APP_ENVIRONMENT), double quotes take \n \t \r
+    a quoted value may run over several lines (alpha.local's APP_ENVIRONMENT), double quotes take \n \t \r
     escapes, an unquoted value ends at ' #'. NAME is None for a line that is no entry or a quote never closed."""
     lines = (text or '').splitlines()
     index = 0

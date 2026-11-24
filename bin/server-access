@@ -76,7 +76,7 @@ ENVIRONMENT = re.compile(r'[a-z][a-z0-9]{1,15}')
 
 def server_environments(directory):
     """stage, prod and the stage-class environments env/common.env lists (setup's STAGE_ENVIRONMENTS, e.g. a
-    temporary mdv): every environment a deploy from here may have. None (no environment repository): stage, prod."""
+    temporary demo): every environment a deploy from here may have. None (no environment repository): stage, prod."""
     extra = []
     try:
         text = (directory / 'env/common.env').read_text(errors='replace') if directory else ''
@@ -127,7 +127,7 @@ def env_closing(text, quote):
 
 def env_entries(text):
     """(line number, NAME, value) of an env file, read as setup reads it (project_env_files.parse_dotenv):
-    a quoted value may run over several lines (asana.local's APP_ENVIRONMENT), double quotes take \n \t \r
+    a quoted value may run over several lines (alpha.local's APP_ENVIRONMENT), double quotes take \n \t \r
     escapes, an unquoted value ends at ' #'. NAME is None for a line that is no entry or a quote never closed."""
     lines = (text or '').splitlines()
     index = 0

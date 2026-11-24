@@ -164,17 +164,17 @@ class ServerAccessTest(unittest.TestCase):
                 self.assertFalse(any(call[3:4] in (["exec"], ["run"], ["stop"]) for call in calls))
 
     def test_a_stage_class_environment_the_project_lists_is_reached_like_stage(self):
-        (self.build_root / "app/env/common.env").write_text('PROJECT_NAME=shop\nSTAGE_ENVIRONMENTS="mdv"\n')
-        (self.build_root / "target.mdv.env").write_text("DEPLOY_CONTEXT=setup-shop-mdv\nDEPLOY_SSH=deploy@mdv.example\n"
-                                                         "DEPLOY_PATH=/home/deploy/mdv\nAPP_UID=1003\nAPP_GID=1003\n")
-        (self.root / "containers").write_text("shop-mdv-php-fpm-1\tphp-fpm\trunning\n")
-        result, calls = self.access("shell shop mdv", "shop:mdv=phpfpm")
+        (self.build_root / "app/env/common.env").write_text('PROJECT_NAME=shop\nSTAGE_ENVIRONMENTS="demo"\n')
+        (self.build_root / "target.demo.env").write_text("DEPLOY_CONTEXT=setup-shop-demo\nDEPLOY_SSH=deploy@demo.example\n"
+                                                         "DEPLOY_PATH=/home/deploy/demo\nAPP_UID=1003\nAPP_GID=1003\n")
+        (self.root / "containers").write_text("shop-demo-php-fpm-1\tphp-fpm\trunning\n")
+        result, calls = self.access("shell shop demo", "shop:demo=phpfpm")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(["docker", "--context", "setup-shop-mdv", "ps", "--all", "--filter",
-                       "label=com.docker.compose.project=shop-mdv", "--format",
+        self.assertIn(["docker", "--context", "setup-shop-demo", "ps", "--all", "--filter",
+                       "label=com.docker.compose.project=shop-demo", "--format",
                        '{{.Names}}\t{{.Label "com.docker.compose.service"}}\t{{.State}}'], calls)
         self.assertEqual(self.last(calls)[3:7], ["exec", "-i", "-u", "1003:1003"])
-        result, _ = self.access("host shop mdv", "shop:mdv=full")
+        result, _ = self.access("host shop demo", "shop:demo=full")
         self.assertEqual(result.returncode, 0, result.stderr)
         result, _ = self.access("shell shop qa", "shop:qa=full")
         self.assertEqual(result.returncode, 65)

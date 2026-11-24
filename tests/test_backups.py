@@ -61,13 +61,13 @@ class RotationTest(unittest.TestCase):
 
     def test_env_files_are_read_as_setup_reads_them(self):
         module = load_backup_projects()
-        text = ('# comment\nPROJECT_NAME=asana  # inline\nexport DOMAIN = asana.local\n'
-                'APP_ENVIRONMENT="\n  ASANA_TOKEN ERP_API_KEY\n  HTPASSWD_WEB\n"\n'
+        text = ('# comment\nPROJECT_NAME=alpha  # inline\nexport DOMAIN = alpha.local\n'
+                'APP_ENVIRONMENT="\n  ALPHA_TOKEN ERP_API_KEY\n  HTPASSWD_WEB\n"\n'
                 "CACHE_CLEAR_COMMAND=\"sh -c 'kill -USR2 1'\"\nHASH='$apr1$x$y'\nEMPTY=\nESCAPED=\"a\\\"b\\nc\"\n")
         values = module.parse_env(text, "common.env")
-        self.assertEqual(values["PROJECT_NAME"], "asana")
-        self.assertEqual(values["DOMAIN"], "asana.local")
-        self.assertEqual(values["APP_ENVIRONMENT"].split(), ["ASANA_TOKEN", "ERP_API_KEY", "HTPASSWD_WEB"])
+        self.assertEqual(values["PROJECT_NAME"], "alpha")
+        self.assertEqual(values["DOMAIN"], "alpha.local")
+        self.assertEqual(values["APP_ENVIRONMENT"].split(), ["ALPHA_TOKEN", "ERP_API_KEY", "HTPASSWD_WEB"])
         self.assertEqual(values["CACHE_CLEAR_COMMAND"], "sh -c 'kill -USR2 1'")
         self.assertEqual(values["HASH"], "$apr1$x$y")
         self.assertEqual(values["EMPTY"], "")
@@ -114,7 +114,7 @@ class BackupProjectsTest(ScriptTest):
         os.environ["DOCKER_LOG"] = str(self.docker_log)
         os.environ["SETUP_SERVER_BACKUP_TIME"] = "20261009T013000"
         os.environ["SETUP_SERVER_CONFIG"] = str(self.root / "etc")
-        os.environ["STORES"] = "demo-prod-secrets demo-stage-secrets"
+        os.environ["STORES"] = "sample-prod-secrets sample-stage-secrets"
         for key in ("MAKE_LOG", "DOCKER_LOG", "SETUP_SERVER_BACKUP_TIME", "SETUP_SERVER_CONFIG", "STORES"):
             self.addCleanup(os.environ.pop, key)
         for key in ("DATABASE_ROOT_PASSWORD", "CI"):
@@ -124,7 +124,7 @@ class BackupProjectsTest(ScriptTest):
         directory = self.projects / name / layout
         (directory / "env").mkdir(parents=True)
         (directory / "Makefile").write_text("include $(SETUP_DIRECTORY)/docker/project.mk\n")
-        (directory / "env/common.env").write_text("PROJECT_NAME=demo\n")
+        (directory / "env/common.env").write_text("PROJECT_NAME=sample\n")
         for environment in environments:
             (directory / f"env/{environment}.env.example").write_text("DOMAIN=example.test\n")
             (directory / f"env/{environment}.env").write_text("DOMAIN=example.test\n")
@@ -142,53 +142,53 @@ class BackupProjectsTest(ScriptTest):
                       if path.name not in ("make.log", "docker.log"))
 
     def test_every_deployed_environment_is_backed_up_and_rotated(self):
-        asana = self.project("asana_tracker", "prod")
-        forsena = self.project("forsena_docker", "stage", "prod", layout="app/docker")
+        alpha = self.project("alpha_shop", "prod")
+        beta = self.project("beta_docker", "stage", "prod", layout="app/docker")
         self.project("not_deployed")
-        backups = self.seed(asana, "prod", 40)
+        backups = self.seed(alpha, "prod", 40)
         # Pre-deploy backups of setup's own naming and stray files are never touched.
-        (backups / "asana-prod-20260101T000000000000.sql.gz").write_text("deploy")
+        (backups / "alpha-prod-20260101T000000000000.sql.gz").write_text("deploy")
         (backups / "worker-prod-notes.txt").write_text("x")
         result = self.run_script("backup-projects")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         kept = sorted(path.name for path in backups.glob("worker-prod-*.sql.gz"))
         self.assertEqual(len(kept), 11, kept)
         self.assertIn("worker-prod-20261009T013000Z.sql.gz", kept)
-        self.assertTrue((backups / "asana-prod-20260101T000000000000.sql.gz").exists())
+        self.assertTrue((backups / "alpha-prod-20260101T000000000000.sql.gz").exists())
         self.assertTrue((backups / "worker-prod-notes.txt").exists())
         for environment in ("stage", "prod"):
-            self.assertTrue((forsena / f".generated/backups/worker-{environment}-20261009T013000Z.sql.gz").is_file())
+            self.assertTrue((beta / f".generated/backups/worker-{environment}-20261009T013000Z.sql.gz").is_file())
         self.assertIn("not_deployed: no env/<env>.env (not deployed from here)", result.stdout)
         self.assertIn("removed 30", result.stdout)
         self.assertIn("Backups: 3 ok, 0 failed", result.stdout)
 
     def test_a_monorepo_build_root_is_backed_up_from_its_app(self):
         # bin/add-project --monorepo: the repository is the build root, a target of its own per environment.
-        zarskis = self.project("zarskis", "stage", "prod")
-        (self.projects / "zarskis/.git").mkdir()
+        gamma = self.project("gamma", "stage", "prod")
+        (self.projects / "gamma/.git").mkdir()
         for environment in ("stage", "prod"):
-            (self.projects / f"zarskis/target.{environment}.env").write_text(
-                f"DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH=/home/tomas/Projects/runtime/zarskis/{environment}\n")
+            (self.projects / f"gamma/target.{environment}.env").write_text(
+                f"DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH=/home/tomas/Projects/runtime/gamma/{environment}\n")
         result = self.run_script("backup-projects")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for environment in ("stage", "prod"):
-            self.assertTrue((zarskis / f".generated/backups/worker-{environment}-20261009T013000Z.sql.gz").is_file())
+            self.assertTrue((gamma / f".generated/backups/worker-{environment}-20261009T013000Z.sql.gz").is_file())
         self.assertIn("Backups: 2 ok, 0 failed", result.stdout)
 
     def test_an_environment_the_project_lists_in_stage_environments_is_backed_up_like_stage(self):
-        os.environ["STORES"] += " demo-mdv-secrets"
-        shop = self.project("shop", "prod", "mdv", "old")
-        (shop / "env/common.env").write_text('PROJECT_NAME=demo\nSTAGE_ENVIRONMENTS="mdv, test bad_Name"\n')
-        self.seed(shop, "mdv", 40)
+        os.environ["STORES"] += " sample-demo-secrets"
+        shop = self.project("shop", "prod", "demo", "old")
+        (shop / "env/common.env").write_text('PROJECT_NAME=sample\nSTAGE_ENVIRONMENTS="demo, test bad_Name"\n')
+        self.seed(shop, "demo", 40)
         result = self.run_script("backup-projects")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         made = sorted(path.name for path in (shop / ".generated/backups").glob("worker-*-20261009T013000Z.sql.gz"))
-        self.assertEqual(made, ["worker-mdv-20261009T013000Z.sql.gz", "worker-prod-20261009T013000Z.sql.gz"],
+        self.assertEqual(made, ["worker-demo-20261009T013000Z.sql.gz", "worker-prod-20261009T013000Z.sql.gz"],
                          "old has an env file but is not listed; test is reserved")
-        self.assertEqual(len(list((shop / ".generated/backups").glob("worker-mdv-*"))), 11, "rotated as any series")
-        one = self.run_script("backup-projects", "shop", "mdv")
+        self.assertEqual(len(list((shop / ".generated/backups").glob("worker-demo-*"))), 11, "rotated as any series")
+        one = self.run_script("backup-projects", "shop", "demo")
         self.assertEqual(one.returncode, 0, one.stdout + one.stderr)
-        self.assertIn("ENV=mdv", self.make_log.read_text())
+        self.assertIn("ENV=demo", self.make_log.read_text())
         self.assertEqual(self.run_script("backup-projects", "shop", "old").returncode, 65)
 
     def test_one_failing_project_does_not_stop_the_others_and_keeps_its_backups(self):
@@ -204,20 +204,20 @@ class BackupProjectsTest(ScriptTest):
         self.assertEqual(len(list((healthy / ".generated/backups").glob("worker-prod-*"))), 11)
 
     def test_check_changes_nothing(self):
-        directory = self.project("asana_tracker", "prod")
+        directory = self.project("alpha_shop", "prod")
         self.seed(directory, "prod", 40)
         before = self.tree()
         result = self.run_script("backup-projects", "--check")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("would back up asana_tracker prod into", result.stdout)
+        self.assertIn("would back up alpha_shop prod into", result.stdout)
         self.assertIn("would delete 30:", result.stdout)
         self.assertEqual(self.tree(), before)
         self.assertFalse(self.make_log.exists(), "--check runs no backup")
 
     def test_one_project_by_build_root_for_the_backup_now_pipeline(self):
-        self.project("asana_tracker", "stage", "prod")
+        self.project("alpha_shop", "stage", "prod")
         self.project("other", "prod")
-        result = self.run_script("backup-projects", str(self.projects / "asana_tracker"), "prod")
+        result = self.run_script("backup-projects", str(self.projects / "alpha_shop"), "prod")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.make_log.read_text().count("db-backup"), 1)
         self.assertIn("ENV=prod", self.make_log.read_text())
@@ -225,8 +225,8 @@ class BackupProjectsTest(ScriptTest):
         for arguments, message in ((["missing"], "No build root"), (["Bad.Name"], "NAME must be"),
                                    (["../etc"], "not a build root under"),
                                    ([str(self.root)], f"not a build root under {self.projects}"),
-                                   (["asana_tracker", "local"], "ENV must be stage, prod or one of"),
-                                   (["asana_tracker", "mdv"], "ENV must be stage, prod or one of"),
+                                   (["alpha_shop", "local"], "ENV must be stage, prod or one of"),
+                                   (["alpha_shop", "demo"], "ENV must be stage, prod or one of"),
                                    (["other", "stage"], "other has no env/stage.env")):
             with self.subTest(arguments=arguments):
                 refused = self.run_script("backup-projects", *arguments)
@@ -235,10 +235,10 @@ class BackupProjectsTest(ScriptTest):
 
     def test_the_secrets_come_from_the_stack_store_and_a_missing_store_is_named(self):
         import gzip
-        directory = self.project("asana_tracker", "prod")
+        directory = self.project("alpha_shop", "prod")
         check = self.run_script("backup-projects", "--check")
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
-        self.assertIn("secrets: from demo-prod-secrets (running)", check.stdout)
+        self.assertIn("secrets: from sample-prod-secrets (running)", check.stdout)
         result = self.run_script("backup-projects")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         backup = directory / ".generated/backups/worker-prod-20261009T013000Z.sql.gz"
@@ -249,18 +249,18 @@ class BackupProjectsTest(ScriptTest):
         os.environ["SETUP_SERVER_BACKUP_TIME"] = "20261010T013000"
         missing = self.run_script("backup-projects")
         self.assertEqual(missing.returncode, 1)
-        self.assertIn("no secret store demo-prod-secrets: deploy asana_tracker prod once with setup 2.5.0", missing.stderr)
+        self.assertIn("no secret store sample-prod-secrets: deploy alpha_shop prod once with setup 2.5.0", missing.stderr)
         self.assertNotIn("20261010", self.make_log.read_text())
         self.assertEqual(self.run_script("backup-projects", "--check").returncode, 1)
         # A deployment step's own variables need no store.
-        step = self.run_script("backup-projects", "asana_tracker", "prod", DATABASE_ROOT_PASSWORD="from-the-step", CI="true")
+        step = self.run_script("backup-projects", "alpha_shop", "prod", DATABASE_ROOT_PASSWORD="from-the-step", CI="true")
         self.assertEqual(step.returncode, 0, step.stdout + step.stderr)
         backup = directory / ".generated/backups/worker-prod-20261010T013000Z.sql.gz"
         self.assertIn("secret=from-the-step", gzip.decompress(backup.read_bytes()).decode())
         self.assertNotIn("from-the-step", step.stdout + step.stderr, "secrets are never printed")
 
     def test_the_store_is_looked_up_through_the_deploy_context(self):
-        directory = self.project("forsena_docker", "prod")
+        directory = self.project("beta_docker", "prod")
         (directory / "env/prod.env").write_text("DEPLOY_CONTEXT=shop-live\n")
         self.assertEqual(self.run_script("backup-projects", "--check").returncode, 0)
         self.assertIn("--context shop-live inspect --type container", self.docker_log.read_text())
@@ -269,17 +269,17 @@ class BackupProjectsTest(ScriptTest):
         self.assertEqual(self.run_script("backup-projects", "--bogus").returncode, 64)
 
     def test_full_backups_are_a_series_of_their_own_with_two_kept(self):
-        directory = self.project("asana_tracker", "prod")
+        directory = self.project("alpha_shop", "prod")
         backups = self.seed(directory, "prod", 3)
         for day in (1, 8, 15):
             (backups / f"full-prod-202609{day:02d}T043000Z.sql.gz").write_text("old full")
-        result = self.run_script("backup-projects", "--full", "asana_tracker", "prod")
+        result = self.run_script("backup-projects", "--full", "alpha_shop", "prod")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("full=1", self.make_log.read_text())
         self.assertEqual(sorted(path.name for path in backups.glob("full-prod-*")),
                          ["full-prod-20260915T043000Z.sql.gz", "full-prod-20261009T013000Z.sql.gz"])
         self.assertEqual(len(list(backups.glob("worker-prod-*"))), 3, "the nightly series is not touched")
-        nightly = self.run_script("backup-projects", "asana_tracker", "prod")
+        nightly = self.run_script("backup-projects", "alpha_shop", "prod")
         self.assertEqual(nightly.returncode, 0)
         self.assertEqual(len(list(backups.glob("full-prod-*"))), 2, "the nightly run does not rotate the full series")
         check = self.run_script("backup-projects", "--check", "--full")
@@ -287,8 +287,8 @@ class BackupProjectsTest(ScriptTest):
         self.assertIn("full-prod-20261009T013000Z.sql.gz", check.stdout)
 
     def test_a_fresh_backup_is_made_once_and_a_recent_one_is_handed_out(self):
-        directory = self.project("asana_tracker", "prod")
-        result = self.run_script("backup-projects", "--fresh", "--progress", "asana_tracker", "prod")
+        directory = self.project("alpha_shop", "prod")
+        result = self.run_script("backup-projects", "--fresh", "--progress", "alpha_shop", "prod")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         backups = directory / ".generated/backups"
         made = backups / "fresh-prod-20261009T013000Z.sql.gz"
@@ -296,12 +296,12 @@ class BackupProjectsTest(ScriptTest):
         self.assertIn(f"progress backup {made.stat().st_size} {made.stat().st_size}", result.stderr)
         self.assertEqual(result.stdout, "", "with --progress everything goes to stderr")
         calls = self.make_log.read_text().count("db-backup")
-        again = self.run_script("backup-projects", "--fresh", "asana_tracker", "prod")
+        again = self.run_script("backup-projects", "--fresh", "alpha_shop", "prod")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn("used instead of a new fresh backup", again.stdout)
         self.assertEqual(self.make_log.read_text().count("db-backup"), calls, "no second backup within 30 minutes")
         # A full fresh backup is not answered by a registry one.
-        full = self.run_script("backup-projects", "--fresh", "--full", "asana_tracker", "prod")
+        full = self.run_script("backup-projects", "--fresh", "--full", "alpha_shop", "prod")
         self.assertEqual(full.returncode, 0, full.stdout + full.stderr)
         self.assertTrue((backups / "fresh-full-prod-20261009T013000Z.sql.gz").is_file())
         self.assertTrue((backups / ".lock-prod").is_file())
@@ -319,7 +319,7 @@ class BackupProjectsTest(ScriptTest):
         self.setup_checkout()
         os.environ["STORES"] = ""  # a files backup reads the target, not the database
         shop = self.project("shop", "stage", "prod")
-        (shop / "env/common.env").write_text('PROJECT_NAME=demo\nBACKUP_FILE_PATHS="modules/*/translations/ config/local.php"\n')
+        (shop / "env/common.env").write_text('PROJECT_NAME=sample\nBACKUP_FILE_PATHS="modules/*/translations/ config/local.php"\n')
         (shop / "env/stage.env").write_text("DOMAIN=example.test\nBACKUP_FILE_PATHS=\n")  # an env file wins
         other = self.project("other", "prod")
         backups = shop / ".generated/backups"
@@ -490,9 +490,9 @@ cat /tmp/verify.log; [ ! -s /tmp/verify.log ]
 echo UNITS_VERIFIED
 visudo -cf /etc/sudoers.d/setup-server-backup && echo SUDOERS_VALID
 # What the rule lets the runner account start (sudo -l: allowed or not, nothing runs).
-build_root=/srv/setup-server/projects/asana_tracker
+build_root=/srv/setup-server/projects/alpha_shop
 for arguments in "$build_root" "$build_root prod" "--full $build_root" "--full $build_root prod" "" "--check" "/etc" \\
-        "--job asana_tracker prod" "/srv/setup-server/projects/../../etc" "$build_root --check" "--fresh $build_root" \\
+        "--job alpha_shop prod" "/srv/setup-server/projects/../../etc" "$build_root --check" "--fresh $build_root" \\
         "--full --check"; do
     if sudo -u setup sudo -n -l /usr/local/sbin/setup-server-backup $arguments >/dev/null 2>&1; then
         echo "SUDO ALLOWED [$arguments]"
@@ -502,12 +502,12 @@ for arguments in "$build_root" "$build_root prod" "--full $build_root" "--full $
 done
 grep -q ' \^' /etc/sudoers.d/setup-server-backup && echo SUDO_REGEX
 cp /stubs/make /stubs/docker /usr/local/bin/
-app=/srv/setup-server/projects/asana_tracker/app
+app=/srv/setup-server/projects/alpha_shop/app
 mkdir -p $app/env && touch $app/Makefile $app/env/prod.env && chown -R setup:setup /srv/setup-server/projects
 cd /srv/setup-server
 # The "backup now" pipeline step, as the runner account with Bitbucket's DOCKER_HOST.
 sudo -u setup env DOCKER_HOST=tcp://localhost:2375 sh -c \\
-    'unset DOCKER_HOST; BUILD_ROOT=/srv/setup-server/projects/asana_tracker; sudo -n /usr/local/sbin/setup-server-backup "$BUILD_ROOT"'
+    'unset DOCKER_HOST; BUILD_ROOT=/srv/setup-server/projects/alpha_shop; sudo -n /usr/local/sbin/setup-server-backup "$BUILD_ROOT"'
 stat -c '%U %a %n' $app/.generated/backups/worker-prod-*.sql.gz
 zcat $app/.generated/backups/worker-prod-*.sql.gz
 /usr/local/sbin/setup-server-backup --check
@@ -518,19 +518,19 @@ zcat $app/.generated/backups/worker-prod-*.sql.gz
         self.assertIn("\n6\n", result.stdout, "a second install changes nothing")
         self.assertIn("UNITS_VERIFIED", output)
         self.assertIn("SUDOERS_VALID", output)
-        build_root = "/srv/setup-server/projects/asana_tracker"
+        build_root = "/srv/setup-server/projects/alpha_shop"
         for arguments in (build_root, f"{build_root} prod", f"--full {build_root}", f"--full {build_root} prod"):
             self.assertIn(f"SUDO ALLOWED [{arguments}]", result.stdout)
-        refused = ["", "--check", "/etc", "--job asana_tracker prod", "/srv/setup-server/projects/../../etc",
+        refused = ["", "--check", "/etc", "--job alpha_shop prod", "/srv/setup-server/projects/../../etc",
                    f"--fresh {build_root}", "--full --check"]
         if "SUDO_REGEX" in result.stdout:  # sudo 1.9.10+: nothing after the build root but stage or prod
             refused.append(f"{build_root} --check")
         for arguments in refused:
             self.assertIn(f"SUDO REFUSED [{arguments}]", result.stdout)
-        self.assertRegex(result.stdout, r"setup 600 /srv/setup-server/projects/asana_tracker/app/\.generated/backups/worker-prod-")
+        self.assertRegex(result.stdout, r"setup 600 /srv/setup-server/projects/alpha_shop/app/\.generated/backups/worker-prod-")
         self.assertIn("prod secret= setup=/srv/setup-server/setup", result.stdout)
         self.assertIn("Backups: 1 ok, 0 failed", result.stdout)
-        self.assertIn("secrets: from asana_tracker-prod-secrets (running)", result.stdout)
+        self.assertIn("secrets: from alpha_shop-prod-secrets (running)", result.stdout)
 
 
 if __name__ == "__main__":

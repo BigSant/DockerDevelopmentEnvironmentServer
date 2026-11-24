@@ -30,12 +30,12 @@ def fixture():
     ssh = case.tree.root / '.ssh'
     ssh.mkdir(exist_ok=True)
     (ssh / 'id_ed25519.pub').write_text('ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPreviewOnlyKey0123456789abcdefABCDEF setup@worker1\n')
-    app = case.tree.projects / 'asana_tracker/app'
+    app = case.tree.projects / 'alpha_shop/app'
     stamp = lambda age: time.strftime('%Y%m%dT%H%M%S', time.gmtime(time.time() - age))
     case.tree.backup(app, f'full-prod-{stamp(3 * 86400)}Z.sql.gz', 3 * 86400, 7_340_032)
-    case.tree.backup(app, f'asana-prod-{stamp(5 * 3600)}123.sql.gz', 5 * 3600, 1_200_000)
+    case.tree.backup(app, f'alpha-prod-{stamp(5 * 3600)}123.sql.gz', 5 * 3600, 1_200_000)
     # Files backups (BACKUP_FILE_PATHS): two nights, one translation changed, one added, one gone.
-    (app / 'env/common.env').write_text('PROJECT_NAME=asana\nBACKUP_FILE_PATHS="modules/*/translations/ themes/*/lang/"\n')
+    (app / 'env/common.env').write_text('PROJECT_NAME=alpha\nBACKUP_FILE_PATHS="modules/*/translations/ themes/*/lang/"\n')
     lt = "<?php\nglobal $_MODULE;\n$_MODULE = array();\n$_MODULE['<{ps_shoppingcart}prestashop>cart_1'] = 'Krepšelis';\n"
     test_ui.files_archive(app, 'prod', 26 * 3600, {'modules/ps_shoppingcart/translations/lt.php': lt.encode(),
                                                     'modules/ps_contact/translations/lt.php': b'<?php\n$_MODULE = array();\n',
@@ -45,40 +45,40 @@ def fixture():
                                                    'modules/ps_banner/translations/lt.php': b'<?php\n$_MODULE = array();\n',
                                                    'themes/classic/lang/flag.png': b'\x89PNG\r\n\x1a\n\0\0'})
     # More projects, most with prod and stage, as a worker with many shops has them.
-    for shop in ('biofitus', 'joldija', 'nespresso', 'papildai', 'forsena', 'vaistai', 'zoo-shop', 'baldai', 'knygos', 'geles'):
+    for shop in ('wellness', 'amber', 'coffee', 'supplements', 'beta', 'pharmacy', 'pet-shop', 'furniture', 'books', 'flowers'):
         case.tree.project(shop, 'prod', 'stage')
     # Developer keys with grants (bin/add-backup-key), their requests, and a setup checkout past its release tag.
     def blob(seed):  # a well-formed ssh-ed25519 public key of its own for each developer
         return base64.b64encode(b'\0\0\0\x0bssh-ed25519\0\0\0\x20' + hashlib.sha256(seed.encode()).digest()).decode()
     access = case.sbin / 'setup-server-access'  # the UI's SETUP_SERVER_SBIN: bin/add-backup-key knows its entries by it
     (ssh / 'authorized_keys').write_text(
-        f'from="10.8.0.0/24",command="{access} --key tomas --pull-all db --pull biofitus:prod=fresh --grant asana_tracker:prod=full '
-        f'--grant forsena_docker:stage=docker --grant shop-two:prod=phpfpm --grant biofitus:prod=phpfpm-readonly '
-        f'--grant biofitus:stage=docker --grant joldija:prod=phpfpm-readonly --grant joldija:stage=docker '
-        f'--grant nespresso:prod=phpfpm --grant nespresso:stage=docker",restrict,pty ssh-ed25519 {blob("tomas")} tomas\n'
-        f'from="10.8.0.0/24",command="{access} --key ona --pull-all none --pull asana_tracker:prod=db '
-        f'--pull joldija:stage=fresh --grant asana_tracker:prod=phpfpm-readonly '
-        f'--grant forsena_docker:stage=phpfpm",restrict,pty ssh-ed25519 {blob("ona")} ona\n'
+        f'from="10.8.0.0/24",command="{access} --key tomas --pull-all db --pull wellness:prod=fresh --grant alpha_shop:prod=full '
+        f'--grant beta_docker:stage=docker --grant shop-two:prod=phpfpm --grant wellness:prod=phpfpm-readonly '
+        f'--grant wellness:stage=docker --grant amber:prod=phpfpm-readonly --grant amber:stage=docker '
+        f'--grant coffee:prod=phpfpm --grant coffee:stage=docker",restrict,pty ssh-ed25519 {blob("tomas")} tomas\n'
+        f'from="10.8.0.0/24",command="{access} --key ona --pull-all none --pull alpha_shop:prod=db '
+        f'--pull amber:stage=fresh --grant alpha_shop:prod=phpfpm-readonly '
+        f'--grant beta_docker:stage=phpfpm",restrict,pty ssh-ed25519 {blob("ona")} ona\n'
         f'from="10.8.0.0/24,10.9.0.5/32",command="{case.sbin / "setup-server-backup-pull"} --key qa-ci",restrict '
         f'ssh-ed25519 {blob("qa-ci")} qa-ci\n')
     now = lambda age: time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(time.time() - age))
     (case.tree.root / 'access.log').write_text(
-        f"{now(7200)} key=tomas from=10.8.0.20 'shell asana_tracker prod' -> started (full): docker exec …\n"
-        f"{now(7100)} key=tomas from=10.8.0.20 'shell asana_tracker prod' -> exit 0\n"
-        f"{now(90000)} key=ona from=10.8.0.33 'docker forsena_docker stage ps' -> refused: needs docker\n")
+        f"{now(7200)} key=tomas from=10.8.0.20 'shell alpha_shop prod' -> started (full): docker exec …\n"
+        f"{now(7100)} key=tomas from=10.8.0.20 'shell alpha_shop prod' -> exit 0\n"
+        f"{now(90000)} key=ona from=10.8.0.33 'docker beta_docker stage ps' -> refused: needs docker\n")
     with (case.tree.root / 'access.log').open('a') as handle:
-        handle.write(f"{now(3000)} key=tomas from=10.8.0.20 'shell biofitus prod' -> started (phpfpm-readonly): docker exec -it "
-                     f"biofitus-prod-php-fpm-1 sh session=20261023T080000Z-4242.log\n"
-                     f"{now(2400)} key=tomas from=10.8.0.20 'shell biofitus prod' -> exit 0\n"
-                     f"{now(1800)} key=tomas from=10.8.0.20 \"exec nespresso prod -- php bin/console cache:clear\" -> started (phpfpm): docker exec\n"
-                     f"{now(1790)} key=tomas from=10.8.0.20 \"exec nespresso prod -- php bin/console cache:clear\" -> exit 1\n"
-                     f"{now(600)} key=tomas from=10.8.0.20 'docker joldija stage logs --tail 200 php-fpm' -> started (docker): docker logs\n"
-                     f"{now(590)} key=tomas from=10.8.0.20 'docker joldija stage logs --tail 200 php-fpm' -> exit 0\n")
+        handle.write(f"{now(3000)} key=tomas from=10.8.0.20 'shell wellness prod' -> started (phpfpm-readonly): docker exec -it "
+                     f"wellness-prod-php-fpm-1 sh session=20261023T080000Z-4242.log\n"
+                     f"{now(2400)} key=tomas from=10.8.0.20 'shell wellness prod' -> exit 0\n"
+                     f"{now(1800)} key=tomas from=10.8.0.20 \"exec coffee prod -- php bin/console cache:clear\" -> started (phpfpm): docker exec\n"
+                     f"{now(1790)} key=tomas from=10.8.0.20 \"exec coffee prod -- php bin/console cache:clear\" -> exit 1\n"
+                     f"{now(600)} key=tomas from=10.8.0.20 'docker amber stage logs --tail 200 php-fpm' -> started (docker): docker logs\n"
+                     f"{now(590)} key=tomas from=10.8.0.20 'docker amber stage logs --tail 200 php-fpm' -> exit 0\n")
     sessions = case.tree.root / 'access-sessions/tomas'
     sessions.mkdir(parents=True)
     (sessions / '20261023T080000Z-4242.log').write_bytes(
         b'cd var/logs\rls -la\rtail -n 50 prod-2026-10-23.log | grep -i errr\x7for\r\x1b[Aphp bin/console about\rexit\r')
-    (case.tree.root / 'backup-pulls.log').write_text(f'{now(40000)} key=qa-ci from=10.9.0.5 info asana_tracker prod -> ok\n')
+    (case.tree.root / 'backup-pulls.log').write_text(f'{now(40000)} key=qa-ci from=10.9.0.5 info alpha_shop prod -> ok\n')
     setup = case.tree.root / 'setup'
     git = lambda *arguments: subprocess.run(['git', '-C', str(setup), *arguments], check=True, capture_output=True,
                                             env={**os.environ, 'GIT_AUTHOR_NAME': 'p', 'GIT_AUTHOR_EMAIL': 'p@p',

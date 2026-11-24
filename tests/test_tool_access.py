@@ -39,7 +39,7 @@ class ToolAccessTest(unittest.TestCase):
             (app / "Makefile").write_text("tool-access:\n\t@echo applied $(ENV)\n")
             for environment in environments:
                 (app / f"env/{environment}.env").write_text("")
-        (self.home / "projects/blog/app/env/common.env").write_text("STAGE_ENVIRONMENTS=mdv\n")
+        (self.home / "projects/blog/app/env/common.env").write_text("STAGE_ENVIRONMENTS=demo\n")
         (self.home / ".ssh").mkdir()
         (self.home / ".ssh/authorized_keys").write_text(
             f'from="10.8.0.0/24",command="/usr/local/sbin/setup-server-access --key tomas --pull-all none",restrict,pty ssh-ed25519 {BLOB} tomas\n'
@@ -125,8 +125,8 @@ class ToolAccessTest(unittest.TestCase):
     def test_wrong_values_are_refused_before_anything_is_written(self):
         cases = ((("--name", "nobody", "--tools", "shop"), "", "no developer key named nobody"),
                  (("--name", "tomas", "--tools", "other"), "", "no project other"),
-                 (("--name", "tomas", "--tools", "shop:mdv"), "", "shop has no environment mdv"),
-                 (("--name", "tomas", "--tools", "blog:mdv,shop:../x"), "", "is not PROJECT"),
+                 (("--name", "tomas", "--tools", "shop:demo"), "", "shop has no environment demo"),
+                 (("--name", "tomas", "--tools", "blog:demo,shop:../x"), "", "is not PROJECT"),
                  (("--name", "tomas", "--password", "-"), "short\n", "12 to 128 characters"),
                  (("--allowed-ips", "0.0.0.0/0"), "", "every address"),
                  (("--allowed-ips", "all"), "", "not an IP"))
@@ -185,19 +185,19 @@ class ToolAccessTest(unittest.TestCase):
     def test_a_login_of_their_own_replaces_the_keys_name_in_the_user_files(self):
         self.run_as_root("--name", "tomas", "--password", "-", "--tools", "shop:prod", stdin=PASSWORD + "\n")
         self.sent.clear()
-        code, output = self.run_as_root("--name", "tomas", "--full-name", " Tomas  Žarskis ", "--login", "tomas@example.lt")
+        code, output = self.run_as_root("--name", "tomas", "--full-name", " Jane  Doe ", "--login", "tomas@example.lt")
         self.assertEqual(code, 0, output)
-        self.assertIn("tomas: full name Tomas Žarskis", output)
+        self.assertIn("tomas: full name Jane Doe", output)
         self.assertIn("tomas: login tomas -> tomas@example.lt", output)
         self.assertEqual(self.sent, ["shop:prod"], "the new login reaches the target at once")
         self.assertRegex(self.files("shop", "prod")["users.htpasswd"], r"^tomas@example\.lt:\$6\$[^\n]+\n$")
         shown = json.loads(self.run_as_root("--show")[1])["users"]["tomas"]
-        self.assertEqual((shown["full_name"], shown["login"]), ("Tomas Žarskis", "tomas@example.lt"))
+        self.assertEqual((shown["full_name"], shown["login"]), ("Jane Doe", "tomas@example.lt"))
         status = load("server_status", ROOT / "bin/server-status").tool_access()["users"]["tomas"]
-        self.assertEqual((status["full_name"], status["login"]), ("Tomas Žarskis", "tomas@example.lt"))
+        self.assertEqual((status["full_name"], status["login"]), ("Jane Doe", "tomas@example.lt"))
         # A full name alone changes no file: nothing is sent.
         self.sent.clear()
-        self.assertEqual(self.run_as_root("--name", "tomas", "--full-name", "Tomas Ž.")[0], 0)
+        self.assertEqual(self.run_as_root("--name", "tomas", "--full-name", "Jane D.")[0], 0)
         self.assertEqual(self.sent, [])
         # Empty: no full name, the key's name again.
         code, output = self.run_as_root("--name", "tomas", "--full-name", "", "--login", "")

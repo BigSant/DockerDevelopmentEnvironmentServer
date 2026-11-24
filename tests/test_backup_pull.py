@@ -148,11 +148,11 @@ class BackupPullTest(unittest.TestCase):
 
     def test_an_environment_the_project_lists_is_pulled_like_stage(self):
         app = self.root / "projects/shop/app"
-        (app / "env/common.env").write_text('STAGE_ENVIRONMENTS="mdv"\n')
-        (self.backups / "worker-mdv-20261013T033000Z.sql.gz").write_bytes(b"mdv")
-        result = self.pull("info shop mdv")
+        (app / "env/common.env").write_text('STAGE_ENVIRONMENTS="demo"\n')
+        (self.backups / "worker-demo-20261013T033000Z.sql.gz").write_bytes(b"demo")
+        result = self.pull("info shop demo")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.decode().strip(), "worker-mdv-20261013T033000Z.sql.gz 3")
+        self.assertEqual(result.stdout.decode().strip(), "worker-demo-20261013T033000Z.sql.gz 4")
         refused = self.pull("latest shop qa")
         self.assertEqual(refused.returncode, 65)
         self.assertIn(b"has no environment qa", refused.stderr)

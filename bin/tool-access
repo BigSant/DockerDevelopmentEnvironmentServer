@@ -57,7 +57,7 @@ class Refused(Exception):
 
 def server_environments(directory):
     """stage, prod and the stage-class environments env/common.env lists (setup's STAGE_ENVIRONMENTS, e.g. a
-    temporary mdv): every environment a deploy from here may have. None (no environment repository): stage, prod."""
+    temporary demo): every environment a deploy from here may have. None (no environment repository): stage, prod."""
     extra = []
     try:
         text = (directory / 'env/common.env').read_text(errors='replace') if directory else ''
@@ -173,7 +173,7 @@ def project_environments(values):
         for word in value.replace(',', ' ').split():
             match = TOOLS.fullmatch(word)
             if not match:
-                raise Refused(f'--tools: {word[:60]} is not PROJECT[:ENV] (ENV stage, prod, mdv…; without it stage and prod)')
+                raise Refused(f'--tools: {word[:60]} is not PROJECT[:ENV] (ENV stage, prod, demo…; without it stage and prod)')
             directory = environment_directory(PROJECTS / match[1])
             if not (PROJECTS / match[1]).is_dir():
                 raise Refused(f'--tools: no project {match[1]} on this server (projects/{match[1]})')

@@ -33,7 +33,7 @@ Usage: sudo $0 [--check] [--shared-key] [--monorepo] [--target [ENV=]local|ssh:/
        sudo $0 [--check] --remove-target ENV --name NAME|NAME
   NAME          directory under $ROOT/projects; defaults to the repository slug of ENV_REPO_URL,
                  which is what pipelines use (BITBUCKET_REPO_SLUG; on GitHub the repository name in
-                 lower case) — give it only to deviate, or when the slug is no NAME (zarskis.lt: --name zarskis)
+                 lower case) — give it only to deviate, or when the slug is no NAME (gamma.example: --name gamma)
   --name NAME    the same as NAME in front of the URL
   ENV_REPO_URL   git URL of the environment repository (cloned into app/)
   CODE_REPO_URL  git URL of a separate code repository (cloned into app/public/); omit when the
@@ -47,7 +47,7 @@ Usage: sudo $0 [--check] [--shared-key] [--monorepo] [--target [ENV=]local|ssh:/
                  account's ids; local:/PATH = this host, project root PATH (created for $ACCOUNT, or writable by it);
                  ssh://USER@HOST/PATH = a server reached as USER (key: $ROOT/.ssh/id_ed25519),
                  project root PATH. ENV=... registers one environment (target.<env>.env): stage, prod or one
-                 of the project's STAGE_ENVIRONMENTS (e.g. mdv=...; without its own target an environment
+                 of the project's STAGE_ENVIRONMENTS (e.g. demo=...; without its own target an environment
                  deploys to target.env).
                  Repeatable. Without it a rerun keeps the registered target.
   --remove-target ENV
@@ -384,7 +384,7 @@ target_lines() {  # target_lines ENV SPEC — the target.env lines of one target
 }
 split_target() {  # split_target [ENV=]SPEC — sets environment (empty: every environment) and spec of the caller
     environment= spec=$1
-    # ENV= in front: stage, prod or a stage-class environment the project lists (setup's STAGE_ENVIRONMENTS, e.g. mdv).
+    # ENV= in front: stage, prod or a stage-class environment the project lists (setup's STAGE_ENVIRONMENTS, e.g. demo).
     if [[ "$spec" =~ ^([a-z][a-z0-9]{1,15})=(.*)$ ]]; then
         environment=${BASH_REMATCH[1]} spec=${BASH_REMATCH[2]}
         case "$environment" in local|test) echo "--target $1: $environment is not a deploy environment" >&2; exit 64 ;; esac
@@ -464,7 +464,7 @@ for file in "$build_root/target.env" "$build_root"/target.*.env; do
 done
 if [ ${#targets[@]} -eq 0 ] && [ -z "$registered" ]; then
     echo "Name the deploy target: --target local (this host, the build root $build_root) or" >&2
-    echo "--target ssh://USER@HOST/PATH (another server); stage=/prod=/mdv= in front for one environment." >&2
+    echo "--target ssh://USER@HOST/PATH (another server); stage=/prod=/demo= in front for one environment." >&2
     exit 64
 fi
 if [ "$monorepo" = 0 ] && [ -d "$build_root/.git" ]; then

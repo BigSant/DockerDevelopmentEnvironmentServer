@@ -304,21 +304,21 @@ class InstallGitHubRunnerTest(ScriptTest):
         self.assertFalse((self.root / "srv").exists(), "--check changes nothing")
 
     def test_a_repository_runner_has_its_own_scope_and_a_name_can_be_given(self):
-        page = f"./config.sh --url https://github.com/BigSant/Forsena_Docker.git/ --token {GITHUB_TOKEN}\n"
+        page = f"./config.sh --url https://github.com/BigSant/Beta_Docker.git/ --token {GITHUB_TOKEN}\n"
         result = self.github("--check", "--name", "vpn-server", stdin=page)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("GitHub runner of the repository BigSant/Forsena_Docker", result.stdout)
+        self.assertIn("GitHub runner of the repository BigSant/Beta_Docker", result.stdout)
         self.assertIn(f"runner vpn-server: labels", result.stdout)
-        self.assertIn(f"{self.root}/srv/github-runner/bigsant.forsena_docker", result.stdout)
-        self.assertIn("setup-server-github-runner@bigsant.forsena_docker.service", result.stdout)
+        self.assertIn(f"{self.root}/srv/github-runner/bigsant.beta_docker", result.stdout)
+        self.assertIn("setup-server-github-runner@bigsant.beta_docker.service", result.stdout)
 
     def test_a_further_instance_has_its_own_scope_and_needs_its_own_name(self):
-        page = f"./config.sh --url https://github.com/BigSant/ai-os --token {GITHUB_TOKEN}\n"
+        page = f"./config.sh --url https://github.com/BigSant/example-app --token {GITHUB_TOKEN}\n"
         result = self.github("--check", "--instance", "2", "--name", "worker1-2", stdin=page)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("runner worker1-2: labels", result.stdout)
-        self.assertIn(f"{self.root}/srv/github-runner/bigsant.ai-os.2", result.stdout)
-        self.assertIn("setup-server-github-runner@bigsant.ai-os.2.service", result.stdout)
+        self.assertIn(f"{self.root}/srv/github-runner/bigsant.example-app.2", result.stdout)
+        self.assertIn("setup-server-github-runner@bigsant.example-app.2.service", result.stdout)
         for arguments, message in ((("--instance", "2"), "needs a --name of its own"),
                                    (("--instance", "1", "--name", "x"), "from 2 to 9"),
                                    (("--instance", "10", "--name", "x"), "from 2 to 9")):
@@ -330,10 +330,10 @@ class InstallGitHubRunnerTest(ScriptTest):
         self.assertEqual(bitbucket.returncode, 64)
 
     def test_a_name_registered_here_already_is_refused(self):
-        first = self.root / "srv/github-runner/bigsant.ai-os"
+        first = self.root / "srv/github-runner/bigsant.example-app"
         first.mkdir(parents=True)
         (first / ".runner").write_text('﻿{\r\n  "agentId": 2,\r\n  "agentName": "worker1",\r\n  "poolId": 1\r\n}')
-        page = f"./config.sh --url https://github.com/BigSant/ai-os --token {GITHUB_TOKEN}\n"
+        page = f"./config.sh --url https://github.com/BigSant/example-app --token {GITHUB_TOKEN}\n"
         refused = self.github("--check", "--instance", "2", "--name", "worker1", stdin=page)
         self.assertEqual(refused.returncode, 65, refused.stdout + refused.stderr)
         self.assertIn("registered as worker1 already", refused.stderr)
@@ -589,30 +589,30 @@ class InstallGitHubRunnerRootTest(ScriptTest):
 
 class AddProjectTest(ScriptTest):
     def test_check_plans_the_build_root(self):
-        result = self.run_script("add-project", "--target", "local", "--check", "asana", "git@bitbucket.org:ws/asana_tracker.git")
+        result = self.run_script("add-project", "--target", "local", "--check", "alpha", "git@bitbucket.org:ws/alpha_shop.git")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("note: git@bitbucket.org:ws/asana_tracker.git is cloned as git@ssh.bitbucket.org:ws/asana_tracker.git",
+        self.assertIn("note: git@bitbucket.org:ws/alpha_shop.git is cloned as git@ssh.bitbucket.org:ws/alpha_shop.git",
                       result.stdout)
-        self.assertIn(f"would clone git@ssh.bitbucket.org:ws/asana_tracker.git into {self.root}/srv/projects/asana/app",
+        self.assertIn(f"would clone git@ssh.bitbucket.org:ws/alpha_shop.git into {self.root}/srv/projects/alpha/app",
                       result.stdout)
-        self.assertIn(f"BUILD_ROOT={self.root}/srv/projects/asana", result.stdout)
+        self.assertIn(f"BUILD_ROOT={self.root}/srv/projects/alpha", result.stdout)
         self.assertEqual(self.run_script("add-project", "--target", "local", "--check", "Bad Name", "x").returncode, 65)
 
     def test_the_build_root_defaults_to_the_repository_slug(self):
-        result = self.run_script("add-project", "--target", "local", "--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        result = self.run_script("add-project", "--target", "local", "--check", "git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f"into {self.root}/srv/projects/asana_tracker/app", result.stdout)
+        self.assertIn(f"into {self.root}/srv/projects/alpha_shop/app", result.stdout)
         self.assertIn("find it themselves", result.stdout)
-        two = self.run_script("add-project", "--target", "local", "--check", "git@bitbucket.org:rsmaizys/Forsena_Docker.git",
-                              "git@bitbucket.org:rsmaizys/forsena.git")
-        self.assertIn(f"into {self.root}/srv/projects/forsena_docker/app/public", two.stdout)
+        two = self.run_script("add-project", "--target", "local", "--check", "git@bitbucket.org:example-team/Beta_Docker.git",
+                              "git@bitbucket.org:example-team/beta.git")
+        self.assertIn(f"into {self.root}/srv/projects/beta_docker/app/public", two.stdout)
 
     def test_without_the_new_options_the_plan_is_unchanged(self):
         # The two-repository layout of before --monorepo and --name, line for line: app/ and app/public/ are clones.
-        result = self.run_script("add-project", "--target", "local", "--check", "git@github.com:BigSant/Forsena_Docker.git",
-                                 "git@github.com:BigSant/forsena.git")
+        result = self.run_script("add-project", "--target", "local", "--check", "git@github.com:BigSant/Beta_Docker.git",
+                                 "git@github.com:BigSant/beta.git")
         self.assertEqual(result.returncode, 0, result.stderr)
-        root, ssh = self.root / "srv/projects/forsena_docker", self.root / "srv/.ssh"
+        root, ssh = self.root / "srv/projects/beta_docker", self.root / "srv/.ssh"
         uid, gid = os.getuid(), os.getgid()
         try:
             uid, gid = (int(subprocess.run(["id", flag, "setup-test-account-missing"], capture_output=True, text=True,
@@ -620,16 +620,16 @@ class AddProjectTest(ScriptTest):
         except subprocess.CalledProcessError:
             uid = gid = 1000
         self.assertEqual(result.stdout, "\n".join((
-            f"==> would create the deploy key {ssh}/github-bigsant.forsena_docker (unless present) and the host alias "
-            f"github.com-bigsant.forsena_docker in {ssh}/config",
-            f"==> would clone git@github.com-bigsant.forsena_docker:BigSant/Forsena_Docker.git into {root}/app",
-            f"==> would create the deploy key {ssh}/github-bigsant.forsena (unless present) and the host alias "
-            f"github.com-bigsant.forsena in {ssh}/config",
-            f"==> would clone git@github.com-bigsant.forsena:BigSant/forsena.git into {root}/app/public",
+            f"==> would create the deploy key {ssh}/github-bigsant.beta_docker (unless present) and the host alias "
+            f"github.com-bigsant.beta_docker in {ssh}/config",
+            f"==> would clone git@github.com-bigsant.beta_docker:BigSant/Beta_Docker.git into {root}/app",
+            f"==> would create the deploy key {ssh}/github-bigsant.beta (unless present) and the host alias "
+            f"github.com-bigsant.beta in {ssh}/config",
+            f"==> would clone git@github.com-bigsant.beta:BigSant/beta.git into {root}/app/public",
             f"==> would write {root}/target.env:",
             "    DEPLOY_CONTEXT=default", "    DEPLOY_SSH=", f"    DEPLOY_PATH={root}", f"    APP_UID={uid}", f"    APP_GID={gid}",
             f"==> Build root: {root}",
-            "    Workflows of 'forsena_docker' find it themselves ($SETUP_SERVER_ROOT/projects/<repository name in lower case>).",
+            "    Workflows of 'beta_docker' find it themselves ($SETUP_SERVER_ROOT/projects/<repository name in lower case>).",
             "    Fill env/<stage|prod>.env.example (no secrets, no DEPLOY_*/APP_UID/APP_GID: the target is in target.env)",
             "    and add the secrets as GitHub environment secrets.", "")))
         self.assertEqual(result.stderr, "")
@@ -657,64 +657,64 @@ class AddProjectTargetTest(ScriptTest):
                                DOCKER_LOG=str(self.docker_log), **env)
 
     def test_check_plans_the_local_target_and_a_remote_one(self):
-        build_root = self.root / "srv/projects/asana_tracker"
-        missing = self.run_script("add-project", "--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        build_root = self.root / "srv/projects/alpha_shop"
+        missing = self.run_script("add-project", "--check", "git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(missing.returncode, 64, missing.stdout + missing.stderr)
         self.assertIn("Name the deploy target: --target local", missing.stderr)
         self.assertNotIn("would clone", missing.stdout, "nothing is planned without a target")
-        local = self.run_script("add-project", "--target", "local", "--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        local = self.run_script("add-project", "--target", "local", "--check", "git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(local.returncode, 0, local.stdout + local.stderr)
         self.assertIn(f"would write {build_root}/target.env:", local.stdout)
         self.assertIn(f"DEPLOY_CONTEXT=default\n    DEPLOY_SSH=\n    DEPLOY_PATH={build_root}\n", local.stdout)
         remote = self.run_script("add-project", "--target", "local", "--check", "--target", "prod=ssh://deploy@shop.example/home/deploy/shop",
-                                 "git@bitbucket.org:rsmaizys/asana_tracker.git")
+                                 "git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(remote.returncode, 0, remote.stdout + remote.stderr)
         self.assertIn(f"would write {build_root}/target.prod.env:", remote.stdout)
-        self.assertIn("DEPLOY_CONTEXT=setup-asana_tracker-prod\n    DEPLOY_SSH=deploy@shop.example\n"
+        self.assertIn("DEPLOY_CONTEXT=setup-alpha_shop-prod\n    DEPLOY_SSH=deploy@shop.example\n"
                       "    DEPLOY_PATH=/home/deploy/shop", remote.stdout)
-        mdv = self.run_script("add-project", "--target", "local", "--check", "--target", "mdv=ssh://deploy@mdv.example/home/deploy/mdv",
-                              "git@bitbucket.org:rsmaizys/asana_tracker.git")
-        self.assertEqual(mdv.returncode, 0, mdv.stdout + mdv.stderr)
-        self.assertIn(f"would write {build_root}/target.mdv.env:", mdv.stdout)
-        self.assertIn("DEPLOY_CONTEXT=setup-asana_tracker-mdv\n", mdv.stdout)
-        reserved = self.run_script("add-project", "--check", "--target", "test=local", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        demo = self.run_script("add-project", "--target", "local", "--check", "--target", "demo=ssh://deploy@demo.example/home/deploy/demo",
+                              "git@bitbucket.org:example-team/alpha_shop.git")
+        self.assertEqual(demo.returncode, 0, demo.stdout + demo.stderr)
+        self.assertIn(f"would write {build_root}/target.demo.env:", demo.stdout)
+        self.assertIn("DEPLOY_CONTEXT=setup-alpha_shop-demo\n", demo.stdout)
+        reserved = self.run_script("add-project", "--check", "--target", "test=local", "git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(reserved.returncode, 64)
         self.assertIn("test is not a deploy environment", reserved.stderr)
-        bad = self.run_script("add-project", "--target", "local", "--check", "--target", "ftp://x/y", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        bad = self.run_script("add-project", "--target", "local", "--check", "--target", "ftp://x/y", "git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(bad.returncode, 64)
         self.assertIn("expected local, local:/PATH or ssh://USER@HOST/ABSOLUTE/PATH", bad.stderr)
         self.assertFalse((self.root / "srv").exists(), "--check changes nothing")
 
     def test_the_local_target_is_written_once_and_kept_on_a_rerun(self):
-        result = self.run_add("--target", "local", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        result = self.run_add("--target", "local", "git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        target = self.root / "srv/projects/asana_tracker/target.env"
+        target = self.root / "srv/projects/alpha_shop/target.env"
         text = target.read_text()
-        self.assertIn(f"DEPLOY_PATH={self.root}/srv/projects/asana_tracker\n", text)
+        self.assertIn(f"DEPLOY_PATH={self.root}/srv/projects/alpha_shop\n", text)
         self.assertIn(f"APP_UID={os.getuid()}\nAPP_GID={os.getgid()}\n", text)
         self.assertEqual(target.stat().st_mode & 0o777, 0o640)
         target.write_text(text + "# edited\n")
-        again = self.run_add("git@bitbucket.org:rsmaizys/asana_tracker.git")
+        again = self.run_add("git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn(f"deploy target kept: {target} (change it with --target)", again.stdout)
         self.assertTrue(target.read_text().endswith("# edited\n"))
 
     def test_a_rerun_moves_an_old_bitbucket_remote_to_the_new_ssh_host(self):
-        self.assertEqual(self.run_add("--target", "local", "git@bitbucket.org:rsmaizys/asana_tracker.git").returncode, 0)
-        origin = self.root / "srv/projects/asana_tracker/app/.git/origin"
-        self.assertEqual(origin.read_text(), "git@ssh.bitbucket.org:rsmaizys/asana_tracker.git\n", "cloned through the new name")
-        origin.write_text("git@bitbucket.org:rsmaizys/asana_tracker.git\n")  # a clone made before the move
-        check = self.run_add("--check", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(self.run_add("--target", "local", "git@bitbucket.org:example-team/alpha_shop.git").returncode, 0)
+        origin = self.root / "srv/projects/alpha_shop/app/.git/origin"
+        self.assertEqual(origin.read_text(), "git@ssh.bitbucket.org:example-team/alpha_shop.git\n", "cloned through the new name")
+        origin.write_text("git@bitbucket.org:example-team/alpha_shop.git\n")  # a clone made before the move
+        check = self.run_add("--check", "git@bitbucket.org:example-team/alpha_shop.git")
         self.assertIn("would move", check.stdout)
-        self.assertEqual(origin.read_text(), "git@bitbucket.org:rsmaizys/asana_tracker.git\n", "--check changes nothing")
-        again = self.run_add("git@bitbucket.org:rsmaizys/asana_tracker.git")
+        self.assertEqual(origin.read_text(), "git@bitbucket.org:example-team/alpha_shop.git\n", "--check changes nothing")
+        again = self.run_add("git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
-        self.assertEqual(origin.read_text(), "git@ssh.bitbucket.org:rsmaizys/asana_tracker.git\n")
+        self.assertEqual(origin.read_text(), "git@ssh.bitbucket.org:example-team/alpha_shop.git\n")
 
     def test_a_local_directory_target_is_created_for_the_account_or_must_be_writable(self):
-        place = self.root / "home/someone/projects/asana"
+        place = self.root / "home/someone/projects/alpha"
         (self.root / "to-srv").symlink_to(self.root / "srv")
-        check = self.run_script("add-project", "--check", "--target", f"local:{place}", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        check = self.run_script("add-project", "--check", "--target", f"local:{place}", "git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
         self.assertIn(f"would create {place}", check.stderr)
         self.assertIn(f"DEPLOY_CONTEXT=default\n    DEPLOY_SSH=\n    DEPLOY_PATH={place}\n", check.stdout)
@@ -726,20 +726,20 @@ class AddProjectTargetTest(ScriptTest):
                               ("prod=ssh://deploy@shop.example/home/deploy/shop/app", "give /home/deploy/shop"),
                               (f"local:{self.root}/to-srv/projects/other", "belongs to setup-server (it resolves to")):
             with self.subTest(spec=spec):
-                refused = self.run_script("add-project", "--check", "--target", spec, "git@bitbucket.org:rsmaizys/asana_tracker.git")
+                refused = self.run_script("add-project", "--check", "--target", spec, "git@bitbucket.org:example-team/alpha_shop.git")
                 self.assertEqual(refused.returncode, 64, refused.stdout + refused.stderr)
                 self.assertIn(message, refused.stderr)
-        result = self.run_add("--target", f"prod=local:{place}", "git@bitbucket.org:rsmaizys/asana_tracker.git")
+        result = self.run_add("--target", f"prod=local:{place}", "git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(place.is_dir())
-        text = (self.root / "srv/projects/asana_tracker/target.prod.env").read_text()
+        text = (self.root / "srv/projects/alpha_shop/target.prod.env").read_text()
         self.assertIn(f"DEPLOY_PATH={place}\nAPP_UID={os.getuid()}\n", text)
         if os.getuid() != 0:
             locked = self.root / "home/locked"
             locked.mkdir(parents=True)
             locked.chmod(0o555)
             self.addCleanup(locked.chmod, 0o755)
-            refused = self.run_add("--target", f"local:{locked}", "git@bitbucket.org:rsmaizys/other_shop.git")
+            refused = self.run_add("--target", f"local:{locked}", "git@bitbucket.org:example-team/other_shop.git")
             self.assertEqual(refused.returncode, 65, refused.stdout + refused.stderr)
             self.assertIn("--target ssh://OWNER@localhost", refused.stderr)
             self.assertIn("can reach and write", refused.stderr)
@@ -747,35 +747,35 @@ class AddProjectTargetTest(ScriptTest):
 
     def test_stage_and_prod_get_a_directory_of_their_own_and_a_rerun_keeps_both(self):
         # One host, two project roots: a stage deploy never touches the files prod's containers mount.
-        places = self.root / "runtime/asana"
+        places = self.root / "runtime/alpha"
         result = self.run_add("--target", f"stage=local:{places}/stage", "--target", f"prod=local:{places}/prod",
-                              "git@bitbucket.org:rsmaizys/asana_tracker.git")
+                              "git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        build_root = self.root / "srv/projects/asana_tracker"
+        build_root = self.root / "srv/projects/alpha_shop"
         for environment in ("stage", "prod"):
             self.assertIn(f"DEPLOY_PATH={places}/{environment}\n", (build_root / f"target.{environment}.env").read_text())
             self.assertTrue((places / environment).is_dir())
         self.assertFalse((build_root / "target.env").exists())
-        again = self.run_add("git@bitbucket.org:rsmaizys/asana_tracker.git")
+        again = self.run_add("git@bitbucket.org:example-team/alpha_shop.git")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn(f"deploy target kept: {build_root}/target.prod.env {build_root}/target.stage.env", again.stdout)
 
     def test_a_remote_target_needs_the_key_then_gets_a_context_and_the_users_ids(self):
-        arguments = ("--target", "prod=ssh://deploy@shop.example/home/deploy/shop", "git@bitbucket.org:rsmaizys/forsena_docker.git")
+        arguments = ("--target", "prod=ssh://deploy@shop.example/home/deploy/shop", "git@bitbucket.org:example-team/beta_docker.git")
         refused = self.run_add(*arguments, FAKE_SSH_FAIL="1")
         self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
         self.assertIn("cannot log in to deploy@shop.example without a password", refused.stderr)
         self.assertIn("ssh-ed25519 AAAAsetupkey setup@worker", refused.stderr)
-        target = self.root / "srv/projects/forsena_docker/target.prod.env"
+        target = self.root / "srv/projects/beta_docker/target.prod.env"
         self.assertFalse(target.exists())
         self.assertFalse(target.parent.exists(), "nothing is cloned before the target answers")
         result = self.run_add(*arguments)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("BatchMode=yes", self.ssh_log.read_text())
-        self.assertIn("context create setup-forsena_docker-prod --docker host=ssh://deploy@shop.example",
+        self.assertIn("context create setup-beta_docker-prod --docker host=ssh://deploy@shop.example",
                       self.docker_log.read_text())
         text = target.read_text()
-        for line in ("DEPLOY_CONTEXT=setup-forsena_docker-prod", "DEPLOY_SSH=deploy@shop.example",
+        for line in ("DEPLOY_CONTEXT=setup-beta_docker-prod", "DEPLOY_SSH=deploy@shop.example",
                      "DEPLOY_PATH=/home/deploy/shop", "APP_UID=1012", "APP_GID=1013"):
             self.assertIn(line + "\n", text)
 
@@ -793,58 +793,58 @@ class AddProjectTargetTest(ScriptTest):
         return build_root
 
     def test_remove_target_checks_then_removes_an_environments_own_target(self):
-        build_root = self.registered("shop", "mdv")
-        own, shared = build_root / "target.mdv.env", build_root / "target.env"
-        check = self.run_add("--check", "--remove-target", "mdv", "--name", "shop", FAKE_CONTEXT="1")
+        build_root = self.registered("shop", "demo")
+        own, shared = build_root / "target.demo.env", build_root / "target.env"
+        check = self.run_add("--check", "--remove-target", "demo", "--name", "shop", FAKE_CONTEXT="1")
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
-        self.assertIn(f"==> would remove the deploy target of mdv: {own}\n    DEPLOY_CONTEXT=setup-shop-mdv\n"
-                      "    DEPLOY_SSH=deploy@mdv.example\n    DEPLOY_PATH=/home/deploy/mdv\n", check.stdout)
-        self.assertIn("would remove the Docker context setup-shop-mdv", check.stdout)
-        self.assertIn(f"==> mdv would then deploy to the shared {shared}:\n    DEPLOY_CONTEXT=default\n", check.stdout)
+        self.assertIn(f"==> would remove the deploy target of demo: {own}\n    DEPLOY_CONTEXT=setup-shop-demo\n"
+                      "    DEPLOY_SSH=deploy@demo.example\n    DEPLOY_PATH=/home/deploy/demo\n", check.stdout)
+        self.assertIn("would remove the Docker context setup-shop-demo", check.stdout)
+        self.assertIn(f"==> demo would then deploy to the shared {shared}:\n    DEPLOY_CONTEXT=default\n", check.stdout)
         self.assertTrue(own.exists(), "--check changes nothing")
         self.assertNotIn("context rm", self.docker_log.read_text())
         if os.getuid() != 0:
-            self.assertEqual(self.run_script("add-project", "--remove-target", "mdv", "shop").returncode, 77, "a change needs root")
-        removed = self.run_add("--remove-target", "mdv", "shop", FAKE_CONTEXT="1")
+            self.assertEqual(self.run_script("add-project", "--remove-target", "demo", "shop").returncode, 77, "a change needs root")
+        removed = self.run_add("--remove-target", "demo", "shop", FAKE_CONTEXT="1")
         self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
         self.assertFalse(own.exists())
         self.assertTrue(shared.exists(), "the shared target stays")
-        self.assertIn(f"==> removed the deploy target of mdv: {own}\n    DEPLOY_CONTEXT=setup-shop-mdv\n", removed.stdout)
-        self.assertIn("context rm -f setup-shop-mdv", self.docker_log.read_text())
-        self.assertIn(f"==> mdv now deploys to the shared {shared}:", removed.stdout)
-        again = self.run_add("--remove-target", "mdv", "shop")
+        self.assertIn(f"==> removed the deploy target of demo: {own}\n    DEPLOY_CONTEXT=setup-shop-demo\n", removed.stdout)
+        self.assertIn("context rm -f setup-shop-demo", self.docker_log.read_text())
+        self.assertIn(f"==> demo now deploys to the shared {shared}:", removed.stdout)
+        again = self.run_add("--remove-target", "demo", "shop")
         self.assertEqual(again.returncode, 65, again.stdout + again.stderr)
-        self.assertIn(f"mdv has no target of its own ({own}): it deploys to the shared {shared}", again.stderr)
+        self.assertIn(f"demo has no target of its own ({own}): it deploys to the shared {shared}", again.stderr)
 
     def test_remove_target_refuses_what_it_cannot_remove_safely(self):
-        shop = self.registered("shop", "mdv")
+        shop = self.registered("shop", "demo")
         split = self.registered("split", "stage", "prod", shared=False)
         outside = self.root / "elsewhere.env"
         outside.write_text("DEPLOY_PATH=/elsewhere\n")
-        (self.registered("linked") / "target.mdv.env").symlink_to(outside)
+        (self.registered("linked") / "target.demo.env").symlink_to(outside)
         (self.root / "srv/projects/alias").symlink_to(shop)
         for arguments, code, message in (
-                (("--remove-target", "mdv", "--name", "nosuch"), 65, "No build root"),
-                (("--remove-target", "mdv", "alias"), 65, "No build root"),
+                (("--remove-target", "demo", "--name", "nosuch"), 65, "No build root"),
+                (("--remove-target", "demo", "alias"), 65, "No build root"),
                 (("--remove-target", "prod", "shop"), 65, "prod has no target of its own"),
                 (("--remove-target", "prod", "split"), 65, "prod would have no target (there is no shared"),
-                (("--remove-target", "mdv", "linked"), 65, "is a symlink; not removed"),
-                (("--remove-target", "mdv", "--target", "local", "shop"), 64, "not with --target, --shared-key or --monorepo"),
-                (("--remove-target", "mdv", "--monorepo", "shop"), 64, "not with --target"),
-                (("--remove-target", "mdv", "shop", "git@bitbucket.org:rsmaizys/shop.git"), 64, "no repository URL"),
-                (("--remove-target", "mdv", "git@bitbucket.org:rsmaizys/shop.git"), 64, "no repository URL"),
-                (("--remove-target", "mdv"), 64, "give the project's NAME"),
-                (("--remove-target", "mdv", "--name", "shop", "other"), 64, "differ"),
+                (("--remove-target", "demo", "linked"), 65, "is a symlink; not removed"),
+                (("--remove-target", "demo", "--target", "local", "shop"), 64, "not with --target, --shared-key or --monorepo"),
+                (("--remove-target", "demo", "--monorepo", "shop"), 64, "not with --target"),
+                (("--remove-target", "demo", "shop", "git@bitbucket.org:example-team/shop.git"), 64, "no repository URL"),
+                (("--remove-target", "demo", "git@bitbucket.org:example-team/shop.git"), 64, "no repository URL"),
+                (("--remove-target", "demo"), 64, "give the project's NAME"),
+                (("--remove-target", "demo", "--name", "shop", "other"), 64, "differ"),
                 (("--remove-target", "test", "shop"), 64, "test is not a deploy environment"),
-                (("--remove-target", "MDV", "shop"), 64, "ENV is stage, prod or an extra environment")):
+                (("--remove-target", "DEMO", "shop"), 64, "ENV is stage, prod or an extra environment")):
             for check in (("--check",), ()):
                 with self.subTest(arguments=arguments, check=check):
                     refused = self.run_add(*check, *arguments)
                     self.assertEqual(refused.returncode, code, refused.stdout + refused.stderr)
                     self.assertIn(message, refused.stderr)
-        self.assertTrue((shop / "target.mdv.env").is_file())
+        self.assertTrue((shop / "target.demo.env").is_file())
         self.assertTrue((split / "target.prod.env").is_file())
-        self.assertTrue((self.root / "srv/projects/linked/target.mdv.env").is_symlink())
+        self.assertTrue((self.root / "srv/projects/linked/target.demo.env").is_symlink())
         self.assertTrue(outside.exists())
 
 
@@ -929,24 +929,24 @@ class AddGitHubProjectTest(ScriptTest):
     deploy key on several repositories), or the account's key with --shared-key."""
 
     def test_check_plans_a_deploy_key_and_alias_per_repository(self):
-        result = self.run_script("add-project", "--target", "local", "--check", "git@github.com:BigSant/Forsena_Docker.git",
-                                 "ssh://git@github.com/BigSant/forsena.git")
+        result = self.run_script("add-project", "--target", "local", "--check", "git@github.com:BigSant/Beta_Docker.git",
+                                 "ssh://git@github.com/BigSant/beta.git")
         self.assertEqual(result.returncode, 0, result.stderr)
         ssh = self.root / "srv/.ssh"
-        self.assertIn(f"would create the deploy key {ssh}/github-bigsant.forsena_docker (unless present) and the host "
-                      f"alias github.com-bigsant.forsena_docker in {ssh}/config", result.stdout)
-        self.assertIn("would clone git@github.com-bigsant.forsena_docker:BigSant/Forsena_Docker.git into "
-                      f"{self.root}/srv/projects/forsena_docker/app", result.stdout)
-        self.assertIn("would clone git@github.com-bigsant.forsena:BigSant/forsena.git into "
-                      f"{self.root}/srv/projects/forsena_docker/app/public", result.stdout)
-        self.assertIn("Workflows of 'forsena_docker' find it themselves", result.stdout)
+        self.assertIn(f"would create the deploy key {ssh}/github-bigsant.beta_docker (unless present) and the host "
+                      f"alias github.com-bigsant.beta_docker in {ssh}/config", result.stdout)
+        self.assertIn("would clone git@github.com-bigsant.beta_docker:BigSant/Beta_Docker.git into "
+                      f"{self.root}/srv/projects/beta_docker/app", result.stdout)
+        self.assertIn("would clone git@github.com-bigsant.beta:BigSant/beta.git into "
+                      f"{self.root}/srv/projects/beta_docker/app/public", result.stdout)
+        self.assertIn("Workflows of 'beta_docker' find it themselves", result.stdout)
         self.assertIn("GitHub environment secrets", result.stdout)
         self.assertFalse((self.root / "srv").exists(), "--check changes nothing")
 
     def test_a_shared_key_clones_the_url_as_given(self):
-        result = self.run_script("add-project", "--target", "local", "--check", "--shared-key", "git@github.com:BigSant/asana_tracker.git")
+        result = self.run_script("add-project", "--target", "local", "--check", "--shared-key", "git@github.com:BigSant/alpha_shop.git")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("would clone git@github.com:BigSant/asana_tracker.git into", result.stdout)
+        self.assertIn("would clone git@github.com:BigSant/alpha_shop.git into", result.stdout)
         self.assertNotIn("deploy key", result.stdout)
 
     def test_the_key_waits_for_github_and_the_alias_reaches_github_with_only_that_key(self):
@@ -958,13 +958,13 @@ class AddGitHubProjectTest(ScriptTest):
                          '  -C) cat "$2/.git/origin";;\n'
                          'esac\n')
         git_log = self.root / "git.calls"
-        run = lambda **env: self.run_script("add-project", "--target", "local", "git@github.com:BigSant/Forsena_Docker.git",
+        run = lambda **env: self.run_script("add-project", "--target", "local", "git@github.com:BigSant/Beta_Docker.git",
                                             PATH=f"{root_bin}:{self.bin}:{os.environ['PATH']}",
                                             SETUP_SERVER_USER=getpass.getuser(), GIT_LOG=str(git_log), **env)
         waiting = run()
         self.assertEqual(waiting.returncode, 1, waiting.stdout + waiting.stderr)
-        key = self.root / "srv/.ssh/github-bigsant.forsena_docker"
-        self.assertIn("https://github.com/BigSant/Forsena_Docker/settings/keys", waiting.stdout)
+        key = self.root / "srv/.ssh/github-bigsant.beta_docker"
+        self.assertIn("https://github.com/BigSant/Beta_Docker/settings/keys", waiting.stdout)
         self.assertIn(key.with_name(key.name + ".pub").read_text().strip(), waiting.stdout)
         self.assertNotIn("clone", git_log.read_text())
         public = key.with_name(key.name + ".pub").read_text()
@@ -973,14 +973,14 @@ class AddGitHubProjectTest(ScriptTest):
 
         cloned = run(FAKE_ACCESS="1")
         self.assertEqual(cloned.returncode, 0, cloned.stdout + cloned.stderr)
-        self.assertIn("clone -q git@github.com-bigsant.forsena_docker:BigSant/Forsena_Docker.git", git_log.read_text())
+        self.assertIn("clone -q git@github.com-bigsant.beta_docker:BigSant/Beta_Docker.git", git_log.read_text())
         self.assertEqual(key.with_name(key.name + ".pub").read_text(), public, "the key is made once")
-        self.assertEqual(config.read_text().count("Host github.com-bigsant.forsena_docker"), 1, "the alias is added once")
+        self.assertEqual(config.read_text().count("Host github.com-bigsant.beta_docker"), 1, "the alias is added once")
         again = run(FAKE_ACCESS="1")
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn("app: present", again.stdout)
         # Real ssh resolves the alias to github.com with only this key (the host key of github.com is checked).
-        resolved = subprocess.run(["ssh", "-G", "-F", str(config), "github.com-bigsant.forsena_docker"],
+        resolved = subprocess.run(["ssh", "-G", "-F", str(config), "github.com-bigsant.beta_docker"],
                                   capture_output=True, text=True, check=True).stdout.splitlines()
         for line in ("hostname github.com", "user git", f"identityfile {key}", "identitiesonly yes"):
             self.assertIn(line, resolved)
@@ -988,14 +988,14 @@ class AddGitHubProjectTest(ScriptTest):
 
 class AddMonorepoProjectTest(ScriptTest):
     """add-project --monorepo: one repository holds app/ (the environment) and app/public/ (the code), as
-    BigSant/zarskis.lt does. It is cloned as the build root itself, and stage and prod each get a target of their own."""
+    BigSant/gamma.example does. It is cloned as the build root itself, and stage and prod each get a target of their own."""
 
-    URL = "git@github.com:BigSant/zarskis.lt.git"
+    URL = "git@github.com:BigSant/gamma.example.git"
 
     def setUp(self):
         super().setUp()
-        self.build_root = self.root / "srv/projects/zarskis"
-        self.places = self.root / "runtime/zarskis"
+        self.build_root = self.root / "srv/projects/gamma"
+        self.places = self.root / "runtime/gamma"
         self.targets = ("--target", f"stage=local:{self.places}/stage", "--target", f"prod=local:{self.places}/prod")
         empty = self.root / "gitconfig"
         empty.write_text("")
@@ -1009,7 +1009,7 @@ class AddMonorepoProjectTest(ScriptTest):
                          'case "$1" in clone|ls-remote) ;; *) exec "$real" "$@";; esac\n'
                          'command=$1 given=\n'
                          'for argument; do shift\n'
-                         '    case "$argument" in git@github.com-bigsant.zarskis.lt:BigSant/*)\n'
+                         '    case "$argument" in git@github.com-bigsant.gamma.example:BigSant/*)\n'
                          '        given=$argument argument=$REMOTE/${argument#*:BigSant/};; esac\n'
                          '    set -- "$@" "$argument"\n'
                          'done\n'
@@ -1022,7 +1022,7 @@ class AddMonorepoProjectTest(ScriptTest):
                               check=True).stdout
 
     def repository(self, *files):
-        """github.com/BigSant/zarskis.lt with these files on master."""
+        """github.com/BigSant/gamma.example with these files on master."""
         work = self.root / "work"
         for name in files:
             (work / name).parent.mkdir(parents=True, exist_ok=True)
@@ -1030,7 +1030,7 @@ class AddMonorepoProjectTest(ScriptTest):
         self.git("init", "-q", "-b", "master", str(work))
         self.git("-C", str(work), "add", "-A")
         self.git("-C", str(work), "commit", "-q", "-m", "files")
-        self.git("clone", "-q", "--bare", str(work), str(self.remote / "zarskis.lt.git"))
+        self.git("clone", "-q", "--bare", str(work), str(self.remote / "gamma.example.git"))
 
     def run_add(self, *arguments):
         root_bin = self.fake_root()
@@ -1039,9 +1039,9 @@ class AddMonorepoProjectTest(ScriptTest):
                                SETUP_SERVER_USER=getpass.getuser(), REMOTE=str(self.remote), **self.git_env)
 
     def test_check_plans_the_clone_as_the_build_root_and_a_target_per_environment(self):
-        result = self.run_script("add-project", "--check", "--monorepo", *self.targets, "--name", "zarskis", self.URL)
+        result = self.run_script("add-project", "--check", "--monorepo", *self.targets, "--name", "gamma", self.URL)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn(f"would clone git@github.com-bigsant.zarskis.lt:BigSant/zarskis.lt.git into {self.build_root} "
+        self.assertIn(f"would clone git@github.com-bigsant.gamma.example:BigSant/gamma.example.git into {self.build_root} "
                       "(--monorepo: the repository is the build root, its app/ the environment)", result.stdout)
         self.assertIn("would require app/Makefile and no tracked target*.env in it", result.stdout)
         self.assertNotIn(f"{self.build_root}/app", result.stdout, "no clone into app/, so no app/app/")
@@ -1051,7 +1051,7 @@ class AddMonorepoProjectTest(ScriptTest):
             self.assertIn(f"would create {self.places}/{environment}", result.stderr)
         self.assertIn("(monorepo: environment app/, code app/public/)", result.stdout)
         self.assertIn("Fill app/env/<stage|prod>.env.example", result.stdout)
-        positional = self.run_script("add-project", "--check", "--monorepo", *self.targets, "zarskis", self.URL)
+        positional = self.run_script("add-project", "--check", "--monorepo", *self.targets, "gamma", self.URL)
         self.assertEqual((positional.returncode, positional.stdout), (0, result.stdout), "--name NAME is NAME")
         self.assertFalse((self.root / "srv").exists(), "--check changes nothing")
         self.assertFalse(self.places.exists(), "--check changes nothing")
@@ -1059,28 +1059,28 @@ class AddMonorepoProjectTest(ScriptTest):
     def test_a_dotted_repository_name_needs_a_name(self):
         refused = self.run_script("add-project", "--check", "--monorepo", *self.targets, self.URL)
         self.assertEqual(refused.returncode, 65, refused.stdout + refused.stderr)
-        self.assertIn("The repository name 'zarskis.lt' is no NAME", refused.stderr)
-        self.assertIn("e.g. --name zarskis", refused.stderr)
+        self.assertIn("The repository name 'gamma.example' is no NAME", refused.stderr)
+        self.assertIn("e.g. --name gamma", refused.stderr)
         self.assertNotIn("would", refused.stdout + refused.stderr)
-        differ = self.run_script("add-project", "--check", "--monorepo", *self.targets, "--name", "zarskis", "other", self.URL)
+        differ = self.run_script("add-project", "--check", "--monorepo", *self.targets, "--name", "gamma", "other", self.URL)
         self.assertEqual(differ.returncode, 64, differ.stdout + differ.stderr)
-        self.assertIn("--name zarskis and NAME other differ", differ.stderr)
-        invalid = self.run_script("add-project", "--check", "--monorepo", *self.targets, "--name", "zarskis.lt", self.URL)
+        self.assertIn("--name gamma and NAME other differ", differ.stderr)
+        invalid = self.run_script("add-project", "--check", "--monorepo", *self.targets, "--name", "gamma.example", self.URL)
         self.assertEqual(invalid.returncode, 65)
         self.assertIn("NAME must be lowercase letters, digits, _ or -", invalid.stderr)
-        plain = self.run_script("add-project", "--check", "--target", "local", "--name", "forsena",
-                                "git@bitbucket.org:rsmaizys/forsena_docker.git")
+        plain = self.run_script("add-project", "--check", "--target", "local", "--name", "beta",
+                                "git@bitbucket.org:example-team/beta_docker.git")
         self.assertEqual(plain.returncode, 0, plain.stdout + plain.stderr)
-        self.assertIn(f"into {self.root}/srv/projects/forsena/app\n", plain.stdout, "--name without --monorepo")
+        self.assertIn(f"into {self.root}/srv/projects/beta/app\n", plain.stdout, "--name without --monorepo")
 
     def test_the_checkout_is_no_target_and_there_is_no_code_repository(self):
         for target in ("local", "prod=local", f"stage=local:{self.build_root}", f"local:{self.build_root}/"):
             with self.subTest(target=target):
-                refused = self.run_script("add-project", "--check", "--monorepo", "--target", target, "zarskis", self.URL)
+                refused = self.run_script("add-project", "--check", "--monorepo", "--target", target, "gamma", self.URL)
                 self.assertEqual(refused.returncode, 64, refused.stdout + refused.stderr)
                 self.assertIn("give each environment its own directory", refused.stderr)
-        code = self.run_script("add-project", "--check", "--monorepo", *self.targets, "zarskis", self.URL,
-                               "git@github.com:BigSant/zarskis-code.git")
+        code = self.run_script("add-project", "--check", "--monorepo", *self.targets, "gamma", self.URL,
+                               "git@github.com:BigSant/gamma-code.git")
         self.assertEqual(code.returncode, 64, code.stdout + code.stderr)
         self.assertIn("no CODE_REPO_URL", code.stderr)
         self.assertFalse((self.root / "srv").exists())
@@ -1095,7 +1095,7 @@ class AddMonorepoProjectTest(ScriptTest):
                               (f"stage=local:{links}/build/stage", "inside the build root"),
                               (f"prod=local:{links}/srv/elsewhere/prod", f"inside {self.root}/srv, which belongs to setup-server")):
             with self.subTest(spec=spec):
-                refused = self.run_script("add-project", "--check", "--monorepo", "--target", spec, "zarskis", self.URL)
+                refused = self.run_script("add-project", "--check", "--monorepo", "--target", spec, "gamma", self.URL)
                 self.assertEqual(refused.returncode, 64, refused.stdout + refused.stderr)
                 self.assertIn(message, refused.stderr)
                 self.assertIn("(it resolves to ", refused.stderr)
@@ -1103,7 +1103,7 @@ class AddMonorepoProjectTest(ScriptTest):
         self.assertFalse((self.root / "srv/projects").exists())
 
     def test_each_environment_deploys_to_a_place_of_its_own(self):
-        shared = self.run_script("add-project", "--check", "--monorepo", "--target", f"local:{self.places}", "zarskis", self.URL)
+        shared = self.run_script("add-project", "--check", "--monorepo", "--target", f"local:{self.places}", "gamma", self.URL)
         self.assertEqual(shared.returncode, 64, shared.stdout + shared.stderr)
         self.assertIn("no environment in front (stage=, prod=)", shared.stderr)
         (self.root / "links").mkdir()
@@ -1111,11 +1111,11 @@ class AddMonorepoProjectTest(ScriptTest):
         for prod in (f"{self.places}/stage", f"{self.places}/stage/", f"{self.root}/links/stage", f"{self.places}/stage/prod"):
             with self.subTest(prod=prod):
                 refused = self.run_script("add-project", "--check", "--monorepo", "--target", f"stage=local:{self.places}/stage",
-                                          "--target", f"prod=local:{prod}", "zarskis", self.URL)
+                                          "--target", f"prod=local:{prod}", "gamma", self.URL)
                 self.assertEqual(refused.returncode, 64, refused.stdout + refused.stderr)
                 self.assertIn("stage and prod would deploy to the same place", refused.stderr)
         remote = self.run_script("add-project", "--check", "--monorepo", "--target", "stage=ssh://deploy@shop.example/srv/z",
-                                 "--target", "prod=ssh://deploy@shop.example/srv/z/", "zarskis", self.URL)
+                                 "--target", "prod=ssh://deploy@shop.example/srv/z/", "gamma", self.URL)
         self.assertEqual(remote.returncode, 64, remote.stdout + remote.stderr)
         self.assertIn("stage and prod would deploy to the same place", remote.stderr)
         self.assertFalse(self.places.exists(), "nothing is created for refused targets")
@@ -1123,25 +1123,25 @@ class AddMonorepoProjectTest(ScriptTest):
         (self.build_root / ".git").mkdir(parents=True)
         (self.build_root / "target.stage.env").write_text(f"DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH={self.places}/stage\n")
         registered = self.run_script("add-project", "--check", "--monorepo", "--target", f"prod=local:{self.root}/links/stage",
-                                     "zarskis", self.URL)
+                                     "gamma", self.URL)
         self.assertEqual(registered.returncode, 64, registered.stdout + registered.stderr)
         self.assertIn("prod and stage would deploy to the same place", registered.stderr)
         (self.build_root / "target.env").write_text(f"DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH={self.places}/all\n")
         everyone = self.run_script("add-project", "--check", "--monorepo", "--target", f"prod=local:{self.places}/prod",
-                                   "zarskis", self.URL)
+                                   "gamma", self.URL)
         self.assertEqual(everyone.returncode, 65, everyone.stdout + everyone.stderr)
         self.assertIn("target.env is one target for every environment", everyone.stderr)
 
     def test_a_repository_that_tracks_a_target_file_is_refused(self):
         self.repository("app/Makefile", "app/env/common.env", "target.prod.env")
-        result = self.run_add("--monorepo", *self.targets, "zarskis", self.URL)
+        result = self.run_add("--monorepo", *self.targets, "gamma", self.URL)
         self.assertEqual(result.returncode, 65, result.stdout + result.stderr)
         self.assertIn("tracks target.prod.env in its top directory", result.stderr)
         self.assertFalse(self.build_root.exists(), "the clone is not kept")
 
     def test_the_repository_becomes_the_build_root_and_a_rerun_keeps_it(self):
         self.repository("app/Makefile", "app/env/common.env", "app/public/index.php", "README.md")
-        result = self.run_add("--monorepo", *self.targets, "--name", "zarskis", self.URL)
+        result = self.run_add("--monorepo", *self.targets, "--name", "gamma", self.URL)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.build_root / ".git").is_dir())
         self.assertTrue((self.build_root / "app/Makefile").is_file())
@@ -1150,7 +1150,7 @@ class AddMonorepoProjectTest(ScriptTest):
         self.assertFalse((self.build_root / "app/.git").exists())
         self.assertEqual(self.build_root.stat().st_mode & 0o777, 0o750)
         self.assertEqual(self.git("-C", str(self.build_root), "remote", "get-url", "origin").strip(),
-                         "git@github.com-bigsant.zarskis.lt:BigSant/zarskis.lt.git", "cloned through the deploy key")
+                         "git@github.com-bigsant.gamma.example:BigSant/gamma.example.git", "cloned through the deploy key")
         for environment in ("stage", "prod"):
             text = (self.build_root / f"target.{environment}.env").read_text()
             self.assertIn(f"DEPLOY_CONTEXT=default\nDEPLOY_SSH=\nDEPLOY_PATH={self.places}/{environment}\n", text)
@@ -1158,52 +1158,52 @@ class AddMonorepoProjectTest(ScriptTest):
         self.assertFalse((self.build_root / "target.env").exists(), "no shared target")
         self.assertEqual(self.git("-C", str(self.build_root), "status", "--porcelain"), "", "the targets are not untracked files")
 
-        again = self.run_add("--monorepo", "zarskis", self.URL)
+        again = self.run_add("--monorepo", "gamma", self.URL)
         self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
         self.assertIn(f"{self.build_root}: present", again.stdout)
         self.assertIn(f"deploy target kept: {self.build_root}/target.prod.env {self.build_root}/target.stage.env (change",
                       again.stdout, "a target per environment is a registered target too")
         self.assertEqual((self.build_root / ".git/info/exclude").read_text().count("/target*.env"), 1)
         self.assertTrue((self.build_root / "target.prod.env").is_file())
-        mixed = self.run_add("zarskis", self.URL)
+        mixed = self.run_add("gamma", self.URL)
         self.assertEqual(mixed.returncode, 65, mixed.stdout + mixed.stderr)
         self.assertIn("is a monorepo clone (the repository is the build root): add --monorepo", mixed.stderr)
         self.assertFalse((self.build_root / "app/.git").exists(), "nothing is cloned into app/")
-        moved = self.run_add("--monorepo", "--target", f"prod=local:{self.places}/stage", "zarskis", self.URL)
+        moved = self.run_add("--monorepo", "--target", f"prod=local:{self.places}/stage", "gamma", self.URL)
         self.assertEqual(moved.returncode, 64, moved.stdout + moved.stderr)
         self.assertIn("prod and stage would deploy to the same place", moved.stderr)
         self.assertIn(f"DEPLOY_PATH={self.places}/prod\n", (self.build_root / "target.prod.env").read_text(), "kept")
         # A commit that starts tracking a target file in the clone: refused before a target is written.
-        (self.build_root / "target.mdv.env").write_text("DEPLOY_PATH=/elsewhere\n")
-        self.git("-C", str(self.build_root), "add", "-f", "target.mdv.env")
+        (self.build_root / "target.demo.env").write_text("DEPLOY_PATH=/elsewhere\n")
+        self.git("-C", str(self.build_root), "add", "-f", "target.demo.env")
         self.git("-C", str(self.build_root), "commit", "-q", "-m", "track a target")
-        tracking = self.run_add("--monorepo", *self.targets, "zarskis", self.URL)
+        tracking = self.run_add("--monorepo", *self.targets, "gamma", self.URL)
         self.assertEqual(tracking.returncode, 65, tracking.stdout + tracking.stderr)
-        self.assertIn("tracks target.mdv.env in its top directory", tracking.stderr)
+        self.assertIn("tracks target.demo.env in its top directory", tracking.stderr)
         self.git("-C", str(self.build_root), "reset", "-q", "--hard", "HEAD~1")
 
         # The commands that read build roots find its app/ as before.
         history = self.build_root / "app/.generated/release/prod/deployments.json"
         history.parent.mkdir(parents=True)
         history.write_text("[]")
-        removal = self.run_script("remove-project", "--check", "zarskis")
+        removal = self.run_script("remove-project", "--check", "gamma")
         self.assertEqual(removal.returncode, 65, removal.stdout + removal.stderr)
         self.assertIn("database backups: 0; environments with deploy history: 1", removal.stdout)
-        self.assertEqual(self.run_script("remove-project", "--check", "--with-backups", "zarskis").returncode, 0)
+        self.assertEqual(self.run_script("remove-project", "--check", "--with-backups", "gamma").returncode, 0)
 
     def test_a_repository_without_app_makefile_leaves_nothing(self):
         self.repository("Makefile", "env/common.env", "public/index.php")  # an environment repository of two
-        result = self.run_add("--monorepo", *self.targets, "zarskis", self.URL)
+        result = self.run_add("--monorepo", *self.targets, "gamma", self.URL)
         self.assertEqual(result.returncode, 65, result.stdout + result.stderr)
         self.assertIn("has no app/Makefile", result.stderr)
         self.assertFalse(self.build_root.exists(), "the clone is not kept")
 
     def test_a_build_root_of_separate_repositories_is_kept(self):
         (self.build_root / "app/.git").mkdir(parents=True)
-        result = self.run_script("add-project", "--check", "--monorepo", *self.targets, "zarskis", self.URL)
+        result = self.run_script("add-project", "--check", "--monorepo", *self.targets, "gamma", self.URL)
         self.assertEqual(result.returncode, 65, result.stdout + result.stderr)
         self.assertIn("holds a project of separate repositories", result.stderr)
-        self.assertIn("bin/remove-project zarskis", result.stderr)
+        self.assertIn("bin/remove-project gamma", result.stderr)
 
 
 class RemoveProjectTest(ScriptTest):
