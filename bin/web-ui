@@ -101,9 +101,10 @@ LEVEL_NOTES = {'phpfpm-readonly': 'php-fpm as nobody: cannot change files, can u
 # (--pull-all, new projects too) is a level of its own, which a project environment's may raise.
 PULL_LEVELS = ('db', 'fresh')
 PULL = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}(?::(?!local=|test=)[a-z][a-z0-9]{1,15})?=(?:db|fresh)')
-LEVEL_LABELS.update({'db': 'db', 'fresh': 'fresh'})
-LEVEL_NOTES.update({'db': 'download backups (make db-pull: registry and full)',
-                    'fresh': "and order a new backup now (make db-pull fresh=1; loads the project's DB)"})
+# The levels keep their add-backup-key names (db, fresh); the UI says what they let a key do.
+LEVEL_LABELS.update({'db': 'download', 'fresh': 'download + new'})
+LEVEL_NOTES.update({'db': 'download the backups this server keeps: DB short, DB full and files (make db-pull, make files-pull)',
+                    'fresh': "and order a new backup now (make db-pull fresh=1; a DB one loads the project's DB)"})
 # The two kinds of what a key may do: its field prefix in the forms, its levels, add-backup-key's option.
 KINDS = {'access': ('grant', LEVELS, '--grant', 'Access', 'make ssh'),
          'backups': ('pull', PULL_LEVELS, '--pull', 'Backups', 'make db-pull')}
@@ -953,7 +954,8 @@ def key_plan(name, stored, granted, pulls, pull_all, public_key, sources, title)
     plan.changes = grant_changes(key_grants(stored), granted) + grant_changes(key_grants(stored, 'backups'), pulls, 'backups')
     before = (stored or {}).get('pull_all', 'none')
     if before != pull_all:
-        plan.changes.append(('warn' if stored else 'ok', f'backups, every project (new ones too): {before} → {pull_all}'))
+        plan.changes.append(('warn' if stored else 'ok', 'backups, every project (new ones too): '
+                             f'{LEVEL_LABELS.get(before, "none")} → {LEVEL_LABELS.get(pull_all, "none")}'))
     if stored is not None:
         if sources and sources != stored.get('sources'):
             plan.changes.append(('warn', f'from: {", ".join(stored.get("sources", []))} → {", ".join(sources)}'))
@@ -4100,7 +4102,7 @@ class Page:
                   '<label><span>Public key (.pub)</span><textarea name="public_key" spellcheck="false" '
                   'placeholder="ssh-ed25519 AAAA… name@computer"></textarea></label>' +
                   text('key_name', 'Name (in the logs)', 'tomas') + text('sources', 'From (VPN network)', '10.8.0.0/24', common) +
-                  '<p class="block-label">Backups (make db-pull)</p><table class="grants">'
+                  '<p class="block-label">Backup downloads (make db-pull, make files-pull)</p><table class="grants">'
                   f'<tr><td><span class="chip muted">every project</span></td><td>{self.seg("pull_all", "", PULL_LEVELS)}</td></tr>' +
                   start('pull', PULL_LEVELS) + '</table>'
                   '<p class="block-label">Access (make ssh)</p><table class="grants">' + start('grant', LEVELS) + '</table>'
@@ -4159,7 +4161,7 @@ class Page:
                      '<button>Preview</button></form>')
             if key.get('legacy'):
                 body += ('<div class="callout warn"><p>This entry was made before the backup permissions: it may pull every project\'s '
-                         f'backups ({e(everything)}). The first change writes that explicitly ("every project").</p></div>')
+                         f'backups ({e(LEVEL_LABELS.get(everything, everything))}). The first change writes that explicitly ("every project").</p></div>')
         # Every prod, every stage or every environment at once.
         bulk = []
         others = sorted({environment for _, environment in columns if environment not in ('prod', 'stage')})
@@ -4179,7 +4181,7 @@ class Page:
         # One row per project, its environments side by side; a filter narrows a long list. Without a level of its
         # own a project environment has every project's backups: the empty choice says which.
         everything = key.get('pull_all', 'none') if tab == 'backups' else 'none'
-        inherited = f'all: {everything}' if everything != 'none' else '—'
+        inherited = f'all: {LEVEL_LABELS[everything]}' if everything != 'none' else '—'
         wanted = query.strip().lower()
         rows = [(project, environments) for project, environments in project_rows(columns)
                 if (not wanted or wanted in project) and

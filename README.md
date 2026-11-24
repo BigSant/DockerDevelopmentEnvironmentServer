@@ -489,7 +489,7 @@ and change nothing. Run them with `--check` first.
 
    **Backup permissions** – for each project environment separately, like access (step 8): `db` – download backups
    (registry and full, `make db-pull [full=1]`), `fresh` – also order a new one now (`make db-pull fresh=1`; loads
-   the project's DB). `--pull PROJECT[:ENV]=LEVEL` (without `:ENV` – stage and prod, repeated or comma-separated), `--pull-all
+   the project's DB). The web UI calls them "download" and "download + new". `--pull PROJECT[:ENV]=LEVEL` (without `:ENV` – stage and prod, repeated or comma-separated), `--pull-all
    none|db|fresh` – all projects, including new ones; a project environment's permission can only raise it. A new key without them
    gets no backups. For an existing key, whatever is not given stays (the key, networks, the `--pull` and `--grant` lists, `--pull-all`);
    `--no-pulls`, `--no-grants` clear the list. Most convenient – the UI's *Access* → key → the "Backups" card (in bulk

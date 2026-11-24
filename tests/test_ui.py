@@ -1913,14 +1913,14 @@ class WebUiTest(Worker):
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
                          f"{library} --name tomas --pull-all none --pull alpha_shop:prod=db --pull beta_docker:stage=fresh "
                          "--grant alpha_shop:prod=full --grant beta_docker:stage=docker")
-        self.assertIn("+ backups: beta_docker stage: fresh", body)
+        self.assertIn("+ backups: beta_docker stage: download + new", body)
         status, _, body = self.preview("add-backup-key", key_name="tomas", merge="yes", pull_all="db",
                                        **{"pull:alpha_shop:prod": "", "pull:shop-two:prod": "fresh"})
         self.assertEqual(self.sudo_calls("add-backup-key")[-1],
                          f"{library} --name tomas --pull-all db --pull shop-two:prod=fresh "
                          "--grant alpha_shop:prod=full --grant beta_docker:stage=docker")
-        self.assertIn("backups, every project (new ones too): none → db", body)
-        self.assertIn("− backups: alpha_shop prod: db removed", body)
+        self.assertIn("backups, every project (new ones too): none → download", body)
+        self.assertIn("− backups: alpha_shop prod: download removed", body)
         for action, fields, message in (("key-bulk", {"key_name": "nobody", "scope": "prod", "level": "full"}, "no key named"),
                                         ("key-bulk", {"key_name": "tomas", "scope": "dev", "level": "full"}, "Choose"),
                                         ("add-backup-key", {"key_name": "tomas", "merge": "yes", "grant:x:local": "full"}, "invalid"),
