@@ -408,18 +408,18 @@ class BackupPolicyTest(BackupFixture):
     def test_the_nightly_run_follows_each_environments_policy_and_makes_the_daily_fulls(self):
         for name in ("alpha", "beta", "gamma", "delta", "epsilon"):
             self.project(name, "prod")
-        # delta's newest short backup is 3 days old (weekly: not due), epsilon's 7 days (due).
+        # delta's newest DB short backup is 3 days old (weekly: not due), epsilon's 7 days (due).
         self.backup(self.projects / "delta/app", "worker-prod-20261006T013000Z.sql.gz")
         self.backup(self.projects / "epsilon/app", "worker-prod-20261002T013000Z.sql.gz")
         # A fresh one does not count for the due rule.
         self.backup(self.projects / "epsilon/app", "fresh-prod-20261008T120000Z.sql.gz")
-        self.policy("# notes\nbeta prod db=off full=daily\ngamma prod db=off full=off files=off  # archived\n"
-                    "delta prod db=weekly\nepsilon prod db=weekly bogus=1 full=yearly\nremoved_project prod db=off\n")
+        self.policy("# notes\nbeta prod db-short=off db-full=daily\ngamma prod db-short=off db-full=off files=off  # archived\n"
+                    "delta prod db-short=weekly\nepsilon prod db-short=weekly bogus=1 db-full=yearly\nremoved_project prod db-short=off\n")
         check = self.run_script("backup-projects", "--check")
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
-        self.assertIn("==> beta prod: skipped: db off\n", check.stdout)
-        self.assertIn("==> gamma prod: skipped: db off\n", check.stdout)
-        self.assertIn("==> delta prod: not due: db weekly, newest 3 d ago\n", check.stdout)
+        self.assertIn("==> beta prod: skipped: db-short off\n", check.stdout)
+        self.assertIn("==> gamma prod: skipped: db-short off\n", check.stdout)
+        self.assertIn("==> delta prod: not due: db-short weekly, newest 3 d ago\n", check.stdout)
         self.assertIn("would back up beta prod into", check.stdout)
         self.assertIn("full-prod-20261009T013000Z.sql.gz", check.stdout)
         self.assertFalse(self.make_log.exists(), "--check runs no backup")
@@ -430,18 +430,18 @@ class BackupPolicyTest(BackupFixture):
         self.assertIn("full=1", [line for line in self.make_log.read_text().splitlines() if "/beta/" in line][0])
         self.assertIn("Backups: 3 ok, 0 failed", result.stdout)
         # Nothing due anywhere: said, and no failure.
-        self.policy("alpha prod db=off\nbeta prod db=off\ngamma prod db=off\ndelta prod db=off\nepsilon prod db=off\n")
+        self.policy("alpha prod db-short=off\nbeta prod db-short=off\ngamma prod db-short=off\ndelta prod db-short=off\nepsilon prod db-short=off\n")
         none = self.run_script("backup-projects")
         self.assertEqual(none.returncode, 0, none.stdout + none.stderr)
         self.assertIn("Nothing to back up in this run", none.stdout)
 
-    def test_the_full_series_of_full_daily_keeps_seven_daily_and_four_weekly(self):
+    def test_the_full_series_of_db_full_daily_keeps_seven_daily_and_four_weekly(self):
         beta = self.project("beta", "prod")
         alpha = self.project("alpha", "prod")
         for directory in (alpha, beta):
             for n in range(1, 41):
                 self.backup(directory, f"full-prod-{datetime(2026, 10, 9) - timedelta(days=n):%Y%m%d}T013000Z.sql.gz")
-        self.policy("beta prod db=off full=daily\n")
+        self.policy("beta prod db-short=off db-full=daily\n")
         check = self.run_script("backup-projects", "--check")
         self.assertIn("would delete 30:", check.stdout)
         result = self.run_script("backup-projects")
@@ -461,12 +461,12 @@ class BackupPolicyTest(BackupFixture):
         self.backup(self.projects / "alpha/app", "full-prod-20261008T013000Z.sql.gz")  # weekly: every weekly run
         self.backup(self.projects / "delta/app", "full-prod-20260929T013000Z.sql.gz")  # 10 days: not due
         self.backup(self.projects / "epsilon/app", "full-prod-20260909T013000Z.sql.gz")  # 30 days: due
-        self.policy("beta prod full=daily\ngamma prod full=off\ndelta prod full=monthly\nepsilon prod full=monthly\n")
+        self.policy("beta prod db-full=daily\ngamma prod db-full=off\ndelta prod db-full=monthly\nepsilon prod db-full=monthly\n")
         result = self.run_script("backup-projects", "--full")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("==> beta prod: skipped: full daily (the nightly run makes it)\n", result.stdout)
-        self.assertIn("==> gamma prod: skipped: full off\n", result.stdout)
-        self.assertIn("==> delta prod: not due: full monthly, newest 10 d ago\n", result.stdout)
+        self.assertIn("==> beta prod: skipped: db-full daily (the nightly run makes it)\n", result.stdout)
+        self.assertIn("==> gamma prod: skipped: db-full off\n", result.stdout)
+        self.assertIn("==> delta prod: not due: db-full monthly, newest 10 d ago\n", result.stdout)
         self.assertEqual(self.made(), ["alpha/full-prod-20261009T013000Z.sql.gz", "epsilon/full-prod-20261009T013000Z.sql.gz"])
 
     def test_the_files_run_follows_the_files_policy(self):
@@ -483,7 +483,7 @@ class BackupPolicyTest(BackupFixture):
 
     def test_backup_now_and_fresh_backups_ignore_the_policy(self):
         self.project("gamma", "prod")
-        self.policy("gamma prod db=off full=off files=off\n")
+        self.policy("gamma prod db-short=off db-full=off files=off\n")
         # The fresh one first: a registry backup younger than 30 minutes would be handed out instead.
         self.assertEqual(self.run_script("backup-projects", "--fresh", "gamma", "prod").returncode, 0)
         self.assertEqual(self.run_script("backup-projects", "gamma", "prod").returncode, 0)
@@ -494,50 +494,52 @@ class BackupPolicyTest(BackupFixture):
     def test_set_merges_writes_atomically_and_keeps_the_other_lines(self):
         alpha = self.project("alpha", "prod")
         self.project("beta", "stage", "prod")
-        path = self.policy("# my notes\nbeta prod db=off full=daily  # full only\nremoved_project prod db=off\n")
-        check = self.run_script("backup-projects", "--set", "alpha", "prod", "db=off", "full=daily", "--check")
+        path = self.policy("# my notes\nbeta prod db-short=off db-full=daily  # DB full only\nremoved_project prod db-short=off\n")
+        check = self.run_script("backup-projects", "--set", "alpha", "prod", "db-short=off", "db-full=daily", "--check")
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
-        self.assertEqual(check.stdout, "alpha prod: db daily → off, full weekly → daily\n")
-        self.assertEqual(path.read_text(), "# my notes\nbeta prod db=off full=daily  # full only\nremoved_project prod db=off\n")
-        result = self.run_script("backup-projects", "--set", "alpha", "prod", "db=off", "full=daily")
+        self.assertEqual(check.stdout, "alpha prod: db-short daily → off, db-full weekly → daily\n")
+        self.assertEqual(path.read_text(), "# my notes\nbeta prod db-short=off db-full=daily  # DB full only\nremoved_project prod db-short=off\n")
+        result = self.run_script("backup-projects", "--set", "alpha", "prod", "db-short=off", "db-full=daily")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout, f"alpha prod: db daily → off, full weekly → daily\n    written to {path}\n")
+        self.assertEqual(result.stdout, f"alpha prod: db-short daily → off, db-full weekly → daily\n    written to {path}\n")
         self.assertEqual(path.stat().st_mode & 0o777, 0o644)
         self.assertEqual(sorted(item.name for item in path.parent.iterdir()), [".backup-policy.conf.lock", "backup-policy.conf"],
                          "no temporary file is left")
         # Series not given keep their value; SERIES=default drops back to the default; a default line goes.
         self.assertEqual(self.run_script("backup-projects", "--set", "alpha", "prod", "files=weekly").returncode, 0)
-        self.assertEqual(self.run_script("backup-projects", "--set", "beta", "prod", "db=default").returncode, 0)
-        self.assertEqual(path.read_text(), "# my notes\nbeta prod full=daily  # full only\nremoved_project prod db=off\n"
-                                           "alpha prod db=off full=daily files=weekly\n")
-        again = self.run_script("backup-projects", "--set", "alpha", "prod", "db=off")
+        self.assertEqual(self.run_script("backup-projects", "--set", "beta", "prod", "db-short=default").returncode, 0)
+        self.assertEqual(path.read_text(), "# my notes\nbeta prod db-full=daily  # DB full only\nremoved_project prod db-short=off\n"
+                                           "alpha prod db-short=off db-full=daily files=weekly\n")
+        again = self.run_script("backup-projects", "--set", "alpha", "prod", "db-short=off")
         self.assertEqual(again.stdout, "alpha prod: no change\n")
-        self.assertEqual(self.run_script("backup-projects", "--set", "beta", "prod", "full=weekly").returncode, 0)
-        self.assertEqual(path.read_text(), "# my notes\nremoved_project prod db=off\nalpha prod db=off full=daily files=weekly\n")
+        self.assertEqual(self.run_script("backup-projects", "--set", "beta", "prod", "db-full=weekly").returncode, 0)
+        self.assertEqual(path.read_text(), "# my notes\nremoved_project prod db-short=off\nalpha prod db-short=off db-full=daily files=weekly\n")
         # An environment of the project's STAGE_ENVIRONMENTS or with a target file of its own.
         (alpha / "env/common.env").write_text('STAGE_ENVIRONMENTS="demo"\n')
         (self.projects / "alpha/target.preview.env").write_text("DEPLOY_CONTEXT=default\n")
         for environment in ("demo", "preview"):
             with self.subTest(environment=environment):
-                self.assertEqual(self.run_script("backup-projects", "--set", "alpha", environment, "db=weekly").returncode, 0)
+                self.assertEqual(self.run_script("backup-projects", "--set", "alpha", environment, "db-short=weekly").returncode, 0)
         # A new file starts with its header.
         path.unlink()
-        self.assertEqual(self.run_script("backup-projects", "--set", "beta", "stage", "full=off").returncode, 0)
+        self.assertEqual(self.run_script("backup-projects", "--set", "beta", "stage", "db-full=off").returncode, 0)
         self.assertEqual(path.read_text().splitlines(),
                          ["# bin/backup-projects --set: how often each series of a project environment is backed up "
-                          "(README: DB backups).", "beta stage full=off"])
+                          "(README: DB backups).", "beta stage db-full=off"])
 
     def test_set_refuses_unknown_projects_environments_and_bad_items(self):
         self.project("alpha", "prod")
-        for arguments, code, message in ((["missing", "prod", "db=off"], 65, "No build root"),
-                                         (["alpha", "demo", "db=off"], 65, "alpha has no environment demo"),
-                                         (["alpha", "local", "db=off"], 65, "alpha has no environment local"),
-                                         (["Bad.Name", "prod", "db=off"], 65, "NAME must be"),
-                                         (["alpha", "prod", "db=monthly"], 64, "db=daily|weekly|off|default"),
+        for arguments, code, message in ((["missing", "prod", "db-short=off"], 65, "No build root"),
+                                         (["alpha", "demo", "db-short=off"], 65, "alpha has no environment demo"),
+                                         (["alpha", "local", "db-short=off"], 65, "alpha has no environment local"),
+                                         (["Bad.Name", "prod", "db-short=off"], 65, "NAME must be"),
+                                         (["alpha", "prod", "db-short=monthly"], 64, "db-short=daily|weekly|off|default"),
                                          (["alpha", "prod", "bogus=daily"], 64, "SERIES=FREQUENCY"),
-                                         (["alpha", "prod", "db"], 64, "SERIES=FREQUENCY"),
+                                         (["alpha", "prod", "db=off"], 64, "SERIES=FREQUENCY"),
+                                         (["alpha", "prod", "full=daily"], 64, "SERIES=FREQUENCY"),
+                                         (["alpha", "prod", "db-short"], 64, "SERIES=FREQUENCY"),
                                          (["alpha", "prod"], 64, "Usage"),
-                                         (["alpha", "prod", "db=off", "--full"], 64, "Usage")):
+                                         (["alpha", "prod", "db-short=off", "--full"], 64, "Usage")):
             with self.subTest(arguments=arguments):
                 result = self.run_script("backup-projects", "--set", *arguments)
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
@@ -546,7 +548,7 @@ class BackupPolicyTest(BackupFixture):
         if os.getuid() != 0:
             # Without a test configuration directory it writes the real root-owned file: only as root.
             env = {key: value for key, value in os.environ.items() if key != "SETUP_SERVER_CONFIG"}
-            refused = subprocess.run([str(ROOT / "bin/backup-projects"), "--set", "alpha", "prod", "db=off"], capture_output=True,
+            refused = subprocess.run([str(ROOT / "bin/backup-projects"), "--set", "alpha", "prod", "db-short=off"], capture_output=True,
                                      text=True, timeout=60, env={**env, "SETUP_SERVER_ROOT": str(self.root / "srv")})
             self.assertEqual(refused.returncode, 77, refused.stdout + refused.stderr)
             self.assertIn("Run as root", refused.stderr)
@@ -554,9 +556,9 @@ class BackupPolicyTest(BackupFixture):
     def test_the_shared_reader_takes_the_defaults_for_what_a_line_does_not_set(self):
         module = load_backup_projects()
         config = self.root / "etc"
-        self.assertEqual(module.backup_policy(config, "alpha", "prod"), {"db": "daily", "full": "weekly", "files": "daily"})
-        self.policy("alpha prod db=off full=monthly files=hourly # db=weekly\nalpha prodx db=weekly\nalpha\n")
-        self.assertEqual(module.backup_policy(config, "alpha", "prod"), {"db": "off", "full": "monthly", "files": "daily"})
+        self.assertEqual(module.backup_policy(config, "alpha", "prod"), {"db-short": "daily", "db-full": "weekly", "files": "daily"})
+        self.policy("alpha prod db-short=off db-full=monthly files=hourly full=daily # db-short=weekly\nalpha prodx db-short=weekly\nalpha\n")
+        self.assertEqual(module.backup_policy(config, "alpha", "prod"), {"db-short": "off", "db-full": "monthly", "files": "daily"})
         self.assertEqual(module.backup_policy(config, "alpha", "stage"), module.BACKUP_DEFAULT)
 
 

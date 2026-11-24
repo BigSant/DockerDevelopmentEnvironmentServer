@@ -35,12 +35,15 @@ is younger than 30 minutes. A files backup needs no secret store, only the targe
 
 Backup policy: how often the timers back up each series of a project environment, in the root-owned
 $SETUP_SERVER_CONFIG/backup-policy.conf (not in a build root: a pipeline cannot switch its backups off), written by
-    backup-projects --set PROJECT ENV db=daily|weekly|off full=daily|weekly|monthly|off files=daily|weekly|off [--check]
-(SERIES=default drops back to the default; series not given keep their value). The default is db=daily full=weekly
-files=daily. Only the timers' runs (no PROJECT) follow it: daily backs up every run; weekly when the newest backup of
-that series is older than 6.5 days (or there is none), monthly older than 27.5 days; off never. The nightly run makes
-the full backup of an environment with full=daily (its full series then keeps 7 daily + 4 weekly, not 2); the weekly
-run backs up full=weekly and full=monthly when due. "Backup now" (PROJECT [ENV]) and --fresh ignore the policy.
+    backup-projects --set PROJECT ENV db-short=daily|weekly|off db-full=daily|weekly|monthly|off files=daily|weekly|off
+                    [--check]
+db-short is the DB short backup (the registry series, worker-<env>), db-full the DB full backup (full-<env>), files the
+files backup (files-<env>); SERIES=default drops back to the default, series not given keep their value. The default
+is db-short=daily db-full=weekly files=daily. Only the timers' runs (no PROJECT) follow it: daily backs up every run;
+weekly when the newest backup of that series is older than 6.5 days (or there is none), monthly older than 27.5 days;
+off never. The nightly run makes the DB full backup of an environment with db-full=daily (its full series then keeps
+7 daily + 4 weekly, not 2); the weekly run backs up db-full=weekly and db-full=monthly when due. "Backup now"
+(PROJECT [ENV]) and --fresh ignore the policy.
 """
 
 from datetime import datetime, timezone
@@ -91,13 +94,14 @@ USAGE = f"""Usage: {Path(sys.argv[0]).name} [--check] [--full | --files] [--fres
   --check     show what would be backed up (and what the policy skips) and which old backups rotation would
               delete; change nothing
   --set       how often the timers back up one project environment, in {CONFIG}/backup-policy.conf (as root):
-              db=daily|weekly|off (the short registry series), full=daily|weekly|monthly|off, files=daily|weekly|off;
-              SERIES=default drops back to the default (db=daily full=weekly files=daily), series not given keep
-              their value. With --check it shows the change and writes nothing
+              db-short=daily|weekly|off (DB short backup: the registry series), db-full=daily|weekly|monthly|off
+              (DB full backup), files=daily|weekly|off (files backup); SERIES=default drops back to the default
+              (db-short=daily db-full=weekly files=daily), series not given keep their value. With --check it shows
+              the change and writes nothing
 The timers follow the policy: daily backs up every run, weekly when the newest backup of the series is older than
-6.5 days, monthly older than 27.5 days, off never; the nightly run makes the full backups of full=daily.
+6.5 days, monthly older than 27.5 days, off never; the nightly run makes the DB full backups of db-full=daily.
 The nightly series keeps the newest backup of each of the last {KEEP_DAILY} days that have one and of
-{KEEP_WEEKLY} more weeks (so does the full series of full=daily); pre-deploy backups and other files in
+{KEEP_WEEKLY} more weeks (so does the full series of db-full=daily); pre-deploy backups and other files in
 .generated/backups are not touched."""
 
 
@@ -153,13 +157,13 @@ def server_environments(directory):
 # BACKUP_POLICY, BACKUP_DEFAULT and backup_policy are identical in bin/backup-projects, bin/server-status and
 # bin/worker-metrics (tests/test_metrics.py).
 # How often each backup series of a project environment is made (bin/backup-projects --set writes it; README: DB backups).
-BACKUP_POLICY = {'db': ('daily', 'weekly', 'off'), 'full': ('daily', 'weekly', 'monthly', 'off'),
+BACKUP_POLICY = {'db-short': ('daily', 'weekly', 'off'), 'db-full': ('daily', 'weekly', 'monthly', 'off'),
                  'files': ('daily', 'weekly', 'off')}
-BACKUP_DEFAULT = {'db': 'daily', 'full': 'weekly', 'files': 'daily'}
+BACKUP_DEFAULT = {'db-short': 'daily', 'db-full': 'weekly', 'files': 'daily'}
 
 
 def backup_policy(config, project, environment):
-    """{'db': …, 'full': …, 'files': …} of one project environment: backup-policy.conf in the config directory,
+    """{'db-short': …, 'db-full': …, 'files': …} of one project environment: backup-policy.conf in the config directory,
     the defaults for whatever it does not set (or when it cannot be read)."""
     policy = dict(BACKUP_DEFAULT)
     try:
@@ -463,7 +467,7 @@ def say(text, error=False):
 
 # --- One backup, run as the setup account --------------------------------------------------------
 def job(name, environment, kind='daily', progress=False, keep_daily=False):
-    """keep_daily: rotate the full series daily + weekly (its policy is full=daily). The caller decides: it reads
+    """keep_daily: rotate the full series daily + weekly (its policy is db-full=daily). The caller decides: it reads
     backup-policy.conf as root, where this account may not."""
     if os.geteuid() == 0:
         raise Refused('--job runs as the setup account, not as root')
@@ -581,30 +585,31 @@ def due(name, environment, kind, frequency):
 
 def scheduled(candidates, kind):
     """[(name, environment, kind)] a timer run makes, by each environment's backup policy: the nightly run its
-    registry backup (db) and, for full=daily, its full one; the weekly run the full backups of full=weekly and,
-    when due, full=monthly; the files run the files backups. What the policy skips is said."""
+    DB short backup (db-short, the registry one) and, for db-full=daily, its DB full one; the weekly run the DB full
+    backups of db-full=weekly and, when due, db-full=monthly; the files run the files backups. What the policy skips
+    is said."""
     jobs = []
     for name, environment in candidates:
         policy = backup_policy(CONFIG, name, environment)
         skipped = []
         if kind == 'daily':
-            go, why = due(name, environment, 'daily', policy['db'])
+            go, why = due(name, environment, 'daily', policy['db-short'])
             if go:
                 jobs.append((name, environment, 'daily'))
             else:
-                skipped.append(f'{"skipped" if why == "off" else "not due"}: db {why}')
-            if policy['full'] == 'daily':
+                skipped.append(f'{"skipped" if why == "off" else "not due"}: db-short {why}')
+            if policy['db-full'] == 'daily':
                 jobs.append((name, environment, 'full'))
         elif kind == 'full':
-            if policy['full'] in ('daily', 'off'):
-                skipped.append(f'skipped: full {policy["full"]}' +
-                               (' (the nightly run makes it)' if policy['full'] == 'daily' else ''))
+            if policy['db-full'] in ('daily', 'off'):
+                skipped.append(f'skipped: db-full {policy["db-full"]}' +
+                               (' (the nightly run makes it)' if policy['db-full'] == 'daily' else ''))
             else:  # weekly: every run of the weekly timer; monthly: when due
-                go, why = due(name, environment, 'full', 'daily' if policy['full'] == 'weekly' else 'monthly')
+                go, why = due(name, environment, 'full', 'daily' if policy['db-full'] == 'weekly' else 'monthly')
                 if go:
                     jobs.append((name, environment, 'full'))
                 else:
-                    skipped.append(f'not due: full {why}')
+                    skipped.append(f'not due: db-full {why}')
         else:
             go, why = due(name, environment, 'files', policy['files'])
             if go:
@@ -617,8 +622,8 @@ def scheduled(candidates, kind):
 
 
 def keeps_daily(name, environment, kind):
-    """Whether the series is rotated daily + weekly instead of the newest N: the full series of full=daily."""
-    return kind == 'full' and backup_policy(CONFIG, name, environment)['full'] == 'daily'
+    """Whether the series is rotated daily + weekly instead of the newest N: the full series of db-full=daily."""
+    return kind == 'full' and backup_policy(CONFIG, name, environment)['db-full'] == 'daily'
 
 
 def check(jobs):
@@ -704,7 +709,7 @@ def run(jobs, progress=False):
             say(f'{name} {environment}: stopped after {timeout // 3600} h', error=True)
             code = 1
         if code:
-            # A nightly run with full=daily mixes the kinds: name the full one.
+            # A nightly run with db-full=daily mixes the kinds: name the full one.
             failed.append(f'{name}/{environment}' + (f'/{kind}' if len({job[2] for job in jobs}) > 1 else ''))
     say(f'==> Backups: {len(jobs) - len(failed)} ok, {len(failed)} failed' + (f': {" ".join(failed)}' if failed else ''))
     return 1 if failed else 0

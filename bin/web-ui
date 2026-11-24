@@ -139,14 +139,14 @@ FILE_MEMBER = re.compile(r'[^\x00-\x1f\x7f]{1,1024}')
 FILE_ROWS = 5000
 # How often each backup series of a project environment is made (bin/backup-projects --set; server-status gives it as
 # backup_policy), the default (today's timers), and how old the newest backup of a series may be at each frequency.
-BACKUP_POLICY = {'db': ('daily', 'weekly', 'off'), 'full': ('daily', 'weekly', 'monthly', 'off'),
+BACKUP_POLICY = {'db-short': ('daily', 'weekly', 'off'), 'db-full': ('daily', 'weekly', 'monthly', 'off'),
                  'files': ('daily', 'weekly', 'off')}
-BACKUP_DEFAULT = {'db': 'daily', 'full': 'weekly', 'files': 'daily'}
+BACKUP_DEFAULT = {'db-short': 'daily', 'db-full': 'weekly', 'files': 'daily'}
 BACKUP_MAX_AGE = {'daily': 26 * 3600, 'weekly': 8 * 86400, 'monthly': 29 * 86400}
-BACKUP_WORDS = {'no backup', 'old backup', 'no full backup', 'old full backup'}  # db_backup_problem's words
-BACKUP_SERIES = {'db': 'Short backup', 'full': 'Full backup', 'files': 'Files backup'}
-BACKUP_KINDS = {'worker': 'nightly', 'full': 'full', 'fresh': 'fresh', 'fresh-full': 'fresh full',
-                'predeploy': 'pre-deploy', 'files': 'files'}
+BACKUP_WORDS = {'no DB short backup', 'old DB short backup', 'no DB full backup', 'old DB full backup'}  # db_backup_problem's words
+BACKUP_SERIES = {'db-short': 'DB short backup', 'db-full': 'DB full backup', 'files': 'Files backup'}
+BACKUP_KINDS = {'worker': 'DB short', 'full': 'DB full', 'fresh': 'DB short fresh', 'fresh-full': 'DB full fresh',
+                'predeploy': 'DB pre-deploy', 'files': 'files'}
 # git over SSH: ssh.bitbucket.org from 2026-11-12, bitbucket.org before (bin/move-bitbucket-ssh moves the remotes).
 BITBUCKET_URL = re.compile(r'(?:git@(?:ssh\.)?bitbucket\.org:|ssh://git@(?:ssh\.)?bitbucket\.org/|https://(?:[^@/\s]+@)?bitbucket\.org/)'
                            r'([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9][A-Za-z0-9._-]*?)(?:\.git)?/?')
@@ -800,11 +800,11 @@ def plan_remove_runner(form, status):
 def plan_install_backups(form, status):
     at = value(form, 'at', re.compile(r'([01][0-9]|2[0-3]):[0-5][0-9]'), 'Time')
     full_at = value(form, 'full_at', re.compile(r'(Mon|Tue|Wed|Thu|Fri|Sat|Sun) ([01][0-9]|2[0-3]):[0-5][0-9]'),
-                    'Full backup day and time')
+                    'DB full backup day and time')
     files_at = value(form, 'files_at', re.compile(r'([01][0-9]|2[0-3]):[0-5][0-9]'), 'Files backup time')
     arguments = (['--at', at] if at else []) + (['--full-at', full_at] if full_at else []) + \
         (['--files-at', files_at] if files_at else [])
-    return Plan('install-backups', 'Backups (nightly, weekly full and files)', *command('install-backups', arguments))
+    return Plan('install-backups', 'Backups (nightly DB short, weekly DB full and files)', *command('install-backups', arguments))
 
 
 def plan_install_metrics(form, status):
@@ -842,13 +842,13 @@ def plan_backup_local(form, status):
     arguments = (['--full'] if full else ['--files'] if files else []) + ([name] if name else []) + \
         ([environment] if environment else [])
     what = ' '.join(part for part in (name or 'all projects', environment) if part)
-    title = f'{"Full DB backup" if full else "Files backup" if files else "DB backup"} now: {what}'
+    title = f'{"DB full backup" if full else "Files backup" if files else "DB short backup"} now: {what}'
     return Plan('backup-local', title, *command('backup-projects', arguments), timeout=12 * 3600)
 
 
 def plan_backup_policy(form, status):
-    """How often each backup series of one project environment is made: bin/backup-projects --set PROJECT ENV db=… full=…
-    files=… (its --check says what changes)."""
+    """How often each backup series of one project environment is made: bin/backup-projects --set PROJECT ENV db-short=…
+    db-full=… files=… (its --check says what changes)."""
     name, entry = project_entry(form, status)
     environment = value(form, 'environment', ENVIRONMENT, 'Environment', required=True, limit=16)
     state = (entry.get('environments') or {}).get(environment)
@@ -868,7 +868,7 @@ def plan_backup_policy(form, status):
     before = environment_policy(state)
     plan.changes = [('bad' if policy[series] == 'off' else 'warn', f'{series}: {before[series]} → {policy[series]}')
                     for series in BACKUP_POLICY if policy[series] != before[series]] or [('muted', 'nothing changes')]
-    if policy['db'] == policy['full'] == 'off' and (before['db'], before['full']) != ('off', 'off'):
+    if policy['db-short'] == policy['db-full'] == 'off' and (before['db-short'], before['db-full']) != ('off', 'off'):
         plan.danger = f'{name} {environment} gets no DB backups any more: the kept ones are rotated away as usual.'
     plan.back = (f'/project/{quote(name)}#backup-{environment}', 'projects')
     return plan
@@ -2407,7 +2407,7 @@ text-overflow:ellipsis}
 small.envline{margin-top:2px;color:var(--faint);font-size:12px}
 .env-item+.env-item{margin-top:5px}
 .toolbar .note.shown{margin:0;white-space:nowrap}.search select{width:auto}
-.tallied{display:inline-block;white-space:nowrap;margin:0 6px 4px 0}
+.tallied{display:inline-block;white-space:nowrap;margin:0 6px 4px 0}.nobreak{white-space:nowrap}
 .tally{display:inline-block;margin-right:4px;color:var(--ink);font-weight:700}
 .keyhead{display:grid;grid-template-columns:minmax(16em,1.3fr) minmax(0,.8fr) minmax(0,.8fr) minmax(0,1.4fr) minmax(0,1fr) minmax(0,1fr);gap:18px;padding:16px 20px;
 background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--rule);border-top:3px solid var(--amber);border-radius:4px}
@@ -2688,13 +2688,19 @@ def environment_policy(state):
 
 
 def policy_text(policy, files=True):
-    """A policy in a few words: 'short daily · full weekly · files daily', 'full only, daily', 'off'; files only when the
-    environment has files to back up."""
-    db, full, files_policy = policy['db'], policy['full'], policy['files'] if files else 'off'
-    if db == full == files_policy == 'off':
+    """A policy in a few words: 'DB short daily · DB full weekly · files daily', 'DB full only, daily', 'DB off', 'off';
+    files only when the environment has files to back up."""
+    short, full, files_policy = policy['db-short'], policy['db-full'], policy['files'] if files else 'off'
+    if short == full == files_policy == 'off':
         return 'off'
-    parts = [f'full only, {full}'] if db == 'off' and full != 'off' else ['DB off'] if db == 'off' else [f'short {db}', f'full {full}']
+    parts = ([f'DB full only, {full}'] if short == 'off' and full != 'off' else ['DB off'] if short == 'off' else
+             [f'DB short {short}', f'DB full {full}'])
     return ' · '.join(parts + ([f'files {policy["files"]}'] if files else []))
+
+
+def policy_html(policy, files=True):
+    """policy_text on a page: each part kept on one line, so a narrow cell wraps only between the parts."""
+    return ' · '.join(f'<span class="nobreak">{e(part)}</span>' for part in policy_text(policy, files).split(' · '))
 
 
 def has_files(state):
@@ -2703,13 +2709,13 @@ def has_files(state):
 
 
 def backup_watch(state):
-    """(series, frequency, newest) of the DB backup an environment's alarm watches: the short registry series while it is
-    on, else the full series while that is on; None when its database is not backed up at all."""
+    """(series, frequency, newest) of the DB backup an environment's alarm watches: the DB short (registry) series while
+    it is on, else the DB full series while that is on; None when its database is not backed up at all."""
     policy = environment_policy(state)
-    if policy['db'] != 'off':
-        return 'db', policy['db'], (state.get('backups') or {}).get('newest')
-    if policy['full'] != 'off':
-        return 'full', policy['full'], (state.get('full_backups') or {}).get('newest')
+    if policy['db-short'] != 'off':
+        return 'db-short', policy['db-short'], (state.get('backups') or {}).get('newest')
+    if policy['db-full'] != 'off':
+        return 'db-full', policy['db-full'], (state.get('full_backups') or {}).get('newest')
     return None
 
 
@@ -2719,12 +2725,13 @@ def backup_late(newest, frequency, now=None):
 
 
 def db_backup_problem(state):
-    """'no backup' / 'old backup' (or 'no full backup' / 'old full backup' for a full-only one) when the DB backup a
-    deployed environment's policy asks for is missing or late; '' otherwise (development, off, fine)."""
+    """'no DB short backup' / 'old DB short backup' (or 'no DB full backup' / 'old DB full backup' for a DB-full-only
+    one) when the DB backup a deployed environment's policy asks for is missing or late; '' otherwise (development, off,
+    fine)."""
     watch = None if not state.get('declared') or state.get('development') else backup_watch(state)
     if not watch or not backup_late(watch[2], watch[1]):
         return ''
-    return ('old ' if watch[2] else 'no ') + ('full backup' if watch[0] == 'full' else 'backup')
+    return ('old ' if watch[2] else 'no ') + BACKUP_SERIES[watch[0]]
 
 
 def environment_kind(state):
@@ -2987,8 +2994,8 @@ class Page:
 
     # What a folded group of per-environment alerts says after its count.
     ATTENTION_GROUPS = {'deploy-failed': 'environments: the last deploy failed', 'secrets-stopped': 'environments: secret store stopped',
-                        'unhealthy': 'environments have unhealthy containers', 'no-backup': 'environments have no backup',
-                        'old-backup': 'environments have an old backup', 'no-files-backup': 'environments have no files backup',
+                        'unhealthy': 'environments have unhealthy containers', 'no-backup': 'environments have no DB backup',
+                        'old-backup': 'environments have an old DB backup', 'no-files-backup': 'environments have no files backup',
                         'old-files-backup': 'environments have an old files backup'}
     ATTENTION_FOLD = 3  # more of one kind than this – folded
 
@@ -3033,7 +3040,7 @@ class Page:
                 # An environment with no target deploys nowhere: nothing to back up, so no alarm (the Projects page shows it
                 # quietly); nor is a series its backup policy turns off.
                 for series, problem, newest in Page.backup_problems(entry, environment, units):
-                    what = 'full backup' if series == 'full' else 'files backup' if series == 'files' else 'backup'
+                    what = BACKUP_SERIES[series].replace('Files', 'files')
                     found.append((f'{problem}-{"files-" if series == "files" else ""}backup',
                                   f'{where}: newest {what} ' + (e(ago(newest['time'])) if newest else 'none'),
                                   f'/files/{quote(entry["name"])}/{quote(environment)}' if series == 'files' else
@@ -3132,14 +3139,14 @@ class Page:
 
     @staticmethod
     def backup_short(state):
-        """The newest DB backup the policy watches, in a few words: 'backup 5 h ago', 'full 2 d ago' (full only),
-        'no backup', 'backups off' (nothing at all) or 'DB backups off' (files only)."""
+        """The newest DB backup the policy watches, in a few words: 'DB short 5 h ago', 'DB full 2 d ago' (DB full only),
+        'no DB short backup', 'backups off' (nothing at all) or 'DB backups off' (files only)."""
         watch = backup_watch(state)
         if watch is None:
             return 'backups off' if environment_policy(state)['files'] == 'off' or not has_files(state) else 'DB backups off'
         series, _, newest = watch
-        word = 'full' if series == 'full' else 'backup'
-        return f'{word} {ago(newest["time"])}' if newest else f'no {"full backup" if series == "full" else "backup"}'
+        words = BACKUP_SERIES[series]
+        return f'{words.removesuffix(" backup")} {ago(newest["time"])}' if newest else f'no {words}'
 
     def project_rows(self, projects):
         """(project, kind, problems, row) for each project: its compact row and whether it needs a look."""
@@ -3236,13 +3243,13 @@ class Page:
     def backup_cell(state):
         if state.get('development'):
             return '<span class="muted">the application\'s recovery backups</span>'
-        return Page.series_cell(state, 'backups', environment_policy(state)['db'], 'bad' if state.get('declared') else 'muted')
+        return Page.series_cell(state, 'backups', environment_policy(state)['db-short'], 'bad' if state.get('declared') else 'muted')
 
     @staticmethod
     def full_backup_cell(state):
-        """The full series (full-<env>): red when missing only while it is the series the alarm watches (full only)."""
-        watched = (backup_watch(state) or ('',))[0] == 'full' and state.get('declared')
-        return Page.series_cell(state, 'full_backups', environment_policy(state)['full'], 'bad' if watched else 'muted')
+        """The DB full series (full-<env>): red when missing only while it is the series the alarm watches (DB full only)."""
+        watched = (backup_watch(state) or ('',))[0] == 'db-full' and state.get('declared')
+        return Page.series_cell(state, 'full_backups', environment_policy(state)['db-full'], 'bad' if watched else 'muted')
 
     @staticmethod
     def fresh_backup_cell(state):
@@ -3319,7 +3326,7 @@ class Page:
         else:
             body += self.projects_board(shown)
             body += ('<p class="note">Each environment: a lamp, the last deploy and what is wrong; below it where it deploys and the '
-                     'newest backup its backup policy watches (the full one when it backs up full only). A project\'s page has its '
+                     'newest DB backup its backup policy watches (the DB full one when it backs up DB full only). A project\'s page has its '
                      'settings: each environment\'s target and backup policy, a new environment, removing. '
                      '<a href="/projects/backups">Backups</a>: every environment\'s policy and newest backups.</p>')
         if data.get('errors'):
@@ -3332,8 +3339,8 @@ class Page:
     # The Backups page's policy filter: (value, words, which policies it keeps).
     POLICY_FILTERS = (('', 'any policy', lambda policy: True),
                       ('custom', 'not the default', lambda policy: policy != BACKUP_DEFAULT),
-                      ('full-only', 'full only', lambda policy: policy['db'] == 'off' and policy['full'] != 'off'),
-                      ('off', 'DB off', lambda policy: policy['db'] == policy['full'] == 'off'))
+                      ('db-full-only', 'DB full only', lambda policy: policy['db-short'] == 'off' and policy['db-full'] != 'off'),
+                      ('db-off', 'DB off', lambda policy: policy['db-short'] == policy['db-full'] == 'off'))
 
     @staticmethod
     def newest_cell(state, key, frequency, problem):
@@ -3346,7 +3353,7 @@ class Page:
         return e(ago(newest['time'])) + (' ' + badge('late', 'bad') if problem else '')
 
     def backups_page(self, data, error, query=None):
-        """Every project environment's backup policy and its newest short, full and files backup: those late or missing
+        """Every project environment's backup policy and its newest DB short, DB full and files backup: those late or missing
         first, filtered like Projects; each row leads to the environment's policy form on its project page."""
         if data is None:
             return self.layout('Backups', f'<div class="callout bad"><p>Could not get the status: {e(error)}</p></div>',
@@ -3376,10 +3383,10 @@ class Page:
                 note = '' if registered else '<small>no target: no alarm</small>'
                 # Each value in one <span>: on a phone the cell is a row of its label and that.
                 values = (('Environment', f'<span class="sign {e(environment)}">{e(environment)}</span>'),
-                          ('Policy', e(policy_text(policy, files)) +
+                          ('Policy', policy_html(policy, files) +
                            (' <span class="muted">· default</span>' if policy == BACKUP_DEFAULT else '')),
-                          ('Short', self.newest_cell(state, 'backups', policy['db'], 'db' in late)),
-                          ('Full', self.newest_cell(state, 'full_backups', policy['full'], 'full' in late)),
+                          ('DB short', self.newest_cell(state, 'backups', policy['db-short'], 'db-short' in late)),
+                          ('DB full', self.newest_cell(state, 'full_backups', policy['db-full'], 'db-full' in late)),
                           ('Files', self.newest_cell(state, 'files_backups', policy['files'], 'files' in late) if files else
                            '<span class="muted" title="no BACKUP_FILE_PATHS">—</span>'))
                 cells = (f'<td class="project" data-label="Project"><a href="{link}">{e(entry["name"])}</a>{note}</td>' +
@@ -3411,10 +3418,10 @@ class Page:
             body += '<div class="empty">No environment matches. <a href="/projects/backups">All environments</a></div>'
         else:
             body += ('<div class="scroll"><table class="board backups"><thead><tr><th scope="col">Project</th>'
-                     '<th scope="col">Environment</th><th scope="col">Policy</th><th scope="col">Short</th><th scope="col">Full</th>'
+                     '<th scope="col">Environment</th><th scope="col">Policy</th><th scope="col">DB short</th><th scope="col">DB full</th>'
                      '<th scope="col">Files</th></tr></thead><tbody>' + ''.join(row[-1] for row in shown) + '</tbody></table></div>')
             body += ('<p class="note">The newest backup of each series and how old it is. Red: the series the alarm watches is late '
-                     'or missing – the short one, or the full one when the policy backs up full only (daily 26 h, weekly 8 days, '
+                     'or missing – the DB short one, or the DB full one when the policy backs up DB full only (daily 26 h, weekly 8 days, '
                      'monthly 29 days); files while the files timer runs. A series the policy turns off is no alarm; — in Files: '
                      'the project lists no BACKUP_FILE_PATHS. '
                      'A row leads to the environment\'s policy form on its project page.</p>')
@@ -3552,12 +3559,12 @@ class Page:
                                   if (state.get(key) or {}).get('newest') else '')
             if not state.get('development'):
                 policy = environment_policy(state)
-                text = e(policy_text(policy, has_files(state)))
+                text = policy_html(policy, has_files(state))
                 rows.append(('Backup policy', (f'<a href="#backup-{e(environment)}">{text}</a>' if self.may('backup-policy') else text) +
                              (' <span class="muted">(default)</span>' if policy == BACKUP_DEFAULT else '')))
-            rows += [('Newest backup', self.backup_cell(state) + newest('backups')),
-                     ('Full backup', self.full_backup_cell(state) + newest('full_backups')),
-                     ('Fresh backup (db-pull fresh=1)', self.fresh_backup_cell(state)),
+            rows += [('DB short backup', self.backup_cell(state) + newest('backups')),
+                     ('DB full backup', self.full_backup_cell(state) + newest('full_backups')),
+                     ('DB short, fresh', self.fresh_backup_cell(state) + ' <span class="muted">· make db-pull fresh=1</span>'),
                      *([('Files backup (BACKUP_FILE_PATHS)', self.files_cell(state) +
                          f' <a class="btn" href="/files/{e(quote(name))}/{e(environment)}">View</a>')]
                        if state.get('file_paths') or (state.get('files_backups') or {}).get('count') else []),
@@ -3580,7 +3587,7 @@ class Page:
             body += f'<div class="deck" id="backup-{e(environment)}">' + self.policy_form(name, environment, state) + self.form(
                 'backup-local', 'Backup now on the server',
                 f'<input type="hidden" name="project" value="{e(name)}"><input type="hidden" name="environment" value="{e(environment)}">'
-                '<label class="check"><input type="checkbox" name="full" value="yes"> full – the data of every table (--full)</label>',
+                '<label class="check"><input type="checkbox" name="full" value="yes"> DB full – the data of every table (--full)</label>',
                 note='Without Bitbucket: works for GitHub projects too. The preview shows the secret store and what the rotation would '
                      'delete. A backup asked for here is made whatever the backup policy says.',
                 command=f'setup-server-backup [--full] {name} {environment}') + '</div>'
@@ -3611,14 +3618,15 @@ class Page:
                               for frequency in BACKUP_POLICY[series])
             return f'<label><span>{e(label)}</span><select name="{series}">{options}</select></label>'
         fields = (f'<input type="hidden" name="project" value="{e(name)}"><input type="hidden" name="environment" value="{e(environment)}">' +
-                  select('db', 'Short backup (db)') + select('full', 'Full backup (full)') +
-                  (select('files', 'Files backup (files)') if has_files(state) else
+                  select('db-short', 'DB short backup') +
+                  select('db-full', 'DB full backup') +
+                  (select('files', 'Files backup (BACKUP_FILE_PATHS)') if has_files(state) else
                    f'<input type="hidden" name="files" value="{e(policy["files"])}">'))
         return self.form('backup-policy', 'Backup policy', fields,
-                         note='How often the timers back this environment up. Short – by the table registry; full – the data of '
-                              'every table; files – BACKUP_FILE_PATHS. Short off and full on: full backups only (daily full ones '
-                              'come with the nightly run). All off: no backups, and no alarm for them.',
-                         command=f'bin/backup-projects --set {name} {environment} db=… full=… files=…')
+                         note='How often the timers back this environment up. DB short – every table\'s structure and the data of the import '
+                              'tables (the registry); DB full – every table\'s data. DB short off and DB full on: DB full backups only '
+                              '(daily DB full ones come with the nightly run). All off: no backups, and no alarm for them.',
+                         command=f'bin/backup-projects --set {name} {environment} db-short=… db-full=… files=…')
 
     @staticmethod
     def backup_list(state):
@@ -4445,7 +4453,7 @@ class Page:
             text('project', 'Project (optional)', 'empty – all projects') +
             '<label><span>Environment</span><select name="environment"><option value="">all of the project</option>'
             '<option value="stage">stage</option><option value="prod">prod</option></select></label>'
-            '<label class="check"><input type="checkbox" name="full" value="yes"> full – the data of every table (--full)</label>'
+            '<label class="check"><input type="checkbox" name="full" value="yes"> DB full – the data of every table (--full)</label>'
             '<label class="check"><input type="checkbox" name="files" value="yes"> files – BACKUP_FILE_PATHS, not the DB (--files)</label>',
             note='The same as the nightly (without --full), weekly (with --full) or files (--files) timer does; without Bitbucket, '
                  'works for GitHub projects too.',
@@ -4453,15 +4461,16 @@ class Page:
         body += self.form(
             'install-backups', 'Backup timers',
             text('at', 'Nightly backup time', '03:30') +
-            text('full_at', 'Weekly full backup day and time', 'Sun 04:30') +
+            text('full_at', 'Weekly DB full backup day and time', 'Sun 04:30') +
             text('files_at', 'Files backup time', 'as the nightly one'),
-            note='Nightly – by the table registry (7 days + 4 weeks), weekly – the data of every table (2 kept), '
+            note='Nightly – the DB short backup, by the table registry (7 days + 4 weeks), weekly – the DB full backup, the data '
+                 'of every table (2 kept), '
                  'files – the BACKUP_FILE_PATHS paths from the target (7 days + 4 weeks). Without values the installed ones stay '
                  '(default 03:30, Sun 04:30, files – as the nightly one). How often each environment is backed up '
                  '(daily, weekly, monthly, off) is its backup policy: on its project page or on '
                  '<a href="/projects/backups">Projects → Backups</a>.', command='bin/install-backups')
         body += ('<div class="pointer"><h3>Backup policy – per environment</h3><p class="note">Every project environment\'s '
-                 'policy and its newest short, full and files backup, late or missing ones first.</p>'
+                 'policy and its newest DB short, DB full and files backup, late or missing ones first.</p>'
                  '<a class="btn" href="/projects/backups">Backups →</a></div>')
         body += ('<div class="pointer"><h3>Backup and access keys</h3><p class="note">The developers\' keys (make db-pull, '
                  'make ssh) and who has which access – on their own page.</p><a class="btn" href="/access">Access →</a></div>')

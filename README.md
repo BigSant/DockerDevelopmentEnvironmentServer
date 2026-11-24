@@ -23,7 +23,7 @@ The first server is the VPN server (Ubuntu Desktop), the first project is alpha.
 | `bin/remove-project` | Removes a project build directory; DB backups and the deploy history – only with `--with-backups`; it does not delete a directory used by a running container. |
 | `bin/update` | Updates this Server OPS checkout and the shared setup checkout to the given tag, checks health, and on failure returns both to their previous commits. It does not restart the runner service. |
 | `bin/install-auto-update` | Installs a one-minute systemd timer for the administrator's two existing `master` clones: only after a successful GitHub CI, without touching local work. It also works on a manually prepared CachyOS; it does not need `prepare-host`. |
-| `bin/install-backups` | DB backups: nightly (`setup-server-backup.timer`, according to the table registry) and weekly full (`setup-server-backup-full.timer`, the data of all tables); a nightly file backup (`setup-server-backup-files.timer`, the project's `BACKUP_FILE_PATHS` paths from the target); the command `/usr/local/sbin/setup-server-backup` (a copy of `bin/backup-projects`) and a sudo rule "backup now" for the pipeline. How often each project environment is backed up (or full only, or not at all): `bin/backup-projects --set`, the backup policy (step 6). |
+| `bin/install-backups` | DB backups: nightly (`setup-server-backup.timer`, according to the table registry) and weekly full (`setup-server-backup-full.timer`, the data of all tables); a nightly file backup (`setup-server-backup-files.timer`, the project's `BACKUP_FILE_PATHS` paths from the target); the command `/usr/local/sbin/setup-server-backup` (a copy of `bin/backup-projects`) and a sudo rule "backup now" for the pipeline. How often each project environment is backed up (or DB full only, or not at all): `bin/backup-projects --set`, the backup policy (step 6). |
 | `bin/install-ssh` | SSH from the VPN: `openssh-server` (Ubuntu Desktop does not have it), started and starting after a reboot, settings `/etc/ssh/sshd_config.d/10-setup-server.conf` – from the given networks and from this server only with a key, no password; with ufw enabled – an allow rule for those networks. Needed for `make db-pull` and the web UI tunnel. |
 | `bin/add-backup-key` | A developer's SSH key for downloading DB backups (`make db-pull`) – only for the allowed project environments (`--pull PROJECT:ENV=db`, `=fresh` – also to order a new backup, `make db-pull fresh=1`; `--pull-all` – all projects): only from the given network (VPN), only the command `/usr/local/sbin/setup-server-backup-pull` (a copy of `bin/backup-pull`), no shell and no Docker. With `--grant PROJECT:ENV=LEVEL` – also access to that project's target through this server (`make ssh`), via `/usr/local/sbin/setup-server-access` (a copy of `bin/server-access`). |
 | `bin/tool-access` | Who opens the projects' browser tools (pma, cron, mailpit, backup, metrics, the project's `PROXY_TOOLS`) and from which addresses: a key name with a password set by the administrator and the allowed project environments, this server's addresses. A change on the target takes effect immediately (setup 3.6.0+ `make tool-access`). See "Tool access". |
@@ -357,44 +357,44 @@ and change nothing. Run them with `--check` first.
    account's Docker contexts). The old `/etc/setup-server/projects/<name>/<env>.env` is no longer used –
    `--check` (with sudo) reminds you to delete it.
 
-   **Backup policy: how often, full only, or none.** The table above is the default. Per project environment three
-   series can each get a frequency of their own:
+   **Backup policy: how often, DB full only, or none.** The table above is the default. Per project environment three
+   series can each get a frequency of their own (both DB series are database backups; they differ in what they hold):
 
    | Series | What | Frequencies | Default |
    | --- | --- | --- | --- |
-   | `db` | the short (registry) nightly backup, `worker-<env>-…Z.sql.gz` | `daily` `weekly` `off` | `daily` |
-   | `full` | the full backup, `full-<env>-…Z.sql.gz` | `daily` `weekly` `monthly` `off` | `weekly` |
-   | `files` | the file backup, `files-<env>-…Z.tar.gz` (see "File backups") | `daily` `weekly` `off` | `daily` |
+   | `db-short` | the DB short backup (by the table registry: every table's structure, the data of the import tables), nightly, `worker-<env>-…Z.sql.gz` | `daily` `weekly` `off` | `daily` |
+   | `db-full` | the DB full backup (every table's data), `full-<env>-…Z.sql.gz` | `daily` `weekly` `monthly` `off` | `weekly` |
+   | `files` | the files backup, `files-<env>-…Z.tar.gz` (see "File backups") | `daily` `weekly` `off` | `daily` |
 
    ```bash
-   sudo /usr/local/lib/setup-server/bin/backup-projects --set alpha_shop prod db=off full=daily --check   # shows the change
-   sudo /usr/local/lib/setup-server/bin/backup-projects --set alpha_shop prod db=off full=daily           # full only, every night
-   sudo /usr/local/lib/setup-server/bin/backup-projects --set beta stage db=off full=off files=off          # no backups
-   sudo /usr/local/lib/setup-server/bin/backup-projects --set beta stage db=default full=default           # back to the default
+   sudo /usr/local/lib/setup-server/bin/backup-projects --set alpha_shop prod db-short=off db-full=daily --check   # shows the change
+   sudo /usr/local/lib/setup-server/bin/backup-projects --set alpha_shop prod db-short=off db-full=daily           # DB full only, every night
+   sudo /usr/local/lib/setup-server/bin/backup-projects --set beta stage db-short=off db-full=off files=off          # no backups
+   sudo /usr/local/lib/setup-server/bin/backup-projects --set beta stage db-short=default db-full=default           # back to the default
    ```
 
    (`bin/backup-projects` of a clone works the same way; the web UI's project page sets it too.) Series not given keep
-   their value, `SERIES=default` drops back to the default. It prints `alpha_shop prod: db daily → off, full weekly →
-   daily` (or `no change`) and, without `--check`, `written to /etc/setup-server/backup-policy.conf`. An unknown project
+   their value, `SERIES=default` drops back to the default. It prints `alpha_shop prod: db-short daily → off, db-full
+   weekly → daily` (or `no change`) and, without `--check`, `written to /etc/setup-server/backup-policy.conf`. An unknown project
    or an environment the project does not have (stage, prod, its `STAGE_ENVIRONMENTS`, a `target.<env>.env`) is
    refused (exit 65), a bad series or frequency is a usage error (exit 64). The policy lives in one root-owned file,
    `/etc/setup-server/backup-policy.conf` (0644), not in a build root: a pipeline cannot switch its backups off. The
    directory is 0711 (others may pass through, not list it; its secrets stay 0600 files): the metrics and the status page
    read the policy as the `setup` account. The installers create it so and `--set` adds the pass-through to an older
    0700 one. One line
-   per environment that differs from the default, `#` comments, e.g. `alpha_shop prod db=off full=daily`; `--set`
+   per environment that differs from the default, `#` comments, e.g. `alpha_shop prod db-short=off db-full=daily`; `--set`
    rewrites the file atomically, keeps the other lines and comments, and drops a line that is back at the default.
    Unknown or invalid items are ignored (the default applies: backing up rather than skipping), lines of removed
    projects are ignored.
 
    Only the timers follow it. A series is backed up when it is due: `daily` – every run; `weekly` – when the newest
    backup of that series (a fresh one does not count) is older than 6.5 days or there is none; `monthly` (every 4 weeks)
-   – older than 27.5 days; `off` – never. The nightly run makes the `db` backup when due and, for `full=daily`, also the
-   full one (so "full only, daily" needs no other timer); the weekly run backs up `full=weekly`, `full=monthly` when
-   due, and skips `daily` (the nightly run made it) and `off`; the files run follows `files`. With `full=daily` the full
-   series is rotated like the nightly one (7 days + 4 weeks) instead of keeping the 2 newest. `--check` shows per
-   environment what the run would skip: `==> alpha_shop prod: skipped: db off`, `==> beta prod: not due: db weekly,
-   newest 3 d ago`. **"Backup now"** (a project given: the pipeline, the web UI) and **fresh** backups
+   – older than 27.5 days; `off` – never. The nightly run makes the DB short backup when due and, for `db-full=daily`,
+   also the DB full one (so "DB full only, daily" needs no other timer); the weekly run backs up `db-full=weekly`,
+   `db-full=monthly` when due, and skips `daily` (`skipped: db-full daily (the nightly run makes it)`) and `off`; the
+   files run follows `files`. With `db-full=daily` the full series is rotated like the nightly one (7 days + 4 weeks)
+   instead of keeping the 2 newest. `--check` shows per environment what the run would skip: `==> alpha_shop prod:
+   skipped: db-short off`, `==> beta prod: not due: db-full monthly, newest 3 d ago`. **"Backup now"** (a project given: the pipeline, the web UI) and **fresh** backups
    (`bin/backup-pull`) ignore the policy – a person asked for them. Switching a series off deletes nothing at once: its
    kept backups stay until a later backup of that series rotates them.
 
@@ -988,7 +988,7 @@ it is not visible publicly; it takes the VPN address even when the VPN interface
 | `setup_worker_deploy_last_rollback` | `1` – the last deploy was `rollback=1` |
 | `setup_worker_deploy_last_info{ref,commit}` | The last deploy's ref (up to 64 characters) and commit (12 characters) |
 | `setup_worker_files_backups`, `setup_worker_files_backup_newest_age_seconds`, `_newest_size_bytes` | The same for file backups (`files-<env>-…Z.tar.gz`, `BACKUP_FILE_PATHS`); `0` – only for an environment with `BACKUP_FILE_PATHS` and only once `setup-server-backup-files.timer` is installed |
-| `setup_worker_backup_policy_interval_seconds{series}` | The backup policy (see step 6) of each environment deployed from here: how often the series (`db`, `full`, `files`) is backed up – `86400` daily, `604800` weekly, `2419200` monthly, `0` off; for alert thresholds that follow the policy |
+| `setup_worker_backup_policy_interval_seconds{series}` | The backup policy (see step 6) of each environment deployed from here: how often the series (`db-short`, `db-full`, `files`) is backed up – `86400` daily, `604800` weekly, `2419200` monthly, `0` off; for alert thresholds that follow the policy |
 | `setup_worker_runner_up`, `setup_worker_runner_state{state}`, `setup_worker_runner_restarts` | The `setup-server-runner` (Bitbucket) state from `systemctl show` (`active`, `failed`, `not-found` …) and automatic restarts |
 | `setup_worker_github_runner_up{scope}`, `setup_worker_github_runner_state{scope,state}`, `setup_worker_github_runner_restarts{scope}` | The same for every registered GitHub runner (`github-runner/<scope>` with `.runner`): the service `setup-server-github-runner@<scope>`. If there are none – these lines are absent |
 | `setup_worker_disk_size_bytes`, `_used_bytes`, `_available_bytes` `{path}` | The file system holding `/srv/setup-server` (like `df`) |
@@ -1001,7 +1001,7 @@ Backups – only `worker-<env>-…Z.sql.gz` (nightly and "backup now"). Deploy a
 are not counted, so that they do not hide a stopped timer. The weekly full series (`full-<env>-…Z.sql.gz`) has its own
 metrics `setup_worker_full_backups`, `setup_worker_full_backup_newest_age_seconds` and
 `setup_worker_full_backup_newest_size_bytes`; `0` for an environment without a full backup is shown only once
-`setup-server-backup-full.timer` is installed, so that a server without weekly backups does not raise an alert (or when the policy makes it nightly: `full=daily`). A series the backup policy switches off (`off`) expects nothing: no `0` count for it; backups that exist keep their metrics. Deploys – from setup's history
+`setup-server-backup-full.timer` is installed, so that a server without weekly backups does not raise an alert (or when the policy makes it nightly: `db-full=daily`). A series the backup policy switches off (`off`) expects nothing: no `0` count for it; backups that exist keep their metrics. Deploys – from setup's history
 `app/.generated/release/<env>/deployments.json` (the last entry). To check without Prometheus:
 
 ```bash
@@ -1041,11 +1041,11 @@ max by (project, environment) (setup_worker_full_backup_newest_age_seconds) > 8 
 ```
 
 With backup policies (step 6) the thresholds can follow each environment's frequency, and a series that is `off`
-raises nothing (here `db`; the same with `series="full"`/`"files"` and their metrics):
+raises nothing (here `db-short`, the DB short backup; the same with `series="db-full"` / `"files"` and their metrics):
 
 ```promql
 max by (project, environment) (setup_worker_backup_newest_age_seconds)
-  > on (project, environment) (setup_worker_backup_policy_interval_seconds{series="db"} > 0) * 1.1
+  > on (project, environment) (setup_worker_backup_policy_interval_seconds{series="db-short"} > 0) * 1.1
   or setup_worker_backups == 0
 ```
 
@@ -1131,8 +1131,9 @@ commit, red when setup is not on a release tag.
   removing and adding again. In the Overview the runners are one card (how many are running, how many are running a job).
 - *Overview* – at the top "Needs attention": everything that is broken or waiting (failed units, setup off a tag, a newer
   version, little space, a failed deploy, a stopped secret store, unhealthy containers, a late or missing backup),
-  each with a link. Which backup is watched follows the environment's backup policy (see "DB backups"): the short registry
-  series while `db` is not `off`, else the full series while `full` is not `off`, else none; it is late after 26 h (`daily`),
+  each with a link. Which backup is watched follows the environment's backup policy (see "DB backups"): the DB short (registry)
+  series while `db-short` is not `off`, else the DB full series while `db-full` is not `off`, else none (the alarm says
+  `old DB short backup`, `no DB full backup`, …); it is late after 26 h (`daily`),
   8 days (`weekly`) or 29 days (`monthly`). The files backup is watched the same way by its own frequency, while the files
   timer is installed and `files` is not `off`. An environment whose policy is all `off` raises no backup alarm; one without a
   target or a development one none either. A backup alarm leads to the environment's backup forms (`/project/NAME#backup-ENV`). Then – the Server OPS version (installed and of the administrator's clone), the shared setup checkout's version
@@ -1150,22 +1151,24 @@ commit, red when setup is not on a release tag.
   server fetches nothing for it, and git runs there without hooks, fsmonitor or system config; unknown, it is left out. *+ Add a project* (`/projects/new`) – the env repo URL, the code repo URL (optional), the name (optional),
   *monorepo* (`--monorepo`), *the account key* (`--shared-key`) and the targets: one for every environment (`target.env`), prod's and
   stage's own, and further `ENV=target` lines (`local`, `local:/PATH`, `ssh://USER@HOST/PATH`). The project page (`/project/<name>`)
-  shows each environment (the last successful deploy, all of its backups – nightly, full, fresh, pre-deploy –, each container's
+  shows each environment (the last successful deploy, all of its backups – DB short, DB full, DB short/full fresh, DB
+  pre-deploy, files –, each container's
   `docker logs` – the last 200, 500 or 2000 lines – and "Backup now on the server"), then **Settings**: the layout and repos, every
   environment with its target and target file (`target.env` shared or `target.<env>.env` its own), *Change the target* and
   *Add an environment* (a name of lowercase letters and digits, 2–16, not `local`/`test`; it deploys once the project lists it in
   `STAGE_ENVIRONMENTS`), and *Remove an environment's own target* (only when a shared `target.env` remains). Each environment
-  (not a development one) also has a *Backup policy* row (`short daily · full weekly`, `full only, daily · files daily`, `off`;
-  "(default)" when nothing is changed) and, next to "Backup now", a *Backup policy* form (`#backup-ENV`): a select for the short
-  (`db`: daily, weekly, off), full (`full`: daily, weekly, monthly – every 4 weeks, off) and files series (`files`: daily, weekly,
-  off – only when the environment has `BACKUP_FILE_PATHS` or files backups; otherwise its value is sent unchanged); the preview
-  lists what changes (`db: daily → off`) and warns above "Run" when the database would no longer be backed up at all. In the list
-  each environment's second line shows the newest backup the policy watches: `backup 5 h ago`, `full 2 d ago` (full only),
-  `no backup`, or a quiet `backups off`. *Backups* (`/projects/backups`, linked from *Projects* and *Actions → Backups*) – every
+  (not a development one) also has *DB short backup*, *DB full backup*, *DB short, fresh* and *Files backup* rows and a
+  *Backup policy* row (`DB short daily · DB full weekly · files daily`, `DB full only, daily`, `DB off · files daily`, `off`;
+  "(default)" when nothing is changed) and, next to "Backup now", a *Backup policy* form (`#backup-ENV`): a select for the DB
+  short (`db-short`: daily, weekly, off), DB full (`db-full`: daily, weekly, monthly – every 4 weeks, off) and files series
+  (`files`: daily, weekly, off – only when the environment has `BACKUP_FILE_PATHS` or files backups; otherwise its value is sent
+  unchanged); the preview lists what changes (`db-short: daily → off`) and warns above "Run" when the database would no longer be
+  backed up at all. In the list each environment's second line shows the newest DB backup the policy watches: `DB short 5 h ago`,
+  `DB full 2 d ago` (DB full only), `no DB short backup`, or a quiet `backups off`. *Backups* (`/projects/backups`, linked from *Projects* and *Actions → Backups*) – every
   project environment in one table (50 projects fit): the project, the environment, its policy (`· default` when unchanged), the
-  age of the newest short, full and files backup (`late` / `none` in red for the series the alarm watches, `off` quiet); late or
-  missing ones first (`?sort=name` by name), a filter by name or repo, "only late or missing" and the policy (not the default, full
-  only, DB off), with "N of M"; each row leads to the environment's policy form. Then who reaches the project
+  age of the newest backup in the *DB short*, *DB full* and *Files* columns (`late` / `none` in red for the series the alarm
+  watches, `off` quiet); late or missing ones first (`?sort=name` by name), a filter by name or repo, "only late or missing" and
+  the policy (not the default, DB full only, DB off), with "N of M"; each row leads to the environment's policy form. Then who reaches the project
   (*Access*), its pipelines and *Remove*.
 - *Access* – developer keys: for each – how many prod, stage and other environments it reaches and at what level (`make ssh`),
   backups (`make db-pull`: the all-projects level and the environments above it), networks and last use; search by key
@@ -1233,9 +1236,9 @@ with an error, there is no "Run"). One action runs at a time; its page refreshes
 | Remove project (on the project page) | `sudo -n L/remove-project [--with-backups] NAME` |
 | Install runner (*Runners*) | `sudo -n L/install-runner --provider bitbucket\|github [--name …] [--instance N] [--tarball URL\|FILE [--sha256 …]]`; the dialog text – via stdin |
 | Remove runner (*Runners*) | `sudo -n L/install-runner --provider github --remove --scope …` (the GitHub "Remove" command – via stdin, not shown) or `--remove` (Bitbucket) |
-| Backup timers (nightly, weekly full and files) | `sudo -n L/install-backups [--at HH:MM] [--full-at "DAY HH:MM"] [--files-at HH:MM]` – when they run; how often each environment is backed up is its backup policy (project page, *Projects → Backups*) |
+| Backup timers (nightly DB short, weekly DB full and files) | `sudo -n L/install-backups [--at HH:MM] [--full-at "DAY HH:MM"] [--files-at HH:MM]` – when they run; how often each environment is backed up is its backup policy (project page, *Projects → Backups*) |
 | Backup now on the server (also on the project and *Files* pages) | `sudo -n L/backup-projects [--full\|--files] [PROJECT [ENV]]` – without Bitbucket, works for GitHub projects too; it backs up whatever the backup policy says |
-| Backup policy (project page) | `sudo -n L/backup-projects --set PROJECT ENV db=… full=… files=…` (the preview: the same with `--check` at the end); the project and environment must be in the status, not a development one |
+| Backup policy (project page) | `sudo -n L/backup-projects --set PROJECT ENV db-short=… db-full=… files=…` (the preview: the same with `--check` at the end); the project and environment must be in the status, not a development one |
 | SSH from the VPN | `sudo -n L/install-ssh [--from NETWORKS]` |
 | Services (also in the Overview) | `sudo -n L/server-unit start\|stop\|restart UNIT` (see below) |
 | Worker metrics | `sudo -n L/install-metrics [--address …] [--allow …] [--port …] [--new-token\|--no-token]` |

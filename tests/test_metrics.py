@@ -368,22 +368,24 @@ class EndpointTest(ScriptTest):
         self.tree.backup(archived, f"worker-prod-{stamp}Z.sql.gz", 40 * 86400, 10)
         config = Path(os.environ["SETUP_SERVER_CONFIG"])
         config.mkdir(parents=True, exist_ok=True)
-        (config / "backup-policy.conf").write_text("# test\nfull_only prod db=off full=daily\n"
-                                                   "archived prod db=off full=off files=off\nbeta_docker stage full=monthly\n")
+        (config / "backup-policy.conf").write_text("# test\nfull_only prod db-short=off db-full=daily\n"
+                                                   "archived prod db-short=off db-full=off files=off\n"
+                                                   "beta_docker stage db-full=monthly\n")
         systemd = self.root / "systemd"
         systemd.mkdir()
         samples = parse(self.scrape(SETUP_SERVER_SYSTEMD=str(systemd)))
         interval = "setup_worker_backup_policy_interval_seconds"
-        for project, environment, series, seconds in (("alpha_shop", "prod", "db", 86400), ("alpha_shop", "prod", "full", 604800),
-                                                      ("alpha_shop", "prod", "files", 86400), ("beta_docker", "stage", "full", 2419200),
-                                                      ("full_only", "prod", "db", 0), ("full_only", "prod", "full", 86400),
+        for project, environment, series, seconds in (("alpha_shop", "prod", "db-short", 86400),
+                                                      ("alpha_shop", "prod", "db-full", 604800),
+                                                      ("alpha_shop", "prod", "files", 86400), ("beta_docker", "stage", "db-full", 2419200),
+                                                      ("full_only", "prod", "db-short", 0), ("full_only", "prod", "db-full", 86400),
                                                       ("archived", "prod", "files", 0)):
             with self.subTest(project=project, series=series):
                 self.assertEqual(value(samples, interval, project=project, environment=environment, series=series), seconds)
         self.assertFalse([key for key in samples if key[0] == interval and ("project", "not_deployed") in key[1]])
         full_only = (("environment", "prod"), ("project", "full_only"))
-        self.assertNotIn(("setup_worker_backups", full_only), samples, "db=off expects no short backups")
-        self.assertEqual(samples[("setup_worker_full_backups", full_only)], 0, "full=daily: the nightly run makes it, no timer needed")
+        self.assertNotIn(("setup_worker_backups", full_only), samples, "db-short=off expects no DB short backups")
+        self.assertEqual(samples[("setup_worker_full_backups", full_only)], 0, "db-full=daily: the nightly run makes it, no timer needed")
         self.assertEqual(value(samples, "setup_worker_backups", project="archived", environment="prod"), 1,
                          "a backup that exists keeps its metrics")
         # With both timers installed: archived (everything off) still expects nothing.

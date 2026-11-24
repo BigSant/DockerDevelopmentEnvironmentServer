@@ -122,13 +122,13 @@ def server_environments(directory):
 # BACKUP_POLICY, BACKUP_DEFAULT and backup_policy are identical in bin/backup-projects, bin/server-status and
 # bin/worker-metrics (tests/test_metrics.py).
 # How often each backup series of a project environment is made (bin/backup-projects --set writes it; README: DB backups).
-BACKUP_POLICY = {'db': ('daily', 'weekly', 'off'), 'full': ('daily', 'weekly', 'monthly', 'off'),
+BACKUP_POLICY = {'db-short': ('daily', 'weekly', 'off'), 'db-full': ('daily', 'weekly', 'monthly', 'off'),
                  'files': ('daily', 'weekly', 'off')}
-BACKUP_DEFAULT = {'db': 'daily', 'full': 'weekly', 'files': 'daily'}
+BACKUP_DEFAULT = {'db-short': 'daily', 'db-full': 'weekly', 'files': 'daily'}
 
 
 def backup_policy(config, project, environment):
-    """{'db': …, 'full': …, 'files': …} of one project environment: backup-policy.conf in the config directory,
+    """{'db-short': …, 'db-full': …, 'files': …} of one project environment: backup-policy.conf in the config directory,
     the defaults for whatever it does not set (or when it cannot be read)."""
     policy = dict(BACKUP_DEFAULT)
     try:

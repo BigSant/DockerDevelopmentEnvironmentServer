@@ -125,13 +125,13 @@ def server_environments(directory):
 # BACKUP_POLICY, BACKUP_DEFAULT and backup_policy are identical in bin/backup-projects, bin/server-status and
 # bin/worker-metrics (tests/test_metrics.py).
 # How often each backup series of a project environment is made (bin/backup-projects --set writes it; README: DB backups).
-BACKUP_POLICY = {'db': ('daily', 'weekly', 'off'), 'full': ('daily', 'weekly', 'monthly', 'off'),
+BACKUP_POLICY = {'db-short': ('daily', 'weekly', 'off'), 'db-full': ('daily', 'weekly', 'monthly', 'off'),
                  'files': ('daily', 'weekly', 'off')}
-BACKUP_DEFAULT = {'db': 'daily', 'full': 'weekly', 'files': 'daily'}
+BACKUP_DEFAULT = {'db-short': 'daily', 'db-full': 'weekly', 'files': 'daily'}
 
 
 def backup_policy(config, project, environment):
-    """{'db': …, 'full': …, 'files': …} of one project environment: backup-policy.conf in the config directory,
+    """{'db-short': …, 'db-full': …, 'files': …} of one project environment: backup-policy.conf in the config directory,
     the defaults for whatever it does not set (or when it cannot be read)."""
     policy = dict(BACKUP_DEFAULT)
     try:
@@ -190,7 +190,7 @@ def backups(metrics, found, now):
     """Nightly and "backup now" backups (worker-<env>-…Z.sql.gz); pre-deploy and fresh backups do not count,
     so neither hides a stopped timer. An ENV deployed from here (env/<env>.env) without any backup gets a
     count of 0 and no age. The weekly full series (full-<env>-…Z.sql.gz) has metrics of its own, with a
-    count of 0 only once its timer is installed (or the policy makes it nightly: full=daily), so a worker without
+    count of 0 only once its timer is installed (or the policy makes it nightly: db-full=daily), so a worker without
     weekly backups raises no alert. So has the files series (files-<env>-…Z.tar.gz): a count of 0 for an ENV with
     BACKUP_FILE_PATHS once its timer is installed. A series the backup policy switches off expects nothing (its
     backups that exist still have their metrics); the policy's interval of each series is a gauge of its own."""
@@ -219,12 +219,13 @@ def backups(metrics, found, now):
         for environment in sorted(declared):
             for kind in BACKUP_POLICY:
                 metrics.add('setup_worker_backup_policy_interval_seconds',
-                            'How often the backup policy backs the series up (db: the registry backups, full, files), '
-                            'in seconds; 0 when it is off', POLICY_INTERVAL[policies[environment][kind]],
+                            'How often the backup policy backs the series up (db-short: the DB short registry backups, '
+                            'db-full: the DB full ones, files), in seconds; 0 when it is off',
+                            POLICY_INTERVAL[policies[environment][kind]],
                             {'project': name, 'environment': environment, 'series': kind})
-        expected = {'worker': {env for env in declared if policies[env]['db'] != 'off'},
-                    'full': {env for env in declared if policies[env]['full'] != 'off'
-                             and (full_timer or policies[env]['full'] == 'daily')},
+        expected = {'worker': {env for env in declared if policies[env]['db-short'] != 'off'},
+                    'full': {env for env in declared if policies[env]['db-full'] != 'off'
+                             and (full_timer or policies[env]['db-full'] == 'daily')},
                     'files': {env for env in with_files if policies[env]['files'] != 'off'}}
         for prefix, metric, what in (('worker', 'setup_worker_backup', 'nightly and "backup now"'),
                                      ('full', 'setup_worker_full_backup', 'weekly full'),
