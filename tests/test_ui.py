@@ -8,6 +8,7 @@ stubbed); Bitbucket is a fake API on 127.0.0.1. No root, no network.
 import base64
 from urllib.parse import quote
 import getpass
+import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.machinery
@@ -786,6 +787,16 @@ class FakeBitbucket(ThreadingHTTPServer):
                 self.requests.append(("GET", handler.path, dict(handler.headers), None))
                 if "/redirect_me/" in handler.path or handler.path.startswith("/elsewhere"):
                     return handler.answer(302, headers=[("Location", f"http://127.0.0.1:{self.server_port}/elsewhere")])
+                if "/pullrequests" in handler.path:
+                    return handler.answer(200, {"values": [
+                        {"id": 12, "title": "Faster checkout", "state": "MERGED", "author": {"display_name": "Ona"},
+                         "source": {"branch": {"name": "feature/checkout"}, "commit": {"hash": "c0ffee12"}},
+                         "destination": {"branch": {"name": "main"}}, "merge_commit": {"hash": "abc123def456"},
+                         "created_on": "2026-10-09T08:00:00.000000+00:00", "updated_on": "2026-10-10T12:00:00.000000+00:00",
+                         "links": {"html": {"href": "https://bitbucket.org/example-team/alpha_shop/pull-requests/12"}}},
+                        {"id": 11, "title": "Old idea", "state": "DECLINED", "author": {"display_name": "Tomas"},
+                         "source": {"branch": {"name": "feature/old"}}, "destination": {"branch": {"name": "main"}},
+                         "created_on": "2026-09-01T08:00:00.000000+00:00", "updated_on": "2026-09-02T08:00:00.000000+00:00"}]})
                 handler.answer(200, {"values": [{"build_number": 41, "state": {"name": "COMPLETED", "result": {"name": "SUCCESSFUL"}},
                                                  "target": {"ref_name": "main", "selector": {"type": "custom", "pattern": "deploy-production"}},
                                                  "created_on": "2026-10-11T09:00:00.000000+00:00",
@@ -1042,6 +1053,246 @@ class WebUiTest(Worker):
                                                               "group:administrators": "1"})[0], 303)
         self.assertEqual(self.as_session("GET", "/", cookie)[0], 303)
         self.assertEqual(self.request("GET", "/", login=("ona", "onos-slaptazodis-1"))[0], 401)
+
+    # --- The API for agents ----------------------------------------------------------------------
+    def api_call(self, path, token=None, method="GET", login=None, headers=None):
+        """(status, headers, JSON) of an API request with a Bearer token (or a Basic login)."""
+        sent = {**({"Authorization": f"Bearer {token}"} if token else {}), **(headers or {})}
+        status, replied, body = self.request(method, path, login=login, headers=sent)
+        try:
+            return status, replied, json.loads(body)
+        except ValueError:
+            self.fail(f"{method} {path}: not JSON ({status}): {body[:300]}")
+
+    def new_token(self, name, groups):
+        form = {"csrf": self.csrf(), "new": "1", "name": name, **{f"group:{group}": "1" for group in groups}}
+        status, _, page = self.request("POST", "/tokens/save", form)
+        self.assertEqual(status, 200, page)
+        return re.search(r"ops_[A-Za-z0-9_-]{43}", page)[0], page
+
+    def agents_group(self, **levels):
+        form = {"csrf": self.csrf(), "group": "", "title": "Agents", **{f"level:{key}": level for key, level in levels.items()}}
+        self.assertEqual(self.request("POST", "/groups/save", form)[0], 303)
+        return "agents"
+
+    def test_api_tokens_are_made_on_the_users_page_and_shown_once(self):
+        group = self.agents_group(overview="view", projects="view")
+        token, page = self.new_token("agent-1", [group])
+        self.assertIn("shown only this once", page)
+        self.assertIn(f"Authorization: Bearer $OPS_TOKEN", page)
+        self.assertEqual(page.count(token), 2, "the token and the export line: nowhere else")
+        # Only its sha256 is kept; the token is in no file, log or output of the UI.
+        accounts = json.loads((self.state / "accounts.json").read_text())
+        self.assertEqual(accounts["tokens"]["agent-1"]["groups"], ["agents"])
+        self.assertEqual(accounts["tokens"]["agent-1"]["digest"], hashlib.sha256(token.encode()).hexdigest())
+        self.assertNotIn(token, self.everything_written())
+        self.assertIn("users token agent-1: created groups=agents disabled=no", self.log.read_text())
+        # The Users page lists it (never the token); its own page shows it without the token.
+        users = self.request("GET", "/users")[2]
+        self.assertIn('<h2 id="tokens">API tokens</h2>', users)
+        self.assertIn('href="/tokens/agent-1"', users)
+        self.assertIn("Overview, Projects", users)
+        self.assertNotIn(token, users)
+        status, _, settings = self.request("GET", "/tokens/agent-1")
+        self.assertEqual(status, 200)
+        self.assertNotIn(token, settings)
+        self.assertIn('action="/tokens/regenerate"', settings)
+        self.assertEqual(self.api_call("/api/v1", token)[2]["caller"], {"kind": "token", "name": "agent-1"})
+        self.assertIsNotNone(json.loads((self.state / "accounts.json").read_text())["tokens"]["agent-1"].get("last_used"))
+        # Regenerated: a new one, the old one refused at once.
+        status, _, page = self.request("POST", "/tokens/regenerate", {"csrf": self.csrf(), "name": "agent-1"})
+        self.assertEqual(status, 200, page)
+        newer = re.search(r"ops_[A-Za-z0-9_-]{43}", page)[0]
+        self.assertNotEqual(newer, token)
+        self.assertEqual(self.api_call("/api/v1", token)[0], 401)
+        self.assertEqual(self.api_call("/api/v1", newer)[0], 200)
+        # Disabled: refused; enabled again: works; deleted: refused and gone.
+        form = {"csrf": self.csrf(), "name": "agent-1", "group:agents": "1", "disabled": "1"}
+        self.assertEqual(self.request("POST", "/tokens/save", form)[1].get("Location"), "/tokens/agent-1?saved=1")
+        self.assertEqual(self.api_call("/api/v1", newer)[0], 401)
+        form.pop("disabled")
+        self.request("POST", "/tokens/save", form)
+        self.assertEqual(self.api_call("/api/v1", newer)[0], 200)
+        self.assertEqual(self.request("POST", "/tokens/save", {"csrf": self.csrf(), "new": "1", "name": "agent-1"})[0], 400)
+        self.assertEqual(self.request("POST", "/tokens/save", {"csrf": self.csrf(), "new": "1", "name": "new"})[0], 400)
+        self.assertEqual(self.request("POST", "/tokens/save", {"csrf": self.csrf(), "new": "1", "name": "x", "group:nope": "1"})[0], 400)
+        self.assertEqual(self.request("POST", "/tokens/delete", {"csrf": self.csrf(), "name": "agent-1"})[1].get("Location"),
+                         "/users?saved=1#tokens")
+        self.assertEqual(self.api_call("/api/v1", newer)[0], 401)
+        self.assertEqual(self.request("GET", "/tokens/agent-1")[0], 404)
+        # A deleted group leaves the tokens too; only "Users: manage" makes tokens.
+        token, _ = self.new_token("agent-2", [group])
+        self.assertEqual(self.request("POST", "/groups/delete", {"csrf": self.csrf(), "group": group})[0], 303)
+        self.assertEqual(json.loads((self.state / "accounts.json").read_text())["tokens"]["agent-2"]["groups"], [])
+        self.assertEqual(self.api_call("/api/v1/projects", token)[0], 403)
+        self.assertEqual(self.add_user("jonas", "jono-slaptazodis-1", ["viewers"])[0], 303)
+        jonas = ("jonas", "jono-slaptazodis-1")
+        self.assertEqual(self.request("GET", "/tokens/new", login=jonas)[0], 403)
+        csrf = re.search(r'name="csrf" value="([0-9a-f]+)"', self.request("GET", "/", login=jonas)[2])[1]
+        self.assertEqual(self.request("POST", "/tokens/save", {"csrf": csrf, "new": "1", "name": "mine"}, login=jonas)[0], 403)
+        self.assertNotIn(newer, self.everything_written())
+
+    def test_the_api_needs_a_token_and_reads_only_what_its_groups_give(self):
+        token, _ = self.new_token("watcher", [self.agents_group(overview="view")])
+        status, headers, body = self.api_call("/api/v1/projects")
+        self.assertEqual((status, body["status"]), (401, 401))
+        self.assertEqual(headers["WWW-Authenticate"], 'Bearer realm="Server OPS"')
+        self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(self.api_call("/api/v1/projects", "ops_" + "x" * 43)[0], 401)
+        self.assertEqual(self.api_call("/api/v1/projects", "not-a-token")[0], 401)
+        self.assertIn("wrong login (401)", self.stderr.read_text())
+        # A browser session is no API login (no cookie counts there).
+        cookie, _ = self.login("admin", PASSWORD)
+        self.assertEqual(self.api_call("/api/v1", headers={"Cookie": f"ops_session={cookie}"})[0], 401)
+        # The token's groups: the overview, not the projects.
+        status, _, index = self.api_call("/api/v1", token)
+        self.assertEqual(status, 200)
+        self.assertEqual(index["permissions"], {"overview": "view"})
+        allowed = {item["path"]: item["allowed"] for item in index["endpoints"]}
+        self.assertTrue(allowed["/api/v1/overview"])
+        self.assertFalse(allowed["/api/v1/projects"])
+        self.assertEqual(self.api_call("/api/v1/overview", token)[0], 200)
+        status, _, body = self.api_call("/api/v1/projects", token)
+        self.assertEqual(status, 403)
+        self.assertIn('"Projects" needs the permission "view"', body["error"])
+        self.assertEqual(self.api_call("/api/v1/projects/alpha_shop/pipelines", token)[0], 403)
+        # Basic auth of a user works as on the pages; unknown paths and projects are 404.
+        self.assertEqual(self.api_call("/api/v1/projects/", login=("admin", PASSWORD))[0], 200)
+        self.assertEqual(self.api_call("/api/v1/nothing", token)[0], 404)
+        self.assertEqual(self.api_call("/api/v2", token)[0], 404)
+        self.assertEqual(self.api_call("/api/v1/projects/no-such", login=("admin", PASSWORD))[0], 404)
+        # Read-only: anything but GET is 405; a rebound Host is refused.
+        for method in ("POST", "PUT", "DELETE", "PATCH"):
+            with self.subTest(method=method):
+                status, headers, body = self.api_call("/api/v1/projects", token, method=method)
+                self.assertEqual((status, headers.get("Allow")), (405, "GET, HEAD"))
+        self.assertEqual(self.api_call("/api/v1", token, headers={"Host": "attacker.example"})[0], 400)
+        # Every request is logged, the token never.
+        lines = (self.state / "api-access.log").read_text().splitlines()
+        self.assertTrue(any(line.endswith("GET /api/v1/overview 200") and "token=watcher client=127.0.0.1" in line for line in lines), lines)
+        self.assertTrue(any(line.endswith("GET /api/v1/projects 403") for line in lines))
+        self.assertTrue(any("caller=-" in line and line.endswith("GET /api/v1/projects 401") for line in lines))
+        self.assertTrue(any(line.endswith("DELETE /api/v1/projects 405") for line in lines))
+        self.assertNotIn(token, self.everything_written())
+
+    def test_the_api_shows_deploys_backups_and_what_needs_a_look(self):
+        token, _ = self.new_token("agent", [self.agents_group(overview="view", projects="view")])
+        status, _, body = self.api_call("/api/v1/projects", token)
+        self.assertEqual(status, 200, body)
+        projects = {item["name"]: item for item in body["projects"]}
+        self.assertEqual(set(projects), {"alpha_shop", "beta_docker", "shop-two"})
+        alpha = projects["alpha_shop"]
+        self.assertEqual(alpha["repository"], "git@bitbucket.org:example-team/alpha_shop.git")
+        prod = alpha["environments"][0]
+        self.assertEqual((prod["name"], prod["mode"], prod["state"], prod["problems"]), ("prod", "docker", "ok", []))
+        last = prod["last_deploy"]
+        self.assertEqual((last["ref"], last["at"], last["succeeded"], last["rollback"]), ("v1.0.0", "2026-10-06T08:30:00Z", True, True))
+        self.assertEqual(prod["last_successful_deploy"]["ref"], "v1.0.0")
+        self.assertEqual(prod["deploy_count"], 2)
+        self.assertEqual(alpha["last_deploy_at"], "2026-10-06T08:30:00Z")
+        self.assertEqual(prod["backup_policy"], {"db-short": "daily", "db-full": "weekly", "files": "daily"})
+        short = prod["backups"]["db-short"]
+        self.assertEqual((short["count"], short["size_bytes"]), (3, 4096))
+        self.assertAlmostEqual(short["age_seconds"], 7200, delta=120)
+        self.assertRegex(short["newest_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertIsNone(prod["backups"]["db-full"])
+        self.assertEqual(prod["ui"], "/project/alpha_shop")
+        self.assertNotIn("target", prod, "the list stays short; one project's detail has the target")
+        # One project: the target and the containers too.
+        status, _, alpha = self.api_call("/api/v1/projects/alpha_shop", token)
+        self.assertEqual(status, 200)
+        prod = alpha["environments"][0]
+        self.assertEqual(prod["target"]["mode"], "docker")
+        self.assertFalse(prod["target"]["remote"])
+        self.assertIn({"name": "alpha-prod-php-fpm", "state": "running", "status": "Up 3 hours (healthy)", "health": "healthy"},
+                      prod["containers"])
+        beta = self.api_call("/api/v1/projects/beta_docker", token)[2]["environments"][0]
+        self.assertEqual((beta["target"]["ssh"], beta["target"]["path"], beta["target"]["docker_context"]),
+                         ("deploy@shop.example", "/home/deploy/shop", "setup-beta_docker-stage"))
+        # What needs a look: the Overview's list as plain text, each with where to act.
+        status, _, overview = self.api_call("/api/v1/overview", token)
+        self.assertEqual(status, 200)
+        self.assertIn({"level": "bad", "kind": "server", "text": "setup-server-backup.service: the last run failed (exit-code)",
+                       "ui": "/logs"}, overview["attention"])
+        units = {unit["name"]: unit for unit in overview["units"]}
+        self.assertEqual(units["setup-server-runner.service"]["active"], "active")
+        self.assertFalse(units["setup-server-metrics.service"]["loaded"])
+        self.assertEqual(overview["projects"], {"count": 3, "environments": 3})
+        self.assertIsNotNone(overview["disk"]["available_bytes"])
+        # The Backups page as a list: the late or missing first.
+        status, _, backups = self.api_call("/api/v1/backups", token)
+        self.assertEqual(status, 200)
+        rows = {(row["project"], row["environment"]): row for row in backups["environments"]}
+        self.assertEqual(rows[("alpha_shop", "prod")]["policy_text"], "DB short daily · DB full weekly")
+        self.assertEqual(rows[("alpha_shop", "prod")]["newest"]["db-short"]["count"], 3)
+        self.assertEqual(rows[("alpha_shop", "prod")]["state"], "ok")
+        self.assertEqual(rows[("alpha_shop", "prod")]["ui"], "/project/alpha_shop#backup-prod")
+        self.assertEqual(backups["late_or_missing"], sum(1 for row in backups["environments"] if row["state"] == "bad"))
+        # Late backups: problems in the project's words; a stale DB short series makes the environment bad.
+        for path in (self.tree.projects / "alpha_shop/app/.generated/backups").glob("worker-*"):
+            os.utime(path, (time.time() - 40 * 3600, time.time() - 40 * 3600))
+        prod = self.api_call("/api/v1/projects?fresh=1", token)[2]["projects"]
+        prod = next(item for item in prod if item["name"] == "alpha_shop")["environments"][0]
+        self.assertEqual((prod["state"], prod["problems"]), ("bad", ["old DB short backup"]))
+        rows = self.api_call("/api/v1/backups", token)[2]["environments"]
+        self.assertEqual((rows[0]["project"], rows[0]["state"], rows[0]["problems"]), ("alpha_shop", "bad", ["old DB short backup"]))
+        # No secret in any answer: env values, Bitbucket tokens, passwords.
+        answers = "".join(self.request("GET", path, headers={"Authorization": f"Bearer {token}"})[2] for path in (
+            "/api/v1", "/api/v1/overview", "/api/v1/projects", "/api/v1/projects/alpha_shop", "/api/v1/backups",
+            "/api/v1/projects/alpha_shop/pipelines", "/api/v1/projects/alpha_shop/pull-requests"))
+        for secret in ("never-shown-password", PROJECT_TOKEN, GENERAL_TOKEN, PASSWORD, PASSWORD_HASH, token):
+            self.assertNotIn(secret, answers)
+
+    def test_the_api_reads_pipelines_and_pull_requests_from_bitbucket(self):
+        token, _ = self.new_token("agent", [self.agents_group(projects="view")])
+        status, _, body = self.api_call("/api/v1/projects/alpha_shop/pipelines", token)
+        self.assertEqual(status, 200, body)
+        self.assertEqual((body["provider"], body["repository"], body["error"]), ("bitbucket", "example-team/alpha_shop", None))
+        run = body["runs"][0]
+        self.assertEqual((run["build_number"], run["state"], run["result"], run["pipeline"], run["ref"]),
+                         (41, "COMPLETED", "SUCCESSFUL", "deploy-production", "main"))
+        self.assertEqual(run["url"], "https://bitbucket.org/example-team/alpha_shop/pipelines/results/41")
+        status, _, body = self.api_call("/api/v1/projects/alpha_shop/pull-requests", token)
+        self.assertEqual(status, 200, body)
+        latest = body["latest"]
+        self.assertEqual((latest["id"], latest["title"], latest["state"], latest["author"], latest["source_branch"],
+                          latest["destination_branch"], latest["merge_commit"]),
+                         (12, "Faster checkout", "MERGED", "Ona", "feature/checkout", "main", "abc123def456"))
+        self.assertEqual(body["repositories"][0]["role"], "environment")
+        self.assertEqual(len(body["repositories"][0]["pull_requests"]), 2)
+        asked = [request for request in self.api.requests if "/pullrequests" in request[1]]
+        self.assertEqual(asked[0][1], "/2.0/repositories/example-team/alpha_shop/pullrequests?state=OPEN&state=MERGED&state=DECLINED"
+                                      "&state=SUPERSEDED&sort=-updated_on&pagelen=10")
+        self.assertEqual(asked[0][2]["Authorization"], f"Bearer {PROJECT_TOKEN}")
+        # Cached for a minute; ?fresh=1 asks again.
+        self.api_call("/api/v1/projects/alpha_shop/pull-requests", token)
+        self.assertEqual(len([request for request in self.api.requests if "/pullrequests" in request[1]]), 1)
+        self.api_call("/api/v1/projects/alpha_shop/pull-requests?fresh=1", token)
+        self.assertEqual(len([request for request in self.api.requests if "/pullrequests" in request[1]]), 2)
+        # A GitHub project: a link to its Actions, nothing read; a redirect is an error, not followed.
+        status, _, body = self.api_call("/api/v1/projects/beta_docker/pipelines", token)
+        self.assertEqual((status, body["provider"], body["runs"]), (200, "github", None))
+        self.assertEqual(body["link"], "https://github.com/BigSant/beta_docker/actions")
+        self.assertIsNone(self.api_call("/api/v1/projects/beta_docker/pull-requests", token)[2]["repositories"][0]["pull_requests"])
+        body = self.api_call("/api/v1/projects/shop-two/pipelines", token)[2]
+        self.assertIsNone(body["runs"])
+        self.assertIn("redirect not followed", body["error"])
+        self.assertFalse(any(request[1].startswith("/elsewhere") for request in self.api.requests))
+
+    def test_the_api_index_and_openapi_list_every_route(self):
+        routes = [route for route, *_ in load_web_ui().API_ROUTES]
+        token, _ = self.new_token("agent", [self.agents_group(projects="view")])
+        index = self.api_call("/api/v1/", token)[2]
+        self.assertEqual([item["path"] for item in index["endpoints"]], ["/api/v1" + route for route in routes])
+        self.assertTrue(all(item["description"] for item in index["endpoints"]))
+        status, _, document = self.api_call("/api/v1/openapi.json", token)
+        self.assertEqual(status, 200)
+        self.assertEqual(document["openapi"], "3.1.0")
+        self.assertEqual(sorted(document["paths"]), sorted("/api/v1" + route for route in routes))
+        operations = [path["get"]["operationId"] for path in document["paths"].values()]
+        self.assertEqual(len(operations), len(set(operations)))
+        self.assertEqual(document["paths"]["/api/v1/projects/{project}"]["get"]["parameters"][0]["name"], "project")
 
     def test_a_user_changes_their_own_password(self):
         self.assertEqual(self.add_user("petras", "petro-slaptazodis-1", ["viewers"])[0], 303)

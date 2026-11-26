@@ -15,6 +15,13 @@ needs a Host of 127.0.0.1/localhost (a DNS-rebound name is refused). Every POST 
 form: an HMAC of the user with a key made at start (a restart invalidates the open forms) and, when the browser
 sends one, an Origin of 127.0.0.1/localhost.
 
+The API for agents. /api/v1 answers GETs with JSON (the index lists every endpoint; /api/v1/openapi.json): the
+deploys, backups, pipelines, pull requests and alarms of the same status the pages show, never a secret. A caller
+sends an API token (Authorization: Bearer ops_…; made on the Users page, shown once, only its sha256 kept in
+accounts.json) or Basic auth of a user; the token's groups decide what it reads, as a user's do. No cookie counts
+there, nothing is changed through it (any other method: 405), and every request is a line of
+$STATE_DIRECTORY/api-access.log (never the token).
+
 What it runs. Status: `sudo -n $LIBRARY/bin/server-status` (read-only, JSON: the overview, the logs, a project
 container's docker logs and the worker's /metrics). Actions: the root-owned copies
 in $LIBRARY/bin (never a writable checkout) through sudo, and bin/update of the admin clone as its owner;
@@ -286,6 +293,9 @@ SESSION_COOKIE = 'ops_session'
 SESSION_IDLE = 12 * 3600       # a session unused this long ends
 SESSION_LIFETIME = 14 * 86400  # and none lasts longer
 LOGIN_FAILURES = (10, 900)     # this many wrong logins from one client within this many seconds: it waits
+# API tokens (the agents' read access to /api/v1): "ops_" and 43 URL-safe characters; only the sha256 is kept.
+API_TOKEN = re.compile(r'ops_[A-Za-z0-9_-]{43}')
+TOKEN_SEEN = 300               # a token's "last used" is written at most this often
 
 
 def unit_sections(unit):
@@ -348,6 +358,7 @@ class Accounts:
             data, before = self.data, json.dumps(self.data, sort_keys=True)
             data.setdefault('groups', json.loads(json.dumps(DEFAULT_GROUPS)))
             data.setdefault('users', {})
+            data.setdefault('tokens', {})
             # The default groups renamed since: each moves to its new id (the users' memberships with it), its
             # title too unless someone changed it; when both ids exist, the old one's members join the new one.
             for old, (new, old_title) in RENAMED_GROUPS.items():
@@ -402,9 +413,10 @@ class Accounts:
 
     # --- Reading ---
     def snapshot(self):
-        """A copy of the users and groups (no lock needed by the caller)."""
+        """A copy of the users, groups and API tokens (no lock needed by the caller)."""
         with self.lock:
-            return json.loads(json.dumps({'users': self.data['users'], 'groups': self.data['groups']}))
+            return json.loads(json.dumps({'users': self.data['users'], 'groups': self.data['groups'],
+                                          'tokens': self.data.get('tokens', {})}))
 
     def password_of(self, name):
         """The stored hash of an enabled user, or None."""
@@ -417,10 +429,11 @@ class Accounts:
         matched = password_matches(password, stored or self.dummy)  # outside the lock: PBKDF2 is slow on purpose
         return matched and stored is not None and self.password_of(name) == stored
 
-    def permissions(self, name):
-        """section -> 'view' or 'manage': the highest level any of the user's groups gives."""
+    def permissions(self, name, kind='users'):
+        """section -> 'view' or 'manage': the highest level any of the user's (kind 'tokens': the API token's) groups
+        gives."""
         with self.lock:
-            user = self.data['users'].get(name)
+            user = self.data[kind].get(name)
             if not user or user.get('disabled'):
                 return {}
             levels = {}
@@ -482,6 +495,63 @@ class Accounts:
     def session_count(self, name):
         with self.lock:
             return sum(1 for entry in self.sessions.values() if entry.get('user') == name)
+
+    # --- API tokens ---
+    def token_name(self, token):
+        """The enabled API token a Bearer token is, or None. Every stored digest is compared (in constant time), so
+        the time does not tell how close a guess came."""
+        if not API_TOKEN.fullmatch(token or ''):
+            return None
+        key, found, now = self.digest(token), None, int(time.time())
+        with self.lock:
+            for name, entry in self.data['tokens'].items():
+                if hmac.compare_digest(entry.get('digest', ''), key) and not entry.get('disabled'):
+                    found = name
+            if found and now - self.data['tokens'][found].get('last_used', 0) > TOKEN_SEEN:
+                self.data['tokens'][found]['last_used'] = now
+                try:
+                    self.write(self.path, self.data)
+                except OSError as error:  # the token still works; only "last used" is late
+                    log(f'{self.path}: {error}')
+        return found
+
+    def save_token(self, name, new, groups, disabled):
+        """A new API token (its text, shown once) or a token's groups and state (None)."""
+        with self.lock:
+            tokens = json.loads(json.dumps(self.data['tokens']))
+            if new and name in tokens:
+                raise Invalid(f'The API token {name} already exists.')
+            if not new and name not in tokens:
+                raise Invalid(f'There is no API token {name}.')
+            unknown = [group for group in groups if group not in self.data['groups']]
+            if unknown:
+                raise Invalid(f'There is no group {unknown[0]}.')
+            text = None
+            entry = tokens.setdefault(name, {'created': int(time.time())})
+            entry.update(groups=sorted(groups), disabled=disabled)
+            if new:
+                text = 'ops_' + secrets.token_urlsafe(32)
+                entry['digest'] = self.digest(text)
+            self.data['tokens'] = tokens
+            self.write(self.path, self.data)
+            return text
+
+    def regenerate_token(self, name):
+        """A new text for an API token (shown once); the old one stops working at once."""
+        with self.lock:
+            if name not in self.data['tokens']:
+                raise Invalid(f'There is no API token {name}.')
+            text = 'ops_' + secrets.token_urlsafe(32)
+            self.data['tokens'][name].update(digest=self.digest(text), regenerated=int(time.time()))
+            self.write(self.path, self.data)
+            return text
+
+    def delete_token(self, name):
+        with self.lock:
+            if name not in self.data['tokens']:
+                raise Invalid(f'There is no API token {name}.')
+            del self.data['tokens'][name]
+            self.write(self.path, self.data)
 
     # --- Changes: each checks that an enabled administrator remains, then writes ---
     def commit(self, users, groups):
@@ -550,7 +620,7 @@ class Accounts:
                 raise Invalid('The group "Administrators" cannot be deleted.')
             if snapshot['groups'].pop(identifier, None) is None:
                 raise Invalid('There is no such group.')
-            for user in snapshot['users'].values():
+            for user in [*snapshot['users'].values(), *self.data['tokens'].values()]:
                 user['groups'] = [group for group in user.get('groups', []) if group != identifier]
             self.commit(snapshot['users'], snapshot['groups'])
 
@@ -1546,6 +1616,22 @@ def pipeline_runs(project, repository, fresh=False):
             return None, error or f'HTTP {code}'
         return data.get('values', []), None
     return CACHE.get(('pipelines', project), PIPELINES_TTL, compute, fresh)
+
+
+def pull_requests(project, repository, fresh=False):
+    """The 10 most recently updated pull requests of a repository, open, merged, declined or superseded: (list, error)."""
+    variable, token = token_for(project)
+    if not token:
+        return None, f'no token ({TOKEN_VARIABLE}_{re.sub(r"[^A-Z0-9]", "_", project.upper())} or {TOKEN_VARIABLE})'
+
+    def compute():
+        code, data, error = bitbucket('GET', f'/repositories/{quote(repository[0])}/{quote(repository[1])}/pullrequests'
+                                             '?state=OPEN&state=MERGED&state=DECLINED&state=SUPERSEDED&sort=-updated_on&pagelen=10',
+                                      token, timeout=8)
+        if error or not isinstance(data, dict):
+            return None, error or f'HTTP {code}'
+        return data.get('values', []), None
+    return CACHE.get(('pull-requests', project, repository), PIPELINES_TTL, compute, fresh)
 
 
 # --- Instructions: preparing a server as a deploy target ------------------------------------------
@@ -3038,54 +3124,63 @@ class Page:
     ATTENTION_FOLD = 3  # more of one kind than this – folded
 
     @staticmethod
-    def attention(data):
-        """What needs a look, gathered from the whole status: each with where to act on it."""
-        ATTENTION_GROUPS, ATTENTION_FOLD = Page.ATTENTION_GROUPS, Page.ATTENTION_FOLD
+    def attention_items(data):
+        """(group, kind, text, href) of what needs a look, gathered from the whole status, each with where to act on it
+        (plain text): the server's own (group None) first, then each project environment's (group: its kind of alarm).
+        The Overview's list and the API's /api/v1/overview both show these."""
         items = []
         units = data.get('units', {})
         for name, unit in sorted(units.items()):
             if unit.get('ActiveState') == 'failed':
-                items.append(('bad', f'{e(name)}: failed', '/logs'))
+                items.append((None, 'bad', f'{name}: failed', '/logs'))
             elif name.endswith('.service') and unit.get('Result') not in (None, '', 'success') and unit.get('LoadState') != 'not-found':
-                items.append(('bad', f'{e(name)}: the last run failed ({e(unit["Result"])})', '/logs'))
+                items.append((None, 'bad', f'{name}: the last run failed ({unit["Result"]})', '/logs'))
         versions = data.get('versions') or {}
         setup = versions.get('setup_git') or {}
         if setup and not setup.get('tag'):
-            items.append(('bad', 'setup is not on a release tag: prod deploys will not work', '/update'))
+            items.append((None, 'bad', 'setup is not on a release tag: prod deploys will not work', '/update'))
         updates = [label for label, state in (('setup', setup), ('Server OPS', versions.get('checkout_git') or {}))
                    if state.get('behind')]
         if updates:
-            items.append(('warn', 'A newer ' + ' and '.join(updates) + ' is available', '/update'))
+            items.append((None, 'warn', 'A newer ' + ' and '.join(updates) + ' is available', '/update'))
         disk = data.get('disk') or {}
         if disk.get('size') and disk['available'] / disk['size'] <= 0.15:
-            items.append(('bad', f'Only {size(disk["available"])} free on the disk', '/'))
-        # Per environment: the same kind may repeat for many projects; a kind repeated more than ATTENTION_FOLD
-        # times folds into one counted <details> (its summary says how many), below the distinct alerts.
-        grouped, ordered = {}, []
+            items.append((None, 'bad', f'Only {size(disk["available"])} free on the disk', '/'))
         for entry in data.get('projects', []):
             link = f'/project/{quote(entry["name"])}'
             for environment, state in entry.get('environments', {}).items():
-                where = f'{e(entry["name"])} {e(environment)}'
-                found = []
+                where = f'{entry["name"]} {environment}'
                 last = ((state.get('deploys') or {}).get('last') or {})
                 if last.get('failed'):
-                    found.append(('deploy-failed', f'{where}: the deploy failed ({e(last["failed"])})', link))
+                    items.append(('deploy-failed', 'bad', f'{where}: the deploy failed ({last["failed"]})', link))
                 if state.get('secrets') == 'stopped':
-                    found.append(('secrets-stopped', f'{where}: secret store stopped', link))
+                    items.append(('secrets-stopped', 'bad', f'{where}: secret store stopped', link))
                 unhealthy = [item['name'] for item in state.get('containers', []) if item.get('health') == 'unhealthy']
                 if unhealthy:
-                    found.append(('unhealthy', f'{where}: unhealthy {e(", ".join(unhealthy))}', link))
+                    items.append(('unhealthy', 'bad', f'{where}: unhealthy {", ".join(unhealthy)}', link))
                 # An environment with no target deploys nowhere: nothing to back up, so no alarm (the Projects page shows it
                 # quietly); nor is a series its backup policy turns off.
                 for series, problem, newest in Page.backup_problems(entry, environment, units):
                     what = BACKUP_SERIES[series].replace('Files', 'files')
-                    found.append((f'{problem}-{"files-" if series == "files" else ""}backup',
-                                  f'{where}: newest {what} ' + (e(ago(newest['time'])) if newest else 'none'),
+                    items.append((f'{problem}-{"files-" if series == "files" else ""}backup', 'bad',
+                                  f'{where}: newest {what} ' + (ago(newest['time']) if newest else 'none'),
                                   f'/files/{quote(entry["name"])}/{quote(environment)}' if series == 'files' else
                                   f'{link}#backup-{quote(environment)}'))
-                for group, text, href in found:
-                    grouped.setdefault(group, []).append(('bad', text, href))
-                    ordered.append((group, ('bad', text, href)))
+        return items
+
+    @staticmethod
+    def attention(data):
+        """What needs a look (attention_items), as the Overview's list."""
+        ATTENTION_GROUPS, ATTENTION_FOLD = Page.ATTENTION_GROUPS, Page.ATTENTION_FOLD
+        found = Page.attention_items(data)
+        items = [(kind, e(text), href) for group, kind, text, href in found if group is None]
+        # Per environment: the same kind may repeat for many projects; a kind repeated more than ATTENTION_FOLD
+        # times folds into one counted <details> (its summary says how many), below the distinct alerts.
+        grouped, ordered = {}, []
+        for group, kind, text, href in found:
+            if group is not None:
+                grouped.setdefault(group, []).append((kind, e(text), href))
+                ordered.append((group, (kind, e(text), href)))
         if not items and not grouped:
             return f'<div class="attention calm">{lamp("ok")}<span>All is well: nothing needs attention.</span></div>'
         items += [item for group, item in ordered if len(grouped[group]) <= ATTENTION_FOLD]
@@ -3395,6 +3490,28 @@ class Page:
             return badge('none', 'bad') if problem else '<span class="muted">none</span>'
         return e(ago(newest['time'])) + (' ' + badge('late', 'bad') if problem else '')
 
+    @staticmethod
+    def backup_rows(data):
+        """Every deployed (not development) project environment's backups: entry, environment, state, policy, files (it
+        has files to back up), database (one here: not a files-only target), problems (backup_problems), registered
+        and kind (bad: late or missing; idle: no target or nothing backed up; else ok). The Backups page and the API's
+        /api/v1/backups."""
+        units = data.get('units', {})
+        rows = []
+        for entry in data.get('projects', []):
+            for environment in sorted(entry.get('environments') or {}, key=environment_order):
+                state = entry['environments'][environment] or {}
+                if state.get('development'):
+                    continue
+                policy, files, database = environment_policy(state), has_files(state), not files_only(state)
+                problems = Page.backup_problems(entry, environment, units)
+                registered = bool(Page.registered(entry, environment) and state.get('declared'))
+                kind = 'bad' if problems else 'idle' if not registered or (
+                    backup_watch(state) is None and (policy['files'] == 'off' or not files)) else 'ok'
+                rows.append({'entry': entry, 'environment': environment, 'state': state, 'policy': policy, 'files': files,
+                             'database': database, 'problems': problems, 'registered': registered, 'kind': kind})
+        return rows
+
     def backups_page(self, data, error, query=None):
         """Every project environment's backup policy and its newest DB short, DB full and files backup: those late or missing
         first, filtered like Projects; each row leads to the environment's policy form on its project page."""
@@ -3409,35 +3526,27 @@ class Page:
         keep = next((test for key, _, test in self.POLICY_FILTERS if key == chosen), None)
         if keep is None:
             chosen, keep = '', self.POLICY_FILTERS[0][2]
-        units = data.get('units', {})
         rows = []
-        for entry in data.get('projects', []):
-            for environment in sorted(entry.get('environments') or {}, key=environment_order):
-                state = entry['environments'][environment] or {}
-                if state.get('development'):
-                    continue
-                policy, files, database = environment_policy(state), has_files(state), not files_only(state)
-                problems = self.backup_problems(entry, environment, units)
-                late = {series for series, *_ in problems}
-                registered = self.registered(entry, environment) and state.get('declared')
-                kind = 'bad' if problems else 'idle' if not registered or (
-                    backup_watch(state) is None and (policy['files'] == 'off' or not files)) else 'ok'
-                link = f'/project/{e(quote(entry["name"]))}#backup-{e(quote(environment))}'
-                note = '' if registered else '<small>no target: no alarm</small>'
-                no_database = '<span class="muted" title="a files-only target: no database here">n/a (files only)</span>'
-                # Each value in one <span>: on a phone the cell is a row of its label and that.
-                values = (('Environment', f'<span class="sign {e(environment)}">{e(environment)}</span>'),
-                          ('Policy', policy_html(policy, files, database) +
-                           (' <span class="muted">· default</span>' if policy == BACKUP_DEFAULT and database else '')),
-                          ('DB short', self.newest_cell(state, 'backups', policy['db-short'], 'db-short' in late)
-                           if database else no_database),
-                          ('DB full', self.newest_cell(state, 'full_backups', policy['db-full'], 'db-full' in late)
-                           if database else no_database),
-                          ('Files', self.newest_cell(state, 'files_backups', policy['files'], 'files' in late) if files else
-                           '<span class="muted" title="no BACKUP_FILE_PATHS">—</span>'))
-                cells = (f'<td class="project" data-label="Project"><a href="{link}">{e(entry["name"])}</a>{note}</td>' +
-                         ''.join(f'<td data-label="{label}"><span>{text}</span></td>' for label, text in values))
-                rows.append((entry, environment, policy, kind, f'<tr class="is-{kind}">{cells}</tr>'))
+        for row in self.backup_rows(data):
+            entry, environment, state, policy = row['entry'], row['environment'], row['state'], row['policy']
+            files, database, kind, registered = row['files'], row['database'], row['kind'], row['registered']
+            late = {series for series, *_ in row['problems']}
+            link = f'/project/{e(quote(entry["name"]))}#backup-{e(quote(environment))}'
+            note = '' if registered else '<small>no target: no alarm</small>'
+            no_database = '<span class="muted" title="a files-only target: no database here">n/a (files only)</span>'
+            # Each value in one <span>: on a phone the cell is a row of its label and that.
+            values = (('Environment', f'<span class="sign {e(environment)}">{e(environment)}</span>'),
+                      ('Policy', policy_html(policy, files, database) +
+                       (' <span class="muted">· default</span>' if policy == BACKUP_DEFAULT and database else '')),
+                      ('DB short', self.newest_cell(state, 'backups', policy['db-short'], 'db-short' in late)
+                       if database else no_database),
+                      ('DB full', self.newest_cell(state, 'full_backups', policy['db-full'], 'db-full' in late)
+                       if database else no_database),
+                      ('Files', self.newest_cell(state, 'files_backups', policy['files'], 'files' in late) if files else
+                       '<span class="muted" title="no BACKUP_FILE_PATHS">—</span>'))
+            cells = (f'<td class="project" data-label="Project"><a href="{link}">{e(entry["name"])}</a>{note}</td>' +
+                     ''.join(f'<td data-label="{label}"><span>{text}</span></td>' for label, text in values))
+            rows.append((entry, environment, policy, kind, f'<tr class="is-{kind}">{cells}</tr>'))
         stats = [(len(rows), 'environments'), (sum(1 for row in rows if row[3] == 'bad'), 'late or missing'),
                  *((sum(1 for row in rows if test(row[2])), words) for key, words, test in self.POLICY_FILTERS[1:])]
         body = '<div class="stats">' + ''.join(f'<div class="stat"><b>{e(number)}</b><span>{e(label)}</span></div>'
@@ -4837,7 +4946,98 @@ class Page:
                  f'<table class="list"><tr><th>Group</th><th>Members</th><th>Sections (✎ – manage)</th></tr>{group_rows}</table>'
                  '<p class="note">A user sees and manages what at least one of their groups allows. "Administrators" always manage '
                  'everything; at least one enabled member of it must remain.</p>')
+        body += self.tokens_section(accounts)
         return self.layout('Users', body, section='users')
+
+    def tokens_section(self, accounts):
+        """The Users page's API tokens: the agents' and scripts' read access to /api/v1."""
+        tokens, groups = accounts.get('tokens') or {}, accounts['groups']
+        manage = self.can('users', 'manage')
+        rows = ''.join(
+            f'<tr><td><a href="/tokens/{quote(name)}">{e(name)}</a></td><td>{e(self.group_titles(groups, token.get("groups", [])))}</td>'
+            f'<td>{e(self.permission_summary(self.token_permissions(groups, token)))}</td>'
+            f'<td>{badge("disabled", "bad") if token.get("disabled") else badge("active", "ok")}</td>'
+            f'<td>{e(ago(token["created"])) if token.get("created") else "—"}</td>'
+            f'<td>{e(ago(token["last_used"])) if token.get("last_used") else "never"}</td></tr>'
+            for name, token in sorted(tokens.items()))
+        body = '<h2 id="tokens">API tokens</h2>' + (
+            '<div class="toolbar"><a class="btn go" href="/tokens/new">+ New token</a></div>' if manage else '')
+        if rows:
+            body += ('<div class="scroll"><table class="list"><tr><th>Name</th><th>Groups</th><th>Reads (✎ – manage)</th><th>State</th>'
+                     f'<th>Created</th><th>Last used</th></tr>{rows}</table></div>')
+        else:
+            body += '<div class="empty">No API tokens yet.</div>'
+        return body + (f'<p class="note">An agent or script reads the JSON API <code>{API_PREFIX}</code> with '
+                       '<code>Authorization: Bearer ops_…</code>: what its groups let it see, read-only. The token is shown once, '
+                       'when it is made; only its sha256 is kept. Every request is logged (api-access.log). README: API for agents.</p>')
+
+    @staticmethod
+    def token_permissions(groups, token):
+        """section -> level an API token's groups give it (as Accounts.permissions; disabled: none)."""
+        levels = {}
+        if token.get('disabled'):
+            return levels
+        for group in token.get('groups', []):
+            for section, level in ((groups.get(group) or {}).get('sections') or {}).items():
+                if level in PERMISSION_LEVELS and PERMISSION_LEVELS.index(level) > PERMISSION_LEVELS.index(levels.get(section, '')):
+                    levels[section] = level
+        return levels
+
+    def token_groups(self, groups, chosen):
+        return ''.join(f'<label class="check"><input type="checkbox" name="group:{e(identifier)}" value="1"'
+                       f'{" checked" if identifier in chosen else ""}><span>{e(group["title"])}'
+                       f'<small class="muted"> — {e(self.permission_summary(group.get("sections") or {}))}</small></span></label>'
+                       for identifier, group in sorted(groups.items(), key=lambda item: (item[0] != ADMINISTRATORS, item[1]['title'])))
+
+    def token_page(self, accounts, name, query):
+        """An API token's settings (name None: a new token)."""
+        groups = accounts['groups']
+        token = (accounts.get('tokens') or {}).get(name, {}) if name else {}
+        manage = self.can('users', 'manage')
+        facts_rows = [('Groups', e(self.group_titles(groups, token.get('groups', [])))),
+                      ('Reads', e(self.permission_summary(self.token_permissions(groups, token)))),
+                      ('State', badge('disabled', 'bad') if token.get('disabled') else badge('active', 'ok')),
+                      ('Created', e(local_time(token['created'])) if token.get('created') else '—'),
+                      ('Regenerated', e(local_time(token['regenerated'])) if token.get('regenerated') else '—'),
+                      ('Last used', e(local_time(token['last_used'])) if token.get('last_used') else 'never')]
+        if not manage:
+            return self.layout(f'API token {name}', facts(facts_rows) + '<p><a href="/users#tokens">← Users</a></p>', section='users')
+        fields = (self.csrf_field() + f'<input type="hidden" name="new" value="{"" if name else "1"}">' +
+                  (f'<input type="hidden" name="name" value="{e(name)}">' if name else
+                   '<label><span>Name (who uses it, e.g. an agent)</span><input type="text" name="name" autocomplete="off" required '
+                   'pattern="[A-Za-z0-9._\\-]{1,32}"></label>') +
+                  '<div class="block-label">Groups (what it may read)</div>' + self.token_groups(groups, set(token.get('groups', []))) +
+                  (f'<label class="check"><input type="checkbox" name="disabled" value="1"{" checked" if token.get("disabled") else ""}>'
+                   '<span>Disabled (its requests are refused)</span></label>' if name else ''))
+        body = self.saved(query) + (facts(facts_rows) if name else '')
+        body += ('<div class="deck">'
+                 f'<form class="action" method="post" action="/tokens/save"><h3>{"Settings" if name else "New API token"}</h3>{fields}'
+                 '<div class="form-foot"><p class="note">The API is read-only; a token reads the sections its groups give "view" '
+                 '(Overview, Projects). ' + ('' if name else 'The token is shown once, on the next page.') +
+                 f'</p><button class="run">{"Save" if name else "Create"}</button></div></form>')
+        if name:
+            body += (f'<form class="action" method="post" action="/tokens/regenerate"><h3>Regenerate</h3>{self.csrf_field()}'
+                     f'<input type="hidden" name="name" value="{e(name)}"><div class="form-foot"><p class="note">A new token, shown once; '
+                     'the old one stops working at once.</p><button class="run">Regenerate</button></div></form>'
+                     f'<form class="action danger" method="post" action="/tokens/delete"><h3>Delete {e(name)}</h3>{self.csrf_field()}'
+                     f'<input type="hidden" name="name" value="{e(name)}"><div class="form-foot"><p class="note">Its requests are refused '
+                     'from now on; its lines stay in api-access.log.</p><button class="stop">Delete</button></div></form>')
+        body += '</div><p><a href="/users#tokens">← Users</a></p>'
+        return self.layout(f'API token {name}' if name else 'New API token', body, section='users')
+
+    def token_shown(self, name, text, accounts, regenerated=False):
+        """The one page that shows an API token: right after it was made or regenerated (never stored, never again)."""
+        token = (accounts.get('tokens') or {}).get(name, {})
+        body = (f'<div class="callout warn"><p>Copy the token now: it is shown only this once. '
+                f'{"The old one no longer works. " if regenerated else ""}Lost – regenerate it.</p></div>'
+                + facts([('Name', e(name)), ('Groups', e(self.group_titles(accounts['groups'], token.get('groups', []))))]) +
+                '<h2>Token</h2>' f'<pre class="cmd">{e(text)}</pre>'
+                '<h2>Use</h2>' f'<pre class="cmd">export OPS_TOKEN={e(text)}\n'
+                f'curl -s -H "Authorization: Bearer $OPS_TOKEN" https://ops.local{API_PREFIX}\n'
+                f'curl -s -H "Authorization: Bearer $OPS_TOKEN" https://ops.local{API_PREFIX}/projects</pre>'
+                f'<p class="note"><code>{API_PREFIX}</code> lists every endpoint; <code>{API_PREFIX}/openapi.json</code> describes them.</p>'
+                f'<p><a class="btn" href="/tokens/{quote(name)}">Done</a></p>')
+        return self.layout(f'API token {name}', body, section='users')
 
     def user_page(self, accounts, name, people, query, sessions=0):
         """A user's settings (name None: a new user)."""
@@ -5091,10 +5291,310 @@ def path_section(path):
     for prefix, section in (('/projects', 'projects'), ('/project/', 'projects'), ('/runners', 'runners'), ('/access', 'access'), ('/files', 'files'),
                             ('/update', 'update'),
                             ('/actions', 'actions'), ('/instructions', 'instructions'), ('/logs', 'logs'),
-                            ('/worker-metrics', 'metrics'), ('/users', 'users'), ('/groups', 'users')):
+                            ('/worker-metrics', 'metrics'), ('/users', 'users'), ('/groups', 'users'), ('/tokens', 'users')):
         if path == prefix.rstrip('/') or path.startswith(prefix.rstrip('/') + '/'):
             return section
     return None
+
+
+# --- The API for agents (/api/v1) ----------------------------------------------------------------
+# Read-only JSON for LLM agents and scripts on other computers (through nginx on ops.local): when each project
+# environment was deployed and whether that worked, its backups against their policy, the pipelines and pull
+# requests, what needs a look. An API token (Users → API tokens) or Basic auth of a user; the token's groups decide
+# what it reads, as a user's do. Built from the same status and the same alarm logic as the pages; never a secret.
+API_PREFIX = '/api/v1'
+API_PROJECT = r'[a-z0-9][a-z0-9_-]{0,63}'
+API_LOG_LIMIT, API_LOG_KEEP = 1_500_000, 5000  # past about 10 000 lines (1.5 MB) the access log keeps its newest 5000
+# (path, section it needs (None: any signed-in caller), what it returns): the index, the OpenAPI document and the
+# dispatcher all come from this one list.
+API_ROUTES = (
+    ('', None, 'This index: who you are, what your groups let you read, and every endpoint.'),
+    ('/openapi.json', None, 'The OpenAPI 3.1 description of this API.'),
+    ('/overview', 'overview', 'What needs a look (the Overview list: failed units, failed deploys, late or missing backups, '
+                              'disk), the units and timers, the versions of Server OPS and setup, the free disk.'),
+    ('/projects', 'projects', 'Every project and its environments: the last deploy (when, which ref and commit, from which branch, '
+                              'whether it succeeded), the last successful one, the newest backup of each series against the '
+                              'environment\'s backup policy, and the problems.'),
+    ('/projects/{project}', 'projects', 'One project as in /projects, with each environment\'s target and containers.'),
+    ('/projects/{project}/pipelines', 'projects', 'The newest Bitbucket pipeline runs of the project (deploys, backups, pull '
+                                                  'request builds): state, result, trigger, ref, commit, pull request, times.'),
+    ('/projects/{project}/pull-requests', 'projects', 'The most recently updated pull requests of the project\'s repositories '
+                                                      '(environment and code repository on Bitbucket), and the latest one.'),
+    ('/backups', 'projects', 'Every project environment\'s backups in one list (the Backups page): policy, the newest backup of '
+                             'each series, the late or missing ones.'),
+)
+
+
+def api_route(path):
+    """(route, project) of an /api/v1 path (a trailing / ignored), or None."""
+    tail = path[len(API_PREFIX):].rstrip('/') if path == API_PREFIX or path.startswith(API_PREFIX + '/') else None
+    if tail is None:
+        return None
+    for route, *_ in API_ROUTES:
+        match = re.fullmatch(re.escape(route).replace(re.escape('{project}'), f'({API_PROJECT})'), tail)
+        if match:
+            return route, (match[1] if match.groups() else None)
+    return None
+
+
+def iso(moment):
+    """A Unix time as ISO 8601 UTC ('2026-11-26T09:41:04Z'), None as None."""
+    return datetime.fromtimestamp(int(moment), timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ') if moment is not None else None
+
+
+def age_seconds(moment, now):
+    return max(0, int(now - moment)) if moment is not None else None
+
+
+def api_deploy(deploy, now):
+    if not deploy:
+        return None
+    branch = deploy.get('branch') or {}
+    return {'at': iso(deploy.get('at')), 'age_seconds': age_seconds(deploy.get('at'), now), 'ref': deploy.get('ref') or None,
+            'commit': deploy.get('commit') or None, 'branch': branch.get('name'),
+            'branch_behind': branch.get('behind') if isinstance(branch.get('behind'), int) else None,
+            'succeeded': not deploy.get('failed'), 'failed': deploy.get('failed'), 'rollback': bool(deploy.get('rollback'))}
+
+
+def api_series(backups, now):
+    """The newest backup of one series and how many are kept; None when there is none."""
+    newest = (backups or {}).get('newest')
+    if not newest:
+        return None
+    return {'newest_at': iso(newest['time']), 'age_seconds': age_seconds(newest['time'], now), 'newest_name': newest.get('name'),
+            'size_bytes': newest.get('size'), 'count': (backups or {}).get('count', 0)}
+
+
+def api_environment(page, entry, environment, units, now, detail=False):
+    """One project environment for the API: its state and problems (Page.project_environment and the files backup of
+    Page.backup_problems: the same words the pages show), the deploys, the backups against the policy."""
+    state = (entry.get('environments') or {}).get(environment) or {}
+    kind, problems = page.project_environment(entry, environment)
+    problems = problems + [f'{problem} files backup' for series, problem, _ in Page.backup_problems(entry, environment, units)
+                           if series == 'files']
+    deploys = state.get('deploys') or {}
+    found = {'name': environment, 'state': 'bad' if problems else kind, 'problems': problems,
+             'mode': 'files' if files_only(state) else 'docker', 'declared': bool(state.get('declared')),
+             'registered': bool(Page.registered(entry, environment)), 'development': bool(state.get('development')),
+             'last_deploy': api_deploy(deploys.get('last'), now), 'last_successful_deploy': api_deploy(deploys.get('last_success'), now),
+             'deploy_count': deploys.get('count', 0),
+             'backup_policy': None if state.get('development') else environment_policy(state),
+             'backups': {series: api_series(state.get(key), now) for series, key in (
+                 ('db-short', 'backups'), ('db-full', 'full_backups'), ('files', 'files_backups'), ('fresh', 'fresh_backups'))},
+             'backup_file_paths': list(state.get('file_paths') or []),
+             'ui': f'/project/{quote(entry["name"])}'}
+    if detail:
+        values = target_values(entry, environment)
+        found['target'] = None if not values else {
+            'mode': 'files' if values.get('DEPLOY_MODE') == 'files' else 'docker', 'remote': remote_target(values),
+            'ssh': values.get('DEPLOY_SSH') or None, 'path': values.get('DEPLOY_PATH') or None,
+            'docker_context': (values.get('DEPLOY_CONTEXT') or None) if values.get('DEPLOY_MODE') != 'files' else None}
+        found['compose_project'] = None if files_only(state) else state.get('compose_project')
+        found['containers'] = [{'name': item.get('name'), 'state': item.get('state'), 'status': item.get('status'),
+                                'health': item.get('health')} for item in state.get('containers', [])]
+        found['secret_store'] = None if files_only(state) else state.get('secrets')
+    return found
+
+
+def api_project(page, entry, units, now, detail=False):
+    environments = sorted(entry.get('environments') or {}, key=environment_order)
+    shown = [api_environment(page, entry, environment, units, now, detail) for environment in environments]
+    return {'name': entry['name'], 'state': Page.project_kind([item['state'] for item in shown]) if shown else 'idle',
+            'repository': entry.get('repository'), 'code_repository': entry.get('code_repository'),
+            'branch': entry.get('branch'), 'monorepo': bool(entry.get('monorepo')),
+            'last_deploy_at': max((item['last_deploy']['at'] for item in shown if item['last_deploy']), default=None),
+            'environments': shown, 'ui': f'/project/{quote(entry["name"])}'}
+
+
+def api_overview(data, now):
+    items = Page.attention_items(data)
+    units = []
+    for name, unit in sorted((data.get('units') or {}).items()):
+        units.append({'name': name, 'loaded': unit.get('LoadState') not in (None, 'not-found'), 'active': unit.get('ActiveState'),
+                      'sub': unit.get('SubState'), 'result': unit.get('Result'), 'enabled': unit.get('UnitFileState'),
+                      'last_trigger': unit.get('LastTriggerUSec'), 'next_run': unit.get('NextElapseUSecRealtime'),
+                      'active_since': unit.get('ActiveEnterTimestamp')})
+    versions = data.get('versions') or {}
+    git = lambda state: None if not state else {'commit': state.get('commit'), 'tag': state.get('tag'), 'behind': state.get('behind'),
+                                                'committed_at': iso(state.get('committed')), 'fetched_at': iso(state.get('fetched'))}
+    disk = data.get('disk') or {}
+    projects = data.get('projects', [])
+    return {'generated_at': iso(data.get('generated', now)),
+            'attention': [{'level': kind, 'kind': group or 'server', 'text': text, 'ui': href} for group, kind, text, href in items],
+            'projects': {'count': len(projects), 'environments': sum(len(entry.get('environments') or {}) for entry in projects)},
+            'units': units,
+            'versions': {'server_ops': {'installed': versions.get('installed'), 'checkout': versions.get('checkout'),
+                                        **(git(versions.get('checkout_git')) or {})},
+                         'setup': {'describe': versions.get('setup'), **(git(versions.get('setup_git')) or {})}},
+            'disk': {'path': disk.get('path'), 'size_bytes': disk.get('size'), 'available_bytes': disk.get('available'),
+                     'available_percent': round(100 * disk['available'] / disk['size'], 1) if disk.get('size') else None}
+            if disk else None,
+            'errors': list(data.get('errors') or [])}
+
+
+def api_backups(data, now):
+    rows = []
+    for row in Page.backup_rows(data):
+        state = row['state']
+        rows.append({'project': row['entry']['name'], 'environment': row['environment'],
+                     'mode': 'docker' if row['database'] else 'files', 'state': row['kind'], 'registered': row['registered'],
+                     'policy': row['policy'], 'policy_text': policy_text(row['policy'], row['files'], row['database']),
+                     'problems': [('old ' if problem == 'old' else 'no ') + BACKUP_SERIES[series] for series, problem, _ in row['problems']],
+                     'newest': {series: api_series(state.get(key), now) for series, key in (
+                         ('db-short', 'backups'), ('db-full', 'full_backups'), ('files', 'files_backups'), ('fresh', 'fresh_backups'))},
+                     'ui': f'/project/{quote(row["entry"]["name"])}#backup-{quote(row["environment"])}'})
+    rows.sort(key=lambda row: (row['state'] != 'bad', row['project'], environment_order(row['environment'])))
+    return {'generated_at': iso(data.get('generated', now)), 'environments': rows,
+            'late_or_missing': sum(1 for row in rows if row['state'] == 'bad')}
+
+
+def api_run(run, repository):
+    """One Bitbucket pipeline run, as the API shows it."""
+    state = run.get('state') or {}
+    target = run.get('target') or {}
+    pull = target.get('pullrequest') or {}
+    number = run.get('build_number')
+    return {'build_number': number, 'uuid': run.get('uuid'), 'state': state.get('name'),
+            'result': (state.get('result') or {}).get('name') or (state.get('stage') or {}).get('name'),
+            'trigger': (run.get('trigger') or {}).get('name'), 'pipeline': (target.get('selector') or {}).get('pattern'),
+            'selector': (target.get('selector') or {}).get('type'), 'ref_type': target.get('ref_type'),
+            'ref': target.get('ref_name') or target.get('source'), 'commit': (target.get('commit') or {}).get('hash'),
+            'pull_request': {'id': pull.get('id'), 'title': pull.get('title'), 'source': target.get('source'),
+                             'destination': target.get('destination')} if pull or target.get('type') == 'pipeline_pullrequest_target' else None,
+            'creator': (run.get('creator') or {}).get('display_name'), 'created_on': run.get('created_on'),
+            'completed_on': run.get('completed_on'), 'duration_seconds': run.get('duration_in_seconds'),
+            'url': f'{BITBUCKET_WEB}/{quote(repository[0])}/{quote(repository[1])}/pipelines/results/{int(number)}'
+            if isinstance(number, int) else None}
+
+
+def api_pull_request(item):
+    branch = lambda side: ((item.get(side) or {}).get('branch') or {}).get('name')
+    return {'id': item.get('id'), 'title': item.get('title'), 'state': item.get('state'),
+            'author': (item.get('author') or {}).get('display_name'), 'source_branch': branch('source'),
+            'destination_branch': branch('destination'), 'source_commit': ((item.get('source') or {}).get('commit') or {}).get('hash'),
+            'merge_commit': (item.get('merge_commit') or {}).get('hash'), 'comment_count': item.get('comment_count'),
+            'created_on': item.get('created_on'), 'updated_on': item.get('updated_on'),
+            'url': ((item.get('links') or {}).get('html') or {}).get('href')}
+
+
+def project_repositories(entry):
+    """[(role, url, (workspace, slug) or None)] of a project's repositories: the environment repo, then the code repo."""
+    found = []
+    for role, url in (('environment', entry.get('repository')), ('code', entry.get('code_repository'))):
+        if url and all(url != item[1] for item in found):
+            found.append((role, url, bitbucket_repository(url)))
+    return found
+
+
+def api_pipelines(entry, fresh):
+    repository = bitbucket_repository(entry.get('repository') or '')
+    if repository is None:
+        link = github_actions_link(entry)
+        return {'project': entry['name'], 'provider': 'github' if link else None, 'runs': None, 'link': link,
+                'error': 'a GitHub project: its runs are in GitHub Actions (link)' if link else
+                'no Bitbucket repository: no pipelines are read'}
+    runs, error = pipeline_runs(entry['name'], repository, fresh)
+    return {'project': entry['name'], 'provider': 'bitbucket', 'repository': '/'.join(repository),
+            'runs': [api_run(run, repository) for run in runs if isinstance(run, dict)] if runs is not None else None,
+            'error': error}
+
+
+def api_pull_requests(entry, fresh):
+    repositories, newest = [], None
+    for role, url, repository in project_repositories(entry):
+        if repository is None:
+            repositories.append({'role': role, 'url': url, 'pull_requests': None,
+                                 'error': 'not on Bitbucket: its pull requests are not read'})
+            continue
+        found, error = pull_requests(entry['name'], repository, fresh)
+        shown = [{**api_pull_request(item), 'repository': '/'.join(repository)} for item in found or [] if isinstance(item, dict)]
+        repositories.append({'role': role, 'repository': '/'.join(repository), 'pull_requests': shown if found is not None else None,
+                             'error': error})
+        for item in shown:
+            if item.get('updated_on') and (newest is None or item['updated_on'] > newest['updated_on']):
+                newest = item
+    return {'project': entry['name'], 'latest': newest, 'repositories': repositories}
+
+
+def api_openapi():
+    """The OpenAPI 3.1 document of API_ROUTES."""
+    project = {'name': 'project', 'in': 'path', 'required': True, 'description': 'the project (its build root\'s name)',
+               'schema': {'type': 'string', 'pattern': f'^{API_PROJECT}$'}}
+    fresh = {'name': 'fresh', 'in': 'query', 'required': False, 'description': '1: read again now instead of the cached answer',
+             'schema': {'type': 'string', 'enum': ['1']}}
+    error = {'description': 'error', 'content': {'application/json': {'schema': {'$ref': '#/components/schemas/Error'}}}}
+    paths = {}
+    for route, section, text in API_ROUTES:
+        parameters = ([project] if '{project}' in route else []) + ([fresh] if route != '/openapi.json' and route != '' else [])
+        responses = {'200': {'description': 'OK', 'content': {'application/json': {'schema': {'type': 'object'}}}},
+                     '401': error}
+        if section:
+            responses['403'] = error
+        if '{project}' in route:
+            responses['404'] = error
+        if section:
+            responses['503'] = error
+        paths[API_PREFIX + route] = {'get': {
+            'summary': text, 'operationId': 'get' + (''.join(part.title() for part in re.split(r'[^a-z]+', route) if part) or 'Index'),
+            'description': f'Needs the permission "view" of the section {SECTION_TITLES[section]}.' if section else 'Any valid token.',
+            'parameters': parameters, 'responses': responses}}
+    return {'openapi': '3.1.0',
+            'info': {'title': 'Server OPS API', 'version': '1',
+                     'description': 'Read-only status of the worker: deploys, backups, pipelines, pull requests and alarms. '
+                                    'Timestamps are ISO 8601 UTC; ages are seconds. No secret is ever returned.'},
+            'servers': [{'url': '/'}],
+            'security': [{'bearer': []}, {'basic': []}],
+            'components': {'securitySchemes': {'bearer': {'type': 'http', 'scheme': 'bearer', 'description': 'an API token ops_…'},
+                                               'basic': {'type': 'http', 'scheme': 'basic', 'description': 'a UI user'}},
+                           'schemas': {'Error': {'type': 'object', 'required': ['error', 'status'],
+                                                 'properties': {'error': {'type': 'string'}, 'status': {'type': 'integer'}}}}},
+            'paths': paths}
+
+
+def api_answer(path, query, kind, name, permissions):
+    """(HTTP status, JSON) of a GET of the API, for a caller (kind 'token' or 'user') with these permissions."""
+    found = api_route(path)
+    if found is None:
+        return 404, {'error': f'no such endpoint; the index is {API_PREFIX}', 'status': 404}
+    route, project = found
+    section = next(item[1] for item in API_ROUTES if item[0] == route)
+    can = lambda key: PERMISSION_LEVELS.index(permissions.get(key, '')) >= PERMISSION_LEVELS.index('view')
+    if route == '':
+        return 200, {'api': 'Server OPS', 'version': 1, 'caller': {'kind': kind, 'name': name},
+                     'permissions': {key: level for key, level in permissions.items() if level},
+                     'endpoints': [{'path': API_PREFIX + route, 'method': 'GET', 'needs': f'{key}: view' if key else None,
+                                    'allowed': key is None or can(key), 'description': text} for route, key, text in API_ROUTES],
+                     'notes': 'Read-only. Timestamps are ISO 8601 UTC, ages in seconds; "ui" fields are paths of the web UI. '
+                              'state: ok, bad (problems lists why) or idle (not deployed from here). ?fresh=1 reads again now '
+                              '(the status is cached for a few seconds, Bitbucket for a minute).'}
+    if route == '/openapi.json':
+        return 200, api_openapi()
+    if section and not can(section):
+        return 403, {'error': f'the section "{SECTION_TITLES[section]}" needs the permission "view"; groups give it (Users)',
+                     'status': 403}
+    fresh = query.get('fresh') == ['1']
+    data, error = status(fresh=fresh and route in ('/overview', '/projects', '/projects/{project}', '/backups'))
+    if data is None:
+        return 503, {'error': f'could not get the status: {error}', 'status': 503}
+    now = time.time()
+    page = Page(name, '', permissions)
+    if route == '/overview':
+        return 200, api_overview(data, now)
+    if route == '/backups':
+        return 200, api_backups(data, now)
+    units = data.get('units', {})
+    if route == '/projects':
+        return 200, {'generated_at': iso(data.get('generated', now)),
+                     'projects': [api_project(page, entry, units, now) for entry in data.get('projects', [])],
+                     'errors': list(data.get('errors') or [])}
+    entry = next((item for item in data.get('projects', []) if item.get('name') == project), None)
+    if entry is None:
+        return 404, {'error': f'there is no project {project}', 'status': 404}
+    if route == '/projects/{project}':
+        return 200, {'generated_at': iso(data.get('generated', now)), **api_project(page, entry, units, now, detail=True)}
+    if route == '/projects/{project}/pipelines':
+        return 200, api_pipelines(entry, fresh)
+    return 200, api_pull_requests(entry, fresh)
 
 
 def safe_target(target):
@@ -5108,6 +5608,7 @@ def handler(accounts):
     failures = {}  # client -> times of its wrong logins
     pending = Pending()
     lock = threading.Lock()
+    api_log_lock = threading.Lock()
 
     class Handler(BaseHTTPRequestHandler):
         server_version = 'setup-server-ui'
@@ -5135,13 +5636,20 @@ def handler(accounts):
         def client(self):
             return self.client_address[0]
 
-        def host_ok(self):
+        def host_ok(self, api=False):
             host = self.headers.get('Host', '')
             if re.sub(r':[0-9]+$', '', host) not in LOOPBACK_HOSTS:
                 log(f'refused {self.client()}: Host {host[:60]!r} (400)')
-                self.reply(400, 'Unexpected Host\n', 'text/plain; charset=utf-8')
+                if api:
+                    self.json_reply(400, {'error': 'unexpected Host', 'status': 400})
+                else:
+                    self.reply(400, 'Unexpected Host\n', 'text/plain; charset=utf-8')
                 return False
             return True
+
+        def json_reply(self, status, data, headers=()):
+            self.reply(status, json.dumps(data, indent=1, sort_keys=True, ensure_ascii=False) + '\n',
+                       'application/json; charset=utf-8', headers)
 
         def cookie(self):
             for part in self.headers.get('Cookie', '').split(';'):
@@ -5159,8 +5667,8 @@ def handler(accounts):
             except ValueError:
                 return self.client()
 
-        def limited(self):
-            """True (and the reply sent) when this client has had too many wrong logins lately."""
+        def limited(self, api=False):
+            """True (and the reply sent) when this client has had too many wrong logins (or API tokens) lately."""
             now = time.time()
             with lock:
                 recent = [moment for moment in failures.get(self.caller(), []) if now - moment < LOGIN_FAILURES[1]]
@@ -5168,8 +5676,11 @@ def handler(accounts):
             if len(recent) < LOGIN_FAILURES[0]:
                 return False
             log(f'refused {self.client()}: too many wrong logins (429)')
-            self.reply(429, Page.login_page('Too many failed attempts: wait a few minutes.'),
-                       headers=[('Retry-After', str(LOGIN_FAILURES[1]))])
+            headers = [('Retry-After', str(LOGIN_FAILURES[1]))]
+            if api:
+                self.json_reply(429, {'error': 'too many failed attempts: wait a few minutes', 'status': 429}, headers)
+            else:
+                self.reply(429, Page.login_page('Too many failed attempts: wait a few minutes.'), headers=headers)
             return True
 
         def failed(self):
@@ -5187,27 +5698,11 @@ def handler(accounts):
                 return None
             header = self.headers.get('Authorization', '')
             if header:
-                digest = hashlib.sha256(header.encode('utf-8', 'surrogateescape')).digest()
-                with lock:
-                    known = verified.get(digest)
-                if known and accounts.password_of(known[0]) == known[1]:  # same password, still enabled
-                    return known[0]
-                if self.limited():
-                    return None
-                given_user, given_password = '', ''
-                if header.startswith('Basic '):
-                    try:
-                        given_user, _, given_password = base64.b64decode(header[6:], validate=True).decode().partition(':')
-                    except (ValueError, UnicodeDecodeError):
-                        pass
-                if USER_NAME.fullmatch(given_user) and accounts.authenticate(given_user, given_password):
-                    with lock:
-                        if len(verified) > 64:
-                            verified.clear()
-                        verified[digest] = (given_user, accounts.password_of(given_user))
-                    return given_user
-                self.failed()
-                self.reply(401, self.page_text('Wrong name or password.'))
+                found = self.credentials(header)
+                if found:
+                    return found[1]
+                if found is None:
+                    self.reply(401, self.page_text('Wrong name or password.'))
                 return None
             name = accounts.session_user(self.cookie())
             if name:
@@ -5217,6 +5712,87 @@ def handler(accounts):
             else:
                 self.reply(401, self.page_text('You need to sign in.'))
             return None
+
+        def credentials(self, header, api=False):
+            """(kind, name) of an Authorization header: ('user', name) for Basic auth of an enabled user, ('token', name)
+            for the Bearer API token of an enabled one (on /api/ only). None when it is wrong (counted as a wrong login;
+            the caller replies), False when this client has had too many (the reply is sent)."""
+            digest = hashlib.sha256(header.encode('utf-8', 'surrogateescape')).digest()
+            with lock:
+                known = verified.get(digest)
+            if known and accounts.password_of(known[0]) == known[1]:  # same password, still enabled
+                return 'user', known[0]
+            if self.limited(api):
+                return False
+            if api and header.startswith('Bearer '):
+                name = accounts.token_name(header[7:].strip())
+                if name:
+                    return 'token', name
+                self.failed()
+                return None
+            given_user, given_password = '', ''
+            if header.startswith('Basic '):
+                try:
+                    given_user, _, given_password = base64.b64decode(header[6:], validate=True).decode().partition(':')
+                except (ValueError, UnicodeDecodeError):
+                    pass
+            if USER_NAME.fullmatch(given_user) and accounts.authenticate(given_user, given_password):
+                with lock:
+                    if len(verified) > 64:
+                        verified.clear()
+                    verified[digest] = (given_user, accounts.password_of(given_user))
+                return 'user', given_user
+            self.failed()
+            return None
+
+        # --- The API (/api/v1): JSON for agents, an API token or Basic auth; GET only ---
+        def api_get(self, path, query):
+            if not self.host_ok(api=True):
+                return
+            header = self.headers.get('Authorization', '')
+            found = self.credentials(header, api=True) if header else None
+            if found is False:
+                return self.api_logged('-', '-', 429)
+            if not found:
+                self.api_logged('-', '-', 401)
+                return self.json_reply(401, {'error': 'an API token is needed: Authorization: Bearer ops_… (Users → API tokens)',
+                                             'status': 401}, [('WWW-Authenticate', 'Bearer realm="Server OPS"')])
+            kind, name = found
+            code, data = api_answer(path, query, kind, name, accounts.permissions(name, 'tokens' if kind == 'token' else 'users'))
+            self.api_logged(kind, name, code)
+            self.json_reply(code, data)
+
+        def api_refused_method(self):
+            """Anything but GET or HEAD on the API: 405 (it changes nothing yet)."""
+            if not self.host_ok(api=True):
+                return
+            self.api_logged('-', '-', 405)
+            self.json_reply(405, {'error': f'{self.command[:10]} is not allowed: the API is read-only (GET)', 'status': 405},
+                            [('Allow', 'GET, HEAD')])
+
+        def api_logged(self, kind, name, code):
+            """One line in $STATE_DIRECTORY/api-access.log: time, caller, client, method, path, status (never a token).
+            Past API_LOG_LIMIT bytes it keeps its newest API_LOG_KEEP lines."""
+            stamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+            who = f'{kind}={name}' if kind != '-' else 'caller=-'
+            line = f'{stamp} {who} client={self.caller()} {self.command[:10]} {self.path[:300]} {code}'.replace('\n', ' ') + '\n'
+            path = STATE / 'api-access.log'
+            try:
+                with api_log_lock:
+                    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+                    with os.fdopen(descriptor, 'a') as handle:
+                        handle.write(line)
+                        grown = handle.tell() > API_LOG_LIMIT
+                    if grown:
+                        kept = path.read_text(errors='replace').splitlines(keepends=True)[-API_LOG_KEEP:]
+                        temporary = path.with_name(path.name + '.tmp')
+                        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+                        with os.fdopen(descriptor, 'w') as handle:
+                            handle.writelines(kept)
+                        os.replace(temporary, path)
+            except OSError as error:
+                log(f'{path}: {error}')
 
         def redirect(self, location, headers=()):
             self.send_response(303)
@@ -5252,6 +5828,8 @@ def handler(accounts):
         def do_GET(self):
             url = urlsplit(self.path)
             path, query = url.path, parse_qs(url.query)
+            if path == '/api' or path.startswith('/api/'):
+                return self.api_get(path, query)
             if path == '/ui.css':  # the login page needs it too; nothing in it is secret
                 return self.reply(200, STYLE, 'text/css; charset=utf-8')
             if path == '/login':
@@ -5306,6 +5884,16 @@ def handler(accounts):
                 if match[1] not in snapshot['users']:
                     return self.reply(404, page.refused(f'There is no user {match[1]}.'))
                 return self.reply(200, page.user_page(snapshot, match[1], self.people(), query, accounts.session_count(match[1])))
+            match = re.fullmatch(r'/tokens/(' + USER_NAME.pattern + ')', unquote(path))
+            if match:
+                snapshot = accounts.snapshot()
+                if match[1] == 'new':
+                    if not self.allowed(page, 'users', 'manage'):
+                        return
+                    return self.reply(200, page.token_page(snapshot, None, query))
+                if match[1] not in snapshot['tokens']:
+                    return self.reply(404, page.refused(f'There is no API token {match[1]}.'))
+                return self.reply(200, page.token_page(snapshot, match[1], query))
             match = re.fullmatch(r'/groups/(' + GROUP_ID.pattern + ')', path)
             if match:
                 snapshot = accounts.snapshot()
@@ -5446,6 +6034,8 @@ def handler(accounts):
 
         def do_POST(self):
             path = urlsplit(self.path).path
+            if path == '/api' or path.startswith('/api/'):
+                return self.api_refused_method()
             if not self.host_ok():
                 return
             origin = self.headers.get('Origin')
@@ -5478,7 +6068,9 @@ def handler(accounts):
             if path == '/account/password':
                 return self.change_password(page, name, form)
             changes = {'/users/save': self.save_user, '/users/delete': self.delete_user,
-                       '/groups/save': self.save_group, '/groups/delete': self.delete_group}
+                       '/groups/save': self.save_group, '/groups/delete': self.delete_group,
+                       '/tokens/save': self.save_token, '/tokens/regenerate': self.regenerate_token,
+                       '/tokens/delete': self.delete_token}
             if path in changes:
                 if not self.allowed(page, 'users', 'manage'):
                     return
@@ -5604,6 +6196,32 @@ def handler(accounts):
             self.change(name, f'group {identifier}: deleted', lambda: accounts.delete_group(identifier))
             self.redirect('/users?saved=1')
 
+        def save_token(self, page, name, form):
+            new = form.get('new') == '1'
+            token = value(form, 'name', USER_NAME, 'Name', required=True)
+            if new and token == 'new':
+                raise Invalid('The name "new" is taken (the new token page).')
+            groups = [key[6:] for key, chosen in form.items() if key.startswith('group:') and chosen == '1']
+            if any(not GROUP_ID.fullmatch(group) for group in groups):
+                raise Invalid('Invalid group.')
+            disabled = form.get('disabled') == '1'
+            what = (f'token {token}: {"created" if new else "saved"} groups={",".join(sorted(groups)) or "-"} '
+                    f'disabled={"yes" if disabled else "no"}')
+            text = self.change(name, what, lambda: accounts.save_token(token, new, groups, disabled))
+            if text:
+                return self.reply(200, page.token_shown(token, text, accounts.snapshot()))
+            self.redirect(f'/tokens/{quote(token)}?saved=1')
+
+        def regenerate_token(self, page, name, form):
+            token = value(form, 'name', USER_NAME, 'Name', required=True)
+            text = self.change(name, f'token {token}: regenerated', lambda: accounts.regenerate_token(token))
+            self.reply(200, page.token_shown(token, text, accounts.snapshot(), regenerated=True))
+
+        def delete_token(self, page, name, form):
+            token = value(form, 'name', USER_NAME, 'Name', required=True)
+            self.change(name, f'token {token}: deleted', lambda: accounts.delete_token(token))
+            self.redirect('/users?saved=1#tokens')
+
         def preview(self, page, name, form):
             builder = ACTIONS.get(form.get('action', ''))
             if builder is None:
@@ -5671,6 +6289,15 @@ def handler(accounts):
                 log(f'ui-actions.log: {failure}')
             CACHE.forget(('pipelines', plan.project))
             self.reply(200 if not error else 502, page.pipeline_result(plan, code, data, error))
+
+        def other_method(self):
+            """PUT, PATCH, DELETE, OPTIONS: 405 on the API, else not implemented."""
+            path = urlsplit(self.path).path
+            if path == '/api' or path.startswith('/api/'):
+                return self.api_refused_method()
+            self.send_error(501, 'Unsupported method')
+
+        do_PUT = do_PATCH = do_DELETE = do_OPTIONS = other_method
 
         def log_message(self, format, *arguments):  # refusals and errors only (log() above)
             pass

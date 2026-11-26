@@ -1324,7 +1324,7 @@ BITBUCKET_ACCESS_TOKEN=…                  # for all others (e.g. a workspace a
 ```
 
 The token is a Bitbucket *Repository* or *Workspace access token* (Bearer) with the permissions **Repositories: Read** and
-**Pipelines: Read, Write**. It is kept only in `ui.env` (root, 0600), the service gets it through the environment; it is
+**Pipelines: Read, Write** (and **Pull requests: Read** for the API's `pull-requests`, see "API for agents"). It is kept only in `ui.env` (root, 0600), the service gets it through the environment; it is
 not passed to commands, not shown on pages, not written to logs (the log has only the variable name). It is sent only to
 `api.bitbucket.org`, redirects are not followed.
 
@@ -1370,6 +1370,63 @@ systemctl status setup-server-ui
 journalctl -u setup-server-ui -n 50                 # rejected sign-ins and CSRF, errors
 sudo tail -n 20 /srv/setup-server/ui-actions.log
 ```
+
+### API for agents
+
+A read-only JSON API for LLM agents and scripts on other computers: when each project environment was deployed (which
+ref, commit and branch) and whether that worked, its backups against the backup policy, the newest pipeline runs and pull
+requests, what needs a look. It is part of the web UI (the same status and the same alarm logic as the pages), so it is
+reached the same way: `https://ops.local/api/v1/…` on the LAN (nginx), or `http://localhost:9102/api/v1/…` through the
+SSH tunnel.
+
+**A token.** *Users* → *API tokens* → "+ New token": a name (who uses it, e.g. `release-agent`) and its groups. The groups
+decide what it reads, as they do for a user: the endpoints need "view" of *Overview* or *Projects* (make e.g. a group
+"Agents" with those two). The token (`ops_` and 43 characters) is shown **once**, on the page right after it is made;
+only its sha256 is kept (`accounts.json`, next to the users), it is never written to a log. Lost – "Regenerate" (the old one
+stops working at once). "Disabled" or deleted – its requests get `401`. "Last used" is updated at most every 5 minutes.
+Creating, changing, regenerating and deleting a token are `users token …` lines in `ui-actions.log` and need *Users*: manage.
+
+```bash
+export OPS_TOKEN=ops_…
+curl -s -H "Authorization: Bearer $OPS_TOKEN" https://ops.local/api/v1             # who am I, every endpoint
+curl -s -H "Authorization: Bearer $OPS_TOKEN" https://ops.local/api/v1/projects | jq '.projects[] | {name, state}'
+```
+
+(`ops.local` has a certificate of its own: give curl `--cacert` with it, or `-k` on a trusted LAN.)
+
+**Endpoints** (GET; JSON; `Cache-Control: no-store`; timestamps ISO 8601 UTC, ages in seconds; `ui` fields are paths of the web UI):
+
+| Path | Needs | What |
+|---|---|---|
+| `/api/v1` | a token | the caller, its permissions and every endpoint with a description (an agent's first call) |
+| `/api/v1/openapi.json` | a token | the OpenAPI 3.1 description |
+| `/api/v1/overview` | Overview: view | `attention` (the Overview's "Needs attention" as text: failed units, failed deploys, late or missing backups, disk), the units and timers, the versions of Server OPS and setup (commit, tag, how far behind), the free disk |
+| `/api/v1/projects` | Projects: view | every project: repositories, branch, `last_deploy_at`, and per environment `state` (ok / bad / idle) and `problems` (the words of the Projects board), `mode` (docker / files), `last_deploy` and `last_successful_deploy` (`at`, `ref`, `commit`, `branch`, `succeeded`, `failed`, `rollback`), `backup_policy`, and the newest backup of each series (`db-short`, `db-full`, `files`, `fresh`: `newest_at`, `age_seconds`, `size_bytes`, `count`) |
+| `/api/v1/projects/NAME` | Projects: view | one project as above, each environment also with its `target` (mode, ssh, path, Docker context), `containers` (name, state, health) and `secret_store` |
+| `/api/v1/projects/NAME/pipelines` | Projects: view | the newest Bitbucket pipeline runs (as on the project page): number, state, result, trigger, pipeline, ref, commit, pull request, times, link. A GitHub project: `runs: null` and a link to its Actions |
+| `/api/v1/projects/NAME/pull-requests` | Projects: view | the 10 most recently updated pull requests (open, merged, declined, superseded) of the environment repo and the code repo on Bitbucket, and `latest`: id, title, state, author, branches, merge commit, times, link |
+| `/api/v1/backups` | Projects: view | the *Backups* page as a list: every environment's policy, the newest backup of each series, `problems`, the late or missing first |
+
+`?fresh=1` reads again now: the status is otherwise cached for 10 s, Bitbucket's answers for a minute. Bitbucket is read
+with the same `BITBUCKET_ACCESS_TOKEN…` as the pipelines; without one (or on an error) the answer is `200` with
+`runs` / `pull_requests` `null` and `error` saying why. Errors are `{"error": …, "status": N}`: `401` (no or a wrong
+token; `WWW-Authenticate: Bearer`), `403` (the token's groups do not give the section), `404` (no such endpoint or
+project), `405` (any method but GET/HEAD), `429` (too many wrong tokens from one address: they count with the wrong
+sign-ins), `503` (the status could not be read).
+
+**What it never returns:** the values of env files (only the target's mode, SSH address, path and Docker context, as the
+project page shows them), passwords, tokens, the secret store's contents, database or backup contents.
+
+**Instead of a token** a script may send Basic auth of a UI user (as on the pages); a browser session cookie does not
+count for the API. **Log:** every API request is a line of `/var/lib/setup-server-ui/api-access.log` (`setup-ui`, 0600):
+time, `token=NAME` or `user=NAME` (`caller=-` when refused), the client (the LAN proxy's `X-Real-IP`), method, path and
+status – never the token. Past about 10 000 lines (1.5 MB) it keeps the newest 5000.
+
+```bash
+sudo tail -n 20 /var/lib/setup-server-ui/api-access.log
+```
+
+The API changes nothing yet: starting pipelines or test environments through it is a later step.
 
 ## Project containers on the server
 

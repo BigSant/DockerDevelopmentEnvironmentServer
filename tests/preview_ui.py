@@ -136,6 +136,11 @@ with patch.object(module.os, 'geteuid', return_value=0), patch.object(module.os,
     sys.exit(module.main(sys.argv[1:]))
 """)
     helper.chmod(0o755)
+    # An agent's API token (Users → API tokens): the group "Agents" reads the Overview and Projects.
+    case.request('POST', '/groups/save', {'csrf': case.csrf(), 'group': '', 'title': 'Agents', 'level:overview': 'view',
+                                          'level:projects': 'view'})
+    case.request('POST', '/tokens/save', {'csrf': case.csrf(), 'new': '1', 'name': 'release-agent', 'group:agents': '1'})
+    case.request('GET', '/api/v1', headers={'Authorization': 'Bearer ' + 'ops_' + 'x' * 43})  # a refused one, in the log
     stub = case.bin / 'sudo'
     stub.write_text(stub.read_text().replace('  */server-status) shift; exec "$SERVER_STATUS" "$@";;',
                                              '  */server-status) shift; exec "$SERVER_STATUS" "$@";;\n'
