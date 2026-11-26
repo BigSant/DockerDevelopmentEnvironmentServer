@@ -19,6 +19,8 @@ Usage: server-status                 versions, units, backup timer, disk and eve
        server-status --metrics       the worker's /metrics exposition (setup-server-metrics --once, as the
                                      setup account; no server, no token)
        server-status --projects      only the projects (the part that runs as the setup account)
+       server-status --deploys       every deploy in every project environment's history (deployments.json), with
+                                     its position there; the branch of the newest 20 of each (as the setup account)
        server-status --activity [KEY]
                                      what the developer keys did, newest first (backup-pulls.log and access.log:
                                      logins, downloads, shells and commands; a shell with its start, end and
@@ -409,6 +411,64 @@ def deploys(directory, environment, clone=None):
     completed = [entry for entry in entries if not entry.get('failed')]
     return {'last': shown(entries[-1]), 'last_success': shown(completed[-1]) if completed else None,
             'count': len(entries)}
+
+
+HISTORY_BRANCHES = 20  # the newest deploys of each environment whose branch --deploys looks up (git per commit)
+
+
+def deploy_history(build_root, errors):
+    """Every deploy of one build root's environments (setup's deployments.json of each, as it stands): for
+    --deploys, which the web UI's /api/v1/deploys journals. Each with its position in the history (setup only
+    appends to it and rewrites the last entry while that deploy runs), the full commit and the target's mode."""
+    directory = environment_directory(build_root)
+    if directory is None:
+        return []
+    monorepo = (build_root / '.git').is_dir() and not (build_root / 'app/.git').exists()
+    clone = code_checkout(development_checkout(build_root) or (build_root if monorepo else build_root / 'app'))
+    release = directory / '.generated/release'
+    try:
+        environments = sorted(item.name for item in release.iterdir() if item.is_dir() and not item.is_symlink()
+                              and ENVIRONMENT.fullmatch(item.name) and item.name not in ('local', 'test'))
+    except OSError:
+        return []
+    shared = parse_env(read_text(build_root / 'target.env'))
+    found = []
+    for environment in environments:
+        try:
+            text = read_text(release / environment / 'deployments.json')
+            entries = json.loads(text) if text is not None else []
+            if not isinstance(entries, list) or not all(isinstance(item, dict) for item in entries):
+                raise ValueError('not a list of deploys')
+            target = parse_env(read_text(build_root / f'target.{environment}.env')) or shared
+            mode = 'files' if target.get('DEPLOY_MODE') == 'files' else 'docker'
+            for index, item in enumerate(entries):
+                commit = next((value for value in (item.get('commit'), item.get('ref'))
+                               if isinstance(value, str) and COMMIT.fullmatch(value)), None)
+                branch = deployed_branch(clone, commit) if index >= len(entries) - HISTORY_BRANCHES else None
+                found.append({'project': build_root.name, 'environment': environment, 'index': index, 'mode': mode,
+                              'ref': str(item.get('ref') or '')[:100] or None, 'commit': commit,
+                              'at': timestamp(str(item['at'])), 'rollback': bool(item.get('rollback')),
+                              'failed': str(item['failed'])[:40] if item.get('failed') else None,
+                              'health': str(item['health'])[:20] if item.get('health') else None,
+                              'attempt': str(item['attempt'])[:100] if item.get('attempt') else None,
+                              'branch': (branch or {}).get('name')})
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            errors.append(f'{build_root.name} {environment}: deployments.json: {type(error).__name__}')
+    return found
+
+
+def deploy_histories():
+    """--deploys: every deploy of every build root under projects/."""
+    errors, found = ERRORS, []
+    try:
+        roots = sorted(PROJECTS.iterdir()) if PROJECTS.is_dir() else []
+    except OSError as error:
+        return {'deploys': [], 'errors': [*errors, f'{PROJECTS}: {error.strerror}']}
+    for build_root in roots:
+        if build_root.is_symlink() or not build_root.is_dir() or not NAME.fullmatch(build_root.name):
+            continue
+        found.extend(deploy_history(build_root, errors))
+    return {'deploys': found, 'errors': errors}
 
 
 def backups(directory, environment, prefix='worker'):
@@ -1095,6 +1155,9 @@ def main(arguments):
             result = files_listing(name, environment, archive)
         else:
             result = files_member(name, environment, archive, arguments[4])
+    elif arguments == ['--deploys']:
+        result = as_account(arguments, lambda error: {'deploys': [], 'errors': [f'deploys: {error}']}) \
+            if os.geteuid() == 0 else deploy_histories()
     elif arguments == ['--metrics']:
         result = as_account(arguments, lambda error: {'error': f'metrics: {error}'}) if os.geteuid() == 0 else metrics()
     elif arguments[:1] == ['--logs'] and len(arguments) <= 2:

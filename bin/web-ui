@@ -20,7 +20,8 @@ deploys, backups, pipelines, pull requests and alarms of the same status the pag
 sends an API token (Authorization: Bearer ops_…; made on the Users page, shown once, only its sha256 kept in
 accounts.json) or Basic auth of a user; the token's groups decide what it reads, as a user's do. No cookie counts
 there, nothing is changed through it (any other method: 405), and every request is a line of
-$STATE_DIRECTORY/api-access.log (never the token).
+$STATE_DIRECTORY/api-access.log (never the token). /api/v1/deploys journals the deploys it has seen in
+$STATE_DIRECTORY/deploy-journal.json, so a poller's cursor gives only what is new or changed since, across restarts.
 
 What it runs. Status: `sudo -n $LIBRARY/bin/server-status` (read-only, JSON: the overview, the logs, a project
 container's docker logs and the worker's /metrics). Actions: the root-owned copies
@@ -5305,6 +5306,9 @@ def path_section(path):
 API_PREFIX = '/api/v1'
 API_PROJECT = r'[a-z0-9][a-z0-9_-]{0,63}'
 API_LOG_LIMIT, API_LOG_KEEP = 1_500_000, 5000  # past about 10 000 lines (1.5 MB) the access log keeps its newest 5000
+# /api/v1/deploys: a call without ?since gives the newest DEPLOYS_FIRST; ?limit= defaults to DEPLOYS_LIMIT. The journal
+# keeps its newest DEPLOYS_KEPT records (a cursor older than that gets what is kept, with gap: true).
+DEPLOYS_FIRST, DEPLOYS_LIMIT, DEPLOYS_MAXIMUM, DEPLOYS_KEPT = 20, 200, 1000, 20000
 # (path, section it needs (None: any signed-in caller), what it returns): the index, the OpenAPI document and the
 # dispatcher all come from this one list.
 API_ROUTES = (
@@ -5322,6 +5326,10 @@ API_ROUTES = (
                                                       '(environment and code repository on Bitbucket), and the latest one.'),
     ('/backups', 'projects', 'Every project environment\'s backups in one list (the Backups page): policy, the newest backup of '
                              'each series, the late or missing ones.'),
+    ('/deploys', 'projects', 'The deploys of every project environment, oldest first, for polling: ?since=<cursor> gives only what '
+                             'is new or changed since that answer (a deploy shows again under its id when its outcome changes); '
+                             f'without it the newest {DEPLOYS_FIRST}. ?limit= (default {DEPLOYS_LIMIT}, at most {DEPLOYS_MAXIMUM}); '
+                             'more says whether another call with the new cursor has more.'),
 )
 
 
@@ -5448,6 +5456,118 @@ def api_backups(data, now):
             'late_or_missing': sum(1 for row in rows if row['state'] == 'bad')}
 
 
+def deploy_id(item):
+    """A deploy's id: the same for the life of its history entry (setup appends to deployments.json and rewrites only
+    the last entry, keeping its time, commit and attempt), so its later outcome comes under the same id; another
+    history at the same place (deleted and deployed again) gives other ids."""
+    key = '\0'.join(str(item.get(field) or '') for field in ('project', 'environment', 'index', 'at', 'commit', 'attempt'))
+    return 'd' + hashlib.sha256(key.encode()).hexdigest()[:20]
+
+
+def deploy_state(item):
+    """What a later answer reports again when it changes: the outcome and what goes with it."""
+    return [item.get(field) for field in ('failed', 'health', 'rollback')]
+
+
+class DeployJournal:
+    """$STATE_DIRECTORY/deploy-journal.json: each deploy seen, and each change of its outcome, as a record with a
+    sequence number; a cursor is the journal's generation and the last number an answer gave. Kept across restarts,
+    so a cursor stays good; a journal made anew (lost, unreadable) has another generation, and an old cursor then
+    gets everything kept, with reset: true."""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+
+    def load(self):
+        try:
+            data = json.loads(self.path.read_text())
+            if isinstance(data, dict) and re.fullmatch(r'[0-9a-f]{12}', str(data.get('generation'))) and \
+                    isinstance(data.get('seq'), int) and isinstance(data.get('known'), dict) and isinstance(data.get('records'), list):
+                return data
+        except (OSError, ValueError):
+            pass
+        return {'generation': secrets.token_hex(6), 'seq': 0, 'known': {}, 'records': []}
+
+    def save(self, data):
+        STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temporary = self.path.with_name(self.path.name + '.tmp')
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(descriptor, 'w') as handle:
+            json.dump(data, handle, separators=(',', ':'))
+        os.replace(temporary, self.path)
+
+    def update(self, deploys):
+        """The journal with what is new or changed in these deploys (server-status --deploys) recorded."""
+        with self.lock:
+            data = self.load()
+            changed = []
+            for item in deploys:
+                if not isinstance(item, dict) or not isinstance(item.get('at'), int):
+                    continue
+                identifier, state = deploy_id(item), deploy_state(item)
+                if data['known'].get(identifier) != state:
+                    changed.append((item, identifier, state))
+            if changed or not self.path.exists():
+                changed.sort(key=lambda found: (found[0]['at'], str(found[0].get('project')),
+                                                str(found[0].get('environment')), found[0].get('index') or 0))
+                for item, identifier, state in changed:
+                    data['seq'] += 1
+                    data['known'][identifier] = state
+                    data['records'].append({'seq': data['seq'], 'id': identifier, **{
+                        key: item.get(key) for key in ('project', 'environment', 'mode', 'ref', 'commit', 'branch', 'at',
+                                                       'failed', 'health', 'rollback', 'attempt')}})
+                data['records'] = data['records'][-DEPLOYS_KEPT:]
+                self.save(data)
+            return data
+
+
+DEPLOY_JOURNAL = DeployJournal(STATE / 'deploy-journal.json')
+
+
+def api_deploy_record(record):
+    failed = record.get('failed')
+    return {'id': record['id'], 'project': record.get('project'), 'environment': record.get('environment'),
+            'mode': record.get('mode'), 'ref': record.get('ref'), 'commit': record.get('commit'),
+            'branch': record.get('branch'), 'at': iso(record.get('at')),
+            'outcome': 'succeeded' if not failed else 'incomplete' if failed == 'incomplete' else 'failed',
+            'succeeded': not failed, 'failed_step': failed if failed and failed != 'incomplete' else None,
+            'health': record.get('health'), 'rollback': bool(record.get('rollback')), 'attempt': record.get('attempt')}
+
+
+def api_deploys(query, fresh):
+    """(status, JSON) of /api/v1/deploys."""
+    since, limit = (query.get('since') or [None])[0], (query.get('limit') or [None])[0]
+    if limit is not None and not (limit.isdigit() and 1 <= int(limit) <= DEPLOYS_MAXIMUM):
+        return 400, {'error': f'limit must be 1 to {DEPLOYS_MAXIMUM}', 'status': 400}
+    cursor = re.fullmatch(r'([0-9a-f]{12})\.([0-9]{1,12})', since or '')
+    if since is not None and not cursor:
+        return 400, {'error': 'since must be a cursor this endpoint gave', 'status': 400}
+    found, error = CACHE.get('deploys', STATUS_TTL, lambda: helper('--deploys'), fresh, since=last_job_end())
+    if found is None:
+        return 503, {'error': f'could not read the deploy histories: {error}', 'status': 503}
+    try:
+        data = DEPLOY_JOURNAL.update(found.get('deploys') or [])
+    except OSError as failure:
+        return 503, {'error': f'the deploy journal: {failure.strerror}', 'status': 503}
+    records, reset, gap = data['records'], False, False
+    if cursor is None:
+        chosen = records[-min(int(limit or DEPLOYS_FIRST), DEPLOYS_FIRST):] if records else []
+        more = False
+    else:
+        if cursor[1] == data['generation'] and int(cursor[2]) <= data['seq']:
+            after = int(cursor[2])
+            gap = bool(records) and records[0]['seq'] > after + 1
+        else:
+            after, reset = 0, True
+        newer = [record for record in records if record['seq'] > after]
+        chosen = newer[:int(limit or DEPLOYS_LIMIT)]
+        more = len(newer) > len(chosen)
+    last = chosen[-1]['seq'] if chosen and more else data['seq']
+    return 200, {'deploys': [api_deploy_record(record) for record in chosen], 'cursor': f'{data["generation"]}.{last}',
+                 'more': more, 'reset': reset, 'gap': gap, 'errors': list(found.get('errors') or [])}
+
+
 def api_run(run, repository):
     """One Bitbucket pipeline run, as the API shows it."""
     state = run.get('state') or {}
@@ -5523,15 +5643,24 @@ def api_openapi():
     fresh = {'name': 'fresh', 'in': 'query', 'required': False, 'description': '1: read again now instead of the cached answer',
              'schema': {'type': 'string', 'enum': ['1']}}
     error = {'description': 'error', 'content': {'application/json': {'schema': {'$ref': '#/components/schemas/Error'}}}}
+    deploys = [{'name': 'since', 'in': 'query', 'required': False,
+                'description': 'the cursor of the previous answer: only the deploys new or changed since then',
+                'schema': {'type': 'string', 'pattern': r'^[0-9a-f]{12}\.[0-9]{1,12}$'}},
+               {'name': 'limit', 'in': 'query', 'required': False,
+                'description': f'at most this many (default {DEPLOYS_LIMIT}; without since at most {DEPLOYS_FIRST})',
+                'schema': {'type': 'integer', 'minimum': 1, 'maximum': DEPLOYS_MAXIMUM}}]
     paths = {}
     for route, section, text in API_ROUTES:
-        parameters = ([project] if '{project}' in route else []) + ([fresh] if route != '/openapi.json' and route != '' else [])
+        parameters = ([project] if '{project}' in route else []) + ([fresh] if route != '/openapi.json' and route != '' else []) + \
+            (deploys if route == '/deploys' else [])
         responses = {'200': {'description': 'OK', 'content': {'application/json': {'schema': {'type': 'object'}}}},
                      '401': error}
         if section:
             responses['403'] = error
         if '{project}' in route:
             responses['404'] = error
+        if route == '/deploys':
+            responses['400'] = error
         if section:
             responses['503'] = error
         paths[API_PREFIX + route] = {'get': {
@@ -5573,6 +5702,8 @@ def api_answer(path, query, kind, name, permissions):
         return 403, {'error': f'the section "{SECTION_TITLES[section]}" needs the permission "view"; groups give it (Users)',
                      'status': 403}
     fresh = query.get('fresh') == ['1']
+    if route == '/deploys':
+        return api_deploys(query, fresh)
     data, error = status(fresh=fresh and route in ('/overview', '/projects', '/projects/{project}', '/backups'))
     if data is None:
         return 503, {'error': f'could not get the status: {error}', 'status': 503}

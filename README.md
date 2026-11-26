@@ -1406,6 +1406,24 @@ curl -s -H "Authorization: Bearer $OPS_TOKEN" https://ops.local/api/v1/projects 
 | `/api/v1/projects/NAME/pipelines` | Projects: view | the newest Bitbucket pipeline runs (as on the project page): number, state, result, trigger, pipeline, ref, commit, pull request, times, link. A GitHub project: `runs: null` and a link to its Actions |
 | `/api/v1/projects/NAME/pull-requests` | Projects: view | the 10 most recently updated pull requests (open, merged, declined, superseded) of the environment repo and the code repo on Bitbucket, and `latest`: id, title, state, author, branches, merge commit, times, link |
 | `/api/v1/backups` | Projects: view | the *Backups* page as a list: every environment's policy, the newest backup of each series, `problems`, the late or missing first |
+| `/api/v1/deploys` | Projects: view | every deploy of every project environment, oldest first, for polling: `?since=CURSOR` gives only the deploys new or changed since the answer that gave the cursor (see below) |
+
+**Polling deploys** (`/api/v1/deploys`). The answer is `{"deploys": [...], "cursor": "…", "more", "reset", "gap", "errors"}`;
+send `cursor` back as `?since=` next time. Without `since` it gives the newest 20 (no replay of the history) and a
+cursor after them; with it, what came since, at most `?limit=` (default 200, at most 1000; `more: true`: call again
+with the new cursor). Each deploy: `id`, `project`, `environment`, `mode` (docker / files: its target now), `ref`,
+`commit`, `branch` (the code repo's branch holding it; the newest 20 per environment, else `null`), `at`,
+`outcome` (`succeeded`, `failed` or `incomplete`: running now, or killed), `succeeded`, `failed_step`, `health`,
+`rollback`, `attempt` (setup's attempt id, when the deploy had one). setup records a deploy as `incomplete` as soon
+as the code reaches the target and rewrites that entry when it completes or fails, so **a deploy comes again under
+the same `id` when its outcome changes** – keep the newest per `id`. The id is a hash of the project, environment,
+position in that environment's `deployments.json`, time, commit and attempt: setup only appends to the history and
+keeps those fields when it rewrites the last entry, so the id holds for the entry's life (a deleted and remade
+history gives new ids). Server OPS keeps a journal of what it has seen and when (`deploy-journal.json` beside the
+access log, newest 20 000 records); the cursor is that journal's generation and the last record given, so it survives
+restarts. A cursor of another journal (the file lost) gets everything kept with `reset: true`; one older than what is
+kept gets what is kept with `gap: true` – the ids tell what is known already. A bad `since` or `limit` is `400`. A
+change shows up within 10 s (the cache; `?fresh=1` reads again now), the same way as on the pages.
 
 `?fresh=1` reads again now: the status is otherwise cached for 10 s, Bitbucket's answers for a minute. Bitbucket is read
 with the same `BITBUCKET_ACCESS_TOKEN…` as the pipelines; without one (or on an error) the answer is `200` with

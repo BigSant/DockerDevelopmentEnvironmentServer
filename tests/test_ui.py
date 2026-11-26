@@ -1244,6 +1244,54 @@ class WebUiTest(Worker):
         for secret in ("never-shown-password", PROJECT_TOKEN, GENERAL_TOKEN, PASSWORD, PASSWORD_HASH, token):
             self.assertNotIn(secret, answers)
 
+    def test_the_api_lists_deploys_and_then_only_what_changed(self):
+        token, _ = self.new_token("poller", [self.agents_group(projects="view")])
+        self.assertEqual(self.api_call("/api/v1/deploys")[0], 401)
+        status, headers, body = self.api_call("/api/v1/deploys", token)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual([(item["project"], item["environment"], item["ref"]) for item in body["deploys"]],
+                         [("alpha_shop", "prod", "v1.1.0"), ("alpha_shop", "prod", "v1.0.0")], "oldest first")
+        first = body["deploys"][1]
+        self.assertEqual({key: first[key] for key in ("mode", "commit", "at", "succeeded", "outcome", "rollback", "attempt")},
+                         {"mode": "docker", "commit": "a" * 40, "at": "2026-10-06T08:30:00Z", "succeeded": True,
+                          "outcome": "succeeded", "rollback": True, "attempt": None})
+        self.assertRegex(first["id"], r"^d[0-9a-f]{20}$")
+        cursor = body["cursor"]
+        self.assertRegex(cursor, r"^[0-9a-f]{12}\.2$")
+        self.assertEqual((body["more"], body["reset"], body["gap"]), (False, False, False))
+        # Nothing new: nothing; the same cursor back.
+        body = self.api_call(f"/api/v1/deploys?since={cursor}", token)[2]
+        self.assertEqual((body["deploys"], body["cursor"]), ([], cursor))
+        # A deploy starts (recorded as incomplete), then completes: each comes once, the second under the same id.
+        directory = self.tree.projects / "alpha_shop/app"
+        running = entry("v1.2.0", "c" * 40, "2026-10-07T09:00:00+00:00", attempt="manual-9", failed="incomplete")
+        history = [entry("v1.1.0", "b" * 40, "2026-10-05T10:00:00+00:00"),
+                   entry("v1.0.0", "a" * 40, "2026-10-06T08:30:00+00:00", rollback=True)]
+        self.tree.deployments(directory, "prod", history + [running])
+        body = self.api_call(f"/api/v1/deploys?since={cursor}&fresh=1", token)[2]
+        self.assertEqual([(item["ref"], item["outcome"], item["succeeded"], item["attempt"]) for item in body["deploys"]],
+                         [("v1.2.0", "incomplete", False, "manual-9")])
+        started, cursor = body["deploys"][0]["id"], body["cursor"]
+        self.tree.deployments(directory, "prod", history + [{**running, "failed": None, "health": "ok"}])
+        body = self.api_call(f"/api/v1/deploys?since={cursor}&fresh=1", token)[2]
+        self.assertEqual([(item["id"], item["outcome"], item["health"]) for item in body["deploys"]], [(started, "succeeded", "ok")])
+        # limit pages through; more tells there is more.
+        everything = self.api_call(f"/api/v1/deploys?since={cursor.split('.')[0]}.0", token)[2]
+        self.assertEqual(len(everything["deploys"]), 4)
+        page = self.api_call(f"/api/v1/deploys?since={cursor.split('.')[0]}.0&limit=3", token)[2]
+        self.assertEqual((len(page["deploys"]), page["more"]), (3, True))
+        rest = self.api_call(f"/api/v1/deploys?since={page['cursor']}&limit=3", token)[2]
+        self.assertEqual(([item["id"] for item in rest["deploys"]], rest["more"]), ([started], False))
+        # Kept across restarts (a file); a cursor of another journal gets everything kept, with reset.
+        self.assertTrue((self.state / "deploy-journal.json").is_file())
+        body = self.api_call("/api/v1/deploys?since=000000000000.5", token)[2]
+        self.assertEqual((len(body["deploys"]), body["reset"]), (4, True))
+        for wrong in ("since=x", "since=abc.1", "limit=0", "limit=1001", "limit=x"):
+            self.assertEqual(self.api_call(f"/api/v1/deploys?{wrong}", token)[0], 400, wrong)
+        self.assertEqual(self.api_call("/api/v1/deploys", token, method="POST")[0], 405)
+        self.assertIn("token=poller", (self.state / "api-access.log").read_text())
+
     def test_the_api_reads_pipelines_and_pull_requests_from_bitbucket(self):
         token, _ = self.new_token("agent", [self.agents_group(projects="view")])
         status, _, body = self.api_call("/api/v1/projects/alpha_shop/pipelines", token)
