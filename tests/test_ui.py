@@ -1418,6 +1418,11 @@ class WebUiTest(Worker):
         self.assertEqual((run["url"], run["grep"], run["status"]), ("https://stage.alpha.example", "^(?=.*(?:@stage(?![\\w-])))(?=.*(?:@cart))", "queued"))
         status, _, again = post("/api/v1/runs", {"target": "stage", "project": "alpha_shop", "client_run_id": "ci-7"})
         self.assertEqual((status, again["run"]["id"], again["created"]), (200, run["id"], False))
+        for _ in range(2):  # stopping is idempotent: a finished run comes back as it is
+            status, _, stopped = post(f"/api/v1/runs/{run['id']}/cancel", {})
+            self.assertEqual(status, 200, stopped)
+            self.assertIn(stopped["run"]["status"], ("cancelled", "error"))
+        self.assertEqual(post("/api/v1/runs/run-000000000000/cancel", {})[0], 404)
         status, _, shown = self.api_call(f"/api/v1/runs/{run['id']}", viewer)
         self.assertEqual((status, shown["run"]["id"]), (200, run["id"]))
         # The run's worker finds no setup here and ends with an error; then an artifact streams with its size and type.
@@ -1425,7 +1430,7 @@ class WebUiTest(Worker):
             if self.api_call(f"/api/v1/runs/{run['id']}", viewer)[2]["run"]["status"] not in ("queued", "running"):
                 break
             time.sleep(0.05)
-        self.assertEqual(self.api_call(f"/api/v1/runs/{run['id']}", viewer)[2]["run"]["status"], "error")
+        self.assertIn(self.api_call(f"/api/v1/runs/{run['id']}", viewer)[2]["run"]["status"], ("error", "cancelled"))
         artifacts = self.tree.root / "test-runs" / run["id"] / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
         (artifacts / "001-test-failed-1.png").write_bytes(b"PNG fake!")

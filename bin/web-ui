@@ -5769,6 +5769,8 @@ TESTENV_ROUTES = (
                                 'storage_states?} → 202 {run} (200 with the existing run for a client_run_id given again).'),
     ('GET', '/runs/{run}', 'view', 'A run: status, summary {passed, failed, flaky, skipped, duration_s} and each test that '
                                    'did not pass.'),
+    ('POST', '/runs/{run}/cancel', 'manage', 'Stop a run: status cancelled. Idempotent: a finished (or already cancelled) run is '
+                                             'returned as it is, 200 either way.'),
     ('GET', '/runs/{run}/artifacts/{name}', 'view', 'One artifact of a run (trace, screenshot, video, error context).'),
 )
 TESTENV_PLACES = {'{session}': TESTENV_SESSION, '{run}': TESTENV_RUN, '{name}': TESTENV_ARTIFACT}
@@ -5858,6 +5860,9 @@ def testenv_request(method, route, places, query, body, caller):
     if route == '/test-sessions/{session}':
         status, data = test_session_helper(['destroy', '--id', session, '--by', caller])
         return (202 if status == 200 else status), data, f'destroy id={session} status={status}'
+    if route == '/runs/{run}/cancel':
+        status, data = test_session_helper(['cancel', '--id', run, '--by', caller])
+        return status, data, f'cancel id={run} result={(data.get("run") or {}).get("status", "-")} status={status}'
     if route in ('/runs', '/snapshots', '/test-sessions/{session}/snapshot'):
         request = dict(body)
         if route == '/test-sessions/{session}/snapshot':

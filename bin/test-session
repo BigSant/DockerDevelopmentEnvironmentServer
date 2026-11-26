@@ -27,6 +27,7 @@ Usage (as the UI calls it; every value is checked again here):
   test-session list | show --id ID | extend --id ID --minutes M | destroy --id ID --by CALLER
   test-session run --request FILE --by CALLER          (FILE: the JSON request, see README "Test environments")
   test-session run-show --id RUN | runs [--session ID] | artifact --id RUN --name NAME   (artifact: raw bytes)
+  test-session cancel --id RUN --by CALLER             (idempotent: a finished run is returned as it is)
   test-session snapshot --request FILE --by CALLER
   test-session reconcile                               (the timer: expiry, crashed workers, orphans, old runs)
 """
@@ -86,10 +87,15 @@ DOM_LIMIT = 200_000
 TERMINAL = ('passed', 'failed', 'error', 'cancelled', 'done')
 
 
+# The refusals that mean "no room now, try again later" (a client may retry them), not a bad request or a broken server.
+CAPACITY = ('memory', 'disk', 'session_exists', 'run_active', 'deploy_locked')
+
+
 class Refusal(Exception):
     def __init__(self, status, error, reason=None, **extra):
         super().__init__(error)
-        self.answer = {'error': error, 'status': status, **({'reason': reason} if reason else {}), **extra}
+        self.answer = {'error': error, 'status': status, **({'reason': reason} if reason else {}),
+                       **({'capacity': True} if reason in CAPACITY else {}), **extra}
 
 
 def now():
@@ -733,12 +739,14 @@ def run_dir(identifier):
 
 def public_run(data):
     shown = {key: data.get(key) for key in ('id', 'kind', 'status', 'target', 'project', 'environment', 'session', 'url',
-                                            'env_ref', 'env_commit', 'grep', 'grep_invert', 'files', 'deploy_check',
+                                            'env_ref', 'env_commit', 'shop_commit', 'grep', 'grep_invert', 'files', 'deploy_check',
                                             'stage_write_safe', 'patch_sha256', 'patch_files', 'client_run_id', 'step',
                                             'error', 'summary', 'tests', 'artifacts', 'created_by', 'roles', 'path',
                                             'snapshot')}
     shown.update(created_at=iso(data.get('created_at')), started_at=iso(data.get('started_at')),
-                 finished_at=iso(data.get('finished_at')))
+                 finished_at=iso(data.get('finished_at')), cancelled_by=data.get('cancelled_by'),
+                 # passed/failed: Playwright ran and reported (failed: some tests did not pass); error/cancelled: it did not.
+                 executed=data.get('status') in ('passed', 'failed', 'done') if data.get('status') in TERMINAL else None)
     return {key: value for key, value in shown.items() if value is not None}
 
 
@@ -824,6 +832,7 @@ def start_run(request, by, manage, states, kind='run'):
             raise Refusal(409, f'session {session["id"]} is {session["status"]}', 'session_not_ready')
         data['session'] = session['id']
         data['url'] = f'https://{session["domain"]}' if session.get('domain') else None
+        data.update(env_ref=session.get('env_ref'), env_commit=session.get('env_commit'), shop_commit=session.get('shop_commit'))
     else:
         if request.get('session'):
             raise Refusal(400, 'session goes with target test only')
@@ -883,8 +892,9 @@ def external_app(data, log):
     relative = docker_directory(root)
     repo = EXTERNAL / data['project'] / 'repo'
     commit = clone(root, repo, data['env_ref'], log)
-    if (root / 'app/public/.git').exists():
-        code_clone(root, repo, None, log)
+    shop = code_clone(root, repo, None, log)
+    if shop:
+        update_run(data['id'], shop_commit=shop)
     app = repo / relative
     write_local_env(app, data['project'])
     return app, commit
@@ -934,7 +944,7 @@ def run_worker(identifier):
             arguments += [f'url={data["url"]}', f'data={results}']
         code = make(log, app, 'e2e', *arguments, timeout=limits['TEST_RUN_TIMEOUT_MINUTES'] * 60)
         if (read_json(directory / 'run.json') or {}).get('status') == 'cancelled':
-            return
+            return  # cancel_run set the outcome
         parsed = read_json(report)
         if not isinstance(parsed, dict) or 'suites' not in parsed:
             raise RuntimeError('Playwright wrote no report' + (' (timed out)' if code == 124 else f' (exit {code})'))
@@ -951,7 +961,8 @@ def run_worker(identifier):
     except Exception as error:  # noqa: BLE001 - the run must never stay "running"
         message = error.answer['error'] if isinstance(error, Refusal) else str(error)
         say(log, f'error at {step}: {message}')
-        update_run(identifier, status='error', step=step, error=message, finished_at=now(), worker=None)
+        if (read_json(directory / 'run.json') or {}).get('status') != 'cancelled':
+            update_run(identifier, status='error', step=step, error=message, finished_at=now(), worker=None)
     finally:
         if data['target'] == 'test':
             with contextlib.suppress(Refusal, OSError):
@@ -984,8 +995,9 @@ ANSI = re.compile(r'\x1b\[[0-9;]*m')
 def digest(report, results, target, limit_mb):
     """(summary, the tests that did not pass, the artifacts copied) of a Playwright JSON report."""
     stats = report.get('stats') or {}
-    summary = {'passed': stats.get('expected', 0), 'failed': stats.get('unexpected', 0), 'flaky': stats.get('flaky', 0),
-               'skipped': stats.get('skipped', 0), 'duration_s': round((stats.get('duration') or 0) / 1000, 1)}
+    summary = {'passed': int(stats.get('expected') or 0), 'failed': int(stats.get('unexpected') or 0),
+               'flaky': int(stats.get('flaky') or 0), 'skipped': int(stats.get('skipped') or 0),
+               'duration_s': round(float(stats.get('duration') or 0) / 1000, 1)}
     tests, artifacts, budget, number = [], [], limit_mb * 1024 * 1024, 0
     target.mkdir(exist_ok=True)
     for suite in report.get('suites') or []:
@@ -1024,22 +1036,31 @@ def digest(report, results, target, limit_mb):
                     item['test_id'] = test_id
                 location = error.get('location') or {}
                 tests.append({'test_id': test_id, 'file': file, 'title': title, 'status': status,
-                              'attempts': len(results_list), 'error': message,
+                              'attempts': max(1, len(results_list)), 'error': message,
                               'step': failed_step(last.get('steps')) or (f'{str(location.get("file", file)).removeprefix("/e2e/tests/")}:{location["line"]}'
                                                                          if location.get('line') else None),
                               'artifacts': names, 'project': test.get('projectName') or None})
     return summary, tests, artifacts
 
 
-def cancel_run(identifier, why):
+def cancel_run(identifier, why, by=None):
+    """Stop a queued or running run: its worker, its Playwright container; status cancelled. A finished run is left as it
+    is (cancelling is idempotent). The run as it is afterwards."""
     data = read_json(run_dir(identifier) / 'run.json')
     if not data or data.get('status') in TERMINAL:
-        return
+        return data
+    data = update_run(identifier, status='cancelled', error=why, finished_at=now(), cancelled_by=by)
     if data.get('worker') and alive(data['worker']):
         with contextlib.suppress(OSError):
             os.killpg(int(data['worker']), signal.SIGTERM)
     subprocess.run(['docker', 'stop', '--time', '5', identifier], capture_output=True)
-    update_run(identifier, status='cancelled', error=why, finished_at=now(), worker=None)
+    data = update_run(identifier, worker=None)
+    if data.get('session'):
+        with contextlib.suppress(Refusal, OSError):
+            session = find_session(data['session'])
+            if session.get('active_run') == identifier:
+                update_session(session['project'], active_run=None)
+    return data
 
 
 # --- Snapshots -------------------------------------------------------------------------------------
@@ -1216,7 +1237,7 @@ def read_request(path):
 def main(arguments):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('command', choices=('create', 'list', 'show', 'extend', 'destroy', 'run', 'run-show', 'runs',
-                                            'artifact', 'snapshot', 'reconcile', 'create-worker', 'destroy-worker',
+                                            'artifact', 'snapshot', 'cancel', 'reconcile', 'create-worker', 'destroy-worker',
                                             'run-worker'))
     parser.add_argument('--project')
     parser.add_argument('--db')
@@ -1281,6 +1302,9 @@ def dispatch(options):
         states = json.loads(options.states or '{}')
         data, created = start_run(request, options.by, options.manage, states, 'run' if command == 'run' else 'snapshot')
         return answer({'run': data, 'created': created})
+    if command == 'cancel':
+        find_run(options.id)
+        return answer({'run': public_run(cancel_run(options.id, f'cancelled by {options.by}', options.by))})
     if command == 'run-show':
         return answer({'run': public_run(find_run(options.id))})
     if command == 'runs':

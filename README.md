@@ -835,7 +835,7 @@ sudo journalctl -u setup-server-test-sessions --since -5min --no-pager  # {"reco
 sudo -u setup-ui sudo -n /usr/local/lib/setup-server/bin/test-session list   # {"sessions": []}
 sudo -u setup make -s -f /srv/setup-server/setup/docker/project.mk setup-capabilities  # … test-session-v1
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9102/api/v1          # 401 without a token
-curl -s -H "Authorization: Bearer $OPS_TOKEN" http://127.0.0.1:9102/api/v1 | jq '[.endpoints[] | select(.needs == "testenv: manage")] | length'  # 6
+curl -s -H "Authorization: Bearer $OPS_TOKEN" http://127.0.0.1:9102/api/v1 | jq '[.endpoints[] | select(.needs == "testenv: manage")] | length'  # 7
 ```
 
 ### Automatic update of local clones
@@ -1558,18 +1558,23 @@ containers of session Compose projects no session owns, and deletes old runs.
 | `GET /runs[?session=ID]` | testenv: view | `{"runs": [Run…]}` (newest 200) |
 | `POST /runs` | testenv: manage | `202 {"run": Run, "created": true}`; `200 … "created": false` for a known `client_run_id` |
 | `GET /runs/{id}` | testenv: view | `{"run": Run}` |
+| `POST /runs/{id}/cancel` | testenv: manage | `200 {"run": Run}`: a queued or running run is stopped (worker and container) and ends `cancelled`; a finished or already cancelled one comes back unchanged (idempotent) |
 | `GET /runs/{id}/artifacts/{name}` | testenv: view | the file (`Content-Type` by its extension, `Content-Disposition: attachment`) |
 
 Session: `id` (`ts-` + 12 hex), `project`, `status` (`creating` → `ready`; `failed`, `destroying`, `destroyed`,
 `expired`), `step` (while creating: `clone`, `test-init`, `build`, `test-prepare`, `e2e-install`), `error`, `db`,
 `env_ref`, `env_commit`, `shop_ref`, `shop_commit`, `created_at`, `ready_at`, `expires_at`, `max_expires_at`,
 `ended_at`, `created_by`, `active_run`, `domain`, `url` (the in-network address) and `reachable`.
-Run: `id` (`run-`/`snap-` + 12 hex), `kind` (`run`/`snapshot`), `status` (`queued` → `running` → `passed` | `failed` |
-`error` | `cancelled`; a snapshot `done` | `error`), `step`, `error`, `target`, `project`, `session` or `environment`,
-`url`, `env_ref`, `env_commit`, `grep`/`grep_invert` (what Playwright got), `files`, `deploy_check`, `stage_write_safe`,
+Run: `id` (`run-`/`snap-` + 12 hex), `kind` (`run`/`snapshot`), `status` – `queued`, `running`, then one of: `passed`
+(Playwright ran, every selected test passed or was flaky), `failed` (Playwright ran and reported, at least one test
+failed – including timed out and interrupted ones), `error` (the run could not be carried out: clone, patch, install,
+no report, timeout; see `error` and `step`), `cancelled` (stopped by `cancel`, the session's end or the timer); a
+snapshot ends `done` or `error`. `executed` (once finished): `true` for `passed`/`failed`/`done`, `false` for
+`error`/`cancelled`. Also `step`, `error`, `target`, `project`, `session` (test) or `environment` (stage/live), `url`,
+`env_ref`, `env_commit` (40 hex), `shop_commit` (40 hex, when `app/public` is its own repository), `cancelled_by`, `grep`/`grep_invert` (what Playwright got), `files`, `deploy_check`, `stage_write_safe`,
 `patch_sha256`, `patch_files`, `client_run_id`, `roles`, `created_by`, times, and when done `summary` `{passed, failed,
 flaky, skipped, duration_s}`, `tests` (each that did not pass: `test_id` = file + " › " + the full title, `file`,
-`title`, `status` `failed`|`flaky`|`skipped`, `attempts`, `error` (the message, colours removed), `step` (the failing
+`title`, `status` `failed`|`flaky`|`skipped`, `attempts` (≥ 1), `error` (the message, colours removed), `step` (the failing
 step, else `file:line`), `artifacts`, `project`), `artifacts` (`name`, `size`, `content_type`, `test_id`).
 
 ```bash
@@ -1602,7 +1607,8 @@ A finished run, as `GET /runs/{id}` answers it (shortened):
 Refusals are `{"error", "status", "reason"?}`: `400` (a bad value: the message says which), `403` (the permission, or
 `stage_write_safe` without "manage"), `404`, `405`, `409` (`reason`: `memory`, `disk`, `session_exists`,
 `deploy_locked`, `session_not_ready`, `session_ended`, `run_active`, `storage_state_missing`, `storage_state_expired`;
-a memory or disk refusal also has `needed_mb` and `available_mb`), `413`, `503` (setup too old, the helper failed).
+a memory or disk refusal also has `needed_mb` and `available_mb`; the capacity refusals – `memory`, `disk`,
+`session_exists`, `run_active`, `deploy_locked` – also carry `"capacity": true`: no room now, retry later), `413`, `503` (setup too old, the helper failed).
 
 **Verified with a fixture.** `tests/fixtures/test_session_project.py PARENT SETUP --lock` writes a generic project
 with a TypeScript Playwright project (one dependency, tests for every target, a failing test and the patch that

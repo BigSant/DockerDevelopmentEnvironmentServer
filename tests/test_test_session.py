@@ -223,7 +223,7 @@ class TestSessionTest(unittest.TestCase):
         again, created = self.ts.start_run({"target": "stage", "project": "alpha", "client_run_id": "ci-1"}, "token:a", True, {})
         self.assertEqual((again["id"], created), (first["id"], False))
         answer = self.refused(409, self.ts.start_run, {"target": "live", "project": "alpha"}, "token:b", True, {}, reason="run_active")
-        self.assertEqual(answer["run"], first["id"])
+        self.assertEqual((answer["run"], answer["capacity"]), (first["id"], True))
         self.assertEqual(len(self.detached), 1)
         (self.root / "etc/test-sessions.env").write_text("TEST_URL_ALPHA_PROD=http://10.0.0.5:8080/\n")
         self.ts.update_run(first["id"], status="passed")
@@ -237,6 +237,23 @@ class TestSessionTest(unittest.TestCase):
                                 ({"target": "stage", "project": "alpha", "client_run_id": "bad id"}, 400)):
             with self.subTest(request=str(request)[:60]):
                 self.refused(status, self.ts.start_run, request, "token:c", True, {})
+
+    def test_cancelling_is_idempotent_and_ends_as_cancelled(self):
+        self.session(env_ref="master", env_commit="a" * 40, shop_commit="b" * 40)
+        run, _ = self.ts.start_run({"target": "test", "session": "ts-0123456789ab", "client_run_id": "asana-17"}, "t", True, {})
+        self.assertEqual((run["env_ref"], run["env_commit"], run["shop_commit"]), ("master", "a" * 40, "b" * 40))
+        self.assertNotIn("executed", run, "not known before it ends")
+        with patch.object(self.ts.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", "")):
+            first = self.ts.public_run(self.ts.cancel_run(run["id"], "cancelled by t", "t"))
+            again = self.ts.public_run(self.ts.cancel_run(run["id"], "cancelled by t", "t"))
+        self.assertEqual((first["status"], first["executed"], first["cancelled_by"]), ("cancelled", False, "t"))
+        self.assertEqual(again, first)
+        self.assertIsNone(self.ts.find_session("ts-0123456789ab")["active_run"], "the session takes the next run")
+        self.ts.update_run(run["id"], status="failed")
+        self.assertEqual(self.ts.public_run(self.ts.cancel_run(run["id"], "x"))["status"], "failed", "a finished run stays")
+        self.assertTrue(self.ts.public_run(self.ts.find_run(run["id"]))["executed"])
+        same, created = self.ts.start_run({"target": "test", "session": "ts-0123456789ab", "client_run_id": "asana-17"}, "t", True, {})
+        self.assertEqual((same["id"], created), (run["id"], False), "the executor's retry after a crash gets the same run")
 
     def test_a_session_run_needs_a_ready_session(self):
         self.session(status="creating")
@@ -282,7 +299,7 @@ class TestSessionTest(unittest.TestCase):
         self.assertEqual(summary, {"passed": 4, "failed": 1, "flaky": 1, "skipped": 1, "duration_s": 12.3})
         self.assertEqual([(test["test_id"], test["status"], test["attempts"]) for test in tests],
                          [("cart.spec.ts › Cart › pays @stage", "failed", 2), ("cart.spec.ts › Cart › flakes", "flaky", 2),
-                          ("cart.spec.ts › Cart › skips", "skipped", 0)])
+                          ("cart.spec.ts › Cart › skips", "skipped", 1)])
         self.assertEqual((tests[0]["error"], tests[0]["step"], tests[0]["file"], tests[0]["title"]),
                          ("Expected ready", "click Pay", "cart.spec.ts", "Cart › pays @stage"))
         self.assertEqual([item["name"] for item in artifacts], ["001-trace.zip", "002-trace.zip"], "the 2 MB video is over the 1 MB budget")
