@@ -5,7 +5,11 @@ stdin and runs the real status helper behind it (as this user, with docker, syst
 stubbed); Bitbucket is a fake API on 127.0.0.1. No root, no network.
 """
 
+import atexit
 import base64
+import contextlib
+import io
+from pathlib import Path
 from urllib.parse import quote
 import getpass
 import hashlib
@@ -18,8 +22,12 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
+import unittest
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 from test_metrics import WorkerTree, entry
@@ -34,11 +42,39 @@ ROOT_COMMANDS = ("add-project", "remove-project", "install-backups", "install-me
                  "tool-access", "update-setup")
 
 
+# bin/update runs these tests on an installed server as its health check, as the administrator: bin/web-ui's paths
+# (STATE_DIRECTORY, SETUP_SERVER_ROOT, SETUP_SERVER_LIBRARY) default to the installed UI's, whose state directory
+# (/var/lib/setup-server-ui, setup-ui 0700) that account cannot read. Every in-process copy of the UI therefore gets its
+# own temporary tree, and INSTALLED below may not be touched by any test (HermeticStateTest).
+HERMETIC = Path(tempfile.mkdtemp(prefix="web-ui-hermetic-"))
+atexit.register(shutil.rmtree, HERMETIC, True)
+HERMETIC_PATHS = {"STATE_DIRECTORY": HERMETIC / "state", "SETUP_SERVER_ROOT": HERMETIC / "root",
+                  "SETUP_SERVER_LIBRARY": HERMETIC / "lib"}
+INSTALLED = ("/var/lib/setup-server-ui", "/var/lib/private/setup-server-ui", "/srv/setup-server", "/usr/local/lib/setup-server")
+
+
+def touches_installed(path):
+    text = os.path.abspath(os.fsdecode(path)) if isinstance(path, (str, bytes, os.PathLike)) else ""
+    return any(text == place or text.startswith(place + "/") for place in INSTALLED)
+
+
+def refuse_installed(event, arguments):
+    """An audit hook: a test that opens, lists, makes or removes anything of the installed UI fails at once."""
+    if event in ("open", "os.listdir", "os.scandir", "os.mkdir", "os.remove", "os.rmdir", "os.rename", "os.chmod",
+                 "shutil.rmtree") and arguments and touches_installed(arguments[0]):
+        raise AssertionError(f"a test touched the installed UI: {event} {arguments[0]}")
+
+
+sys.addaudithook(refuse_installed)
+
+
 def load_web_ui():
+    """bin/web-ui as a module, its paths in HERMETIC whatever this process's environment says."""
     loader = importlib.machinery.SourceFileLoader("web_ui", str(ROOT / "bin/web-ui"))
     spec = importlib.util.spec_from_loader("web_ui", loader)
     module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
+    with patch.dict(os.environ, {name: str(path) for name, path in HERMETIC_PATHS.items()}):
+        loader.exec_module(module)
     return module
 
 
@@ -2912,3 +2948,40 @@ class WebUiTest(Worker):
 if __name__ == "__main__":
     import unittest
     unittest.main()
+
+
+class HermeticStateTest(unittest.TestCase):
+    """No test reads or writes the installed UI's state, library or worker tree (bin/update's health check)."""
+
+    def test_an_in_process_ui_keeps_every_path_in_its_own_tree(self):
+        with patch.dict(os.environ, {"STATE_DIRECTORY": "/var/lib/setup-server-ui", "SETUP_SERVER_ROOT": "/srv/setup-server",
+                                     "SETUP_SERVER_LIBRARY": "/usr/local/lib/setup-server"}):
+            web_ui = load_web_ui()
+        paths = {"STATE": web_ui.STATE, "JOBS": web_ui.JOBS, "ACTIONS_LOG": web_ui.ACTIONS_LOG, "ROOT": web_ui.ROOT,
+                 "LIBRARY": web_ui.LIBRARY, "DEPLOY_JOURNAL": web_ui.DEPLOY_JOURNAL.path}
+        for name, path in paths.items():
+            with self.subTest(name=name):
+                self.assertTrue(Path(path).is_relative_to(HERMETIC), f"{name} = {path}")
+                self.assertFalse(touches_installed(path))
+
+    def test_touching_the_installed_state_fails_the_test(self):
+        for path in ("/var/lib/setup-server-ui/jobs", "/srv/setup-server/ui-actions.log"):
+            with self.subTest(path=path), self.assertRaisesRegex(AssertionError, "touched the installed UI"):
+                open(path)
+        self.assertFalse(touches_installed("/var/lib/setup-server-ui-other"))
+
+    def test_an_unreadable_jobs_directory_is_logged_not_a_crashed_page(self):
+        web_ui = load_web_ui()
+        locked = HERMETIC / "locked"
+        (locked / "state/jobs").mkdir(parents=True, exist_ok=True)
+        web_ui.JOBS = locked / "state/jobs"
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o700)
+        if os.access(locked, os.R_OK):  # root reads anything: nothing to show then
+            self.skipTest("this account reads every directory")
+        errors = io.StringIO()
+        with contextlib.redirect_stderr(errors):
+            self.assertEqual(web_ui.jobs(), [])
+            self.assertIsNone(web_ui.running_job())
+        self.assertIn("cannot read the jobs", errors.getvalue())
+

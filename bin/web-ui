@@ -1448,9 +1448,15 @@ def job_state(directory):
 
 
 def jobs(limit=None):
-    if not JOBS.is_dir():
+    """The job directories, newest first. One this account cannot read (only outside the service: by hand, in a test
+    run by another account) is logged and lists none, so a page still renders; start_job fails on it all the same."""
+    try:
+        found = sorted((path for path in JOBS.iterdir() if JOB_ID.fullmatch(path.name)), reverse=True)
+    except (FileNotFoundError, NotADirectoryError):
         return []
-    found = sorted((path for path in JOBS.iterdir() if JOB_ID.fullmatch(path.name)), reverse=True)
+    except OSError as error:
+        log(f'cannot read the jobs in {JOBS}: {error.strerror}')
+        return []
     return found[:limit] if limit else found
 
 
