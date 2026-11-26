@@ -39,7 +39,7 @@ GENERAL_TOKEN = "general-token-XYZxyz9876543210"
 SECRET = "ATOAfake_secret-VALUE_9"  # the OAuthClientSecret of test_scripts.DIALOG
 ROOT_COMMANDS = ("add-project", "remove-project", "install-backups", "install-metrics", "install-runner", "install-ssh",
                  "add-backup-key", "backup-projects", "move-bitbucket-ssh", "prepare-host", "server-status", "server-unit",
-                 "tool-access", "update-setup")
+                 "test-session", "tool-access", "update-setup")
 
 
 # bin/update runs these tests on an installed server as its health check, as the administrator: bin/web-ui's paths
@@ -89,6 +89,7 @@ echo "$*" >> "$STUB_DIR/sudo.calls"
 while [ $# -gt 0 ]; do case "$1" in -u) shift 2;; -*) shift;; *) break;; esac; done
 case "$1" in
   */server-status) shift; exec "$SERVER_STATUS" "$@";;
+  */test-session) shift; exec "$TEST_SESSION" "$@";;
 esac
 input=$(cat)
 printf '%s\n----\n' "$input" >> "$STUB_DIR/sudo.stdin"
@@ -873,7 +874,8 @@ class WebUiTest(Worker):
         environment = {key: value for key, value in os.environ.items() if "proxy" not in key.lower()}
         return {**environment, "PATH": f"{self.bin}:{os.environ['PATH']}", "SETUP_SERVER_ROOT": str(self.tree.root),
                 "SETUP_SERVER_LIBRARY": str(self.library), "STATE_DIRECTORY": str(self.state),
-                "SERVER_STATUS": str(ROOT / "bin/server-status"), "UI_USER": "admin", "UI_PASSWORD_HASH": PASSWORD_HASH,
+                "SERVER_STATUS": str(ROOT / "bin/server-status"), "TEST_SESSION": str(ROOT / "bin/test-session"),
+                "SETUP_SERVER_HANDOFF": str(self.root / "handoff"), "UI_USER": "admin", "UI_PASSWORD_HASH": PASSWORD_HASH,
                 "UI_PORT": "0", "BITBUCKET_API": f"http://127.0.0.1:{self.api.server_port}/2.0",
                 "BITBUCKET_ACCESS_TOKEN_ALPHA_SHOP": PROJECT_TOKEN, "BITBUCKET_ACCESS_TOKEN": GENERAL_TOKEN,
                 "SETUP_SERVER_SBIN": str(self.sbin), "SETUP_SERVER_CONFIG": str(self.root / "config"), **settings}
@@ -1365,18 +1367,91 @@ class WebUiTest(Worker):
         self.assertFalse(any(request[1].startswith("/elsewhere") for request in self.api.requests))
 
     def test_the_api_index_and_openapi_list_every_route(self):
-        routes = [route for route, *_ in load_web_ui().API_ROUTES]
+        web_ui = load_web_ui()
+        routes = [route for route, *_ in web_ui.API_ROUTES]
+        writes = [(method, route) for method, route, *_ in web_ui.TESTENV_ROUTES]
         token, _ = self.new_token("agent", [self.agents_group(projects="view")])
         index = self.api_call("/api/v1/", token)[2]
-        self.assertEqual([item["path"] for item in index["endpoints"]], ["/api/v1" + route for route in routes])
+        self.assertEqual([(item["method"], item["path"]) for item in index["endpoints"]],
+                         [("GET", "/api/v1" + route) for route in routes] + [(method, "/api/v1" + route) for method, route in writes])
         self.assertTrue(all(item["description"] for item in index["endpoints"]))
+        self.assertFalse(any(item["allowed"] for item in index["endpoints"] if (item["needs"] or "").startswith("testenv")))
         status, _, document = self.api_call("/api/v1/openapi.json", token)
         self.assertEqual(status, 200)
         self.assertEqual(document["openapi"], "3.1.0")
-        self.assertEqual(sorted(document["paths"]), sorted("/api/v1" + route for route in routes))
-        operations = [path["get"]["operationId"] for path in document["paths"].values()]
+        self.assertEqual(sorted(document["paths"]), sorted({"/api/v1" + route for route in routes} | {"/api/v1" + route for _, route in writes}))
+        self.assertEqual(sorted(document["paths"]["/api/v1/test-sessions/{session}"]), ["delete", "get"])
+        operations = [operation["operationId"] for path in document["paths"].values() for operation in path.values()]
         self.assertEqual(len(operations), len(set(operations)))
         self.assertEqual(document["paths"]["/api/v1/projects/{project}"]["get"]["parameters"][0]["name"], "project")
+
+    def test_the_test_environments_api_needs_its_own_permission_and_logs_every_change(self):
+        build = self.tree.projects / "alpha_shop"
+        for arguments in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "x"]):
+            subprocess.run(["git", "-C", str(build), *arguments], check=True, capture_output=True)
+        (build / "app/env/stage.env.example").write_text("DOMAIN=stage.alpha.example\n")
+        reader, _ = self.new_token("reader", [self.agents_group(projects="view")])
+        self.assertEqual(self.api_call("/api/v1/test-sessions", reader)[0], 403)
+        self.assertEqual(self.api_call("/api/v1/runs", reader, method="POST")[0], 403)
+        form = {"csrf": self.csrf(), "group": "", "title": "Testers", "level:testenv": "view"}
+        self.assertEqual(self.request("POST", "/groups/save", form)[0], 303)
+        viewer, _ = self.new_token("viewer", ["testers"])
+        status, _, body = self.api_call("/api/v1/test-sessions", viewer)
+        self.assertEqual((status, body), (200, {"sessions": []}))
+        self.assertEqual(self.api_call("/api/v1/test-sessions", viewer, method="POST")[0], 403)
+        form.update(group="testers", **{"level:testenv": "manage"})
+        self.assertEqual(self.request("POST", "/groups/save", form)[0], 303)
+        post = lambda path, body, method="POST": self.json_call(method, path, viewer, body)
+        self.assertEqual(post("/api/v1/test-sessions", {"project": "alpha_shop", "db": "backup:prod"})[0], 400)
+        self.assertEqual(post("/api/v1/test-sessions", {"project": "nope", "db": "dataset:dev"})[0], 404)
+        self.assertEqual(post("/api/v1/test-sessions", {"project": "alpha_shop", "db": "dataset:dev", "ttl_minutes": "x"})[0], 400)
+        self.assertEqual(self.json_call("POST", "/api/v1/runs", viewer, None, raw=b"{not json")[0], 400)
+        self.assertEqual(self.json_call("POST", "/api/v1/runs", viewer, None, raw=b"{}", length=3 * 1024 * 1024)[0], 413)
+        self.assertEqual(post("/api/v1/test-sessions/ts-0123456789ab", {}, "DELETE")[0], 404)
+        self.assertEqual(self.api_call("/api/v1/test-sessions", viewer, method="PUT")[0], 405)
+        status, _, body = post("/api/v1/runs", {"target": "stage", "project": "alpha_shop", "client_run_id": "ci-7", "grep": "@cart",
+                                                "patch": "diff --git a/public/x b/public/x\n--- a/public/x\n+++ b/public/x\n"})
+        self.assertEqual(status, 400, body)
+        status, _, body = post("/api/v1/runs", {"target": "stage", "project": "alpha_shop", "client_run_id": "ci-7", "grep": "@cart"})
+        self.assertEqual(status, 202, body)
+        run = body["run"]
+        self.assertEqual((run["url"], run["grep"], run["status"]), ("https://stage.alpha.example", "^(?=.*(?:@stage(?![\\w-])))(?=.*(?:@cart))", "queued"))
+        status, _, again = post("/api/v1/runs", {"target": "stage", "project": "alpha_shop", "client_run_id": "ci-7"})
+        self.assertEqual((status, again["run"]["id"], again["created"]), (200, run["id"], False))
+        status, _, shown = self.api_call(f"/api/v1/runs/{run['id']}", viewer)
+        self.assertEqual((status, shown["run"]["id"]), (200, run["id"]))
+        # The run's worker finds no setup here and ends with an error; then an artifact streams with its size and type.
+        for _ in range(200):
+            if self.api_call(f"/api/v1/runs/{run['id']}", viewer)[2]["run"]["status"] not in ("queued", "running"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(self.api_call(f"/api/v1/runs/{run['id']}", viewer)[2]["run"]["status"], "error")
+        artifacts = self.tree.root / "test-runs" / run["id"] / "artifacts"
+        artifacts.mkdir(parents=True, exist_ok=True)
+        (artifacts / "001-test-failed-1.png").write_bytes(b"PNG fake!")
+        record = json.loads((artifacts.parent / "run.json").read_text())
+        record["artifacts"] = [{"name": "001-test-failed-1.png", "size": 9, "content_type": "image/png"}]
+        (artifacts.parent / "run.json").write_text(json.dumps(record))
+        status, headers, data = self.request("GET", f"/api/v1/runs/{run['id']}/artifacts/001-test-failed-1.png", login=None,
+                                             headers={"Authorization": f"Bearer {viewer}"})
+        self.assertEqual((status, headers["Content-Type"], data), (200, "image/png", "PNG fake!"))
+        self.assertEqual(self.api_call(f"/api/v1/runs/{run['id']}/artifacts/other.zip", viewer)[0], 404)
+        actions = self.log.read_text()
+        self.assertIn(f"user=token:viewer client=127.0.0.1 testenv run project=alpha_shop target=stage id={run['id']}", actions)
+        self.assertIn("testenv create project=nope db=dataset:dev id=- status=404", actions)
+        self.assertNotIn("diff --git", actions + self.everything_written(), "a patch is never logged")
+
+    def json_call(self, method, path, token, body, raw=None, length=None):
+        """(status, headers, JSON) of an API request with a JSON body (or raw bytes; length: a Content-Length to claim)."""
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+        data = raw if raw is not None else json.dumps(body).encode()
+        connection.request(method, path, body=data, headers={"Host": f"127.0.0.1:{self.port}", "Authorization": f"Bearer {token}",
+                                                             "Content-Type": "application/json",
+                                                             "Content-Length": str(length or len(data))})
+        response = connection.getresponse()
+        text = response.read().decode()
+        connection.close()
+        return response.status, dict(response.getheaders()), json.loads(text)
 
     def test_a_user_changes_their_own_password(self):
         self.assertEqual(self.add_user("petras", "petro-slaptazodis-1", ["viewers"])[0], 303)

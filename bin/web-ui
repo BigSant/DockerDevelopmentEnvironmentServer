@@ -19,7 +19,8 @@ The API for agents. /api/v1 answers GETs with JSON (the index lists every endpoi
 deploys, backups, pipelines, pull requests and alarms of the same status the pages show, never a secret. A caller
 sends an API token (Authorization: Bearer ops_…; made on the Users page, shown once, only its sha256 kept in
 accounts.json) or Basic auth of a user; the token's groups decide what it reads, as a user's do. No cookie counts
-there, nothing is changed through it (any other method: 405), and every request is a line of
+there; nothing is changed through it but the test environments (sessions, runs, snapshots through bin/test-session,
+"Test environments: manage"; any other method elsewhere: 405), and every request is a line of
 $STATE_DIRECTORY/api-access.log (never the token). /api/v1/deploys journals the deploys it has seen in
 $STATE_DIRECTORY/deploy-journal.json, so a poller's cursor gives only what is new or changed since, across restarts.
 
@@ -255,7 +256,7 @@ def installation():
 # The UI's sections, and whether one has anything to manage (a view-only section has no actions).
 SECTIONS = (('overview', 'Overview', True), ('projects', 'Projects', True), ('runners', 'Runners', True), ('access', 'Access', True), ('files', 'Files', True),
             ('update', 'Update', True), ('actions', 'Actions', True), ('instructions', 'Instructions', False),
-            ('logs', 'Logs', False), ('metrics', 'Metrics', False), ('users', 'Users', True))
+            ('logs', 'Logs', False), ('metrics', 'Metrics', False), ('testenv', 'Test environments', True), ('users', 'Users', True))
 SECTION_TITLES = {key: title for key, title, _ in SECTIONS}
 MANAGED_SECTIONS = tuple(key for key, _, manage in SECTIONS if manage)
 PERMISSION_LEVELS = ('', 'view', 'manage')
@@ -5675,15 +5676,16 @@ def api_openapi():
             'parameters': parameters, 'responses': responses}}
     return {'openapi': '3.1.0',
             'info': {'title': 'Server OPS API', 'version': '1',
-                     'description': 'Read-only status of the worker: deploys, backups, pipelines, pull requests and alarms. '
-                                    'Timestamps are ISO 8601 UTC; ages are seconds. No secret is ever returned.'},
+                     'description': 'The status of the worker (deploys, backups, pipelines, pull requests, alarms; read-only) '
+                                    'and its test environments (sessions, Playwright runs, page snapshots). Timestamps are '
+                                    'ISO 8601 UTC; ages are seconds. No secret is ever returned.'},
             'servers': [{'url': '/'}],
             'security': [{'bearer': []}, {'basic': []}],
             'components': {'securitySchemes': {'bearer': {'type': 'http', 'scheme': 'bearer', 'description': 'an API token ops_…'},
                                                'basic': {'type': 'http', 'scheme': 'basic', 'description': 'a UI user'}},
                            'schemas': {'Error': {'type': 'object', 'required': ['error', 'status'],
                                                  'properties': {'error': {'type': 'string'}, 'status': {'type': 'integer'}}}}},
-            'paths': paths}
+            'paths': {**paths, **testenv_openapi()}}
 
 
 def api_answer(path, query, kind, name, permissions):
@@ -5698,8 +5700,11 @@ def api_answer(path, query, kind, name, permissions):
         return 200, {'api': 'Server OPS', 'version': 1, 'caller': {'kind': kind, 'name': name},
                      'permissions': {key: level for key, level in permissions.items() if level},
                      'endpoints': [{'path': API_PREFIX + route, 'method': 'GET', 'needs': f'{key}: view' if key else None,
-                                    'allowed': key is None or can(key), 'description': text} for route, key, text in API_ROUTES],
-                     'notes': 'Read-only. Timestamps are ISO 8601 UTC, ages in seconds; "ui" fields are paths of the web UI. '
+                                    'allowed': key is None or can(key), 'description': text} for route, key, text in API_ROUTES] +
+                                  [{'path': API_PREFIX + route, 'method': method, 'needs': f'testenv: {level}',
+                                    'allowed': PERMISSION_LEVELS.index(permissions.get('testenv', '')) >= PERMISSION_LEVELS.index(level),
+                                    'description': text} for method, route, level, text in TESTENV_ROUTES],
+                     'notes': 'Read-only, except the test environments (testenv: manage). Timestamps are ISO 8601 UTC, ages in seconds; "ui" fields are paths of the web UI. '
                               'state: ok, bad (problems lists why) or idle (not deployed from here). ?fresh=1 reads again now '
                               '(the status is cached for a few seconds, Bitbucket for a minute).'}
     if route == '/openapi.json':
@@ -5732,6 +5737,175 @@ def api_answer(path, query, kind, name, permissions):
     if route == '/projects/{project}/pipelines':
         return 200, api_pipelines(entry, fresh)
     return 200, api_pull_requests(entry, fresh)
+
+
+# --- Test environments through the API (/api/v1/test-sessions, /runs, /snapshots) ------------------
+# Sessions (an isolated ENV=test in its own clone) and Playwright runs, carried out by bin/test-session as root (its
+# sudo rule), which drops to the setup account. "view" of the section Test environments reads them, "manage" changes
+# them; only a token or Basic auth counts (never a cookie), so no CSRF token is needed. Every change is a line of
+# ui-actions.log (testenv ...), never a patch or a storage state.
+TESTENV_SESSION = r'ts-[0-9a-f]{12}'
+TESTENV_RUN = r'(?:run|snap)-[0-9a-f]{12}'
+TESTENV_ARTIFACT = r'[A-Za-z0-9][A-Za-z0-9._-]{0,150}'
+TESTENV_BODY_LIMIT = 2 * 1024 * 1024  # a patch may be 1 MiB (bin/test-session refuses a larger one with 413)
+TESTENV_TIMEOUT, TESTENV_SNAPSHOT_TIMEOUT = 120, 300
+# (method, path, level, what it does): the dispatcher, the index and the OpenAPI document all come from this list.
+TESTENV_ROUTES = (
+    ('GET', '/test-sessions', 'view', 'Every test session (an isolated ENV=test of a project in its own clone on this server).'),
+    ('POST', '/test-sessions', 'manage', 'Create a test session: {project, db: "dataset:<name>", env_ref?, shop_ref?, '
+                                          'ttl_minutes?} → 202 {session} (status creating; poll it). 409 with reason '
+                                          'memory, disk, session_exists or deploy_locked.'),
+    ('GET', '/test-sessions/{session}', 'view', 'One session and its runs.'),
+    ('POST', '/test-sessions/{session}/extend', 'manage', 'Extend a session: {minutes?} (default 120), never past 6 h from '
+                                                          'its creation.'),
+    ('DELETE', '/test-sessions/{session}', 'manage', 'Destroy a session (its run is cancelled): 202, status destroying.'),
+    ('POST', '/test-sessions/{session}/snapshot', 'manage', 'A page of the session as an agent needs it: {path, role?: '
+                                                            '"guest"} → its ARIA snapshot, trimmed DOM and a screenshot artifact.'),
+    ('POST', '/snapshots', 'manage', 'The same of a real site: {project, environment: "stage"|"live", path, role?} '
+                                     '(one GET navigation, nothing submitted).'),
+    ('GET', '/runs', 'view', 'The newest runs (?session=<id> for one session\'s).'),
+    ('POST', '/runs', 'manage', 'Start a Playwright run: {target: test|stage|live, project, session? (test), grep?, '
+                                'grep_invert?, files?, patch?, deploy_check?, stage_write_safe?, client_run_id?, env_ref?, '
+                                'storage_states?} → 202 {run} (200 with the existing run for a client_run_id given again).'),
+    ('GET', '/runs/{run}', 'view', 'A run: status, summary {passed, failed, flaky, skipped, duration_s} and each test that '
+                                   'did not pass.'),
+    ('GET', '/runs/{run}/artifacts/{name}', 'view', 'One artifact of a run (trace, screenshot, video, error context).'),
+)
+TESTENV_PLACES = {'{session}': TESTENV_SESSION, '{run}': TESTENV_RUN, '{name}': TESTENV_ARTIFACT}
+ARTIFACT_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webm': 'video/webm',
+                  '.zip': 'application/zip', '.json': 'application/json', '.txt': 'text/plain; charset=utf-8',
+                  '.md': 'text/markdown; charset=utf-8', '.html': 'application/octet-stream'}
+
+
+def testenv_route(method, path):
+    """(route, level, {placeholder: value}) of a test-environment API request; (None, None, {}) when the path is none of
+    them; ('', None, {}) when it is but not with this method."""
+    tail = path[len(API_PREFIX):].rstrip('/') if path.startswith(API_PREFIX + '/') else None
+    if tail is None:
+        return None, None, {}
+    known = False
+    for route_method, route, level, _ in TESTENV_ROUTES:
+        pattern = re.escape(route)
+        for place, expression in TESTENV_PLACES.items():
+            pattern = pattern.replace(re.escape(place), f'({expression})')
+        match = re.fullmatch(pattern, tail)
+        if match:
+            known = True
+            if route_method == method:
+                names = re.findall(r'\{[a-z]+\}', route)
+                return route, level, dict(zip(names, match.groups()))
+    return ('', None, {}) if known else (None, None, {})
+
+
+def test_session_helper(arguments, payload=None, timeout=TESTENV_TIMEOUT):
+    """(HTTP status, JSON) of bin/test-session through its sudo rule."""
+    argv = ['sudo', '-n', str(LIBRARY / 'bin/test-session'), *arguments]
+    try:
+        result = subprocess.run(argv, input=json.dumps(payload).encode() if payload is not None else b'', capture_output=True,
+                                timeout=timeout, env=child_environment())
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 503, {'error': f'test-session: {error}', 'status': 503}
+    try:
+        data = json.loads(result.stdout)
+    except ValueError:
+        return 503, {'error': f'test-session: exit {result.returncode}, no JSON ({result.stderr.decode(errors="replace").strip()[:200]})',
+                     'status': 503}
+    if not isinstance(data, dict):
+        return 503, {'error': 'test-session: unexpected answer', 'status': 503}
+    if 'error' in data:
+        status = data.get('status') if data.get('status') in (400, 403, 404, 409, 413, 503) else 503
+        return status, {**data, 'status': status}
+    return 200, data
+
+
+def testenv_request(method, route, places, query, body, caller):
+    """(HTTP status, JSON, audit text or None) of one test-environment request (its permission already checked)."""
+    session, run = places.get('{session}'), places.get('{run}')
+    if method == 'GET':
+        if route == '/test-sessions':
+            return (*test_session_helper(['list']), None)
+        if route == '/test-sessions/{session}':
+            return (*test_session_helper(['show', '--id', session]), None)
+        if route == '/runs':
+            wanted = query.get('session', [''])[0]
+            if wanted and not re.fullmatch(TESTENV_SESSION, wanted):
+                return 400, {'error': 'session: a session id (ts-…)', 'status': 400}, None
+            return (*test_session_helper(['runs', *(['--session', wanted] if wanted else [])]), None)
+        return (*test_session_helper(['run-show', '--id', run]), None)
+    if not isinstance(body, dict):
+        return 400, {'error': 'the body must be a JSON object (Content-Type: application/json)', 'status': 400}, None
+    if route == '/test-sessions':
+        arguments = ['create', '--by', caller]
+        for key, option in (('project', '--project'), ('db', '--db'), ('env_ref', '--env-ref'), ('shop_ref', '--shop-ref')):
+            if body.get(key) is not None:
+                if not isinstance(body[key], str) or not 0 < len(body[key]) <= 200:
+                    return 400, {'error': f'{key}: a string', 'status': 400}, None
+                arguments += [option, body[key]]
+        if body.get('ttl_minutes') is not None:
+            if not isinstance(body['ttl_minutes'], int) or isinstance(body['ttl_minutes'], bool):
+                return 400, {'error': 'ttl_minutes: an integer', 'status': 400}, None
+            arguments += ['--ttl', str(body['ttl_minutes'])]
+        status, data = test_session_helper(arguments)
+        made = (data.get('session') or {}).get('id')
+        return (202 if status == 200 else status), data, \
+            f'create project={body.get("project")} db={body.get("db")} id={made or "-"} status={status}'
+    if route == '/test-sessions/{session}/extend':
+        minutes = body.get('minutes', 120)
+        if not isinstance(minutes, int) or isinstance(minutes, bool):
+            return 400, {'error': 'minutes: an integer', 'status': 400}, None
+        status, data = test_session_helper(['extend', '--id', session, '--minutes', str(minutes)])
+        return status, data, f'extend id={session} minutes={minutes} status={status}'
+    if route == '/test-sessions/{session}':
+        status, data = test_session_helper(['destroy', '--id', session, '--by', caller])
+        return (202 if status == 200 else status), data, f'destroy id={session} status={status}'
+    if route in ('/runs', '/snapshots', '/test-sessions/{session}/snapshot'):
+        request = dict(body)
+        if route == '/test-sessions/{session}/snapshot':
+            request.update(target='test', session=session)
+        elif route == '/snapshots':
+            environment = request.pop('environment', None)
+            if environment not in ('stage', 'live'):
+                return 400, {'error': 'environment: stage or live', 'status': 400}, None
+            request['target'] = environment
+        command = 'run' if route == '/runs' else 'snapshot'
+        status, data = test_session_helper([command, '--by', caller, '--manage', '--request', '-'], request,
+                                           TESTENV_TIMEOUT if command == 'run' else TESTENV_SNAPSHOT_TIMEOUT)
+        shown = data.get('run') or {}
+        audit = (f'{command} project={shown.get("project") or request.get("project")} target={request.get("target")} '
+                 f'id={shown.get("id", "-")} session={shown.get("session", "-")} patch_sha256={shown.get("patch_sha256", "-")} '
+                 f'client_run_id={shown.get("client_run_id", "-")} new={data.get("created", "-")} status={status}')
+        if status == 200 and command == 'run':
+            status = 202 if data.get('created') else 200
+        return status, data, audit
+    return 404, {'error': 'no such endpoint', 'status': 404}, None
+
+
+def testenv_openapi():
+    """The OpenAPI paths of TESTENV_ROUTES."""
+    error = {'description': 'error', 'content': {'application/json': {'schema': {'$ref': '#/components/schemas/Error'}}}}
+    places = {'{session}': ('session', TESTENV_SESSION), '{run}': ('run', TESTENV_RUN), '{name}': ('name', TESTENV_ARTIFACT)}
+    paths = {}
+    for method, route, level, text in TESTENV_ROUTES:
+        parameters = [{'name': name, 'in': 'path', 'required': True, 'schema': {'type': 'string', 'pattern': f'^{pattern}$'}}
+                      for place, (name, pattern) in places.items() if place in route]
+        if route == '/runs' and method == 'GET':
+            parameters.append({'name': 'session', 'in': 'query', 'required': False,
+                               'schema': {'type': 'string', 'pattern': f'^{TESTENV_SESSION}$'}})
+        responses = {'200': {'description': 'OK', 'content': {'application/octet-stream' if '{name}' in route else
+                                                              'application/json': {'schema': {'type': 'object'} if '{name}' not in route
+                                                                                   else {'type': 'string', 'format': 'binary'}}}},
+                     '400': error, '401': error, '403': error, '404': error, '503': error}
+        if method != 'GET':
+            responses.update({'202': {'description': 'accepted: poll the session or run'}, '409': error, '413': error})
+        operation = {'summary': text, 'operationId': method.lower() + ''.join(
+            part.title() for part in re.split(r'[^a-z]+', route) if part),
+            'description': f'Needs the permission "{level}" of the section Test environments.', 'parameters': parameters,
+            'responses': responses}
+        if method == 'POST':
+            operation['requestBody'] = {'required': route != '/test-sessions/{session}/extend',
+                                        'content': {'application/json': {'schema': {'type': 'object'}}}}
+        paths.setdefault(API_PREFIX + route, {})[method.lower()] = operation
+    return paths
 
 
 def safe_target(target):
@@ -5883,29 +6057,123 @@ def handler(accounts):
             return None
 
         # --- The API (/api/v1): JSON for agents, an API token or Basic auth; GET only ---
-        def api_get(self, path, query):
+        def api_caller(self):
+            """(kind, name) of the API caller, or None when the reply (401, 429) is sent."""
             if not self.host_ok(api=True):
-                return
+                return None
             header = self.headers.get('Authorization', '')
             found = self.credentials(header, api=True) if header else None
             if found is False:
-                return self.api_logged('-', '-', 429)
+                self.api_logged('-', '-', 429)
+                return None
             if not found:
                 self.api_logged('-', '-', 401)
-                return self.json_reply(401, {'error': 'an API token is needed: Authorization: Bearer ops_… (Users → API tokens)',
-                                             'status': 401}, [('WWW-Authenticate', 'Bearer realm="Server OPS"')])
+                self.json_reply(401, {'error': 'an API token is needed: Authorization: Bearer ops_… (Users → API tokens)',
+                                      'status': 401}, [('WWW-Authenticate', 'Bearer realm="Server OPS"')])
+                return None
+            return found
+
+        def api_get(self, path, query):
+            route, _, _ = testenv_route(self.command if self.command != 'HEAD' else 'GET', path)
+            if route is not None:
+                return self.api_testenv(path, query)
+            found = self.api_caller()
+            if not found:
+                return
             kind, name = found
             code, data = api_answer(path, query, kind, name, accounts.permissions(name, 'tokens' if kind == 'token' else 'users'))
             self.api_logged(kind, name, code)
             self.json_reply(code, data)
 
-        def api_refused_method(self):
-            """Anything but GET or HEAD on the API: 405 (it changes nothing yet)."""
+        def api_testenv(self, path, query):
+            """A test-environment endpoint (TESTENV_ROUTES), any method: the permission, the body, the helper, the audit line."""
+            method = 'GET' if self.command == 'HEAD' else self.command
+            route, level, places = testenv_route(method, path)
+            if route is None or route == '':
+                return self.api_refused_method(path)
+            found = self.api_caller()
+            if not found:
+                return
+            kind, name = found
+            permissions = accounts.permissions(name, 'tokens' if kind == 'token' else 'users')
+            if PERMISSION_LEVELS.index(permissions.get('testenv', '')) < PERMISSION_LEVELS.index(level):
+                self.api_logged(kind, name, 403)
+                return self.json_reply(403, {'error': f'the section "Test environments" needs the permission "{level}"; groups '
+                                                      'give it (Users)', 'status': 403})
+            body = None
+            if method in ('POST', 'DELETE'):
+                length = self.headers.get('Content-Length', '0') or '0'
+                if not length.isdigit():
+                    self.api_logged(kind, name, 400)
+                    return self.json_reply(400, {'error': 'Content-Length is needed', 'status': 400})
+                if int(length) > TESTENV_BODY_LIMIT:
+                    self.api_logged(kind, name, 413)
+                    return self.json_reply(413, {'error': f'the body may be at most {TESTENV_BODY_LIMIT} bytes', 'status': 413})
+                raw = self.rfile.read(int(length)) if int(length) else b''
+                try:
+                    body = json.loads(raw) if raw.strip() else {}
+                except ValueError:
+                    self.api_logged(kind, name, 400)
+                    return self.json_reply(400, {'error': 'the body is not JSON', 'status': 400})
+            if route == '/runs/{run}/artifacts/{name}':
+                return self.api_artifact(kind, name, places['{run}'], places['{name}'])
+            caller = f'{kind}:{name}'
+            code, data, audit = testenv_request(method, route, places, query, body, caller)
+            if audit:
+                try:
+                    record(f'{kind}:{name}', self.caller(), 'testenv', audit)
+                except OSError as error:
+                    log(f'ui-actions.log: {error}')
+            self.api_logged(kind, name, code)
+            self.json_reply(code, data)
+
+        def api_artifact(self, kind, name, run, artifact):
+            """One artifact's bytes, streamed from bin/test-session (its size from the run's list)."""
+            code, data = test_session_helper(['run-show', '--id', run])
+            listed = next((item for item in ((data.get('run') or {}).get('artifacts') or []) if item.get('name') == artifact),
+                          None) if code == 200 else None
+            if listed is None:
+                code = code if code != 200 else 404
+                self.api_logged(kind, name, code)
+                return self.json_reply(code, data if code != 404 or 'error' in data else
+                                       {'error': f'run {run} has no artifact {artifact}', 'status': 404})
+            argv = ['sudo', '-n', str(LIBRARY / 'bin/test-session'), 'artifact', '--id', run, '--name', artifact]
+            try:
+                process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                           env=child_environment())
+            except OSError as error:
+                self.api_logged(kind, name, 503)
+                return self.json_reply(503, {'error': f'test-session: {error}', 'status': 503})
+            self.send_response(200)
+            self.send_header('Content-Type', ARTIFACT_TYPES.get(os.path.splitext(artifact)[1].lower(), 'application/octet-stream'))
+            self.send_header('Content-Length', str(int(listed.get('size') or 0)))
+            self.send_header('Content-Disposition', f'attachment; filename="{artifact}"')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Content-Security-Policy', "default-src 'none'; sandbox")
+            self.end_headers()
+            try:
+                while self.command != 'HEAD':
+                    chunk = process.stdout.read(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+            except OSError:
+                pass
+            finally:
+                process.stdout.close()
+                process.kill() if process.poll() is None else None
+                process.wait()
+            self.api_logged(kind, name, 200)
+
+        def api_refused_method(self, path=''):
+            """A method an API path does not take: 405 (GET only, but on the test environments)."""
             if not self.host_ok(api=True):
                 return
             self.api_logged('-', '-', 405)
-            self.json_reply(405, {'error': f'{self.command[:10]} is not allowed: the API is read-only (GET)', 'status': 405},
-                            [('Allow', 'GET, HEAD')])
+            methods = sorted({method for method, route, _, _ in TESTENV_ROUTES if testenv_route(method, path)[0]}) or ['GET', 'HEAD']
+            self.json_reply(405, {'error': f'{self.command[:10]} is not allowed here: {", ".join(methods)}', 'status': 405},
+                            [('Allow', ', '.join(methods))])
 
         def api_logged(self, kind, name, code):
             """One line in $STATE_DIRECTORY/api-access.log: time, caller, client, method, path, status (never a token).
@@ -6172,7 +6440,7 @@ def handler(accounts):
         def do_POST(self):
             path = urlsplit(self.path).path
             if path == '/api' or path.startswith('/api/'):
-                return self.api_refused_method()
+                return self.api_testenv(path, parse_qs(urlsplit(self.path).query))
             if not self.host_ok():
                 return
             origin = self.headers.get('Origin')
@@ -6431,7 +6699,9 @@ def handler(accounts):
             """PUT, PATCH, DELETE, OPTIONS: 405 on the API, else not implemented."""
             path = urlsplit(self.path).path
             if path == '/api' or path.startswith('/api/'):
-                return self.api_refused_method()
+                if self.command == 'DELETE':
+                    return self.api_testenv(path, parse_qs(urlsplit(self.path).query))
+                return self.api_refused_method(path)
             self.send_error(501, 'Unsupported method')
 
         do_PUT = do_PATCH = do_DELETE = do_OPTIONS = other_method

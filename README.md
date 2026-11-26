@@ -808,6 +808,36 @@ If the check fails, both checkouts are returned to their previous commits (or to
 one), and the installed command copies – to the previous ones; it prints which check failed and returns code 1. Code 2 means that the rollback failed too –
 the commands for manual recovery are printed.
 
+### Updating an old install (no API, no automatic update)
+
+A server installed before the API (e.g. 2026-11-06) is updated by hand, in this order:
+
+1. **Look first** (as the clone's owner, no sudo): `cd ~/setup-server && bin/update --check --server-ref origin/master
+   --setup-ref v5.7.0` – setup must be 5.7.0 or newer for test sessions (`test-session-v1`).
+2. **Update** (no sudo; it asks for the password of its own `sudo` calls): `bin/update --server-ref origin/master
+   --setup-ref v5.7.0`. It fetches and switches both checkouts, rewrites the installed copies
+   (`install-backups`, `install-metrics`, `add-backup-key` and `install-ui --refresh`: `/usr/local/sbin/setup-server-*` and
+   every command in `/usr/local/lib/setup-server/bin/`, `bin/test-session` too), restarts the UI, runs the health check
+   (these tests, the setup checkout, the runners' PIDs) and returns everything on a failure. It never changes units,
+   sudo rules or settings: it prints `note: … differs` for them.
+3. **Root, once:** `sudo bin/install-ui`. It writes the sudo rule that now names `test-session`, installs and enables
+   `setup-server-test-sessions.service` and `.timer`, and keeps the login, port and Bitbucket tokens. Without it the
+   UI cannot run `test-session` (the API answers `503`) and nothing expires sessions.
+4. Optional: `/etc/setup-server/test-sessions.env` (root, 0644) with other gate values; `sudo bin/install-auto-update`
+   only if this server should follow CI by itself.
+
+**Verify:**
+
+```bash
+sudo bin/install-ui --check | grep -E 'would|differs' || echo "install-ui: nothing left to apply"
+systemctl list-timers setup-server-test-sessions.timer --no-pager      # next run within a minute
+sudo journalctl -u setup-server-test-sessions --since -5min --no-pager  # {"reconciled": []}
+sudo -u setup-ui sudo -n /usr/local/lib/setup-server/bin/test-session list   # {"sessions": []}
+sudo -u setup make -s -f /srv/setup-server/setup/docker/project.mk setup-capabilities  # … test-session-v1
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9102/api/v1          # 401 without a token
+curl -s -H "Authorization: Bearer $OPS_TOKEN" http://127.0.0.1:9102/api/v1 | jq '[.endpoints[] | select(.needs == "testenv: manage")] | length'  # 6
+```
+
 ### Automatic update of local clones
 
 All `tests` workflow jobs run on this repository's local runner
@@ -1429,7 +1459,7 @@ change shows up within 10 s (the cache; `?fresh=1` reads again now), the same wa
 with the same `BITBUCKET_ACCESS_TOKEN…` as the pipelines; without one (or on an error) the answer is `200` with
 `runs` / `pull_requests` `null` and `error` saying why. Errors are `{"error": …, "status": N}`: `401` (no or a wrong
 token; `WWW-Authenticate: Bearer`), `403` (the token's groups do not give the section), `404` (no such endpoint or
-project), `405` (any method but GET/HEAD), `429` (too many wrong tokens from one address: they count with the wrong
+project), `405` (a method the path does not take), `429` (too many wrong tokens from one address: they count with the wrong
 sign-ins), `503` (the status could not be read).
 
 **What it never returns:** the values of env files (only the target's mode, SSH address, path and Docker context, as the
@@ -1444,7 +1474,140 @@ status – never the token. Past about 10 000 lines (1.5 MB) it keeps the newest
 sudo tail -n 20 /var/lib/setup-server-ui/api-access.log
 ```
 
-The API changes nothing yet: starting pipelines or test environments through it is a later step.
+The API also runs test environments (below); everything else in it changes nothing.
+
+### Test environments (sessions, runs, snapshots)
+
+An agent gets an isolated ENV=test of a project on this server (a **session**), runs the project's Playwright tests there
+or against the real STAGE/LIVE site (a **run**), and looks at a page without a browser of its own (a **snapshot**). The
+work is done by `bin/test-session`, which the UI runs as root through its sudo rule and which drops to the `setup` account
+at once (every clone, `make`, `git` and Docker command runs with that account's rights).
+
+**Permission.** A section of its own, *Test environments* (Users → a group): "view" reads sessions and runs, "manage"
+creates, extends and destroys sessions and starts runs and snapshots. Administrators have it; every other group starts
+without it. Only a token or Basic auth counts (never the browser's cookie), so the writes need no CSRF token. Every
+change is a `testenv …` line of `ui-actions.log` (caller, project, ids, patch sha256, the answer's status) – never a
+patch, a storage state or a password.
+
+**A session** lives in `$ROOT/test-sessions/<project>/repo`: a clone of the build root at `env_ref` (default: the build
+root's current commit; a branch, tag or commit), its submodules from the build root's own copies (else their remotes,
+with the setup account's keys), the code repository too when `app/public` is one (`shop_ref`). It never uses the build
+root's checkout and never takes the deploy lock, so a deploy is not disturbed. The clone gets `env/local.env` (the
+committed `local.env.example`, else generated names, no secrets) and `env/test.env` with `TEST_TLS=self-signed` and
+`TEST_HOST_ROUTE=off`; then `make test-init`, `make build`, `make test-prepare set=<data set>` and `make e2e-install`
+run (setup with `test-session-v1`, 5.7.0+). Its site is reached **inside its project network only** (Playwright,
+snapshots), never from outside. Only `db: "dataset:<name>"` is supported; `backup:prod` is refused (`400`) until
+anonymisation exists. One session per project. It expires after `ttl_minutes` (default 120); `extend` adds minutes up
+to 6 h after its creation. Expired, destroyed or crashed: its run is cancelled, its containers, networks and volumes
+removed (`docker compose -p <PROJECT_NAME>-test down --volumes`) and its clone deleted.
+
+**Gates** (`409` with `reason`): `memory` – MemAvailable minus `TEST_SESSION_MEMORY_MB` (2500) for each session still
+being created must leave `TEST_SESSION_MEMORY_MB` + `TEST_SESSION_RESERVE_MB` (2048): on a server with about 5 GB free
+that is one session; `disk` – at least `TEST_SESSION_DISK_MB` (5120) free under `$ROOT`; `session_exists`;
+`deploy_locked` – a deploy of the project holds its lock (read from `/proc/locks`, nothing is locked by the check). The
+values (and the others below) are integers in `/etc/setup-server/test-sessions.env`, e.g. `TEST_SESSION_MEMORY_MB=3000`;
+`TEST_URL_<PROJECT>_<ENV>=https://…` there gives a run another address than `https://<DOMAIN>`.
+
+**A run** is `make e2e json=1` with a selection built here. The **tag rule** cannot be widened by the caller: `test` runs
+everything but the tests tagged for another target only (`@stage`, `@stage-write`, `@live` without `@test`); `stage`
+runs `@stage`, and `@stage-write` too only with `stage_write_safe: true` (and "manage"); `live` runs `@live`;
+`deploy_check: true` also requires `@deploy`. A tag ends where a letter, digit, `_` or `-` would continue it. The
+caller's `grep` is ANDed in (a lookahead), `grep_invert` ORed into the exclusions and `files` passed as spec filters:
+they only narrow (a pattern whose parentheses do not balance, or with `[]`/`[^]`, is refused). `test` runs in a ready
+session; `stage`/`live` run from `$ROOT/test-external/<project>/repo` (a clone at the build root's commit or `env_ref`)
+against the environment's address, in Playwright's container on Docker's bridge network. One run at a time per
+session, and per project for stage/live (`409 run_active`).
+- **patch** (≤ 1 MiB, else `413`): a unified diff whose paths are relative to the project directory (the one with the
+  Makefile) and lie under `tests/playwright/` or `config/playwright/`; no `package.json`, `package-lock.json`, `.npmrc`,
+  binary or symlink changes. From a git clone of the environment repository: `git diff --relative=app` (in a specs
+  submodule: `git diff --src-prefix=a/tests/playwright/ --dst-prefix=b/tests/playwright/`). Before each run both
+  directories are reset to the checked-out commit (a submodule too; `node_modules` kept); then the patch is applied
+  with `git apply` (in a session it is checked when the run is asked for: `400 patch does not apply`). Its sha256 is
+  recorded, its text is never returned.
+- **client_run_id** (1–100 of `A-Za-z0-9._:-`): the idempotency key, per caller. A second POST with it returns the
+  first run (`200`, `"created": false`) instead of starting another.
+- **storage_states** `{role: operation_uuid}`: the seam for Vault. Each file `/run/vault-handoff/<env>/<uuid>.json`
+  (`env`: `stage` or `prod`; `test` for a session) must be a regular file written within
+  `TEST_STORAGE_STATE_MAX_AGE` (900 s), else `409 storage_state_missing` / `storage_state_expired`; root checks it,
+  Docker mounts it read-only as `/e2e/auth/<role>.json` (`E2E_STORAGE_STATE_<ROLE>`, all as JSON in
+  `E2E_STORAGE_STATES`). Server OPS does not call Vault yet.
+- Results: `$ROOT/test-runs/<id>/` (`run.json`, `report.json`, `log`, the artifacts of the tests that did not pass,
+  at most `TEST_RUN_ARTIFACTS_MB` (500) per run), kept `TEST_RUN_KEEP_DAYS` (7). A run longer than
+  `TEST_RUN_TIMEOUT_MINUTES` (60) ends as `error`.
+
+**A snapshot** (synchronous, up to 4 minutes): one GET navigation to `path` in a fresh browser context, then the page's
+ARIA snapshot, its DOM without scripts, styles, comments, `style`/`on…` attributes and SVG contents (at most 200 000
+characters, `dom_truncated`), and a full-page screenshot artifact. Only `role: "guest"` (the default); other roles are
+`400` until Vault provides them.
+
+**The timer** `setup-server-test-sessions.timer` (every minute, `bin/test-session reconcile` as root → setup) expires
+sessions, finishes a destroy, fails a session or run whose process died, cancels runs past their timeout, removes the
+containers of session Compose projects no session owns, and deletes old runs.
+
+**Endpoints** (`/api/v1`; JSON bodies, `Content-Type: application/json`, at most 2 MiB):
+
+| Method, path | Needs | Answer |
+|---|---|---|
+| `GET /test-sessions` | testenv: view | `{"sessions": [Session…]}` |
+| `POST /test-sessions` | testenv: manage | `202 {"session": Session}` (status `creating`); `400`, `404`, `409` |
+| `GET /test-sessions/{id}` | testenv: view | `{"session": Session, "runs": [Run…]}` |
+| `POST /test-sessions/{id}/extend` | testenv: manage | `{"session": Session}`; body `{"minutes": 120}` |
+| `DELETE /test-sessions/{id}` | testenv: manage | `202 {"session": Session}` (status `destroying`) |
+| `POST /test-sessions/{id}/snapshot` | testenv: manage | `200 {"run": Run}` with `snapshot`; body `{"path": "/", "role": "guest"}` |
+| `POST /snapshots` | testenv: manage | the same of a real site; body `{"project", "environment": "stage"\|"live", "path"}` |
+| `GET /runs[?session=ID]` | testenv: view | `{"runs": [Run…]}` (newest 200) |
+| `POST /runs` | testenv: manage | `202 {"run": Run, "created": true}`; `200 … "created": false` for a known `client_run_id` |
+| `GET /runs/{id}` | testenv: view | `{"run": Run}` |
+| `GET /runs/{id}/artifacts/{name}` | testenv: view | the file (`Content-Type` by its extension, `Content-Disposition: attachment`) |
+
+Session: `id` (`ts-` + 12 hex), `project`, `status` (`creating` → `ready`; `failed`, `destroying`, `destroyed`,
+`expired`), `step` (while creating: `clone`, `test-init`, `build`, `test-prepare`, `e2e-install`), `error`, `db`,
+`env_ref`, `env_commit`, `shop_ref`, `shop_commit`, `created_at`, `ready_at`, `expires_at`, `max_expires_at`,
+`ended_at`, `created_by`, `active_run`, `domain`, `url` (the in-network address) and `reachable`.
+Run: `id` (`run-`/`snap-` + 12 hex), `kind` (`run`/`snapshot`), `status` (`queued` → `running` → `passed` | `failed` |
+`error` | `cancelled`; a snapshot `done` | `error`), `step`, `error`, `target`, `project`, `session` or `environment`,
+`url`, `env_ref`, `env_commit`, `grep`/`grep_invert` (what Playwright got), `files`, `deploy_check`, `stage_write_safe`,
+`patch_sha256`, `patch_files`, `client_run_id`, `roles`, `created_by`, times, and when done `summary` `{passed, failed,
+flaky, skipped, duration_s}`, `tests` (each that did not pass: `test_id` = file + " › " + the full title, `file`,
+`title`, `status` `failed`|`flaky`|`skipped`, `attempts`, `error` (the message, colours removed), `step` (the failing
+step, else `file:line`), `artifacts`, `project`), `artifacts` (`name`, `size`, `content_type`, `test_id`).
+
+```bash
+H=(-H "Authorization: Bearer $OPS_TOKEN" -H "Content-Type: application/json")
+curl -s "${H[@]}" -d '{"project":"shop","db":"dataset:dev","ttl_minutes":120}' https://ops.local/api/v1/test-sessions
+curl -s "${H[@]}" https://ops.local/api/v1/test-sessions/ts-6de03ce5d957 | jq .session.status        # until "ready"
+curl -s "${H[@]}" -d '{"path":"/checkout"}' https://ops.local/api/v1/test-sessions/ts-6de03ce5d957/snapshot | jq .run.snapshot.aria
+jq -n --rawfile p fix.diff '{target:"test",session:"ts-6de03ce5d957",client_run_id:"pr-41-1",grep:"@cart",patch:$p}' |
+  curl -s "${H[@]}" -d @- https://ops.local/api/v1/runs | jq .run.id
+curl -s "${H[@]}" https://ops.local/api/v1/runs/run-5d864778d7db | jq '.run | {status, summary, tests}'
+curl -s "${H[@]}" -d '{"target":"live","project":"shop","deploy_check":true}' https://ops.local/api/v1/runs
+curl -s "${H[@]}" -X DELETE https://ops.local/api/v1/test-sessions/ts-6de03ce5d957
+```
+
+A finished run, as `GET /runs/{id}` answers it (shortened):
+
+```json
+{"run": {"id": "run-17aa54a8ce40", "kind": "run", "status": "failed", "target": "test", "project": "shop",
+ "session": "ts-6de03ce5d957", "url": "https://shop.test.local",
+ "grep_invert": "(?:^(?!.*@test(?![\\w-])).*@(?:stage|stage-write|live)(?![\\w-]))",
+ "summary": {"passed": 2, "failed": 1, "flaky": 0, "skipped": 0, "duration_s": 3.1},
+ "tests": [{"test_id": "fixme.spec.ts › status says ready", "file": "fixme.spec.ts", "title": "status says ready",
+            "status": "failed", "attempts": 1, "error": "Error: expect(locator).toHaveText(expected) failed …",
+            "step": "fixme.spec.ts:5", "artifacts": ["001-test-failed-1.png", "002-error-context.md", "003-trace.zip"]}],
+ "artifacts": [{"name": "003-trace.zip", "size": 81234, "content_type": "application/zip",
+                "test_id": "fixme.spec.ts › status says ready"}],
+ "created_at": "2026-11-26T22:52:10Z", "started_at": "2026-11-26T22:52:10Z", "finished_at": "2026-11-26T22:52:31Z"}}
+```
+
+Refusals are `{"error", "status", "reason"?}`: `400` (a bad value: the message says which), `403` (the permission, or
+`stage_write_safe` without "manage"), `404`, `405`, `409` (`reason`: `memory`, `disk`, `session_exists`,
+`deploy_locked`, `session_not_ready`, `session_ended`, `run_active`, `storage_state_missing`, `storage_state_expired`;
+a memory or disk refusal also has `needed_mb` and `available_mb`), `413`, `503` (setup too old, the helper failed).
+
+**Verified with a fixture.** `tests/fixtures/test_session_project.py PARENT SETUP --lock` writes a generic project
+with a TypeScript Playwright project (one dependency, tests for every target, a failing test and the patch that
+fixes it); with it as `$ROOT/projects/autotest-demo` and `SETUP_SERVER_ROOT` pointing there, `bin/test-session`
+runs the whole cycle as any account in the docker group.
 
 ## Project containers on the server
 

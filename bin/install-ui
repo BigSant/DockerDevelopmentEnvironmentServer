@@ -27,7 +27,7 @@ NAME=setup-server-ui
 ADDRESS=127.0.0.1
 # What the UI runs as root, from $LIBRARY/bin; bin/update runs as the owner of this checkout instead.
 ROOT_COMMANDS=(add-project remove-project install-backups install-metrics install-runner install-ssh add-backup-key
-               backup-projects move-bitbucket-ssh prepare-host server-status server-unit tool-access update-setup)
+               backup-projects move-bitbucket-ssh prepare-host server-status server-unit test-session tool-access update-setup)
 
 check=0
 refresh=0
@@ -184,6 +184,35 @@ ProtectControlGroups=true
 WantedBy=multi-user.target
 EOF
 
+# The test sessions' timer: every minute bin/test-session reconcile (as root; it drops to $ACCOUNT) expires sessions,
+# ends crashed runs and removes orphaned session containers and old runs (README: Test environments).
+cat > "$staging/test-sessions.service" <<EOF
+[Unit]
+Description=Test sessions of setup-server: expiry, crashed runs, orphans
+Documentation=https://github.com/BigSant/DockerDevelopmentEnvironmentServer
+After=docker.service
+
+[Service]
+Type=oneshot
+Environment=SETUP_SERVER_ROOT=$ROOT
+Environment=SETUP_SERVER_USER=$ACCOUNT
+Environment=SETUP_SERVER_CONFIG=$CONFIG
+ExecStart=$LIBRARY/bin/test-session reconcile
+TimeoutStartSec=600
+EOF
+cat > "$staging/test-sessions.timer" <<EOF
+[Unit]
+Description=Reconcile the test sessions of setup-server every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+
 changed=0
 place() {  # place SOURCE TARGET MODE [quiet|DISPLAY] — write only what differs
     if cmp -s "$1" "$2" 2>/dev/null; then
@@ -231,7 +260,8 @@ if [ "$refresh" = 1 ]; then
     place "$staging/command" "$command" 0755 quiet
     place_library
     place "$staging/install.env" "$LIBRARY/install.env" 0644 quiet
-    for file in "service:$SYSTEMD/$NAME.service" "sudoers:$SUDOERS/$NAME"; do
+    for file in "service:$SYSTEMD/$NAME.service" "sudoers:$SUDOERS/$NAME" "test-sessions.service:$SYSTEMD/setup-server-test-sessions.service" \
+                "test-sessions.timer:$SYSTEMD/setup-server-test-sessions.timer"; do
         cmp -s "$staging/${file%%:*}" "${file#*:}" 2>/dev/null \
             || echo "==> note: ${file#*:} differs from this version; apply it with: sudo bin/install-ui"
     done
@@ -323,17 +353,20 @@ place "$staging/install.env" "$LIBRARY/install.env" 0644
 place "$staging/settings" "$settings" 0600 "$staging/settings.shown"
 place "$staging/service" "$SYSTEMD/$NAME.service" 0644
 place "$staging/sudoers" "$SUDOERS/$NAME" 0440
+place "$staging/test-sessions.service" "$SYSTEMD/setup-server-test-sessions.service" 0644
+place "$staging/test-sessions.timer" "$SYSTEMD/setup-server-test-sessions.timer" 0644
 names=$(printf '%s\n' "$tokens" | sed -n 's/^\(BITBUCKET_ACCESS_TOKEN[A-Z0-9_]*\)=.\{1,\}$/\1/p' | paste -sd ' ')
 listen="http://$ADDRESS:$port/ for $user; Bitbucket tokens: ${names:-none}"
 
 if [ "$check" = 1 ]; then
     echo "==> would listen on $listen"
-    echo "==> would enable $NAME.service and $([ "$changed" = 1 ] && echo restart || echo start) it"
+    echo "==> would enable $NAME.service and $([ "$changed" = 1 ] && echo restart || echo start) it, and setup-server-test-sessions.timer"
     exit 0
 fi
 
 systemctl daemon-reload
 systemctl enable "$NAME.service" >/dev/null
+systemctl enable --now setup-server-test-sessions.timer >/dev/null
 if [ "$changed" = 1 ]; then
     systemctl restart "$NAME.service"
 else
