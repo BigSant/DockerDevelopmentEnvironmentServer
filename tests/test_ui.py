@@ -1448,7 +1448,7 @@ class WebUiTest(Worker):
         self.assertEqual(status, 202, body)
         run = body["run"]
         self.assertEqual((run["url"], run["grep"], run["grep_invert"], run["status"]),
-                         ("https://stage.alpha.example", "^(?=.*(?:(?<!\\S)@stage(?!\\S)))(?=.*(?:@cart))",
+                         ("https://stage.alpha.example", "^(?=.*(?:(?<!\\S)@stage(?!\\S)|(?<!\\S)@live(?!\\S)))(?=.*(?:@cart))",
                           "(?:(?<!\\S)@stage\\-write(?!\\S))", "queued"))
         status, _, again = post("/api/v1/runs", {"target": "stage", "project": "alpha_shop", "client_run_id": "ci-7"})
         self.assertEqual((status, again["run"]["id"], again["created"]), (200, run["id"], False))

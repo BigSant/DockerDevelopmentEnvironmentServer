@@ -5779,7 +5779,10 @@ TESTENV_ROUTES = (
                                      '(one GET navigation, nothing submitted, nothing of another origin).',
      (200, 400, 404, 409, 413, 500, 503)),
     ('GET', '/runs', 'view', 'The newest runs (?session=<id> for one session\'s).', (200, 400, 503)),
-    ('POST', '/runs', 'manage', 'Start a Playwright run: {target: test|stage|live, project, session? (test), grep?, '
+    ('POST', '/runs', 'manage', 'Start a Playwright run (tag rule: test runs every test; stage runs @stage and @live, '
+                                '@stage-write only with stage_write_safe; live runs @live, never @stage-write; '
+                                'deploy_check also requires @deploy; grep, grep_invert and files only narrow; error names '
+                                'an out-of-memory end, oom: true): {target: test|stage|live, project, session? (test), grep?, '
                                 'grep_invert?, files?, patch? (test only), deploy_check?, stage_write_safe?, client_run_id?, '
                                 'env_ref? (stage/live: a trusted commit only), storage_states?} → 202 {run, created} (200 with '
                                 'the existing run for a client_run_id given again; 409 reason cancelled when that '
