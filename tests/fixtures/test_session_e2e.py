@@ -141,6 +141,14 @@ test('the root filesystem is read-only', async () => {
   expect(() => fs.writeFileSync('/e2e/x', 'x')).toThrow();
 });
 """
+OOM_SPEC = """import { test } from '@playwright/test';
+
+test('takes more memory than its container has', async () => {
+  test.setTimeout(120000);
+  const blocks = [];
+  for (let i = 0; i < 400; i += 1) blocks.push(Buffer.alloc(8 * 1024 * 1024, 1));
+});
+"""
 FILL_SPEC = """import { test } from '@playwright/test';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -295,6 +303,13 @@ def main():
     filled = wait_run(ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'files': ['fill.spec.ts'],
                                                                 'patch': new_file_patch('tests/playwright/fill.spec.ts', FILL_SPEC)})['run']['id'])
     check(filled['status'] == 'error' and 'disk quota' in (filled.get('error') or ''), 'a run over its disk quota is stopped', filled)
+    hungry = wait_run(ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'files': ['oom.spec.ts'],
+                                                                'patch': new_file_patch('tests/playwright/oom.spec.ts', OOM_SPEC)})['run']['id'])
+    check(hungry.get('oom') is True and 'ran out of its 1024 MB (TEST_RUN_MEMORY_MB)' in (hungry.get('error') or ''),
+          'a run whose container hit its memory limit says so', hungry)
+    every = wait_run(ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'],
+                                                               'files': ['targets.spec.ts']})['run']['id'])
+    check(every['summary']['passed'] + every['summary']['failed'] == 5, 'test runs every tagged test (no tag exclusion)', every)
 
     # Snapshots: the page, and a path that would leave the site.
     snap = ts('snapshot', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'path': '/'})
@@ -339,8 +354,8 @@ http.createServer((q, s) => {
         stage = ts('run', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME})
         check('run' in stage, 'a stage run starts', stage)
         stage = wait_run(stage['run']['id'])
-        check(stage['summary']['passed'] + stage['summary']['failed'] == 2, 'stage runs its 2 @stage tests (not @stage-write)',
-              stage)
+        check(stage['summary']['passed'] + stage['summary']['failed'] == 4,
+              'stage runs its 4 @stage and @live tests (not @stage-write, not the untagged)', stage)
         check(not (root / 'test-runs' / stage['id'] / 'data').exists(), "a stage run's traces and report are not kept")
         again = wait_run(ts('run', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME})['run']['id'])
         install = (root / 'test-runs' / again['id'] / 'log').read_text()

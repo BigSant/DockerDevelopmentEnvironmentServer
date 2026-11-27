@@ -1608,15 +1608,30 @@ lock. Integers in `/etc/setup-server/test-sessions.env`; `TEST_URL_<PROJECT>_<EN
 address than `https://<DOMAIN>`.
 
 **A run** is `make e2e json=1` with a selection built here, in a container named after the run. The **tag rule**
-cannot be widened by the caller: `test` runs everything but the tests tagged for another target only (`@stage`,
-`@stage-write`, `@live` without `@test`); `stage` runs `@stage` but never `@stage-write`, unless `stage_write_safe:
-true` (and "manage"); `live` runs `@live` but never `@stage-write`; `deploy_check: true` also requires `@deploy`. A tag
-counts only as a word of Playwright's grep text. The caller's `grep` (a JavaScript regular expression, at most 1000
+(the caller cannot widen it): the isolated `test` environment may run every test, and a tag only widens where a test may
+also run:
+
+| Tag on the test | Where it may run |
+|---|---|
+| none | `test` only |
+| `@stage` | `test` and `stage` (the test only reads) |
+| `@stage-write` | `test`; `stage` only with `stage_write_safe: true` (and "manage"), for a project whose STAGE is safe for writes; never `live` |
+| `@live` | `test`, `stage`, `live` (the test only reads) |
+
+So `test` applies no tag exclusion; `stage` runs `@stage` or `@live` (plus `@stage-write` with `stage_write_safe`);
+`live` runs `@live` (never one also tagged `@stage-write`); `deploy_check: true` also requires `@deploy`. A tag counts
+only as a word of Playwright's grep text. The caller's `grep` (a JavaScript regular expression, at most 1000
 characters, its parentheses balanced) is ANDed in, `grep_invert` ORed into the exclusions and `files` (spec paths,
 `FILE[:LINE]`, at most 100) passed as filters: they only narrow. `test` runs in a ready session (its specs rebuilt from
 `tests_commit` before every run, then the patch); `stage`/`live` from `$WORK/test-external/<project>/` (the trusted
 commit; its dependency install kept between runs; `env_ref` only a trusted ref). One run at a time per session, and per
 project for stage/live (`409 run_active`).
+- **Out of memory.** Each run's Playwright container has `TEST_RUN_MEMORY_MB` (1024) of memory and no swap (for
+  `test`, the value its session's create wrote into the session; a new session takes a changed setting). When the
+  kernel kills Playwright or a browser in it for that limit, the run's `error` says `the test container ran out of
+  its N MB (TEST_RUN_MEMORY_MB)` and the run has `oom: true` – also when Playwright then ended without a report. Raise
+  it in `/etc/setup-server/test-sessions.env` (`TEST_RUN_MEMORY_MB=2048`; the memory gate counts it) or run fewer
+  workers.
 - **Stopping.** A timeout (`TEST_RUN_TIMEOUT_MINUTES`, 60), a run over its disk quota (`TEST_RUN_DISK_MB` of results,
   looked at every 20 s and once more when it ends) or a cancel stops the run's command (SIGTERM, SIGKILL after 15 s) and
   removes its containers (`docker rm -f`; every container a run or session starts is named or labelled

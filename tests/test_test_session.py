@@ -58,6 +58,7 @@ case "$1 $2" in
     grep -vxF -- "$3" "$here/images.txt" > "$here/images.new" 2>/dev/null; mv "$here/images.new" "$here/images.txt" 2>/dev/null
     exit 0;;
   "builder prune") echo "Total:	1.2GB";;
+  "events --filter") cat "$here/events.oom" 2>/dev/null; exit 0;;
   "compose -p")
     case "$*" in *" down "*) exit "$(cat "$here/down.exit" 2>/dev/null || echo 0)";; esac;;
 esac
@@ -301,8 +302,11 @@ class TagRuleTest(Base):
                   "live+write": "chromium t.spec.ts Live block @live wipes @stage-write",
                   "email": "chromium t.spec.ts registers jonas@live.com", "path": "chromium @live/x.spec.ts reads",
                   "dotted": "chromium t.spec.ts reads @stage.old"}
-        cases = {("test", ()): {"plain", "both", "email", "path", "dotted"}, ("stage", ()): {"stage", "both"},
-                 ("stage", ("stage_write_safe",)): {"stage", "write", "both", "stage+write", "live+write"},
+        everything = set(titles)
+        cases = {("test", ()): everything, ("test", ("deploy_check",)): {"deploy"},
+                 ("stage", ()): {"stage", "live", "deploy", "both"},
+                 ("stage", ("stage_write_safe",)): {"stage", "live", "deploy", "write", "both", "stage+write", "live+write"},
+                 ("stage", ("deploy_check",)): {"deploy"},
                  ("live", ()): {"live", "deploy"}, ("live", ("deploy_check",)): {"deploy"}}
         for (target, flags), expected in cases.items():
             grep, invert = self.ts.selection(target, {flag: True for flag in flags}, manage=True)
@@ -311,8 +315,28 @@ class TagRuleTest(Base):
         grep, invert = self.ts.selection("live", {"grep": "reads|check", "grep_invert": "@deploy"}, manage=True)
         self.assertEqual({key for key, title in titles.items() if self.matches(grep, invert, title)}, {"live"})
         grep, _ = self.ts.selection("stage", {"grep": ".*"}, manage=True)
-        self.assertFalse(self.matches(grep, None, titles["live"]), "a caller's .* does not widen stage to @live")
+        _, invert = self.ts.selection("stage", {"grep": ".*"}, manage=True)
+        self.assertFalse(self.matches(grep, invert, titles["write"]), "a caller's .* does not widen stage to @stage-write")
+        self.assertFalse(self.matches(grep, invert, titles["plain"]), "nor to an untagged test")
         self.refused(403, self.ts.selection, "stage", {"stage_write_safe": True}, manage=False)
+
+    def test_the_contract_table_row_by_row(self):
+        """The tags only widen where a test may also run; the isolated test environment runs every test."""
+        rows = {"none": ("chromium a.spec.ts plain", {"test"}),
+                "@stage": ("chromium a.spec.ts reads @stage", {"test", "stage", "stage (stage_write_safe)"}),
+                "@stage-write": ("chromium a.spec.ts writes @stage-write", {"test", "stage (stage_write_safe)"}),
+                "@live": ("chromium a.spec.ts reads @live", {"test", "stage", "stage (stage_write_safe)", "live"})}
+        targets = {"test": ("test", {}), "stage": ("stage", {}), "stage (stage_write_safe)": ("stage", {"stage_write_safe": True}),
+                   "live": ("live", {})}
+        for row, (title, allowed) in rows.items():
+            for name, (target, request) in targets.items():
+                with self.subTest(tag=row, target=name):
+                    grep, invert = self.ts.selection(target, request, manage=True)
+                    self.assertEqual(self.matches(grep, invert, title), name in allowed)
+        self.assertEqual(self.ts.selection("test", {}, manage=True), (None, None), "test: no tag exclusion at all")
+        grep, invert = self.ts.selection("test", {"grep": "@smoke"}, manage=True)
+        self.assertFalse(self.matches(grep, invert, "chromium a.spec.ts reads @stage"), "a caller's grep still narrows")
+        self.assertTrue(self.matches(grep, invert, "chromium a.spec.ts reads @stage @smoke"))
 
     def test_a_pattern_that_could_leave_its_group_is_refused(self):
         for pattern in ("x)|(.*", "[^]))|.*(?:(]", "[]))|(", "(", "a\nb", "x" * 1001, "(?P<", 5):
@@ -704,7 +728,29 @@ class WorkerTest(Base):
         self.assertEqual(self.ts.find_run(again["id"])["status"], "failed", "a later run without the patch has the specs back")
         e2e = [arguments for target, arguments in made if target == "e2e"][0]
         self.assertIn(f"container={run['id']}", e2e)
-        self.assertTrue(any(item.startswith("grep_invert=") for item in e2e))
+        self.assertFalse(any(item.startswith(("grep=", "grep_invert=")) for item in e2e), "test: no tag exclusion")
+
+    def test_a_run_whose_container_ran_out_of_memory_says_so(self):
+        session, _ = self.ready_session()
+        (self.root / "fakebin/events.oom").write_text("oom\n")
+
+        def fake_make(log, directory, target, *arguments, **keywords):
+            return 2 if target == "e2e" else 0  # Playwright ended by itself after a browser was killed: no report
+        with patch.object(self.ts, "make", fake_make):
+            run, _ = self.ts.start_run({"target": "test", "session": session["id"]}, "t", True, {})
+            self.ts.run_worker(run["id"])
+        ended = self.ts.public_run(self.ts.find_run(run["id"]))
+        self.assertEqual((ended["status"], ended["oom"]), ("error", True))
+        self.assertIn("the test container ran out of its 1024 MB (TEST_RUN_MEMORY_MB)", ended["error"])
+        self.assertIn("Playwright wrote no report (exit 2)", ended["error"], "what else happened stays said")
+        self.assertIn(f"events --filter event=oom --filter container={run['id']} --format {{{{.Action}}}}", self.docker_calls())
+        (self.root / "fakebin/events.oom").unlink()
+        with patch.object(self.ts, "make", fake_make):
+            again, _ = self.ts.start_run({"target": "test", "session": session["id"]}, "t", True, {})
+            self.ts.run_worker(again["id"])
+        plain = self.ts.public_run(self.ts.find_run(again["id"]))
+        self.assertEqual(plain["error"], "Playwright wrote no report (exit 2)")
+        self.assertNotIn("oom", plain)
 
     def test_a_snapshot_returns_the_page_or_nothing_when_it_left_the_site(self):
         session, _ = self.ready_session()

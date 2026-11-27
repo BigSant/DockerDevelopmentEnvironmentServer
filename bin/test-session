@@ -1953,13 +1953,15 @@ def scan_pattern(pattern, label):
 
 def selection(target, request, manage):
     """(grep, grep_invert) of a run: the target's tag rule (here only) AND the caller's narrowing. A tag counts only as
-    a word (tag()); @stage-write runs on stage with stage_write_safe only, and never on live."""
+    a word (tag()). The tags only widen where a test may also run: test runs every test (no tag excludes one); stage runs
+    @stage and @live, @stage-write only with stage_write_safe; live runs @live, never @stage-write; deploy_check
+    requires @deploy too."""
     required, inverted = [], []
     if target == 'stage':
         write = request.get('stage_write_safe') is True
         if write and not manage:
             raise Refusal(403, 'stage_write_safe needs the permission "manage" of Test environments')
-        required.append(tag('stage') if not write else f'{tag("stage")}|{tag("stage-write")}')
+        required.append('|'.join(tag(name) for name in ('stage', 'live', *(('stage-write',) if write else ()))))
         if not write:
             inverted.append(tag('stage-write'))
     elif target == 'live':
@@ -1971,8 +1973,6 @@ def selection(target, request, manage):
     if grep:
         required.append(scan_pattern(grep, 'grep'))
     combined = '^' + ''.join(f'(?=.*(?:{part}))' for part in required) if required else None
-    if target == 'test':
-        inverted.append(rf'^(?!.*{tag("test")}).*(?:{tag("stage")}|{tag("stage-write")}|{tag("live")})')
     if invert:
         inverted.append(scan_pattern(invert, 'grep_invert'))
     return combined, '|'.join(f'(?:{part})' for part in inverted) or None
@@ -2042,7 +2042,7 @@ def public_run(data, full=True):
     VIEW_ONLY."""
     shown = {key: data.get(key) for key in ('id', 'kind', 'status', 'target', 'project', 'environment', 'session', 'url',
                                             'env_ref', 'env_commit', 'tests_commit', 'shop_commit', 'grep', 'grep_invert',
-                                            'files', 'deploy_check', 'stage_write_safe', 'patch_sha256', 'patch_files',
+                                            'files', 'deploy_check', 'stage_write_safe', 'patch_sha256', 'patch_files', 'oom',
                                             'client_run_id', 'step', 'error', 'errors', 'summary', 'tests', 'artifacts',
                                             'created_by', 'roles', 'path', 'snapshot')}
     executed = data.get('executed')
@@ -2447,12 +2447,15 @@ def run_worker(identifier):
         if data['target'] != 'test':
             arguments += [f'url={data["url"]}', f'data={results}']
         # Launched once make e2e runs (recorded by the process itself): from then on some tests may have run.
-        code = make(log, app, 'e2e', *arguments, timeout=limits['TEST_RUN_TIMEOUT_MINUTES'] * 60, run=identifier,
-                    quota=(results, limits['TEST_RUN_DISK_MB'] * 1024 * 1024),
-                    record=lambda recorded: recorded and update_run(identifier, suite_started=True))
+        with oom_watch(identifier, directory) as killed:
+            code = make(log, app, 'e2e', *arguments, timeout=limits['TEST_RUN_TIMEOUT_MINUTES'] * 60, run=identifier,
+                        quota=(results, limits['TEST_RUN_DISK_MB'] * 1024 * 1024),
+                        record=lambda recorded: recorded and update_run(identifier, suite_started=True))
         if code == 130:
             raise Cancelled()
         outcome = outcome_of(code, results, directory, limits, launched=True)
+        if killed():
+            outcome = out_of_memory(outcome, playwright_memory(app, data, limits))
         update_run(identifier, ('running',), step=None, finished_at=now(), worker=None, **outcome)
     except Cancelled:
         pass
@@ -2464,6 +2467,47 @@ def run_worker(identifier):
                    executed=launched)
     finally:
         finish_run(identifier)
+
+
+@contextlib.contextmanager
+def oom_watch(name, directory):
+    """Docker's oom events of the run's container (named after the run) while make e2e runs: the container is removed
+    when it ends (--rm), so its OOMKilled state is gone by then. The event comes also when only a browser or a worker
+    inside was killed by the memory limit and Playwright itself ended on its own (exit 2, no report). Yields a callable:
+    True when one came."""
+    events = directory / 'oom.events'
+    watcher = None
+    with contextlib.suppress(OSError):
+        with open(events, 'w') as handle:
+            watcher = subprocess.Popen(['docker', 'events', '--filter', 'event=oom', '--filter', f'container={name}',
+                                        '--format', '{{.Action}}'], stdout=handle, stderr=subprocess.DEVNULL,
+                                       env=child_environment(), start_new_session=True)
+    try:
+        yield lambda: 'oom' in (events.read_text(errors='replace') if events.is_file() else '')
+    finally:
+        if watcher:
+            time.sleep(1)  # an event of the last moment reaches the listener
+            watcher.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                watcher.wait(timeout=5)
+
+
+def playwright_memory(app, data, limits):
+    """The memory limit the run's Playwright container had (MB): a session's as its create wrote it, else the setting."""
+    value = env_value(app / 'env/test.env', 'PLAYWRIGHT_MEMORY') if data.get('target') == 'test' else None
+    match = re.fullmatch(r'(\d+)m', value or '')
+    return int(match[1]) if match else limits['TEST_RUN_MEMORY_MB']
+
+
+def out_of_memory(outcome, megabytes):
+    """A run whose Playwright container hit its memory limit says so in error (and oom: true), whatever else ended it."""
+    text = (f'the test container ran out of its {megabytes} MB (TEST_RUN_MEMORY_MB): the kernel killed Playwright or a '
+            'browser; run fewer workers or raise TEST_RUN_MEMORY_MB')
+    outcome = dict(outcome, oom=True)
+    if outcome.get('status') == 'passed':
+        outcome['status'] = 'error'
+    outcome['error'] = text + (f' ({outcome["error"]})' if outcome.get('error') else '')
+    return outcome
 
 
 def session_specs(session, log):
