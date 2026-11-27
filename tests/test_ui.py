@@ -91,7 +91,8 @@ exit "$(cat "$STUB_DIR/exit" 2>/dev/null || echo 0)"
 # Docker: the project containers of the default context (compose label, name, state, status).
 DOCKER_STUB = r'''
 echo "$*" >> "$STUB_DIR/docker.calls"
-case "$1" in info) echo /; exit 0;; rm|image|compose) exit 0;; esac
+case "$1" in info) echo /; exit 0;; version) echo 29.0.0; exit 0;; rm|image|compose|network) exit 0;; esac
+case "$1 $2" in "ps -aq") exit 0;; esac
 case " $* " in *" logs "*) for last; do :; done; echo "2026-10-12T00:00:01Z first line of $last"
   echo "2026-10-12T00:00:02Z second line of $last" >&2; exit 0;; esac
 printf 'alpha-prod\talpha-prod-secrets\trunning\tUp 3 hours\n'
