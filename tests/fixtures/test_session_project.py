@@ -173,7 +173,7 @@ def build(parent, setup, lock=False, lock_file=None, services='playwright'):
 # the shop's own index.php, which says whether the release paths are there.
 PS_NAME = 'autotest-ps'
 PS_VERSION = '8.2.9'  # prestashop/prestashop:8 on this machine; its official image is the release
-PS_RELEASE_PATHS = 'vendor bin config/defines.inc.php themes/classic composer.json composer.lock'
+PS_RELEASE_PATHS = 'vendor bin config/defines.inc.php themes/classic composer.lock'  # the 8.2.9 image has no composer.json
 PS_SCHEMA = {
     'ps_configuration': ('CREATE TABLE `ps_configuration` (\n  `id_configuration` int unsigned NOT NULL AUTO_INCREMENT,\n'
                          '  `id_shop_group` int unsigned DEFAULT NULL,\n  `id_shop` int unsigned DEFAULT NULL,\n'
@@ -189,10 +189,12 @@ PS_SCHEMA = {
 PS_DATA = ("INSERT INTO `ps_configuration` (`id_configuration`, `name`, `value`, `date_add`, `date_upd`) VALUES\n"
            f"(1,'PS_VERSION_DB','{PS_VERSION}',NOW(),NOW()),(2,'PS_SHOP_DEFAULT','1',NOW(),NOW()),"
            "(3,'PS_SHOP_DOMAIN','shop.example',NOW(),NOW()),(4,'PS_SHOP_DOMAIN_SSL','shop.example',NOW(),NOW()),"
-           "(5,'PS_SSL_ENABLED','1',NOW(),NOW()),(6,'PS_SSL_ENABLED_EVERYWHERE','1',NOW(),NOW());\n"
+           "(5,'PS_SSL_ENABLED','1',NOW(),NOW()),(6,'PS_SSL_ENABLED_EVERYWHERE','1',NOW(),NOW()),"
+           # The keys setup's cache and mail policy sets (an installed shop has them all).
+           "(7,'PS_SMARTY_CACHE','1',NOW(),NOW()),(8,'PS_SMARTY_FORCE_COMPILE','1',NOW(),NOW()),(9,'PS_CSS_THEME_CACHE','1',NOW(),NOW()),(10,'PS_JS_THEME_CACHE','1',NOW(),NOW()),(11,'PS_HTML_THEME_COMPRESSION','1',NOW(),NOW()),(12,'PS_JS_HTML_THEME_COMPRESSION','1',NOW(),NOW()),(13,'PS_MAIL_METHOD','1',NOW(),NOW()),(14,'PS_MAIL_SERVER','1',NOW(),NOW()),(15,'PS_MAIL_SMTP_PORT','1',NOW(),NOW()),(16,'PS_MAIL_SMTP_ENCRYPTION','1',NOW(),NOW()),(17,'PS_MAIL_USER','1',NOW(),NOW()),(18,'PS_MAIL_PASSWD','1',NOW(),NOW());\n"
            "INSERT INTO `ps_shop_url` VALUES (1,1,'shop.example','shop.example','/','',1,1);\n")
 PS_INDEX = """<?php
-$paths = ['vendor/autoload.php', 'bin/console', 'config/defines.inc.php', 'themes/classic/theme.yml', 'composer.json'];
+$paths = ['vendor/autoload.php', 'bin/console', 'config/defines.inc.php', 'themes/classic/config/theme.yml', 'composer.lock'];
 $missing = array_values(array_filter($paths, fn ($path) => !is_file(__DIR__ . '/' . $path)));
 header('Content-Type: text/html; charset=utf-8');
 ?><!doctype html>

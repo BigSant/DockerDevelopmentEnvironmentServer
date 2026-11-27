@@ -427,7 +427,7 @@ def prestashop_cycle(options):
     check('PrestaShop 8.2.9 release paths into the test copy' in text and 'Release: vendor -> vendor' in text,
           'make test-prepare copied the release paths into the test copy')
     copy = root / 'test-sessions' / fixture.PS_NAME / 'repo/app/.generated/test/app'
-    for path in ('vendor/autoload.php', 'bin/console', 'config/defines.inc.php', 'themes/classic/theme.yml', 'composer.json',
+    for path in ('vendor/autoload.php', 'bin/console', 'config/defines.inc.php', 'themes/classic/config/theme.yml', 'composer.lock',
                  'modules/fixture/fixture.php', 'index.php'):
         check((copy / path).is_file(), f'the test copy has {path}')
     check(not (root / 'test-sessions' / fixture.PS_NAME / 'content/public/vendor').exists(),
