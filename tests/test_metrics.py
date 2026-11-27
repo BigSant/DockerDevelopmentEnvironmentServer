@@ -6,6 +6,7 @@ B level (opt-in, SETUP_SERVER_UBUNTU_IMAGE=ubuntu:22.04): install-metrics for re
 container, systemd-analyze verify of its unit, and a scrape of the installed command as the setup account.
 """
 
+import hermetic  # noqa: F401  first: no test touches the installed server (tests/hermetic.py)
 import json
 import os
 from pathlib import Path

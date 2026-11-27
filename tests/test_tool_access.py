@@ -1,5 +1,6 @@
 """Who opens the projects' browser tools (bin/tool-access): the state, the files in the build roots and their sending."""
 
+import hermetic  # noqa: F401  first: no test touches the installed server (tests/hermetic.py)
 import contextlib
 import importlib.machinery
 import importlib.util

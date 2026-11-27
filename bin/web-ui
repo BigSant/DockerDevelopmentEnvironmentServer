@@ -278,7 +278,8 @@ ACTION_SECTIONS = {'pipeline': ('overview',), 'unit': ('overview',), 'remove-pro
                    'tool-access': ('access',), 'tool-bulk': ('access',), 'tool-password': ('access',),
                    'tool-person': ('access',), 'tool-ips': ('access',), 'tool-apply': ('access',)}
 ADMINISTRATORS = 'administrators'
-VIEW_ALL = {key: 'view' for key, _, _ in SECTIONS if key != 'users'}
+# Test environments are the administrators' only (README: Test environments): a new install's other groups see none.
+VIEW_ALL = {key: 'view' for key, _, _ in SECTIONS if key not in ('users', 'testenv')}
 DEFAULT_GROUPS = {
     ADMINISTRATORS: {'title': 'Administrators', 'sections': {key: 'manage' if manage else 'view' for key, _, manage in SECTIONS}},
     'operators': {'title': 'Operators', 'sections': {**VIEW_ALL, 'overview': 'manage', 'projects': 'manage', 'runners': 'manage',
@@ -1448,14 +1449,17 @@ def job_state(directory):
         return meta, None, time.time() - meta['started'] < 30
 
 
-def jobs(limit=None):
+def jobs(limit=None, strict=False):
     """The job directories, newest first. One this account cannot read (only outside the service: by hand, in a test
-    run by another account) is logged and lists none, so a page still renders; start_job fails on it all the same."""
+    run by another account) is logged and lists none, so a page still renders; with strict (before a job starts) it
+    raises, so no second job can start beside one that cannot be seen."""
     try:
         found = sorted((path for path in JOBS.iterdir() if JOB_ID.fullmatch(path.name)), reverse=True)
     except (FileNotFoundError, NotADirectoryError):
         return []
     except OSError as error:
+        if strict:
+            raise
         log(f'cannot read the jobs in {JOBS}: {error.strerror}')
         return []
     return found[:limit] if limit else found
@@ -1473,7 +1477,7 @@ def running_job():
 
 def start_job(plan, identifier, user, client):
     JOBS.mkdir(parents=True, exist_ok=True, mode=0o700)
-    for old in jobs()[KEEP_JOBS:]:
+    for old in jobs(strict=True)[KEEP_JOBS:]:
         if (old / 'result.json').exists():
             shutil.rmtree(old, ignore_errors=True)
     directory = JOBS / identifier
@@ -5683,8 +5687,7 @@ def api_openapi():
             'security': [{'bearer': []}, {'basic': []}],
             'components': {'securitySchemes': {'bearer': {'type': 'http', 'scheme': 'bearer', 'description': 'an API token ops_…'},
                                                'basic': {'type': 'http', 'scheme': 'basic', 'description': 'a UI user'}},
-                           'schemas': {'Error': {'type': 'object', 'required': ['error', 'status'],
-                                                 'properties': {'error': {'type': 'string'}, 'status': {'type': 'integer'}}}}},
+                           'schemas': dict(TESTENV_SCHEMAS)},
             'paths': {**paths, **testenv_openapi()}}
 
 
@@ -5703,7 +5706,7 @@ def api_answer(path, query, kind, name, permissions):
                                     'allowed': key is None or can(key), 'description': text} for route, key, text in API_ROUTES] +
                                   [{'path': API_PREFIX + route, 'method': method, 'needs': f'testenv: {level}',
                                     'allowed': PERMISSION_LEVELS.index(permissions.get('testenv', '')) >= PERMISSION_LEVELS.index(level),
-                                    'description': text} for method, route, level, text in TESTENV_ROUTES],
+                                    'description': text} for method, route, level, text, _ in TESTENV_ROUTES],
                      'notes': 'Read-only, except the test environments (testenv: manage). Timestamps are ISO 8601 UTC, ages in seconds; "ui" fields are paths of the web UI. '
                               'state: ok, bad (problems lists why) or idle (not deployed from here). ?fresh=1 reads again now '
                               '(the status is cached for a few seconds, Bitbucket for a minute).'}
@@ -5742,36 +5745,51 @@ def api_answer(path, query, kind, name, permissions):
 # --- Test environments through the API (/api/v1/test-sessions, /runs, /snapshots) ------------------
 # Sessions (an isolated ENV=test in its own clone) and Playwright runs, carried out by bin/test-session as root (its
 # sudo rule), which drops to the setup account. "view" of the section Test environments reads them, "manage" changes
-# them; only a token or Basic auth counts (never a cookie), so no CSRF token is needed. Every change is a line of
-# ui-actions.log (testenv ...), never a patch or a storage state.
+# them; only a token or Basic auth counts (never a cookie), so no CSRF token is needed. Every change is two lines of
+# ui-actions.log (testenv ...: what is asked, before it is done, then its outcome), never a patch or a storage state.
 TESTENV_SESSION = r'ts-[0-9a-f]{12}'
 TESTENV_RUN = r'(?:run|snap)-[0-9a-f]{12}'
 TESTENV_ARTIFACT = r'[A-Za-z0-9][A-Za-z0-9._-]{0,150}'
 TESTENV_BODY_LIMIT = 2 * 1024 * 1024  # a patch may be 1 MiB (bin/test-session refuses a larger one with 413)
 TESTENV_TIMEOUT, TESTENV_SNAPSHOT_TIMEOUT = 120, 300
-# (method, path, level, what it does): the dispatcher, the index and the OpenAPI document all come from this list.
+TESTENV_STATUSES = (400, 403, 404, 409, 413, 503)
+# (method, path, level, what it does, its answers): the dispatcher, the index and the OpenAPI document come from this list.
 TESTENV_ROUTES = (
-    ('GET', '/test-sessions', 'view', 'Every test session (an isolated ENV=test of a project in its own clone on this server).'),
+    ('GET', '/test-sessions', 'view', 'Every test session (an isolated ENV=test of a project in its own clone on this server).',
+     (200, 503)),
     ('POST', '/test-sessions', 'manage', 'Create a test session: {project, db: "dataset:<name>", env_ref?, shop_ref?, '
-                                          'ttl_minutes?} → 202 {session} (status creating; poll it). 409 with reason '
-                                          'memory, disk, session_exists or deploy_locked.'),
-    ('GET', '/test-sessions/{session}', 'view', 'One session and its runs.'),
+                                          'ttl_minutes?, client_run_id?} → 202 {session} (status creating; poll it). The host-side '
+                                          'tree is always a trusted commit (env_ref when trusted, else the deploy branch); an '
+                                          'untrusted env_ref gives only its tests/playwright and config/playwright. 409 with '
+                                          'reason memory, disk or deploy_locked (capacity: retry later), session_exists or '
+                                          'cancelled (no capacity).', (202, 400, 404, 409, 503)),
+    ('GET', '/test-sessions/{session}', 'view', 'One session and its runs.', (200, 400, 404, 503)),
     ('POST', '/test-sessions/{session}/extend', 'manage', 'Extend a session: {minutes?} (default 120), never past 6 h from '
-                                                          'its creation.'),
-    ('DELETE', '/test-sessions/{session}', 'manage', 'Destroy a session (its run is cancelled): 202, status destroying.'),
+                                                          'its creation.', (200, 400, 404, 409, 503)),
+    ('DELETE', '/test-sessions/{session}', 'manage', 'Destroy a session (its run is cancelled): 202, status destroying.',
+     (202, 400, 404, 503)),
     ('POST', '/test-sessions/{session}/snapshot', 'manage', 'A page of the session as an agent needs it: {path, role?: '
-                                                            '"guest"} → its ARIA snapshot, trimmed DOM and a screenshot artifact.'),
+                                                            '"guest"} → its ARIA snapshot, trimmed DOM and a screenshot artifact. '
+                                                            'path is a path of the site (one leading /); the page may load '
+                                                            'nothing of another origin.', (200, 400, 404, 409, 503)),
     ('POST', '/snapshots', 'manage', 'The same of a real site: {project, environment: "stage"|"live", path, role?} '
-                                     '(one GET navigation, nothing submitted).'),
-    ('GET', '/runs', 'view', 'The newest runs (?session=<id> for one session\'s).'),
+                                     '(one GET navigation, nothing submitted, nothing of another origin).', (200, 400, 404, 409, 503)),
+    ('GET', '/runs', 'view', 'The newest runs (?session=<id> for one session\'s).', (200, 400, 503)),
     ('POST', '/runs', 'manage', 'Start a Playwright run: {target: test|stage|live, project, session? (test), grep?, '
-                                'grep_invert?, files?, patch?, deploy_check?, stage_write_safe?, client_run_id?, env_ref?, '
-                                'storage_states?} → 202 {run} (200 with the existing run for a client_run_id given again).'),
-    ('GET', '/runs/{run}', 'view', 'A run: status, summary {passed, failed, flaky, skipped, duration_s} and each test that '
-                                   'did not pass.'),
+                                'grep_invert?, files?, patch? (test only), deploy_check?, stage_write_safe?, client_run_id?, '
+                                'env_ref? (stage/live: a trusted commit only), storage_states?} → 202 {run, created} (200 with '
+                                'the existing run for a client_run_id given again; 409 reason cancelled when that '
+                                'client_run_id was cancelled first).', (200, 202, 400, 403, 404, 409, 413, 503)),
+    ('POST', '/runs/cancel', 'manage', 'Cancel by {project, client_run_id}, also before the run exists: OPS keeps the key '
+                                       'cancelled for 48 h and refuses a later POST /runs (or POST /test-sessions) with it '
+                                       '(409, reason cancelled). → 200 {cancelled: true, run: {…}|null}; idempotent.',
+     (200, 400, 404, 503)),
+    ('GET', '/runs/{run}', 'view', 'A run: status, summary {passed, failed, flaky, skipped, duration_s}, executed, errors and '
+                                   'each test that did not pass.', (200, 400, 404, 503)),
     ('POST', '/runs/{run}/cancel', 'manage', 'Stop a run: status cancelled. Idempotent: a finished (or already cancelled) run is '
-                                             'returned as it is, 200 either way.'),
-    ('GET', '/runs/{run}/artifacts/{name}', 'view', 'One artifact of a run (trace, screenshot, video, error context).'),
+                                             'returned as it is, 200 either way. No body.', (200, 400, 404, 503)),
+    ('GET', '/runs/{run}/artifacts/{name}', 'view', 'One artifact of a run (trace, screenshot, video, error context); of a run '
+                                                    'with storage states (roles) only with "manage".', (200, 400, 403, 404, 503)),
 )
 TESTENV_PLACES = {'{session}': TESTENV_SESSION, '{run}': TESTENV_RUN, '{name}': TESTENV_ARTIFACT}
 ARTIFACT_TYPES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webm': 'video/webm',
@@ -5786,7 +5804,7 @@ def testenv_route(method, path):
     if tail is None:
         return None, None, {}
     known = False
-    for route_method, route, level, _ in TESTENV_ROUTES:
+    for route_method, route, level, _, _ in TESTENV_ROUTES:
         pattern = re.escape(route)
         for place, expression in TESTENV_PLACES.items():
             pattern = pattern.replace(re.escape(place), f'({expression})')
@@ -5800,8 +5818,10 @@ def testenv_route(method, path):
 
 
 def test_session_helper(arguments, payload=None, timeout=TESTENV_TIMEOUT):
-    """(HTTP status, JSON) of bin/test-session through its sudo rule."""
-    argv = ['sudo', '-n', str(LIBRARY / 'bin/test-session'), *arguments]
+    """(HTTP status, JSON) of bin/test-session through its sudo rule. Every value goes as --OPTION=VALUE (arguments are
+    [command, (option, value)...]), so a value such as --help is never read as an option."""
+    argv = ['sudo', '-n', str(LIBRARY / 'bin/test-session'), arguments[0],
+            *[item if isinstance(item, str) else f'{item[0]}={item[1]}' for item in arguments[1:]]]
     try:
         result = subprocess.run(argv, input=json.dumps(payload).encode() if payload is not None else b'', capture_output=True,
                                 timeout=timeout, env=child_environment())
@@ -5815,9 +5835,20 @@ def test_session_helper(arguments, payload=None, timeout=TESTENV_TIMEOUT):
     if not isinstance(data, dict):
         return 503, {'error': 'test-session: unexpected answer', 'status': 503}
     if 'error' in data:
-        status = data.get('status') if data.get('status') in (400, 403, 404, 409, 413, 503) else 503
+        status = data.get('status') if data.get('status') in TESTENV_STATUSES else 503
         return status, {**data, 'status': status}
     return 200, data
+
+
+def testenv_intent(method, route, places, body):
+    """The audit line of a change before it is made (what is asked; never a patch or a storage state)."""
+    body = body if isinstance(body, dict) else {}
+    keys = ('project', 'db', 'env_ref', 'shop_ref', 'target', 'environment', 'session', 'client_run_id', 'path', 'minutes')
+    shown = ' '.join(f'{key}={str(body[key])[:100]}' for key in keys if isinstance(body.get(key), (str, int)) and
+                     not isinstance(body.get(key), bool))
+    extra = ' patch_sha256=' + hashlib.sha256(body['patch'].encode()).hexdigest() if isinstance(body.get('patch'), str) else ''
+    where = ' '.join(f'{name.strip("{}")}={value}' for name, value in places.items())
+    return f'{method} {route} {where} {shown}{extra} (asked)'.replace('  ', ' ')
 
 
 def testenv_request(method, route, places, query, body, caller):
@@ -5827,26 +5858,33 @@ def testenv_request(method, route, places, query, body, caller):
         if route == '/test-sessions':
             return (*test_session_helper(['list']), None)
         if route == '/test-sessions/{session}':
-            return (*test_session_helper(['show', '--id', session]), None)
+            return (*test_session_helper(['show', ('--id', session)]), None)
         if route == '/runs':
             wanted = query.get('session', [''])[0]
             if wanted and not re.fullmatch(TESTENV_SESSION, wanted):
                 return 400, {'error': 'session: a session id (ts-…)', 'status': 400}, None
-            return (*test_session_helper(['runs', *(['--session', wanted] if wanted else [])]), None)
-        return (*test_session_helper(['run-show', '--id', run]), None)
+            return (*test_session_helper(['runs', *([('--session', wanted)] if wanted else [])]), None)
+        return (*test_session_helper(['run-show', ('--id', run)]), None)
+    if route == '/runs/{run}/cancel':
+        status, data = test_session_helper(['cancel', ('--id', run), ('--by', caller)])
+        return status, data, f'cancel id={run} result={(data.get("run") or {}).get("status", "-")} status={status}'
+    if route == '/test-sessions/{session}' and method == 'DELETE':
+        status, data = test_session_helper(['destroy', ('--id', session), ('--by', caller)])
+        return (202 if status == 200 else status), data, f'destroy id={session} status={status}'
     if not isinstance(body, dict):
         return 400, {'error': 'the body must be a JSON object (Content-Type: application/json)', 'status': 400}, None
     if route == '/test-sessions':
-        arguments = ['create', '--by', caller]
-        for key, option in (('project', '--project'), ('db', '--db'), ('env_ref', '--env-ref'), ('shop_ref', '--shop-ref')):
+        arguments = ['create', ('--by', caller)]
+        for key, option in (('project', '--project'), ('db', '--db'), ('env_ref', '--env-ref'), ('shop_ref', '--shop-ref'),
+                            ('client_run_id', '--client-run-id')):
             if body.get(key) is not None:
-                if not isinstance(body[key], str) or not 0 < len(body[key]) <= 200:
+                if not isinstance(body[key], str) or not 0 < len(body[key]) <= 200 or '\0' in body[key]:
                     return 400, {'error': f'{key}: a string', 'status': 400}, None
-                arguments += [option, body[key]]
+                arguments.append((option, body[key]))
         if body.get('ttl_minutes') is not None:
             if not isinstance(body['ttl_minutes'], int) or isinstance(body['ttl_minutes'], bool):
                 return 400, {'error': 'ttl_minutes: an integer', 'status': 400}, None
-            arguments += ['--ttl', str(body['ttl_minutes'])]
+            arguments.append(('--ttl', str(body['ttl_minutes'])))
         status, data = test_session_helper(arguments)
         made = (data.get('session') or {}).get('id')
         return (202 if status == 200 else status), data, \
@@ -5855,14 +5893,16 @@ def testenv_request(method, route, places, query, body, caller):
         minutes = body.get('minutes', 120)
         if not isinstance(minutes, int) or isinstance(minutes, bool):
             return 400, {'error': 'minutes: an integer', 'status': 400}, None
-        status, data = test_session_helper(['extend', '--id', session, '--minutes', str(minutes)])
+        status, data = test_session_helper(['extend', ('--id', session), ('--minutes', str(minutes))])
         return status, data, f'extend id={session} minutes={minutes} status={status}'
-    if route == '/test-sessions/{session}':
-        status, data = test_session_helper(['destroy', '--id', session, '--by', caller])
-        return (202 if status == 200 else status), data, f'destroy id={session} status={status}'
-    if route == '/runs/{run}/cancel':
-        status, data = test_session_helper(['cancel', '--id', run, '--by', caller])
-        return status, data, f'cancel id={run} result={(data.get("run") or {}).get("status", "-")} status={status}'
+    if route == '/runs/cancel':
+        for key in ('project', 'client_run_id'):
+            if not isinstance(body.get(key), str) or not 0 < len(body[key]) <= 200 or '\0' in body[key]:
+                return 400, {'error': f'{key}: a string', 'status': 400}, None
+        status, data = test_session_helper(['cancel-key', ('--project', body['project']),
+                                            ('--client-run-id', body['client_run_id']), ('--by', caller)])
+        return status, data, (f'cancel-key project={body["project"]} client_run_id={body["client_run_id"]} '
+                              f'run={(data.get("run") or {}).get("id", "-")} status={status}')
     if route in ('/runs', '/snapshots', '/test-sessions/{session}/snapshot'):
         request = dict(body)
         if route == '/test-sessions/{session}/snapshot':
@@ -5873,7 +5913,7 @@ def testenv_request(method, route, places, query, body, caller):
                 return 400, {'error': 'environment: stage or live', 'status': 400}, None
             request['target'] = environment
         command = 'run' if route == '/runs' else 'snapshot'
-        status, data = test_session_helper([command, '--by', caller, '--manage', '--request', '-'], request,
+        status, data = test_session_helper([command, ('--by', caller), '--manage'], request,
                                            TESTENV_TIMEOUT if command == 'run' else TESTENV_SNAPSHOT_TIMEOUT)
         shown = data.get('run') or {}
         audit = (f'{command} project={shown.get("project") or request.get("project")} target={request.get("target")} '
@@ -5885,28 +5925,89 @@ def testenv_request(method, route, places, query, body, caller):
     return 404, {'error': 'no such endpoint', 'status': 404}, None
 
 
+TESTENV_SCHEMAS = {
+    'Error': {'type': 'object', 'required': ['error', 'status'], 'properties': {
+        'error': {'type': 'string', 'description': 'what went wrong, in words'},
+        'status': {'type': 'integer', 'description': 'the HTTP status again'},
+        'reason': {'type': 'string', 'enum': ['memory', 'disk', 'run_active', 'deploy_locked', 'session_exists',
+                                              'session_not_ready', 'session_ended', 'storage_state_missing',
+                                              'storage_state_expired', 'gate_unknown', 'cancelled'],
+                   'description': 'a 409/503 the client can act on'},
+        'capacity': {'type': 'boolean', 'description': 'true: no room now (memory, disk, run_active, deploy_locked); retry '
+                                                       'later. Absent otherwise: retrying the same request does not help.'},
+        'run': {'type': 'string'}, 'session': {'type': 'string'}, 'needed_mb': {'type': 'integer'},
+        'available_mb': {'type': 'integer'}}},
+    'Session': {'type': 'object', 'required': ['id', 'project', 'status'], 'properties': {
+        'id': {'type': 'string', 'pattern': f'^{TESTENV_SESSION}$'}, 'project': {'type': 'string'},
+        'status': {'type': 'string', 'enum': ['creating', 'ready', 'failed', 'destroying', 'destroyed', 'expired'],
+                   'description': 'expired: reconcile tore it down at expires_at; destroyed: DELETE; failed: creating '
+                                  'stopped at step (error says why), a new POST replaces it'},
+        'db': {'type': 'string'}, 'env_ref': {'type': 'string'},
+        'env_commit': {'type': 'string', 'description': 'the trusted commit whose Makefile, env and compose files run'},
+        'env_branch': {'type': 'string', 'description': 'the trusted branch that contains env_commit'},
+        'tests_commit': {'type': 'string', 'description': 'where tests/playwright and config/playwright come from'},
+        'shop_ref': {'type': ['string', 'null']}, 'shop_commit': {'type': ['string', 'null']},
+        'step': {'type': ['string', 'null']}, 'error': {'type': ['string', 'null']}, 'url': {'type': ['string', 'null']},
+        'created_at': {'type': 'string', 'format': 'date-time'}, 'expires_at': {'type': 'string', 'format': 'date-time'},
+        'max_expires_at': {'type': 'string', 'format': 'date-time'}, 'active_run': {'type': ['string', 'null']},
+        'client_run_id': {'type': ['string', 'null']}}},
+    'Run': {'type': 'object', 'required': ['id', 'kind', 'status', 'target', 'project'], 'properties': {
+        'id': {'type': 'string', 'pattern': f'^{TESTENV_RUN}$'}, 'kind': {'type': 'string', 'enum': ['run', 'snapshot']},
+        'status': {'type': 'string', 'enum': ['queued', 'running', 'passed', 'failed', 'error', 'cancelled', 'done']},
+        'executed': {'type': 'boolean', 'description': 'set once the run has ended: true when Playwright ran tests and '
+                                                       'reported them (some may have failed, the run may still be error '
+                                                       'after a timeout); false when no test ran'},
+        'target': {'type': 'string', 'enum': ['test', 'stage', 'live']}, 'project': {'type': 'string'},
+        'error': {'type': 'string'}, 'errors': {'type': 'array', 'items': {'type': 'string'},
+                                                'description': 'Playwright\'s own errors (no test found, a config or TypeScript error)'},
+        'summary': {'type': 'object', 'properties': {key: {'type': 'number'} for key in
+                                                     ('passed', 'failed', 'flaky', 'skipped', 'duration_s')}},
+        'tests': {'type': 'array', 'items': {'type': 'object'}}, 'artifacts': {'type': 'array', 'items': {'type': 'object'}},
+        'client_run_id': {'type': 'string'}, 'env_commit': {'type': 'string'}, 'tests_commit': {'type': 'string'},
+        'roles': {'type': 'array', 'items': {'type': 'string'}}, 'snapshot': {'type': 'object'}}},
+}
+
+
 def testenv_openapi():
     """The OpenAPI paths of TESTENV_ROUTES."""
     error = {'description': 'error', 'content': {'application/json': {'schema': {'$ref': '#/components/schemas/Error'}}}}
     places = {'{session}': ('session', TESTENV_SESSION), '{run}': ('run', TESTENV_RUN), '{name}': ('name', TESTENV_ARTIFACT)}
+    envelopes = {'/test-sessions': {'sessions': {'type': 'array', 'items': {'$ref': '#/components/schemas/Session'}}},
+                 '/runs': {'runs': {'type': 'array', 'items': {'$ref': '#/components/schemas/Run'}}}}
     paths = {}
-    for method, route, level, text in TESTENV_ROUTES:
+    for method, route, level, text, codes in TESTENV_ROUTES:
         parameters = [{'name': name, 'in': 'path', 'required': True, 'schema': {'type': 'string', 'pattern': f'^{pattern}$'}}
                       for place, (name, pattern) in places.items() if place in route]
         if route == '/runs' and method == 'GET':
             parameters.append({'name': 'session', 'in': 'query', 'required': False,
                                'schema': {'type': 'string', 'pattern': f'^{TESTENV_SESSION}$'}})
-        responses = {'200': {'description': 'OK', 'content': {'application/octet-stream' if '{name}' in route else
-                                                              'application/json': {'schema': {'type': 'object'} if '{name}' not in route
-                                                                                   else {'type': 'string', 'format': 'binary'}}}},
-                     '400': error, '401': error, '403': error, '404': error, '503': error}
-        if method != 'GET':
-            responses.update({'202': {'description': 'accepted: poll the session or run'}, '409': error, '413': error})
+        if '{name}' in route:
+            ok = {'application/octet-stream': {'schema': {'type': 'string', 'format': 'binary'}}}
+        elif method == 'GET' and route in envelopes:
+            ok = {'application/json': {'schema': {'type': 'object', 'required': list(envelopes[route]),
+                                                  'properties': envelopes[route]}}}
+        elif 'session' in route and 'snapshot' not in route:
+            ok = {'application/json': {'schema': {'type': 'object', 'required': ['session'], 'properties': {
+                'session': {'$ref': '#/components/schemas/Session'},
+                **({'runs': {'type': 'array', 'items': {'$ref': '#/components/schemas/Run'}}} if method == 'GET' else {})}}}}
+        elif route == '/runs/cancel':
+            ok = {'application/json': {'schema': {'type': 'object', 'required': ['cancelled', 'run'], 'properties': {
+                'cancelled': {'type': 'boolean', 'const': True},
+                'run': {'oneOf': [{'$ref': '#/components/schemas/Run'}, {'type': 'null'}]}}}}}
+        else:
+            ok = {'application/json': {'schema': {'type': 'object', 'required': ['run'], 'properties': {
+                'run': {'$ref': '#/components/schemas/Run'}, 'created': {'type': 'boolean'}}}}}
+        responses = {'401': error}
+        for code in codes:
+            responses[str(code)] = {'description': {200: 'OK', 202: 'accepted: poll the session or run'}[code], 'content': ok} \
+                if code in (200, 202) else error
+        if level == 'manage' or '{name}' in route:
+            responses['403'] = error
         operation = {'summary': text, 'operationId': method.lower() + ''.join(
             part.title() for part in re.split(r'[^a-z]+', route) if part),
             'description': f'Needs the permission "{level}" of the section Test environments.', 'parameters': parameters,
-            'responses': responses}
-        if method == 'POST':
+            'responses': dict(sorted(responses.items()))}
+        if method == 'POST' and route != '/runs/{run}/cancel':
             operation['requestBody'] = {'required': route != '/test-sessions/{session}/extend',
                                         'content': {'application/json': {'schema': {'type': 'object'}}}}
         paths.setdefault(API_PREFIX + route, {})[method.lower()] = operation
@@ -6091,7 +6192,8 @@ def handler(accounts):
             self.json_reply(code, data)
 
         def api_testenv(self, path, query):
-            """A test-environment endpoint (TESTENV_ROUTES), any method: the permission, the body, the helper, the audit line."""
+            """A test-environment endpoint (TESTENV_ROUTES), any method: the caller, the permission, the body, the audit
+            line of what is asked (before anything is done), the helper, the audit line of its outcome."""
             method = 'GET' if self.command == 'HEAD' else self.command
             route, level, places = testenv_route(method, path)
             if route is None or route == '':
@@ -6121,62 +6223,94 @@ def handler(accounts):
                     self.api_logged(kind, name, 400)
                     return self.json_reply(400, {'error': 'the body is not JSON', 'status': 400})
             if route == '/runs/{run}/artifacts/{name}':
-                return self.api_artifact(kind, name, places['{run}'], places['{name}'])
+                manage = PERMISSION_LEVELS.index(permissions.get('testenv', '')) >= PERMISSION_LEVELS.index('manage')
+                return self.api_artifact(kind, name, places['{run}'], places['{name}'], manage)
             caller = f'{kind}:{name}'
+            if method != 'GET':
+                try:
+                    record(caller, self.caller(), 'testenv', testenv_intent(method, route, places, body))
+                except OSError as error:
+                    self.api_logged(kind, name, 500)
+                    return self.json_reply(500, {'error': f'the action log cannot be written ({error.strerror}): nothing was done',
+                                                 'status': 500})
             code, data, audit = testenv_request(method, route, places, query, body, caller)
             if audit:
                 try:
-                    record(f'{kind}:{name}', self.caller(), 'testenv', audit)
+                    record(caller, self.caller(), 'testenv', audit)
                 except OSError as error:
                     log(f'ui-actions.log: {error}')
             self.api_logged(kind, name, code)
             self.json_reply(code, data)
 
-        def api_artifact(self, kind, name, run, artifact):
-            """One artifact's bytes, streamed from bin/test-session (its size from the run's list)."""
-            code, data = test_session_helper(['run-show', '--id', run])
-            listed = next((item for item in ((data.get('run') or {}).get('artifacts') or []) if item.get('name') == artifact),
-                          None) if code == 200 else None
+        def api_artifact(self, kind, name, run, artifact, manage):
+            """One artifact's bytes, streamed from bin/test-session: its first line says the size it opened (or the error),
+            so the status is sent only once the file is open. A run that used storage states (roles) may carry their
+            cookies in its traces: its artifacts need "manage"."""
+            code, data = test_session_helper(['run-show', ('--id', run)])
+            shown = (data.get('run') or {}) if code == 200 else {}
+            listed = next((item for item in (shown.get('artifacts') or []) if item.get('name') == artifact), None)
             if listed is None:
                 code = code if code != 200 else 404
                 self.api_logged(kind, name, code)
                 return self.json_reply(code, data if code != 404 or 'error' in data else
                                        {'error': f'run {run} has no artifact {artifact}', 'status': 404})
-            argv = ['sudo', '-n', str(LIBRARY / 'bin/test-session'), 'artifact', '--id', run, '--name', artifact]
+            if shown.get('roles') and not manage:
+                self.api_logged(kind, name, 403)
+                return self.json_reply(403, {'error': 'this run used storage states: its artifacts need the permission "manage" '
+                                                      'of Test environments', 'status': 403})
+            argv = ['sudo', '-n', str(LIBRARY / 'bin/test-session'), 'artifact', f'--id={run}', f'--name={artifact}']
             try:
                 process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                            env=child_environment())
             except OSError as error:
                 self.api_logged(kind, name, 503)
                 return self.json_reply(503, {'error': f'test-session: {error}', 'status': 503})
-            self.send_response(200)
-            self.send_header('Content-Type', ARTIFACT_TYPES.get(os.path.splitext(artifact)[1].lower(), 'application/octet-stream'))
-            self.send_header('Content-Length', str(int(listed.get('size') or 0)))
-            self.send_header('Content-Disposition', f'attachment; filename="{artifact}"')
-            self.send_header('Cache-Control', 'no-store')
-            self.send_header('X-Content-Type-Options', 'nosniff')
-            self.send_header('Content-Security-Policy', "default-src 'none'; sandbox")
-            self.end_headers()
             try:
-                while self.command != 'HEAD':
-                    chunk = process.stdout.read(65536)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-            except OSError:
-                pass
+                first = process.stdout.readline(4096)
+                try:
+                    head = json.loads(first)
+                except ValueError:  # an error: one JSON object over several lines, and nothing after it
+                    try:
+                        head = json.loads(first + process.stdout.read(65536))
+                    except ValueError:
+                        head = None
+                size = (head or {}).get('artifact', {}).get('size') if isinstance(head, dict) else None
+                if not isinstance(size, int):
+                    error = head if isinstance(head, dict) and 'error' in head else \
+                        {'error': 'test-session: no artifact header', 'status': 503}
+                    status = error.get('status') if error.get('status') in TESTENV_STATUSES else 503
+                    self.api_logged(kind, name, status)
+                    return self.json_reply(status, {**error, 'status': status})
+                self.send_response(200)
+                self.send_header('Content-Type', ARTIFACT_TYPES.get(os.path.splitext(artifact)[1].lower(), 'application/octet-stream'))
+                self.send_header('Content-Length', str(size))
+                self.send_header('Content-Disposition', f'attachment; filename="{artifact}"')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Content-Security-Policy', "default-src 'none'; sandbox")
+                self.end_headers()
+                try:
+                    while self.command != 'HEAD':
+                        chunk = process.stdout.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                except OSError:
+                    pass
+                self.api_logged(kind, name, 200)
             finally:
                 process.stdout.close()
                 process.kill() if process.poll() is None else None
                 process.wait()
-            self.api_logged(kind, name, 200)
 
         def api_refused_method(self, path=''):
-            """A method an API path does not take: 405 (GET only, but on the test environments)."""
-            if not self.host_ok(api=True):
+            """A method an API path does not take: 405 (GET only, but on the test environments), once the caller is known
+            (a caller without credentials gets 401, whatever the path)."""
+            found = self.api_caller()
+            if not found:
                 return
-            self.api_logged('-', '-', 405)
-            methods = sorted({method for method, route, _, _ in TESTENV_ROUTES if testenv_route(method, path)[0]}) or ['GET', 'HEAD']
+            self.api_logged(*found, 405)
+            methods = sorted({method for method, route, _, _, _ in TESTENV_ROUTES if testenv_route(method, path)[0]}) or ['GET', 'HEAD']
             self.json_reply(405, {'error': f'{self.command[:10]} is not allowed here: {", ".join(methods)}', 'status': 405},
                             [('Allow', ', '.join(methods))])
 
@@ -6665,6 +6799,11 @@ def handler(accounts):
                 return self.reply(403, page.invalid('Your groups do not give the permission "manage" for this action.'))
             if plan.kind == 'pipeline':
                 return self.pipeline(page, name, plan)
+            try:
+                jobs(strict=True)
+            except OSError as error:
+                return self.reply(500, page.invalid(f'The jobs in {JOBS} cannot be read ({error.strerror}): nothing was run, '
+                                                    'since another action could be running unseen.'))
             busy = running_job()
             if busy:
                 return self.reply(409, page.layout('Busy', f'<div class="callout warn"><p>Another action is still running: '

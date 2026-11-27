@@ -1,4 +1,5 @@
 """A publish arriving during a real Git update must be applied before the workflow succeeds."""
+import hermetic  # noqa: F401  first: no test touches the installed server (tests/hermetic.py)
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import importlib.machinery
 import importlib.util
