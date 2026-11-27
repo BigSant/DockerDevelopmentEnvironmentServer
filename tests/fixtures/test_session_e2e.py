@@ -454,7 +454,11 @@ def prestashop_cycle(options):
     left = [line for line in subprocess.run(['docker', 'image', 'ls', '--format', '{{.Repository}}:{{.Tag}}'], capture_output=True,
                                             text=True).stdout.split() if line.startswith(prefix)]
     check(not left, 'none of its images is left', left)
-    check('build cache bounded' in log.read_text(), 'the build cache was bounded after the teardown')
+    for _ in range(60):  # once the session has ended, so just after its status says so
+        if 'build cache bounded' in log.read_text():
+            break
+        time.sleep(2)
+    check('build cache bounded' in log.read_text(), 'the build cache was bounded once the session had ended')
     print(f'all checks passed in {int(time.time() - started)} s')
     if not options.keep:
         shutil.rmtree(base, ignore_errors=True)
