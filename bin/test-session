@@ -1802,7 +1802,6 @@ def teardown(data, log):
         if os.path.lexists(path):
             say(log, f'{path} could not be removed (files of another account, no image to remove them with); tried again')
             return False
-    bound_build_cache(log)
     return True
 
 
@@ -1834,8 +1833,9 @@ def remove_session_images(prefix, log):
 
 def bound_build_cache(log):
     """BuildKit's cache, which make build fills on this host (sessions and the project's own builds alike) and no
-    session limit bounds: pruned down to TEST_BUILD_CACHE_GB (10; 0: not pruned), the least recently used first, after
-    every teardown. A failure is logged and changes nothing else."""
+    session limit bounds: pruned down to TEST_BUILD_CACHE_GB (10; 0: not pruned), the least recently used first, once a
+    session has ended (its teardown complete, the next session of the project free to start). A failure is logged and
+    changes nothing else."""
     limit = settings()['TEST_BUILD_CACHE_GB']
     if not limit:
         return
@@ -1893,6 +1893,8 @@ def destroy_worker(identifier):
             try_update_session(data['project'], identifier, ('destroying',), status=final,
                                step=data.get('step') if final == 'failed' else None,  # a failure keeps where it failed
                                worker=None, command=None, ended_at=now(), active_run=None, cleanup=None)
+            # After the session has ended: a long prune never holds the project's next session back.
+            bound_build_cache(log)
         else:
             try_update_session(data['project'], identifier, ('destroying',), worker=None,
                                attempts=int(data.get('attempts') or 0) + 1,

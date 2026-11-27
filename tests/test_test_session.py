@@ -766,6 +766,16 @@ class SessionImagesTest(Base):
         self.assertIn("builder prune --force --max-used-space 10gb", self.docker_calls())
         self.assertIn("removed the session's images", (self.ts.SESSIONS / "alpha/log").read_text())
 
+    def test_the_build_cache_is_pruned_only_once_the_session_has_ended(self):
+        made = self.ts.create(self.options())[0]
+        seen = []
+        prune = self.ts.bound_build_cache
+        with patch.object(self.ts, "make", self.make_failing_at("build")), \
+                patch.object(self.ts, "bound_build_cache",
+                             lambda log: seen.append(self.ts.find_session(made["id"])["status"]) or prune(log)):
+            self.ts.create_worker(made["id"])
+        self.assertEqual(seen, ["failed"], "a long prune never keeps the session destroying (and the next one waiting)")
+
     def test_a_teardown_is_not_done_while_an_image_of_the_session_is_left(self):
         self.config("TEST_BUILD_CACHE_GB=0\n")
         made = self.ts.create(self.options())[0]

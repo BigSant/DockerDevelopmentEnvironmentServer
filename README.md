@@ -1508,7 +1508,7 @@ separate filesystem, or point `TEST_DOCKER_HOST=unix:///…|tcp://…|ssh://…`
 resource-limited VM without the production deploy keys is the operator's strongest option). Both are settings in
 `/etc/setup-server/test-sessions.env`; nothing else changes. Without them, what stays shared: the Docker daemon and its
 data root (images, the session's volumes and containers' writable layers), the disk under `$ROOT`, the kernel, the
-build cache of `docker compose build` (BuildKit is not bounded by these limits: after every teardown it is pruned to
+build cache of `docker compose build` (BuildKit is not bounded by these limits: once a session has ended it is pruned to
 `TEST_BUILD_CACHE_GB`, 10, least recently used first, the project's own builds' cache included; `0` leaves it alone), the
 images named by their content (`php-fpm-base-…`, `nginx-proxy-…`, the database, Playwright: one per version, shared by
 every session and kept), and the build root's Git objects (read only).

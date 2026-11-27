@@ -189,7 +189,9 @@ def main():
     (base / 'work').mkdir()
     work = fixture.build(base / 'work', options.setup, lock_file=options.lock_file, services='playwright metrics cron backup')
     # This machine shares its host with the sessions knowingly (a production host gets its own filesystem and daemon).
-    (config / 'test-sessions.env').write_text('TEST_RUN_DISK_MB=200\nTEST_SESSIONS_SHARE_PRODUCTION_HOST=accept-risk\n')
+    # TEST_BUILD_CACHE_GB above this machine's own cache: the prune runs, a developer's cache stays.
+    (config / 'test-sessions.env').write_text('TEST_RUN_DISK_MB=200\nTEST_SESSIONS_SHARE_PRODUCTION_HOST=accept-risk\n'
+                                          'TEST_BUILD_CACHE_GB=500\n')
     origin = base / 'origin.git'
     subprocess.run(['git', 'init', '-q', '--bare', '-b', 'master', str(origin)], check=True)
     fixture.git(work, 'remote', 'add', 'origin', str(origin))
