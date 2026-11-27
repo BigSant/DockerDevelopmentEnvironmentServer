@@ -2,34 +2,44 @@
 """Test sessions and Playwright runs of the projects on this worker, for the web UI's API (bin/web-ui).
 
 The UI's account runs the root-owned copy through its sudo rule (bin/install-ui); the timer
-setup-server-test-sessions.timer runs `reconcile` every minute. As root it checks only what needs root (the storage
-state files Vault hands over in /run/vault-handoff) and then runs itself again as the setup account: every clone,
-make, git and Docker command runs with that account's rights, never root's. Each command prints one JSON object;
-an error is {"error", "status" (the HTTP status the UI answers), "reason"?} with exit 1.
+setup-server-test-sessions.timer runs `reconcile` every minute. As root it accepts only the public commands below (a run's
+request on stdin, at most REQUEST_LIMIT bytes), reads only what needs root (the storage state files Vault hands over in
+/run/vault-handoff) and then runs itself again as the setup account with what it checked: every clone, make, git and
+Docker command runs with that account's rights, never root's. Each command prints one JSON object; an error is
+{"error", "status" (the HTTP status the UI answers), "reason"?, "capacity"?} with exit 1.
 
-A session is an isolated ENV=test of one project in its own clone, $ROOT/test-sessions/<project>/repo (from the
-build root, with its submodules), never the build root's checkout, whose deploy lock it never takes. The clone gets
-an env/local.env (the committed local.env.example, else generated names) and an env/test.env with TEST_TLS=self-signed
-and TEST_HOST_ROUTE=off; then make test-init, make build, make test-prepare set=<data set> and make e2e-install.
-One session per project; creating one is refused (409) when the memory or disk gate fails, the project has one
-already or a deploy of it runs. It lives TEST_SESSION_TTL_MINUTES (default 120), may be extended up to
-TEST_SESSION_MAX_MINUTES (360) from its creation, and is destroyed when it expires (reconcile).
+Trust (README "Test environments"): code that runs ON THIS HOST (the environment repository's Makefile, env/, compose
+files, whatever make runs here) comes only from a trusted commit: one reachable from the project's deploy branch (the
+build root's origin/HEAD) or from a branch $CONFIG/test-sessions.env allows (TEST_TRUSTED_REFS_<PROJECT>=a b). Nothing is
+fetched for it. Code the caller chooses (the specs and their configuration, tests/playwright/ and config/playwright/, from
+env_ref or a patch; the shop code of shop_ref) is only ever files written onto that trusted tree and runs only inside
+containers; tests/playwright's package.json, package-lock.json and .npmrc always come from the trusted commit. stage and
+live run only the trusted commit's suite: no patch, no env_ref but a trusted one.
+
+A session is an isolated ENV=test of one project in its own clone, $ROOT/test-sessions/<project>/repo, never the build
+root's checkout, whose deploy lock it never takes. Its env/test.env (TEST_TLS=self-signed, TEST_HOST_ROUTE=off: no
+published port, an internal network; CRON_SCHEDULE=off; the container limits SESSION_MEMORY_MB) is this program's.
+One session per project; creating one is refused (409) when the memory or disk gate fails, the project has a live one or
+a deploy of it runs; a failed one is replaced. It lives TEST_SESSION_TTL_MINUTES (default 120), may be extended up to
+TEST_SESSION_MAX_MINUTES (360) from its creation, and is torn down by reconcile when it expires (status expired).
 
 A run is make e2e json=1 with the selection this program builds: the target's tag rule, which the caller can only
-narrow. In a session (target test) on its tree, after its tests/playwright and config/playwright are reset to the
-checked-out commit and the caller's patch (if any) applied; against stage or live (the environment's DOMAIN) with
-url=, from $ROOT/test-external/<project>/repo, a clone of the build root at its current commit (or env_ref). One run
-at a time per session and per project's external clone. Results: $ROOT/test-runs/<id>/ (run.json, report.json, the
-artifacts of the tests that did not pass); kept TEST_RUN_KEEP_DAYS (7).
+narrow. One run at a time per session and per project's external clone; each in a container named after the run, with
+limits, which a timeout, a cancel or reconcile removes. Results: $ROOT/test-runs/<id>/ (run.json, report.json, the
+artifacts of the tests that did not pass); kept TEST_RUN_KEEP_DAYS (7) and within TEST_RUNS_TOTAL_MB.
 
-Usage (as the UI calls it; every value is checked again here):
-  test-session create --project P --db dataset:NAME [--env-ref REF] [--shop-ref REF] [--ttl MINUTES] --by CALLER
-  test-session list | show --id ID | extend --id ID --minutes M | destroy --id ID --by CALLER
-  test-session run --request FILE --by CALLER          (FILE: the JSON request, see README "Test environments")
-  test-session run-show --id RUN | runs [--session ID] | artifact --id RUN --name NAME   (artifact: raw bytes)
-  test-session cancel --id RUN --by CALLER             (idempotent: a finished run is returned as it is)
-  test-session snapshot --request FILE --by CALLER
-  test-session reconcile                               (the timer: expiry, crashed workers, orphans, old runs)
+Usage (as the UI calls it, --OPTION=VALUE; every value is checked again here):
+  test-session create --project=P --db=dataset:NAME [--env-ref=REF] [--shop-ref=REF] [--ttl=MINUTES]
+                      [--client-run-id=K] --by=CALLER
+  test-session list | show --id=ID | extend --id=ID --minutes=M | destroy --id=ID --by=CALLER
+  test-session run --by=CALLER [--manage] < REQUEST.json     (README "Test environments")
+  test-session snapshot --by=CALLER [--manage] < REQUEST.json
+  test-session run-show --id=RUN | runs [--session=ID]
+  test-session artifact --id=RUN --name=NAME   (a JSON line {"artifact": {"size"}}, then the bytes)
+  test-session cancel --id=RUN --by=CALLER     (idempotent: a finished run is returned as it is)
+  test-session cancel-key --project=P --client-run-id=K --by=CALLER
+                                               (cancel what K names, also before it exists: a tombstone, 48 h)
+  test-session reconcile                       (the timer: expiry, crashed workers, orphans, old runs)
 """
 
 import argparse
@@ -42,6 +52,7 @@ from pathlib import Path, PurePosixPath
 import pwd
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import stat
@@ -58,37 +69,55 @@ PROJECTS = ROOT / 'projects'
 SESSIONS = ROOT / 'test-sessions'
 EXTERNAL = ROOT / 'test-external'
 RUNS = ROOT / 'test-runs'
-PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+# The commands' PATH (SETUP_SERVER_PATH: the tests' fake docker; sudo and the units never pass it).
+PATH = os.environ.get('SETUP_SERVER_PATH') or '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 NAME = re.compile(r'[a-z0-9][a-z0-9_-]{0,63}')
 SESSION_ID = re.compile(r'ts-[0-9a-f]{12}')
 RUN_ID = re.compile(r'(?:run|snap)-[0-9a-f]{12}')
 REF = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,99}')
+COMMIT = re.compile(r'[0-9a-f]{40}')
 DATASET = re.compile(r'dataset:([a-z0-9][a-z0-9_-]{0,63})')
 CALLER = re.compile(r'[A-Za-z0-9._@:-]{1,80}')
 CLIENT_RUN_ID = re.compile(r'[A-Za-z0-9._:-]{1,100}')
 ROLE = re.compile(r'[a-z][a-z0-9_-]{0,31}')
 OPERATION = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 SPEC_FILTER = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_.@/-]{0,199}(?::[0-9]{1,6})?')
-PAGE_PATH = re.compile(r'/[A-Za-z0-9._~%/?&=+,;:@!$*()-]{0,999}')
+# A path of the site: one leading /, never // or /\ (a scheme-relative URL leads to another host).
+PAGE_PATH = re.compile(r'/(?![/\\])[A-Za-z0-9._~%/?&=+,;:@!$*()-]{0,999}')
 ARTIFACT = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,150}')
 TARGETS = {'test': None, 'stage': 'stage', 'live': 'prod'}  # target -> the environment of the build root
+REQUEST_LIMIT = 2 * 1024 * 1024
 PATCH_LIMIT = 1024 * 1024
-PATCH_ROOTS = ('tests/playwright/', 'config/playwright/')
-PATCH_FORBIDDEN = ('package.json', 'package-lock.json', '.npmrc')  # dependencies come from the reviewed commit
+PATCH_ROOTS = ('tests/playwright', 'config/playwright')  # relative to app/, as setup's PROJECT_APP_DIRECTORY
+PACKAGE_FILES = ('package.json', 'package-lock.json', '.npmrc')  # the specs' dependencies: the trusted commit's only
+OVERLAY_FILES, OVERLAY_BYTES = 20000, 200 * 1024 * 1024
+STATE_LIMIT = 1024 * 1024
+REPORT_LIMIT = 32 * 1024 * 1024
+TESTS_LIMIT, ARTIFACTS_LIMIT, MESSAGE_LIMIT = 500, 200, 4000
 PATTERN_LIMIT = 1000
-# The tag rule, enforced here: a tag ends where a letter, digit, _ or - would continue it (@stage is not @stage-write).
-END = r'(?![\w-])'
-OTHER_TARGETS = rf'@(?:stage|stage-write|live){END}'
-DEFAULTS = {'TEST_SESSION_MEMORY_MB': 2500, 'TEST_SESSION_RESERVE_MB': 2048, 'TEST_SESSION_DISK_MB': 5120,
-            'TEST_SESSION_TTL_MINUTES': 120, 'TEST_SESSION_MAX_MINUTES': 360, 'TEST_RUN_TIMEOUT_MINUTES': 60,
-            'TEST_RUN_ARTIFACTS_MB': 500, 'TEST_RUN_KEEP_DAYS': 7, 'TEST_STORAGE_STATE_MAX_AGE': 900,
-            'TEST_SNAPSHOT_TIMEOUT': 240}
+DEFAULTS = {'TEST_SESSION_RESERVE_MB': 2048, 'TEST_SESSION_DISK_MB': 5120, 'TEST_SESSION_TTL_MINUTES': 120,
+            'TEST_SESSION_MAX_MINUTES': 360, 'TEST_RUN_TIMEOUT_MINUTES': 60, 'TEST_RUN_MEMORY_MB': 1024, 'TEST_RUN_CPUS': 2,
+            'TEST_RUN_DISK_MB': 1024, 'TEST_RUN_ARTIFACTS_MB': 200, 'TEST_RUNS_TOTAL_MB': 2048, 'TEST_RUN_KEEP_DAYS': 7,
+            'TEST_STORAGE_STATE_MAX_AGE': 900, 'TEST_SNAPSHOT_TIMEOUT': 240}
+# The container limits of a session's services (env/test.env, MB): what the memory gate counts for a session, with
+# TEST_RUN_MEMORY_MB for its Playwright container. A service the project does not use costs nothing but is counted.
+SESSION_MEMORY_MB = {'PHP': 512, 'DATABASE': 768, 'WEBSERVER': 192, 'PROXY': 96, 'CRON': 128, 'MEMCACHED': 64,
+                     'REDIS': 64, 'MAILPIT': 64, 'PMA': 128, 'DBMONITOR': 64, 'METRICS': 64, 'BACKUP': 64}
 DOM_LIMIT = 200_000
 TERMINAL = ('passed', 'failed', 'error', 'cancelled', 'done')
+ACTIVE = ('queued', 'running')
+STOP_GRACE = 15
+QUOTA_EVERY = 10  # run_logged looks at a run's disk use every this many 2 s waits
+
+
+def tag(name):
+    """A tag as the tag rule matches it: a word of Playwright's grep text ("<project> <file> <titles> <tags>", joined
+    by spaces), so neither jonas@live.com nor a path @live/x.spec.ts nor @stage-write is @live / @stage."""
+    return rf'(?<!\S)@{re.escape(name)}(?!\S)'
 
 
 # The refusals that mean "no room now, try again later" (a client may retry them), not a bad request or a broken server.
-CAPACITY = ('memory', 'disk', 'session_exists', 'run_active', 'deploy_locked')
+CAPACITY = ('memory', 'disk', 'run_active', 'deploy_locked')
 
 
 class Refusal(Exception):
@@ -96,6 +125,10 @@ class Refusal(Exception):
         super().__init__(error)
         self.answer = {'error': error, 'status': status, **({'reason': reason} if reason else {}),
                        **({'capacity': True} if reason in CAPACITY else {}), **extra}
+
+
+class Cancelled(Exception):
+    """The run was cancelled (or its session ended) while its worker ran: cancel_run set the outcome."""
 
 
 def now():
@@ -109,15 +142,22 @@ def iso(moment):
 def settings():
     """The gate values and limits: DEFAULTS, overridden by $CONFIG/test-sessions.env (KEY=integer lines)."""
     values = dict(DEFAULTS)
-    try:
-        text = (CONFIG / 'test-sessions.env').read_text()
-    except OSError:
-        text = ''
-    for line in text.splitlines():
+    for line in config_text().splitlines():
         match = re.fullmatch(r'\s*([A-Z_]+)\s*=\s*([0-9]{1,9})\s*(?:#.*)?', line)
         if match and match[1] in values:
             values[match[1]] = int(match[2])
     return values
+
+
+def config_text():
+    try:
+        return (CONFIG / 'test-sessions.env').read_text()
+    except OSError:
+        return ''
+
+
+def session_memory_mb(limits):
+    return sum(SESSION_MEMORY_MB.values()) + limits['TEST_RUN_MEMORY_MB']
 
 
 # --- Files -----------------------------------------------------------------------------------------
@@ -150,44 +190,235 @@ def say(log, text):
         handle.write(f'{iso(now())} {text}\n')
 
 
-def run_logged(log, command, cwd=None, env=None, timeout=None):
-    """Run a command with its output appended to the log; its exit code (124 on a timeout)."""
-    say(log, '$ ' + ' '.join(command))
-    with open(log, 'a') as handle:
+def managed_bases():
+    return (SESSIONS, EXTERNAL, RUNS)
+
+
+def inside_managed(path, base_too=False):
+    """path, refused (RuntimeError) unless it lies below a session, external or run directory (or is one, base_too)
+    with every component from there a real directory (no symlink): what a cleanup may touch, so it never leaves them."""
+    path = Path(os.path.abspath(path))
+    for base in managed_bases():
+        base = Path(os.path.abspath(base))
         try:
-            process = subprocess.Popen(command, cwd=cwd, env=env, stdout=handle, stderr=subprocess.STDOUT,
-                                       stdin=subprocess.DEVNULL, start_new_session=True)
-            return process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGTERM)
-            process.wait(30)
-            return 124
-        except OSError as error:
-            handle.write(f'{command[0]}: {error.strerror}\n')
-            return 127
-
-
-def playwright_image():
-    found = subprocess.run(['docker', 'image', 'ls', '--filter', 'label=setup.service=playwright', '--format',
-                            '{{.Repository}}:{{.Tag}}'], capture_output=True, text=True)
-    return next((line for line in found.stdout.split() if line and '<none>' not in line), None)
+            parts = path.relative_to(base).parts
+        except ValueError:
+            continue
+        if '..' in parts or (not parts and not base_too):
+            break
+        current = base
+        for part in parts:
+            current = current / part
+            try:
+                details = os.lstat(current)
+            except FileNotFoundError:
+                return path  # nothing there, so nothing below it either
+            if not stat.S_ISDIR(details.st_mode):
+                raise RuntimeError(f'{current} is not a directory (a symlink?): not removed')
+        return path
+    raise RuntimeError(f'{path} is outside the test session directories: not removed')
 
 
 def remove_tree(path):
-    """Remove a directory this account made; files a container wrote there as root go through a throwaway container."""
+    """Remove a path this account made: a symlink or a file is unlinked (never what a link points to); a directory is
+    removed, files a container wrote there as root through a throwaway container that sees that directory only."""
     path = Path(path)
-    if not path.exists() and not path.is_symlink():
+    inside_managed(path.parent, base_too=True)  # no component above it is a symlink an unlink would follow
+    try:
+        details = os.lstat(path)
+    except FileNotFoundError:
         return
+    if not stat.S_ISDIR(details.st_mode):
+        os.unlink(path)
+        return
+    inside_managed(path)
     try:
         shutil.rmtree(path)
         return
     except OSError:
         pass
+    inside_managed(path)
     image = playwright_image()
     if image:
-        subprocess.run(['docker', 'run', '--rm', '--network', 'none', '--user', '0', '--entrypoint', 'find', '-v',
-                        f'{path}:/target', image, '/target', '-mindepth', '1', '-delete'], capture_output=True)
+        subprocess.run(['docker', 'run', '--rm', '--network', 'none', '--user', '0', '--security-opt', 'no-new-privileges:true',
+                        '--entrypoint', 'find', '--volume', f'{path}:/target', image, '/target', '-mindepth', '1', '-delete'],
+                       capture_output=True, timeout=600, env=child_environment())
     shutil.rmtree(path, ignore_errors=True)
+
+
+def tree_size(path):
+    """Bytes below path, symlinks not followed."""
+    total = 0
+    for directory, folders, files in os.walk(path):
+        for name in files + folders:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(directory, name)).st_blocks * 512
+    return total
+
+
+def open_directory(base, parts):
+    """A descriptor of base/parts…, each component opened without following a symlink."""
+    descriptor = os.open(base, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        for part in parts:
+            if part in ('', '.', '..') or '/' in part:
+                raise OSError(f'bad path component {part!r}')
+            inner = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = inner
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def open_regular(directory_fd, relative):
+    """(descriptor, size) of a regular file at relative below directory_fd: no component and not the file a symlink,
+    not a FIFO or device; OSError otherwise."""
+    parts = PurePosixPath(relative).parts
+    if not parts or any(part in ('', '.', '..', '/') for part in parts):
+        raise OSError(f'bad path {relative!r}')
+    inner = os.dup(directory_fd)
+    try:
+        for part in parts[:-1]:
+            nested = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=inner)
+            os.close(inner)
+            inner = nested
+        descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=inner)
+    finally:
+        os.close(inner)
+    details = os.fstat(descriptor)
+    if not stat.S_ISREG(details.st_mode):
+        os.close(descriptor)
+        raise OSError(f'{relative} is not a regular file')
+    return descriptor, details.st_size
+
+
+def read_bounded(descriptor, limit):
+    """At most limit bytes of descriptor (closed); OSError when there are more."""
+    with os.fdopen(descriptor, 'rb') as handle:
+        data = handle.read(limit + 1)
+    if len(data) > limit:
+        raise OSError(f'larger than {limit} bytes')
+    return data
+
+
+def read_inside(base, relative, limit, parents=()):
+    """The bytes of base/parents…/relative, safely (open_directory, open_regular), at most limit; None if unreadable."""
+    try:
+        directory = open_directory(base, parents)
+        try:
+            descriptor, _ = open_regular(directory, relative)
+        finally:
+            os.close(directory)
+        return read_bounded(descriptor, limit)
+    except OSError:
+        return None
+
+
+def write_new(directory_fd, name, data, mode=0o644):
+    descriptor = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, mode, dir_fd=directory_fd)
+    with os.fdopen(descriptor, 'wb') as handle:
+        handle.write(data)
+
+
+# --- Commands --------------------------------------------------------------------------------------
+def process_start(pid):
+    """The start time of a process (field 22 of /proc/<pid>/stat), which tells a reused pid from the one recorded."""
+    try:
+        text = (PROC / str(int(pid)) / 'stat').read_text()
+        return int(text[text.rindex(')') + 2:].split()[19])
+    except (OSError, ValueError, TypeError, IndexError):
+        return None
+
+
+def identity(pid):
+    return {'pid': pid, 'start': process_start(pid)}
+
+
+def alive(recorded):
+    """True while the process recorded ({pid, start}, or a bare pid of an older record) still runs."""
+    if isinstance(recorded, dict):
+        pid, start = recorded.get('pid'), recorded.get('start')
+    else:
+        pid, start = recorded, None
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return start is None or process_start(pid) == start
+
+
+def kill_group(recorded, signal_number):
+    """Signal the process group a recorded process leads, if it is still that process."""
+    if recorded and alive(recorded):
+        pid = recorded['pid'] if isinstance(recorded, dict) else recorded
+        with contextlib.suppress(OSError, TypeError, ValueError):
+            os.killpg(int(pid), signal_number)
+
+
+def remove_container(name):
+    """docker rm -f of a run's container (by its exact name; nothing when there is none)."""
+    if RUN_ID.fullmatch(name or ''):
+        subprocess.run(['docker', 'rm', '--force', '--volumes', name], capture_output=True, timeout=120, env=child_environment())
+
+
+def stop_command(recorded, container):
+    """A command's process group: SIGTERM, then SIGKILL after STOP_GRACE seconds; then its container."""
+    kill_group(recorded, signal.SIGTERM)
+    deadline = time.monotonic() + STOP_GRACE
+    while alive(recorded) and time.monotonic() < deadline:
+        time.sleep(0.5)
+    kill_group(recorded, signal.SIGKILL)
+    remove_container(container)
+
+
+def run_logged(log, command, cwd=None, env=None, timeout=None, run=None, quota=None):
+    """Run a command (in its own process group) with its output appended to the log. Its exit code; 124 on a timeout,
+    125 when quota (directory, bytes) is exceeded, 130 when run (an id) was cancelled meanwhile; in those cases its
+    process group and the run's container are stopped. A run records the group so cancel_run can stop it."""
+    say(log, '$ ' + ' '.join(command))
+    with open(log, 'a') as handle:
+        try:
+            process = subprocess.Popen(command, cwd=cwd, env=env, stdout=handle, stderr=subprocess.STDOUT,
+                                       stdin=subprocess.DEVNULL, start_new_session=True)
+        except OSError as error:
+            handle.write(f'{command[0]}: {error.strerror}\n')
+            return 127
+    recorded = identity(process.pid)
+    if run:
+        update_run(run, command=recorded)
+    deadline = time.monotonic() + timeout if timeout else None
+    checks = 0
+    try:
+        while True:
+            try:
+                return process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            checks += 1
+            code = None
+            if deadline and time.monotonic() > deadline:
+                code = 124
+            elif quota and checks % QUOTA_EVERY == 0 and tree_size(quota[0]) > quota[1]:
+                code = 125
+            elif run and (read_json(run_dir(run) / 'run.json') or {}).get('status') == 'cancelled':
+                code = 130
+            if code:
+                say(log, {124: 'timed out', 125: 'over its disk quota', 130: 'cancelled'}[code] + ': stopping it')
+                stop_command(recorded, run)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(30)
+                return code
+    finally:
+        if run:
+            update_run(run, command=None)
+
+
+def playwright_image():
+    found = subprocess.run(['docker', 'image', 'ls', '--filter', 'label=setup.service=playwright', '--format',
+                            '{{.Repository}}:{{.Tag}}'], capture_output=True, text=True, env=child_environment())
+    return next((line for line in found.stdout.split() if line and '<none>' not in line), None)
 
 
 # --- Projects --------------------------------------------------------------------------------------
@@ -213,6 +444,10 @@ def env_value(path, key):
         text = Path(path).read_text(errors='replace')
     except OSError:
         return None
+    return env_value_of(text, key)
+
+
+def env_value_of(text, key):
     found = None
     for line in text.splitlines():
         match = re.fullmatch(rf'\s*(?:export\s+)?{key}\s*=\s*(["\']?)([^"\'#]*)\1\s*(?:#.*)?', line)
@@ -226,31 +461,43 @@ def server_environments(directory):
     return ['stage', 'prod', *[name for name in re.split(r'[\s,]+', extra) if re.fullmatch(r'[a-z][a-z0-9]{1,15}', name)]]
 
 
+def project_key(prefix, project, suffix=''):
+    return re.sub(r'[^A-Z0-9]', '_', f'{prefix}_{project}{suffix}'.upper())
+
+
 def url_override(project, environment):
     """TEST_URL_<PROJECT>_<ENV>=http(s)://… in $CONFIG/test-sessions.env: the address runs use instead of DOMAIN."""
-    key = re.sub(r'[^A-Z0-9]', '_', f'TEST_URL_{project}_{environment}'.upper())
-    value = env_value(CONFIG / 'test-sessions.env', key)
+    value = env_value_of(config_text(), project_key('TEST_URL', project, f'_{environment}'))
     if value and re.fullmatch(r'https?://[A-Za-z0-9.-]+(?::[0-9]{1,5})?(?:/[A-Za-z0-9._~%/-]*)?', value):
         return value.rstrip('/')
     return None
 
 
-def environment_url(root, environment):
+def environment_url(root, environment, commit):
     """The address of a server environment of the build root: TEST_URL_<PROJECT>_<ENV> when set, else https://<DOMAIN>
-    (its env file, else the committed example)."""
+    (its env file, else the committed example of the trusted commit)."""
     directory = root / docker_directory(root)
     if environment not in server_environments(directory):
         raise Refusal(404, f'{root.name} has no {environment} environment')
     override = url_override(root.name, environment)
     if override:
         return override
-    for name in (f'env/{environment}.env', f'env/{environment}.env.example'):
-        domain = env_value(directory / name, 'DOMAIN')
+    relative = directory.relative_to(root)
+    for text in (read_text_safe(directory / f'env/{environment}.env'),
+                 git(root, 'show', f'{commit}:{relative}/env/{environment}.env.example', check=False, raw=True)):
+        domain = env_value_of(text or '', 'DOMAIN')
         if domain:
             host = re.split(r'[\s,]+', domain)[0]
             if re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?', host):
                 return f'https://{host}'
     raise Refusal(503, f'{root.name} {environment}: no DOMAIN in env/{environment}.env')
+
+
+def read_text_safe(path):
+    try:
+        return Path(path).read_text(errors='replace')
+    except OSError:
+        return None
 
 
 def deploy_running(root):
@@ -268,7 +515,7 @@ def deploy_running(root):
     try:
         text = (PROC / 'locks').read_text()
     except OSError:
-        return False
+        return True  # cannot be told: as if a deploy ran
     for line in text.splitlines():
         match = re.search(r'\s([0-9a-f]+):([0-9a-f]+):([0-9]+)\s', line + ' ')
         if match and (int(match[1], 16), int(match[2], 16), int(match[3])) in inodes:
@@ -281,42 +528,97 @@ def child_environment():
             'SETUP_DIRECTORY': str(ROOT / 'setup'), 'GIT_TERMINAL_PROMPT': '0'}
 
 
-def git(directory, *arguments, check=True):
-    result = subprocess.run(['git', '-C', str(directory), *arguments], capture_output=True, text=True,
-                            env=child_environment())
+# Every git over a project's repositories: no hooks, no fsmonitor, no system or global configuration.
+GIT_HARDENING = ('-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'protocol.ext.allow=never')
+GIT_ENVIRONMENT = {'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0'}
+
+
+def git_environment():
+    return {**child_environment(), **GIT_ENVIRONMENT}
+
+
+def git(directory, *arguments, check=True, raw=False, git_dir=None):
+    location = ['--git-dir', str(git_dir)] if git_dir else ['-C', str(directory)]
+    result = subprocess.run(['git', *GIT_HARDENING, *location, *arguments], capture_output=True, env=git_environment())
     if check and result.returncode:
-        raise RuntimeError(f'git {arguments[0]}: {result.stderr.strip()[:300]}')
-    return result.stdout.strip()
+        raise RuntimeError(f'git {arguments[0]}: {result.stderr.decode(errors="replace").strip()[:300]}')
+    if result.returncode:
+        return None if raw else ''
+    return result.stdout if raw == 'bytes' else result.stdout.decode(errors='replace') if raw else \
+        result.stdout.decode(errors='replace').strip()
 
 
-def make(log, directory, target, *arguments, timeout=3600):
+def make(log, directory, target, *arguments, timeout=3600, run=None, quota=None):
     """make TARGET VAR=value ...: a value's $ is doubled, so make passes it as written."""
     return run_logged(log, ['make', '--no-print-directory', target, *[item.replace('$', '$$') for item in arguments]],
-                      cwd=directory, env=child_environment(), timeout=timeout)
+                      cwd=directory, env=child_environment(), timeout=timeout, run=run, quota=quota)
 
 
 def require_setup():
     result = subprocess.run(['make', '-s', '-f', str(ROOT / 'setup/docker/project.mk'), 'setup-capabilities'],
                             capture_output=True, text=True, env=child_environment())
-    if 'test-session-v1' not in result.stdout.split():
-        raise Refusal(503, f'setup in {ROOT / "setup"} is too old for test sessions (no test-session-v1): bin/update-setup')
+    if 'test-session-v2' not in result.stdout.split():
+        raise Refusal(503, f'setup in {ROOT / "setup"} is too old for test sessions (no test-session-v2): bin/update-setup')
 
 
-def clone(source, destination, ref, log):
-    """destination: a clone of the build root at ref (a commit, tag or branch), its submodules too (from the build
-    root's own copies when they have the commit, else from their remotes with this account's keys). The commit."""
+# --- Trust -----------------------------------------------------------------------------------------
+def deploy_branch(root):
+    """The project's deploy branch: the build root's origin/HEAD (what add-project registered)."""
+    found = git(root, 'symbolic-ref', '-q', '--short', 'refs/remotes/origin/HEAD', check=False)
+    branch = found[len('origin/'):] if found.startswith('origin/') else ''
+    if not REF.fullmatch(branch):
+        raise Refusal(503, f'{root.name}: the build root has no deploy branch (origin/HEAD); git remote set-head origin -a')
+    return branch
+
+
+def trusted_branches(root):
+    """The deploy branch and the branches the operator allows: TEST_TRUSTED_REFS_<PROJECT>=a b."""
+    extra = env_value_of(config_text(), project_key('TEST_TRUSTED_REFS', root.name)) or ''
+    return [deploy_branch(root), *[name for name in extra.split() if REF.fullmatch(name)]]
+
+
+def resolve(directory, ref):
+    """The commit of ref (a commit, tag, branch or origin/<branch>) among what directory already has; None if none."""
+    for candidate in (ref, f'origin/{ref}', f'refs/tags/{ref}'):
+        found = git(directory, 'rev-parse', '--verify', '-q', '--end-of-options', f'{candidate}^{{commit}}', check=False)
+        if COMMIT.fullmatch(found or ''):
+            return found
+    return None
+
+
+def trusted_commit(root, ref=None):
+    """(commit, branch) of a trusted ref of the build root: the tip of origin/<deploy branch> when ref is None, else ref's
+    commit when a trusted branch (origin/<branch>) contains it. (None, None) when ref is not trusted. Nothing fetched."""
+    branches = trusted_branches(root)
+    if ref is None:
+        commit = resolve(root, f'origin/{branches[0]}')
+        if not commit:
+            raise Refusal(503, f'{root.name}: origin/{branches[0]} is not in the build root')
+        return commit, branches[0]
+    commit = resolve(root, ref)
+    if not commit:
+        return None, None
+    for branch in branches:
+        tip = f'refs/remotes/origin/{branch}'
+        result = subprocess.run(['git', *GIT_HARDENING, '-C', str(root), 'merge-base', '--is-ancestor', commit, tip],
+                                capture_output=True, env=git_environment())
+        if result.returncode == 0:
+            return commit, branch
+    return None, None
+
+
+# --- Clones and overlays ---------------------------------------------------------------------------
+def clone(source, destination, commit, log):
+    """destination: a clone of the build root at a commit it has, its submodules too (from the build root's own copies
+    when they have the commit, else from their remotes with this account's keys). {submodule path: its git dir}."""
     remove_tree(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if run_logged(log, ['git', 'clone', '-q', '--no-checkout', str(source), str(destination)], env=child_environment()):
+    if run_logged(log, ['git', *GIT_HARDENING, 'clone', '-q', '--no-checkout', '--', str(source), str(destination)],
+                  env=git_environment(), timeout=900):
         raise RuntimeError('git clone of the build root failed')
-    origin = git(source, 'config', '--get', 'remote.origin.url', check=False)
-    commit = git(destination, 'rev-parse', '--verify', '-q', f'{ref}^{{commit}}', check=False) or \
-        git(destination, 'rev-parse', '--verify', '-q', f'origin/{ref}^{{commit}}', check=False)
-    if not commit and origin:
-        run_logged(log, ['git', '-C', str(destination), 'fetch', '-q', origin, ref], env=child_environment(), timeout=300)
-        commit = git(destination, 'rev-parse', '--verify', '-q', 'FETCH_HEAD^{commit}', check=False)
-    if not commit:
-        raise Refusal(400, f'env_ref {ref} is not a commit, tag or branch of the environment repository')
+    # Every ref and tag of the build root (its remote branches too), for the commits a session may name.
+    git(destination, 'fetch', '-q', 'origin', '+refs/remotes/origin/*:refs/remotes/build/*', '+refs/tags/*:refs/tags/*',
+        check=False)
     git(destination, 'checkout', '-q', '--detach', commit)
     if (destination / '.gitmodules').is_file():
         names = git(destination, 'config', '-f', '.gitmodules', '--get-regexp', r'^submodule\..*\.path$', check=False)
@@ -326,72 +628,334 @@ def clone(source, destination, ref, log):
             local = source / '.git/modules' / name
             if local.is_dir():
                 git(destination, 'config', f'submodule.{name}.url', str(local))
-        status = run_logged(log, ['git', '-C', str(destination), '-c', 'protocol.file.allow=always', 'submodule', 'update',
-                                  '--init', '--recursive', '-q'], env=child_environment(), timeout=600)
+        status = run_logged(log, ['git', *GIT_HARDENING, '-C', str(destination), '-c', 'protocol.file.allow=always',
+                                  'submodule', 'update', '--init', '--recursive', '-q'], env=git_environment(), timeout=600)
         if status:
             git(destination, 'submodule', 'sync', '--recursive', check=False)
-            if run_logged(log, ['git', '-C', str(destination), 'submodule', 'update', '--init', '--recursive', '-q'],
-                          env=child_environment(), timeout=900):
+            if run_logged(log, ['git', *GIT_HARDENING, '-C', str(destination), 'submodule', 'update', '--init', '--recursive',
+                                '-q'], env=git_environment(), timeout=900):
                 raise RuntimeError('git submodule update failed')
-    return commit
+    return submodule_dirs(destination)
 
 
-def code_clone(source, destination, ref, log):
-    """app/public when it is its own repository (a separate code repository): a clone at ref, else at the build
-    root's code commit. None for one repository."""
-    code = source / 'app/public'
-    if not (code / '.git').exists():
+def submodule_dirs(repository):
+    """{path of each (nested) submodule relative to the repository: its absolute git dir}."""
+    found = {}
+    listing = git(repository, 'submodule', 'foreach', '--quiet', '--recursive', 'echo "$displaypath"', check=False)
+    for relative in listing.splitlines():
+        if relative and '..' not in PurePosixPath(relative).parts:
+            directory = git(repository / relative, 'rev-parse', '--absolute-git-dir', check=False)
+            if directory:
+                found[relative] = directory
+    return found
+
+
+def fetch_ref(repository, ref, origin, log):
+    """The commit of a caller's ref (files only: specs or shop code) in repository: what it has, else fetched from
+    origin (the remote of the build root). None when there is none."""
+    commit = resolve(repository, ref) or resolve(repository, f'build/{ref}')
+    if commit or not origin:
+        return commit
+    if run_logged(log, ['git', *GIT_HARDENING, '-C', str(repository), 'fetch', '-q', '--no-tags', '--', origin,
+                        f'+{ref}:refs/setup/fetched'], env=git_environment(), timeout=300):
         return None
-    return clone(code, destination / 'app/public', ref or git(code, 'rev-parse', 'HEAD'), log)
+    return resolve(repository, 'refs/setup/fetched')
 
 
-def write_local_env(directory, project):
-    """env/local.env of a clone: the committed example (no secrets), else the names the project would get locally."""
-    target = directory / 'env/local.env'
-    example = directory / 'env/local.env.example'
-    name = env_value(directory / 'env/common.env', 'PROJECT_NAME') or project
-    text = example.read_text() if example.is_file() else ''
-    database = name.replace('-', '_')
-    additions = {'DOMAIN': f'{name.replace("_", "-")}.local', 'DATABASE_NAME': database, 'DATABASE_USER': database,
-                 'DATABASE_PASSWORD': secrets.token_hex(16), 'DATABASE_ROOT_PASSWORD': secrets.token_hex(16)}
-    for key, value in additions.items():
-        if not re.search(rf'^\s*{key}\s*=', text, re.M):
-            text += f'{"" if not text or text.endswith(chr(10)) else chr(10)}{key}={value}\n'
-    target.write_text(text)
-    target.chmod(0o600)
+def tree_files(repository, git_dirs, commit, prefix, log, origin_of=None):
+    """{path below prefix: (bytes, executable)} of the regular files of commit under prefix (a directory of the
+    repository), across a submodule there. Symlinks and node_modules are left out; at most OVERLAY_FILES files and
+    OVERLAY_BYTES bytes."""
+    files, total = {}, 0
+
+    def walk(git_dir, revision, inside, base):
+        nonlocal total
+        listing = git(repository, 'ls-tree', '-r', '-z', '--full-tree', revision, '--', *( [inside] if inside else []),
+                      raw='bytes', git_dir=git_dir)
+        if listing is None:
+            raise RuntimeError(f'commit {revision} has no tree here')
+        for entry in listing.split(b'\0'):
+            if not entry:
+                continue
+            meta, _, name = entry.partition(b'\t')
+            mode, kind, obj = meta.decode().split()
+            path = name.decode(errors='replace')
+            relative = path[len(inside):].lstrip('/') if inside else path
+            parts = PurePosixPath(relative).parts
+            if 'node_modules' in parts or '..' in parts:
+                continue
+            if mode == '160000':
+                nested = git_dirs.get(str(PurePosixPath(base, path)))
+                if not nested:
+                    raise RuntimeError(f'submodule {PurePosixPath(base, path)} is not checked out')
+                if not git(repository, 'cat-file', '-e', f'{obj}^{{commit}}', check=False, raw=True, git_dir=nested) \
+                        is not None:
+                    git(repository, 'fetch', '-q', 'origin', obj, check=False, git_dir=nested)
+                for sub, data in walk_into(nested, obj, str(PurePosixPath(base, path))).items():
+                    files[str(PurePosixPath(relative, sub))] = data
+                continue
+            if mode not in ('100644', '100755') or kind != 'blob':
+                say(log, f'left out {path} (mode {mode}): only regular files are written')
+                continue
+            content = git(repository, 'cat-file', 'blob', obj, raw='bytes', git_dir=git_dir)
+            total += len(content)
+            if len(files) >= OVERLAY_FILES or total > OVERLAY_BYTES:
+                raise Refusal(400, f'{prefix}: more than {OVERLAY_FILES} files or {OVERLAY_BYTES} bytes')
+            files[relative] = (content, mode == '100755')
+
+    def walk_into(git_dir, revision, base):
+        before = dict(files)
+        files.clear()
+        walk(git_dir, revision, '', base)
+        found = dict(files)
+        files.clear()
+        files.update(before)
+        return found
+
+    # The superproject's path may itself be (or lie inside) a submodule: descend to the repository that has it.
+    git_dir, revision, base, inside = str(Path(git(repository, 'rev-parse', '--absolute-git-dir'))), commit, '', prefix
+    for submodule in sorted(git_dirs, key=len):
+        if inside == submodule or inside.startswith(submodule + '/'):
+            relative = submodule[len(base):].lstrip('/') if base else submodule
+            entry = git(repository, 'ls-tree', '-z', revision, '--', relative, raw='bytes', git_dir=git_dir) or b''
+            match = re.match(rb'160000 commit ([0-9a-f]{40})\t', entry)
+            if not match:
+                break
+            revision, git_dir, base = match[1].decode(), git_dirs[submodule], submodule
+            if git(repository, 'cat-file', '-e', f'{revision}^{{commit}}', check=False, raw=True, git_dir=git_dir) is None:
+                git(repository, 'fetch', '-q', 'origin', revision, check=False, git_dir=git_dir)
+            inside = inside[len(submodule):].lstrip('/')
+    walk(git_dir, revision, inside, base)
+    return files
+
+
+def real_directory_below(base, relative):
+    """base/relative with every component below base a real directory (made when missing, never through a symlink)."""
+    current = Path(base)
+    for part in PurePosixPath(relative).parts:
+        current = current / part
+        try:
+            details = os.lstat(current)
+        except FileNotFoundError:
+            os.mkdir(current, 0o755)
+            continue
+        if not stat.S_ISDIR(details.st_mode):
+            raise RuntimeError(f'{current} is not a directory (a symlink?)')
+    return current
+
+
+def install_tree(base, relative, files, keep_modules=False):
+    """base/relative replaced by a new directory holding exactly files ({path: (bytes, executable)}), written without
+    following any symlink; for tests/playwright an empty node_modules (the mount point of the installed dependencies)."""
+    parent = real_directory_below(base, str(PurePosixPath(relative).parent))
+    name = PurePosixPath(relative).name
+    fresh = parent / f'.{name}.new-{secrets.token_hex(4)}'
+    os.mkdir(fresh, 0o755)
+    for path, (content, executable) in sorted(files.items()):
+        parts = PurePosixPath(path).parts
+        if not parts or any(part in ('', '.', '..') for part in parts) or 'node_modules' in parts:
+            raise RuntimeError(f'bad path {path!r}')
+        directory = open_directory(fresh, ())
+        try:
+            for part in parts[:-1]:
+                with contextlib.suppress(FileExistsError):
+                    os.mkdir(part, 0o755, dir_fd=directory)
+                inner = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=directory)
+                os.close(directory)
+                directory = inner
+            write_new(directory, parts[-1], content, 0o755 if executable else 0o644)
+        finally:
+            os.close(directory)
+    if keep_modules:
+        os.mkdir(fresh / 'node_modules', 0o755)
+    old = parent / f'.{name}.old-{secrets.token_hex(4)}'
+    with contextlib.suppress(FileNotFoundError):
+        if stat.S_ISDIR(os.lstat(parent / name).st_mode):
+            os.rename(parent / name, old)
+        else:
+            os.unlink(parent / name)
+    os.rename(fresh, parent / name)
+    remove_tree(old)
+
+
+def spec_files(repository, git_dirs, tests_commit, trusted, log):
+    """{root: files} of the specs and their configuration: tests_commit's (the caller's choice), with tests/playwright's
+    package files those of the trusted commit only."""
+    found = {}
+    for root in PATCH_ROOTS:
+        files = {path: data for path, data in tree_files(repository, git_dirs, tests_commit, f'app/{root}', log).items()
+                 if not (root == 'tests/playwright' and path in PACKAGE_FILES)}
+        if root == 'tests/playwright':
+            reviewed = tree_files(repository, git_dirs, trusted, f'app/{root}', log)
+            files.update({path: reviewed[path] for path in PACKAGE_FILES if path in reviewed})
+        found[root] = files
+    return found
+
+
+def write_specs(repository, specs):
+    for root, files in specs.items():
+        install_tree(repository / 'app', root, files, keep_modules=root == 'tests/playwright')
+
+
+# --- Patches ---------------------------------------------------------------------------------------
+def patch_paths(text, directory):
+    """The paths a patch writes, as git apply itself reads them (git apply --numstat --summary -z -p1, so a diff
+    without a/ b/ prefixes is judged as it would land), refused unless every one is a text change of a regular file under
+    tests/playwright/ or config/playwright/: no symlink or other special mode, no mode change outside them, no
+    node_modules, no package.json, package-lock.json or .npmrc."""
+    if 'GIT binary patch' in text or re.search(r'^Binary files ', text, re.M):
+        raise Refusal(400, 'patch: binary changes are not allowed')
+    for match in re.finditer(r'^(?:new file mode|deleted file mode|old mode|new mode|index [0-9a-f]+\.\.[0-9a-f]+)\s*(\S*)',
+                             text, re.M):
+        if match[1] and match[1] not in ('100644', '100755'):
+            raise Refusal(400, f'patch: mode {match[1]} is not allowed (symlinks, submodules and other special files)')
+    path = Path(directory) / 'check.diff'
+    path.write_text(text)
+    result = subprocess.run(['git', *GIT_HARDENING, 'apply', '-p1', '--numstat', '--summary', '-z', str(path)], cwd=directory,
+                            capture_output=True, env={**git_environment(), 'GIT_CEILING_DIRECTORIES': str(directory)})
+    path.unlink()
+    if result.returncode:
+        raise Refusal(400, 'patch: not a unified diff git apply reads: ' +
+                      (result.stderr.decode(errors='replace').strip().splitlines() or ['?'])[0][:300])
+    output = result.stdout.decode(errors='replace')
+    numstat, _, summary = output.rpartition('\0')
+    paths, fields = set(), numstat.split('\0')
+    index = 0
+    while index < len(fields):
+        item = fields[index]
+        if item.count('\t') >= 2:
+            counts, _, name = item.split('\t', 2)[0:2], None, item.split('\t', 2)[2]
+            if name:
+                paths.add(name)
+            else:  # a rename or copy: the source and the destination follow
+                paths.update(fields[index + 1:index + 3])
+                index += 2
+        elif item:
+            paths.add(item)
+        index += 1
+    for line in summary.splitlines():
+        modes = re.findall(r'\b(1[0-9]{5})\b', line)
+        if any(mode not in ('100644', '100755') for mode in modes):
+            raise Refusal(400, f'patch: {line.strip()[:200]}: only regular files may be written')
+    paths.discard('')
+    if not paths:
+        raise Refusal(400, 'patch: no file changes found (a unified diff, as git diff writes it)')
+    for name in sorted(paths):
+        parts = PurePosixPath(name).parts
+        if name.startswith('/') or '..' in parts or not any(parts[:2] == tuple(root.split('/')) and len(parts) > 2
+                                                             for root in PATCH_ROOTS):
+            raise Refusal(400, f'patch: {name} is outside tests/playwright/ and config/playwright/ (paths are relative to '
+                               'app/, the project directory, as git diff --relative writes them)')
+        if 'node_modules' in parts:
+            raise Refusal(400, f'patch: {name}: node_modules is not part of the specs')
+        if parts[-1] in PACKAGE_FILES:
+            raise Refusal(400, f'patch: {name}: dependencies come from the trusted commit, not from a patch')
+    return sorted(paths)
+
+
+def apply_patch(specs, text, directory):
+    """specs ({root: files}) with the patch applied: git apply into a staging copy below directory (outside any
+    repository, so it cannot write elsewhere), whose result is checked again: regular files only, no node_modules, the
+    package files unchanged. A patch that does not apply is a 400."""
+    patch_paths(text, directory)
+    staging = Path(directory) / f'staging-{secrets.token_hex(4)}'
+    os.mkdir(staging, 0o700)
+    try:
+        for root, files in specs.items():
+            install_tree(staging, root, {path: data for path, data in files.items()})
+        (Path(directory) / 'apply.diff').write_text(text)
+        result = subprocess.run(['git', *GIT_HARDENING, 'apply', '-p1', '--whitespace=nowarn', str(Path(directory) / 'apply.diff')],
+                                cwd=staging, capture_output=True, env={**git_environment(), 'GIT_CEILING_DIRECTORIES': str(directory)})
+        (Path(directory) / 'apply.diff').unlink()
+        if result.returncode:
+            raise Refusal(400, 'patch does not apply: ' +
+                          (result.stderr.decode(errors='replace').strip().splitlines() or ['?'])[0][:300])
+        patched = {}
+        for root in PATCH_ROOTS:
+            files = {}
+            top = staging / root
+            for folder, folders, names in os.walk(top):
+                for entry in folders + names:
+                    full = Path(folder) / entry
+                    relative = str(full.relative_to(top))
+                    details = os.lstat(full)
+                    if entry == 'node_modules':
+                        raise Refusal(400, f'patch: {root}/{relative}: node_modules is not part of the specs')
+                    if stat.S_ISDIR(details.st_mode):
+                        continue
+                    if not stat.S_ISREG(details.st_mode):
+                        raise Refusal(400, f'patch: {root}/{relative} is not a regular file')
+                    files[relative] = (full.read_bytes(), bool(details.st_mode & 0o100))
+            for name in PACKAGE_FILES if root == 'tests/playwright' else ():
+                if files.get(name) != specs[root].get(name):
+                    raise Refusal(400, f'patch: {root}/{name}: dependencies come from the trusted commit')
+            patched[root] = files
+        return patched
+    finally:
+        remove_tree(staging)
 
 
 # --- Gates -----------------------------------------------------------------------------------------
 def available_mb():
+    """MemAvailable in MB; a 503 when it cannot be read (the gates fail closed)."""
     try:
         text = (PROC / 'meminfo').read_text()
     except OSError:
-        return None
+        text = ''
     match = re.search(r'^MemAvailable:\s+(\d+) kB', text, re.M)
-    return int(match[1]) // 1024 if match else None
+    if not match:
+        raise Refusal(503, f'{PROC / "meminfo"} has no MemAvailable: the memory gate cannot be checked', 'gate_unknown')
+    return int(match[1]) // 1024
+
+
+def docker_root():
+    result = subprocess.run(['docker', 'info', '--format', '{{.DockerRootDir}}'], capture_output=True, text=True, timeout=60,
+                            env=child_environment())
+    path = result.stdout.strip()
+    if result.returncode or not path.startswith('/'):
+        raise Refusal(503, 'docker info gave no data root: the disk gate cannot be checked', 'gate_unknown')
+    return path
 
 
 def free_disk_mb():
-    target = ROOT if ROOT.exists() else ROOT.parent
-    stats = os.statvfs(target)
-    return stats.f_bavail * stats.f_frsize // (1024 * 1024)
+    """The least free space (MB) of this program's tree and Docker's data root (images, containers, volumes)."""
+    free = []
+    for target in (ROOT if ROOT.exists() else ROOT.parent, docker_root()):
+        try:
+            stats = os.statvfs(target)
+        except OSError:
+            raise Refusal(503, f'{target}: the disk gate cannot be checked', 'gate_unknown') from None
+        free.append(stats.f_bavail * stats.f_frsize // (1024 * 1024))
+    return min(free)
 
 
-def gates(limits, creating):
-    """409 when a new session does not fit: MemAvailable minus the estimate of each session still being created
-    (its containers are not running yet) minus this one's must leave the reserve; the disk must have room."""
-    memory = available_mb()
-    if memory is not None:
-        needed = limits['TEST_SESSION_MEMORY_MB'] + limits['TEST_SESSION_RESERVE_MB']
-        left = memory - creating * limits['TEST_SESSION_MEMORY_MB']
-        if left < needed:
-            raise Refusal(409, f'not enough memory for a test session: {left} MB available, {needed} MB needed '
-                               f'(TEST_SESSION_MEMORY_MB + TEST_SESSION_RESERVE_MB)', 'memory', needed_mb=needed,
-                          available_mb=left)
+def memory_gate(needed, creating_mb=0, what='a test session'):
+    reserve = settings()['TEST_SESSION_RESERVE_MB']
+    left = available_mb() - creating_mb
+    if left - needed < reserve:
+        raise Refusal(409, f'not enough memory for {what}: {left} MB available, {needed + reserve} MB needed '
+                           f'({needed} MB of container limits + TEST_SESSION_RESERVE_MB)', 'memory',
+                      needed_mb=needed + reserve, available_mb=left)
+
+
+def disk_gate(needed, what='a test session'):
     disk = free_disk_mb()
-    if disk < limits['TEST_SESSION_DISK_MB']:
-        raise Refusal(409, f'not enough disk for a test session: {disk} MB free, {limits["TEST_SESSION_DISK_MB"]} MB needed',
-                      'disk', needed_mb=limits['TEST_SESSION_DISK_MB'], available_mb=disk)
+    if disk < needed:
+        raise Refusal(409, f'not enough disk for {what}: {disk} MB free, {needed} MB needed', 'disk', needed_mb=needed,
+                      available_mb=disk)
+
+
+def session_gates(limits, creating):
+    """409 when a new session does not fit: MemAvailable minus the limits of each session still being created (its
+    containers are not running yet) minus this one's must leave the reserve; the disk must have room."""
+    memory_gate(session_memory_mb(limits), creating * session_memory_mb(limits))
+    disk_gate(limits['TEST_SESSION_DISK_MB'])
+
+
+def run_gates(limits):
+    """Before every run and snapshot: its Playwright container's limit must fit in memory, its quota on the disk."""
+    memory_gate(limits['TEST_RUN_MEMORY_MB'], what='a run')
+    disk_gate(limits['TEST_RUN_DISK_MB'] + limits['TEST_RUN_ARTIFACTS_MB'], 'a run')
 
 
 # --- Sessions --------------------------------------------------------------------------------------
@@ -417,23 +981,29 @@ def find_session(identifier):
     raise Refusal(404, f'there is no session {identifier}')
 
 
-def alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (OSError, TypeError, ValueError):
-        return False
-
-
 def public_session(data):
-    shown = {key: data.get(key) for key in ('id', 'project', 'status', 'db', 'env_ref', 'env_commit', 'shop_ref',
-                                            'shop_commit', 'step', 'error', 'created_by', 'active_run', 'domain')}
+    shown = {key: data.get(key) for key in ('id', 'project', 'status', 'db', 'env_ref', 'env_commit', 'env_branch',
+                                            'tests_commit', 'shop_ref', 'shop_commit', 'step', 'error', 'created_by',
+                                            'active_run', 'domain', 'client_run_id')}
     shown.update(created_at=iso(data.get('created_at')), expires_at=iso(data.get('expires_at')),
                  ready_at=iso(data.get('ready_at')), ended_at=iso(data.get('ended_at')),
                  max_expires_at=iso(data.get('created_at', 0) + settings()['TEST_SESSION_MAX_MINUTES'] * 60),
                  url=f'https://{data["domain"]}' if data.get('domain') else None,
-                 reachable='inside the session\'s project network only (Playwright, snapshots); not from outside')
+                 reachable='inside the session\'s internal project network only (Playwright, snapshots); not from outside')
     return shown
+
+
+def update_session(project, identifier=None, expect=None, **fields):
+    """Change a session's record under the lock; only while it is still session identifier (when given) in one of the
+    statuses expect (when given). The record afterwards, or None when it was not changed."""
+    path = session_dir(project) / 'session.json'
+    with locked(SESSIONS / '.lock'):
+        data = read_json(path) or {}
+        if (identifier and data.get('id') != identifier) or (expect and data.get('status') not in expect):
+            return None
+        data.update(fields)
+        write_json(path, data)
+    return data
 
 
 def create(options):
@@ -447,43 +1017,44 @@ def create(options):
     for key in ('env_ref', 'shop_ref'):
         if getattr(options, key) and not REF.fullmatch(getattr(options, key)):
             raise Refusal(400, f'{key}: a branch, tag or commit')
+    client = getattr(options, 'client_run_id', None)
+    if client is not None and not CLIENT_RUN_ID.fullmatch(client):
+        raise Refusal(400, 'client_run_id: 1–100 letters, digits, . _ : -')
     ttl = options.ttl or limits['TEST_SESSION_TTL_MINUTES']
     if not 1 <= ttl <= limits['TEST_SESSION_MAX_MINUTES']:
         raise Refusal(400, f'ttl_minutes: 1–{limits["TEST_SESSION_MAX_MINUTES"]}')
     docker_directory(root)
     require_setup()
-    with locked(SESSIONS / '.lock'):
+    # The host-side tree: env_ref itself when trusted, else the deploy branch's tip with env_ref's specs on it.
+    commit, branch = trusted_commit(root, options.env_ref) if options.env_ref else (None, None)
+    if not commit:
+        commit, branch = trusted_commit(root)
+    with locked(SESSIONS / '.lock'), locked(RUNS / '.lock'):
+        refuse_tombstone(options.project, client)
         existing = read_json(session_dir(options.project) / 'session.json')
-        if existing and existing.get('status') not in ('destroyed', 'expired'):
+        if existing and existing.get('status') not in ('destroyed', 'expired', 'failed'):
             raise Refusal(409, f'{options.project} has a test session already ({existing["id"]}, {existing["status"]})',
                           'session_exists', session=existing['id'])
         if deploy_running(root):
             raise Refusal(409, f'a deploy of {options.project} is running; try again when it has finished', 'deploy_locked')
-        gates(limits, sum(1 for item in sessions() if item.get('status') == 'creating'))
+        session_gates(limits, sum(1 for item in sessions() if item.get('status') == 'creating'))
         directory = session_dir(options.project)
-        remove_tree(directory)
+        remove_tree(directory)  # a failed session's containers went with its teardown
         directory.mkdir(parents=True, mode=0o750)
         moment = now()
         data = {'id': 'ts-' + secrets.token_hex(6), 'project': options.project, 'status': 'creating', 'db': options.db,
-                'env_ref': options.env_ref or git(root, 'rev-parse', 'HEAD'), 'shop_ref': options.shop_ref,
-                'created_at': moment, 'expires_at': moment + ttl * 60, 'created_by': options.by, 'step': 'queued'}
+                'env_ref': options.env_ref or branch, 'env_commit': commit, 'env_branch': branch,
+                'shop_ref': options.shop_ref, 'created_at': moment, 'expires_at': moment + ttl * 60,
+                'created_by': options.by, 'step': 'queued', 'client_run_id': client}
         write_json(directory / 'session.json', data)
-        data['worker'] = detach('create-worker', '--id', data['id'])
+        data['worker'] = identity(detach('create-worker', f'--id={data["id"]}'))
         write_json(directory / 'session.json', data)
     return public_session(data)
 
 
-def update_session(project, **fields):
-    path = session_dir(project) / 'session.json'
-    with locked(SESSIONS / '.lock'):
-        data = read_json(path) or {}
-        data.update(fields)
-        write_json(path, data)
-    return data
-
-
 def detach(*arguments):
-    """This program with these arguments in the background, in its own session (it outlives the UI's request)."""
+    """This program with these arguments in the background, in its own session (it outlives the UI's request; the UI's
+    service stops only its own process, KillMode=process)."""
     log = open(os.devnull, 'w')
     process = subprocess.Popen([sys.executable, os.path.realpath(__file__), *arguments], stdin=subprocess.DEVNULL,
                                stdout=log, stderr=log, start_new_session=True,
@@ -492,83 +1063,196 @@ def detach(*arguments):
     return process.pid
 
 
+def session_env(limits):
+    """env/test.env of a session: no host route or published port, no cron schedule, its container limits."""
+    lines = ['TEST_TLS=self-signed', 'TEST_HOST_ROUTE=off', 'CRON_SCHEDULE=off',
+             *[f'{name}_MEMORY={size}m' for name, size in SESSION_MEMORY_MB.items()],
+             f'PLAYWRIGHT_MEMORY={limits["TEST_RUN_MEMORY_MB"]}m', f'PLAYWRIGHT_CPUS={limits["TEST_RUN_CPUS"]}']
+    return '\n'.join(lines) + '\n'
+
+
+def write_private(path, text):
+    """A file of a clone, written as a new regular file (an existing one or a symlink there is removed first)."""
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(descriptor, 'w') as handle:
+        handle.write(text)
+
+
+def write_local_env(directory, project, limits):
+    """env/local.env of a clone: the committed example (no secrets), else the names the project would get locally, and
+    the Playwright limits."""
+    example = directory / 'env/local.env.example'
+    name = env_value(directory / 'env/common.env', 'PROJECT_NAME') or project
+    text = example.read_text() if example.is_file() and not example.is_symlink() else ''
+    database = name.replace('-', '_')
+    additions = {'DOMAIN': f'{name.replace("_", "-")}.local', 'DATABASE_NAME': database, 'DATABASE_USER': database,
+                 'DATABASE_PASSWORD': secrets.token_hex(16), 'DATABASE_ROOT_PASSWORD': secrets.token_hex(16)}
+    for key, value in additions.items():
+        if not re.search(rf'^\s*{key}\s*=', text, re.M):
+            text += f'{"" if not text or text.endswith(chr(10)) else chr(10)}{key}={value}\n'
+    text += f'PLAYWRIGHT_MEMORY={limits["TEST_RUN_MEMORY_MB"]}m\nPLAYWRIGHT_CPUS={limits["TEST_RUN_CPUS"]}\n'
+    write_private(directory / 'env/local.env', text)
+
+
+def compose_name(app):
+    name = env_value(app / 'env/common.env', 'PROJECT_NAME')
+    return f'{name}-test' if name and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', name) else None
+
+
+def shop_code(root, repo, shop_ref, log, git_dirs, trusted):
+    """The shop code of shop_ref (code that runs only in the session's containers). app/public as its own repository:
+    a clone at shop_ref (fetched from its remote when the build root does not have it), else at the build root's code
+    commit; in one repository its app/public files of shop_ref written over the trusted tree. Its commit or None."""
+    code = root / 'app/public'
+    if (code / '.git').exists():
+        target = repo / 'app/public'
+        remove_tree(target)
+        real_directory_below(repo, 'app')
+        commit = resolve(code, shop_ref) if shop_ref else git(code, 'rev-parse', 'HEAD')
+        origin = git(code, 'config', '--get', 'remote.origin.url', check=False)
+        if run_logged(log, ['git', *GIT_HARDENING, 'clone', '-q', '--no-checkout', '--', str(code), str(target)],
+                      env=git_environment(), timeout=900):
+            raise RuntimeError('git clone of the code repository failed')
+        if not commit and shop_ref:
+            commit = fetch_ref(target, shop_ref, origin, log)
+        if not commit:
+            raise Refusal(400, f'shop_ref {shop_ref} is not a commit, tag or branch of the code repository')
+        git(target, 'checkout', '-q', '--detach', commit)
+        return commit
+    if not shop_ref:
+        return None
+    origin = git(root, 'config', '--get', 'remote.origin.url', check=False)
+    commit = fetch_ref(repo, shop_ref, origin, log)
+    if not commit:
+        raise Refusal(400, f'shop_ref {shop_ref} is not a commit, tag or branch of the repository')
+    install_tree(repo, 'app/public', tree_files(repo, git_dirs, commit, 'app/public', log))
+    return commit
+
+
+def check_compose_files(app, shop_ref):
+    """A project compose file inside app/public would be shop code a caller chose: refused with shop_ref."""
+    listed = (env_value(app / 'env/common.env', 'PROJECT_COMPOSE_FILES') or '').split()
+    for entry in listed:
+        target = PurePosixPath(os.path.normpath(str(PurePosixPath('app') / entry)))
+        if shop_ref and (target.parts[:2] == ('app', 'public')):
+            raise Refusal(400, f'shop_ref: PROJECT_COMPOSE_FILES lists {entry} inside app/public; this project\'s shop '
+                               'code cannot be chosen per session')
+
+
 def create_worker(identifier):
     data = find_session(identifier)
     project, directory = data['project'], session_dir(data['project'])
     log = directory / 'log'
-    update_session(project, worker=os.getpid())
+    if not update_session(project, identifier, ('creating',), worker=identity(os.getpid())):
+        return
+    limits = settings()
     root = build_root(project)
     relative = docker_directory(root)
     repo = directory / 'repo'
     app = repo / relative
     dataset = DATASET.fullmatch(data['db'])[1]
     step = 'clone'
+
+    def advance(name, **fields):
+        if not update_session(project, identifier, ('creating',), step=name, **fields):
+            raise Cancelled()
+
     try:
-        update_session(project, step=step)
-        commit = clone(root, repo, data['env_ref'], log)
-        shop = code_clone(root, repo, data.get('shop_ref'), log)
-        update_session(project, env_commit=commit, shop_commit=shop)
-        write_local_env(app, project)
-        (app / 'env/test.env').write_text('TEST_TLS=self-signed\nTEST_HOST_ROUTE=off\n')
-        (app / 'env/test.env').chmod(0o600)
+        advance(step)
+        git_dirs = clone(root, repo, data['env_commit'], log)
+        name = compose_name(app)
+        if not name:
+            raise RuntimeError('env/common.env of the trusted commit has no PROJECT_NAME')
+        origin = git(root, 'config', '--get', 'remote.origin.url', check=False)
+        tests = data['env_commit']
+        if data.get('env_ref') and data['env_ref'] != data.get('env_branch'):
+            tests = fetch_ref(repo, data['env_ref'], origin, log)
+            if not tests:
+                raise Refusal(400, f'env_ref {data["env_ref"]} is not a commit, tag or branch of the environment repository')
+        advance('specs', compose_project=name, git_dirs=git_dirs, tests_commit=tests)
+        write_specs(repo, spec_files(repo, git_dirs, tests, data['env_commit'], log))
+        check_compose_files(app, data.get('shop_ref'))
+        shop = shop_code(root, repo, data.get('shop_ref'), log, git_dirs, data['env_commit'])
+        advance('env', shop_commit=shop)
+        write_local_env(app, project, limits)
+        write_private(app / 'env/test.env', session_env(limits))
         for step, target, arguments in (('test-init', 'test-init', ()), ('build', 'build', ()),
                                         ('test-prepare', 'test-prepare', (f'set={dataset}',)),
                                         ('e2e-install', 'e2e-install', ())):
-            update_session(project, step=step)
+            advance(step)
             if make(log, app, target, *arguments):
                 raise RuntimeError(f'make {target} failed (see the session log)')
         domain = env_value(app / 'env/test.env', 'DOMAIN')
-        current = read_json(directory / 'session.json') or {}
-        if current.get('status') != 'creating':
+        if not update_session(project, identifier, ('creating',), status='ready', step=None, ready_at=now(), domain=domain,
+                              worker=None):
             return  # destroyed meanwhile: its destroy cleans up
-        update_session(project, status='ready', step=None, ready_at=now(), domain=domain, worker=None)
+    except Cancelled:
+        return
     except Exception as error:  # noqa: BLE001 - the session must never stay "creating"
         message = error.answer['error'] if isinstance(error, Refusal) else str(error)
         say(log, f'failed at {step}: {message}')
-        teardown(data, log)
-        update_session(project, status='failed', error=message, step=step, worker=None, ended_at=now())
-
-
-def compose_project(directory):
-    """The Compose project name of a session's ENV=test (setup's <PROJECT_NAME>-test)."""
-    for app in (directory / 'repo/app', directory / 'repo/app/docker'):
-        name = env_value(app / 'env/common.env', 'PROJECT_NAME')
-        if name:
-            return f'{name}-test'
-    return None
+        if not update_session(project, identifier, ('creating',), step=step, error=message, worker=None):
+            return
+        current = read_json(directory / 'session.json') or data
+        cleaned = teardown(current, log)
+        update_session(project, identifier, ('creating',), status='failed' if cleaned else 'destroying',
+                       end_reason='failed', ended_at=now())
 
 
 def teardown(data, log):
-    """Stop a session's run, remove its ENV=test containers, networks and volumes, delete its clone."""
+    """Stop a session's run, remove its ENV=test containers, networks, volumes and images, delete its clone. True when
+    Compose removed everything (the clone is kept otherwise, so a retry can run compose down again)."""
     directory = session_dir(data['project'])
     run = data.get('active_run')
     if run:
         cancel_run(run, 'the session ended')
-    name = compose_project(directory)
+    name = data.get('compose_project') or compose_name(directory / 'repo/app') or compose_name(directory / 'repo/app/docker')
     if name:
-        run_logged(log, ['docker', 'compose', '-p', name, 'down', '--volumes', '--remove-orphans', '--timeout', '20'],
-                   env=child_environment(), timeout=300)
+        images = subprocess.run(['docker', 'compose', '-p', name, 'images', '--quiet'], capture_output=True, text=True,
+                                env=child_environment(), timeout=120).stdout.split()
+        code = run_logged(log, ['docker', 'compose', '-p', name, 'down', '--volumes', '--remove-orphans', '--timeout', '20'],
+                          env=child_environment(), timeout=300)
+        if code:
+            say(log, f'compose down of {name} failed (exit {code}); it is tried again')
+            return False
+        for image in sorted(set(images)):
+            # Docker refuses an image another container uses; the shared Playwright image stays for the next session.
+            tags = subprocess.run(['docker', 'image', 'inspect', '--format', '{{join .RepoTags " "}}', image],
+                                  capture_output=True, text=True, env=child_environment()).stdout
+            if re.fullmatch(r'(?:sha256:)?[0-9a-f]{12,64}', image) and not any(item.startswith('playwright-') for item in tags.split()):
+                subprocess.run(['docker', 'image', 'rm', image], capture_output=True, timeout=120, env=child_environment())
     remove_tree(directory / 'repo')
+    return True
 
 
-def destroy(identifier, by, reason='destroyed'):
+def destroy(identifier, by, reason='destroyed', wait=False):
+    """End a session: status destroying, then its teardown (in the background, or here with wait, as reconcile does:
+    a worker it left would be killed with the timer's unit)."""
     data = find_session(identifier)
     if data['status'] in ('destroyed', 'expired'):
         return public_session(data)
-    if data.get('worker') and alive(data['worker']) and data['status'] == 'creating':
-        with contextlib.suppress(OSError):
-            os.killpg(int(data['worker']), signal.SIGTERM)
-    data = update_session(data['project'], status='destroying', step='destroy', destroyed_by=by, worker=None)
-    data['worker'] = detach('destroy-worker', '--id', identifier, '--reason', reason)
-    update_session(data['project'], worker=data['worker'])
+    if data['status'] == 'creating':
+        kill_group(data.get('worker'), signal.SIGTERM)
+    data = update_session(data['project'], identifier, ('creating', 'ready', 'failed', 'destroying'), status='destroying',
+                          step='destroy', destroyed_by=by, end_reason=reason, worker=None) or data
+    if wait:
+        destroy_worker(identifier)
+        return public_session(find_session(identifier))
+    update_session(data['project'], identifier, ('destroying',), worker=identity(detach('destroy-worker', f'--id={identifier}')))
     return public_session(data)
 
 
-def destroy_worker(identifier, reason):
+def destroy_worker(identifier):
     data = find_session(identifier)
     log = session_dir(data['project']) / 'log'
-    teardown(data, log)
-    update_session(data['project'], status=reason, step=None, worker=None, ended_at=now(), active_run=None)
+    if teardown(data, log):
+        update_session(data['project'], identifier, ('destroying',), status=data.get('end_reason') or 'destroyed', step=None,
+                       worker=None, ended_at=now(), active_run=None, error=None)
+    else:
+        update_session(data['project'], identifier, ('destroying',), worker=None, attempts=int(data.get('attempts') or 0) + 1,
+                       error='compose down failed; reconcile tries again')
 
 
 def extend(identifier, minutes):
@@ -580,7 +1264,10 @@ def extend(identifier, minutes):
         raise Refusal(400, f'minutes: 1–{limits["TEST_SESSION_MAX_MINUTES"]}')
     ceiling = data['created_at'] + limits['TEST_SESSION_MAX_MINUTES'] * 60
     expires = min(ceiling, max(data['expires_at'], now()) + minutes * 60)
-    return public_session(update_session(data['project'], expires_at=expires))
+    changed = update_session(data['project'], identifier, ('creating', 'ready'), expires_at=expires)
+    if not changed:
+        raise Refusal(409, f'session {identifier} has ended', 'session_ended')
+    return public_session(changed)
 
 
 # --- Runs ------------------------------------------------------------------------------------------
@@ -588,8 +1275,8 @@ def scan_pattern(pattern, label):
     """A caller's pattern, which is put inside a group of a larger JavaScript regular expression: refused unless its
     parentheses balance outside character classes by JavaScript's rules (so it cannot close that group and widen the
     tag rule) and it compiles. [] and [^] (empty and any-character classes in JavaScript, not in Python) are refused."""
-    if len(pattern) > PATTERN_LIMIT or any(ord(character) < 32 for character in pattern):
-        raise Refusal(400, f'{label}: at most {PATTERN_LIMIT} characters, no control characters')
+    if not isinstance(pattern, str) or len(pattern) > PATTERN_LIMIT or any(ord(character) < 32 for character in pattern):
+        raise Refusal(400, f'{label}: a string of at most {PATTERN_LIMIT} characters, no control characters')
     depth, index, in_class = 0, 0, False
     while index < len(pattern):
         character = pattern[index]
@@ -619,24 +1306,27 @@ def scan_pattern(pattern, label):
 
 
 def selection(target, request, manage):
-    """(grep, grep_invert, notes) of a run: the target's tag rule (here only) AND the caller's narrowing."""
-    required = []
+    """(grep, grep_invert) of a run: the target's tag rule (here only) AND the caller's narrowing. A tag counts only as
+    a word (tag()); @stage-write runs on stage with stage_write_safe only, and never on live."""
+    required, inverted = [], []
     if target == 'stage':
         write = request.get('stage_write_safe') is True
         if write and not manage:
             raise Refusal(403, 'stage_write_safe needs the permission "manage" of Test environments')
-        required.append(rf'@stage{END}' if not write else rf'@stage(?:-write)?{END}')
+        required.append(tag('stage') if not write else f'{tag("stage")}|{tag("stage-write")}')
+        if not write:
+            inverted.append(tag('stage-write'))
     elif target == 'live':
-        required.append(rf'@live{END}')
+        required.append(tag('live'))
+        inverted.append(tag('stage-write'))
     if request.get('deploy_check') is True:
-        required.append(rf'@deploy{END}')
+        required.append(tag('deploy'))
     grep, invert = request.get('grep'), request.get('grep_invert')
     if grep:
         required.append(scan_pattern(grep, 'grep'))
     combined = '^' + ''.join(f'(?=.*(?:{part}))' for part in required) if required else None
-    inverted = []
     if target == 'test':
-        inverted.append(rf'^(?!.*@test{END}).*{OTHER_TARGETS}')
+        inverted.append(rf'^(?!.*{tag("test")}).*(?:{tag("stage")}|{tag("stage-write")}|{tag("live")})')
     if invert:
         inverted.append(scan_pattern(invert, 'grep_invert'))
     return combined, '|'.join(f'(?:{part})' for part in inverted) or None
@@ -653,63 +1343,10 @@ def check_files(files):
     return files
 
 
-def patch_paths(text):
-    """Every path a unified diff touches (a/ b/ prefixes dropped), refused when it is anything but a text change under
-    tests/playwright/ or config/playwright/ (no dependency files, symlinks or binary patches)."""
-    if 'GIT binary patch' in text or re.search(r'^Binary files ', text, re.M):
-        raise Refusal(400, 'patch: binary changes are not allowed')
-    if re.search(r'^(?:new|deleted) file mode 120000|^(?:old|new) mode 120000', text, re.M):
-        raise Refusal(400, 'patch: symlinks are not allowed')
-    paths = set()
-    for match in re.finditer(r'^(?:diff --git a/(\S+) b/(\S+)|--- (\S+)|\+\+\+ (\S+)|(?:rename|copy) (?:from|to) (\S+))',
-                             text, re.M):
-        for path in match.groups():
-            if path and path != '/dev/null':
-                paths.add(re.sub(r'^[ab]/', '', path) if not match[1] and not match[5] else path)
-    if not paths:
-        raise Refusal(400, 'patch: no file changes found (a unified diff, as git diff writes it)')
-    for path in sorted(paths):
-        parts = PurePosixPath(path).parts
-        if path.startswith('/') or '..' in parts or not any(path.startswith(root) for root in PATCH_ROOTS):
-            raise Refusal(400, f'patch: {path} is outside tests/playwright/ and config/playwright/ (paths are relative to '
-                               'the project directory, the one with the Makefile)')
-        if parts[-1] in PATCH_FORBIDDEN:
-            raise Refusal(400, f'patch: {path}: dependencies come from the commit, not from a patch')
-    return sorted(paths)
-
-
-def reset_tests(app):
-    """tests/playwright and config/playwright back to the checked-out commit (a submodule there too); node_modules
-    is kept."""
-    for relative in ('tests/playwright', 'config/playwright'):
-        directory = app / relative
-        if not directory.is_dir():
-            continue
-        top = Path(git(directory, 'rev-parse', '--show-toplevel'))
-        if top.resolve() == directory.resolve():
-            git(directory, 'checkout', '-q', '--', '.')
-            git(directory, 'clean', '-fdq', '-e', 'node_modules')
-        else:
-            inside = str(directory.resolve().relative_to(top.resolve()))
-            git(top, 'checkout', '-q', '--', inside)
-            git(top, 'clean', '-fdq', '-e', 'node_modules', '--', inside)
-
-
-def apply_patch(app, patch, check_only=False):
-    """git apply of a patch whose paths are relative to the project directory; outside any repository, so it applies
-    across a submodule boundary as well."""
-    # The ceiling is the directory above the project: git finds no repository from the project directory up.
-    environment = {**child_environment(), 'GIT_CEILING_DIRECTORIES': str(app.resolve().parent)}
-    for extra in ([['--check']] if check_only else [['--check'], []]):
-        result = subprocess.run(['git', 'apply', '--whitespace=nowarn', *extra, str(patch)], cwd=app, env=environment,
-                                capture_output=True, text=True)
-        if result.returncode:
-            raise Refusal(400, 'patch does not apply: ' + (result.stderr.strip().splitlines() or ['?'])[0][:300])
-
-
-def storage_states(request, environment):
-    """{role: path} of the request's storage_states (Vault's handoff files), each checked: a regular file, not a
-    symlink, written within TEST_STORAGE_STATE_MAX_AGE seconds. Root checks them (the files are group vault-handoff)."""
+def read_storage_states(request, environment):
+    """{role: the file's text} of the request's storage_states (Vault's handoff files), each checked as root: a regular
+    file (opened without following a symlink), at most STATE_LIMIT bytes, written within TEST_STORAGE_STATE_MAX_AGE
+    seconds. Root reads them (Vault writes them 0640 root:vault-handoff); the run gets a copy of its own."""
     given = request.get('storage_states')
     if given is None:
         return {}
@@ -720,16 +1357,26 @@ def storage_states(request, environment):
     for role, operation in sorted(given.items()):
         if not ROLE.fullmatch(str(role)) or not OPERATION.fullmatch(str(operation)):
             raise Refusal(400, f'storage_states: {role!r}: a role (a-z, 0-9, _ -) and an operation uuid')
-        path = HANDOFF / (environment or 'test') / f'{operation}.json'
         try:
-            details = os.lstat(path)
-        except OSError:
+            directory = open_directory(HANDOFF, (environment or 'test',))
+            try:
+                descriptor, _ = open_regular(directory, f'{operation}.json')
+            finally:
+                os.close(directory)
+        except FileNotFoundError:
             raise Refusal(409, f'storage state of {role} ({operation}) is missing', 'storage_state_missing') from None
-        if not stat.S_ISREG(details.st_mode):
-            raise Refusal(409, f'storage state of {role} is not a regular file', 'storage_state_missing')
-        if time.time() - details.st_mtime > limit:
+        except OSError:
+            raise Refusal(409, f'storage state of {role} is not a regular file', 'storage_state_missing') from None
+        if time.time() - os.fstat(descriptor).st_mtime > limit:
+            os.close(descriptor)
             raise Refusal(409, f'storage state of {role} ({operation}) has expired', 'storage_state_expired')
-        found[role] = str(path)
+        try:
+            text = read_bounded(descriptor, STATE_LIMIT).decode()
+            json.loads(text)
+        except (OSError, ValueError):
+            raise Refusal(409, f'storage state of {role} is not a JSON file of at most {STATE_LIMIT} bytes',
+                          'storage_state_missing') from None
+        found[role] = text
     return found
 
 
@@ -739,14 +1386,17 @@ def run_dir(identifier):
 
 def public_run(data):
     shown = {key: data.get(key) for key in ('id', 'kind', 'status', 'target', 'project', 'environment', 'session', 'url',
-                                            'env_ref', 'env_commit', 'shop_commit', 'grep', 'grep_invert', 'files', 'deploy_check',
-                                            'stage_write_safe', 'patch_sha256', 'patch_files', 'client_run_id', 'step',
-                                            'error', 'summary', 'tests', 'artifacts', 'created_by', 'roles', 'path',
-                                            'snapshot')}
+                                            'env_ref', 'env_commit', 'tests_commit', 'shop_commit', 'grep', 'grep_invert',
+                                            'files', 'deploy_check', 'stage_write_safe', 'patch_sha256', 'patch_files',
+                                            'client_run_id', 'step', 'error', 'errors', 'summary', 'tests', 'artifacts',
+                                            'created_by', 'roles', 'path', 'snapshot')}
+    executed = data.get('executed')
+    if executed is None and data.get('status') in TERMINAL:
+        executed = data.get('status') in ('passed', 'failed', 'done')
     shown.update(created_at=iso(data.get('created_at')), started_at=iso(data.get('started_at')),
                  finished_at=iso(data.get('finished_at')), cancelled_by=data.get('cancelled_by'),
-                 # passed/failed: Playwright ran and reported (failed: some tests did not pass); error/cancelled: it did not.
-                 executed=data.get('status') in ('passed', 'failed', 'done') if data.get('status') in TERMINAL else None)
+                 # true: Playwright ran tests and reported them (some may have failed); false: no test ran.
+                 executed=executed if data.get('status') in TERMINAL else None)
     return {key: value for key, value in shown.items() if value is not None}
 
 
@@ -759,27 +1409,100 @@ def find_run(identifier):
     return data
 
 
-def update_run(identifier, **fields):
+def update_run(identifier, expect=None, **fields):
+    """Change a run's record under the lock, only while its status is one of expect (when given): the record
+    afterwards, or None when it was not changed (a missing run is never made)."""
     path = run_dir(identifier) / 'run.json'
     with locked(RUNS / '.lock'):
-        data = read_json(path) or {}
+        data = read_json(path)
+        if not data or (expect and data.get('status') not in expect):
+            return None
         data.update(fields)
         write_json(path, data)
     return data
 
 
-def runs(session=None):
+def runs(session=None, limit=200):
     found = []
-    for path in sorted(RUNS.glob('*/run.json'), key=lambda item: item.stat().st_mtime, reverse=True)[:200] \
-            if RUNS.is_dir() else []:
+    entries = []
+    for path in RUNS.glob('*/run.json') if RUNS.is_dir() else []:
+        with contextlib.suppress(OSError):
+            entries.append((path.stat().st_mtime, path))
+    for _, path in sorted(entries, reverse=True):
         data = read_json(path)
         if data and (session is None or data.get('session') == session):
             found.append(public_run(data))
+            if len(found) >= limit:
+                break
     return found
 
 
 def key_path(by, client_run_id):
     return RUNS / 'keys' / (hashlib.sha256(f'{by}\0{client_run_id}'.encode()).hexdigest() + '.json')
+
+
+TOMBSTONE_SECONDS = 48 * 3600
+
+
+def project_key_path(kind, project, client):
+    """RUNS/<kind>/<sha256 of project and client_run_id>.json: what a client_run_id names within a project, whoever asks
+    (clients: the run it made; tombstones: a cancel that came first)."""
+    return RUNS / kind / (hashlib.sha256(f'{project}\0{client}'.encode()).hexdigest() + '.json')
+
+
+def tombstone(project, client):
+    """The cancel recorded for a project's client_run_id before any run of it existed (kept TOMBSTONE_SECONDS)."""
+    data = read_json(project_key_path('tombstones', project, client))
+    return data if isinstance(data, dict) and now() - int(data.get('at') or 0) < TOMBSTONE_SECONDS else None
+
+
+def refuse_tombstone(project, client):
+    found = tombstone(project, client) if client is not None else None
+    if found:
+        raise Refusal(409, f'client_run_id {client} of {project} was cancelled ({iso(found.get("at"))}, by '
+                           f'{found.get("by")}): nothing is started for it', 'cancelled')
+
+
+def cancel_by_key(project, client, by):
+    """Cancel what a project's client_run_id names, also before it exists: its run (as cancel_run) and a session made
+    for it; and a tombstone, so a request with that key that arrives later starts nothing. Idempotent."""
+    build_root(project)
+    if not CLIENT_RUN_ID.fullmatch(str(client or '')):
+        raise Refusal(400, 'client_run_id: 1–100 letters, digits, . _ : -')
+    with locked(RUNS / '.lock'):
+        path = project_key_path('tombstones', project, client)
+        if not tombstone(project, client):
+            write_json(path, {'project': project, 'client_run_id': client, 'by': by, 'at': now()})
+        known = read_json(project_key_path('clients', project, client)) or {}
+    run = None
+    if RUN_ID.fullmatch(str(known.get('run'))):
+        run = cancel_run(known['run'], f'cancelled by {by} (client_run_id {client})', by)
+    for session in sessions():
+        if session['project'] == project and session.get('client_run_id') == client and \
+                session['status'] in ('creating', 'ready', 'failed'):
+            destroy(session['id'], by, 'destroyed')
+    return {'cancelled': True, 'run': public_run(run) if run else None}
+
+
+def known_run(by, client):
+    """The run a caller's client_run_id already made, or None."""
+    if client is None or not CLIENT_RUN_ID.fullmatch(str(client)):
+        return None
+    known = read_json(key_path(by, client))
+    return read_json(run_dir(str(known.get('run'))) / 'run.json') if isinstance(known, dict) and RUN_ID.fullmatch(
+        str(known.get('run'))) else None
+
+
+def scope_path(data):
+    """The one-run-at-a-time slot of a run: its session's, or its project's external clone's."""
+    return RUNS / 'active' / (data['session'] if data.get('session') else f'external-{data["project"]}')
+
+
+def release_scope(data):
+    path = scope_path(data)
+    with contextlib.suppress(OSError):
+        if (read_json(path) or {}).get('run') == data.get('id'):
+            path.unlink()
 
 
 def start_run(request, by, manage, states, kind='run'):
@@ -789,18 +1512,17 @@ def start_run(request, by, manage, states, kind='run'):
     client = request.get('client_run_id')
     if client is not None and not CLIENT_RUN_ID.fullmatch(str(client)):
         raise Refusal(400, 'client_run_id: 1–100 letters, digits, . _ : -')
-    with locked(RUNS / '.lock'):
-        if client is not None:
-            known = read_json(key_path(by, client))
-            existing = read_json(run_dir(known['run']) / 'run.json') if known else None
-            if existing:
-                return public_run(existing), False
+    existing = known_run(by, client)
+    if existing:
+        return public_run(existing), False
     target = request.get('target')
     if target not in TARGETS:
         raise Refusal(400, 'target: test, stage or live')
     if target == 'test' and not request.get('project') and SESSION_ID.fullmatch(str(request.get('session') or '')):
         request = {**request, 'project': find_session(request['session'])['project']}
     root = build_root(request.get('project'))
+    refuse_tombstone(root.name, client)
+    limits = settings()
     data = {'kind': kind, 'target': target, 'project': root.name, 'created_by': by, 'created_at': now(),
             'status': 'queued', 'step': 'queued', 'client_run_id': client, 'roles': sorted(states) or None}
     if kind == 'run':
@@ -811,20 +1533,23 @@ def start_run(request, by, manage, states, kind='run'):
     else:
         path = request.get('path') or '/'
         if not isinstance(path, str) or not PAGE_PATH.fullmatch(path):
-            raise Refusal(400, 'path: a path of the site, starting with /')
+            raise Refusal(400, 'path: a path of the site, starting with a single /')
         role = request.get('role', 'guest')
         if role != 'guest':
             raise Refusal(400, f'role {role!r}: only guest is supported yet (authenticated roles come with Vault)')
         data['path'] = path
     patch = request.get('patch')
-    if patch is not None and kind == 'run':
+    if patch is not None:
+        if kind != 'run' or target != 'test':
+            raise Refusal(400, 'patch goes with target test only: stage and live run the trusted commit\'s suite as it is')
         if not isinstance(patch, str):
             raise Refusal(400, 'patch: the text of a unified diff')
         if len(patch.encode()) > PATCH_LIMIT:
             raise Refusal(413, f'patch: at most {PATCH_LIMIT} bytes')
-        data['patch_files'] = patch_paths(patch)
         data['patch_sha256'] = hashlib.sha256(patch.encode()).hexdigest()
     if target == 'test':
+        if request.get('env_ref') is not None:
+            raise Refusal(400, 'env_ref goes with the session (POST /test-sessions), not with its runs')
         session = find_session(request.get('session') or '')
         if session['project'] != root.name:
             raise Refusal(400, f'session {session["id"]} is of project {session["project"]}')
@@ -832,49 +1557,71 @@ def start_run(request, by, manage, states, kind='run'):
             raise Refusal(409, f'session {session["id"]} is {session["status"]}', 'session_not_ready')
         data['session'] = session['id']
         data['url'] = f'https://{session["domain"]}' if session.get('domain') else None
-        data.update(env_ref=session.get('env_ref'), env_commit=session.get('env_commit'), shop_commit=session.get('shop_commit'))
+        data.update(env_ref=session.get('env_ref'), env_commit=session.get('env_commit'),
+                    tests_commit=session.get('tests_commit'), shop_commit=session.get('shop_commit'))
     else:
         if request.get('session'):
             raise Refusal(400, 'session goes with target test only')
-        environment = TARGETS[target]
-        data.update(environment=environment, url=environment_url(root, environment))
         ref = request.get('env_ref')
         if ref is not None and not REF.fullmatch(str(ref)):
             raise Refusal(400, 'env_ref: a branch, tag or commit')
-        data['env_ref'] = ref or git(root, 'rev-parse', 'HEAD')
-    with locked(RUNS / '.lock'):
-        if client is not None:
-            known = read_json(key_path(by, client))
-            existing = read_json(run_dir(known['run']) / 'run.json') if known else None
-            if existing:
-                return public_run(existing), False
-        busy = [item for item in runs() if item['status'] in ('queued', 'running') and
-                ((target == 'test' and item.get('session') == data['session']) or
-                 (target != 'test' and item.get('target') != 'test' and item['project'] == root.name))]
-        if busy:
-            raise Refusal(409, f'run {busy[0]["id"]} is still {busy[0]["status"]} there; one run at a time', 'run_active',
-                          run=busy[0]['id'])
-        identifier = ('run-' if kind == 'run' else 'snap-') + secrets.token_hex(6)
-        data['id'] = identifier
-        directory = run_dir(identifier)
-        directory.mkdir(parents=True, mode=0o750)
-        if patch is not None and kind == 'run':
-            (directory / 'patch.diff').write_text(patch)
-            (directory / 'patch.diff').chmod(0o600)
+        commit, branch = trusted_commit(root, ref) if ref is not None else trusted_commit(root)
+        if not commit:
+            raise Refusal(400, f'env_ref {ref}: stage and live run only a trusted commit (one of origin/'
+                               f'{", origin/".join(trusted_branches(root))}); test other specs in a session')
+        environment = TARGETS[target]
+        data.update(environment=environment, url=environment_url(root, environment, commit), env_ref=ref or branch,
+                    env_commit=commit, tests_commit=commit)
+    run_gates(limits)
+    identifier = ('run-' if kind == 'run' else 'snap-') + secrets.token_hex(6)
+    data['id'] = identifier
+    directory = run_dir(identifier)
+    RUNS.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(mode=0o750)
+    try:
+        if patch is not None:
+            session = find_session(data['session'])
+            repo = session_dir(session['project']) / 'repo'
+            specs = spec_files(repo, session.get('git_dirs') or {}, session['tests_commit'], session['env_commit'],
+                               directory / 'log')
+            data['patch_files'] = patch_paths(patch, directory)
+            apply_patch(specs, patch, directory)  # a patch that does not apply is a 400 now
+            write_private(directory / 'patch.diff', patch)
         if states:
-            write_json(directory / 'states.json', states)
-        if target == 'test' and kind == 'run' and patch is not None:
-            app = session_app(find_session(data['session']))
-            reset_tests(app)
-            apply_patch(app, directory / 'patch.diff', check_only=True)  # a patch that does not apply is a 400 now
+            auth = directory / 'auth'
+            auth.mkdir(mode=0o700)
+            for role, text in states.items():
+                write_private(auth / f'{role}.json', text)
+    except BaseException:
+        remove_tree(directory)
+        raise
+    with locked(RUNS / '.lock'):
+        existing = known_run(by, client)
+        if existing:
+            remove_tree(directory)
+            return public_run(existing), False
+        try:
+            refuse_tombstone(root.name, client)
+        except Refusal:
+            remove_tree(directory)
+            raise
+        slot = scope_path(data)
+        holder = read_json(slot) or {}
+        held = read_json(run_dir(str(holder.get('run'))) / 'run.json') if RUN_ID.fullmatch(str(holder.get('run'))) else None
+        if held and held.get('status') in ACTIVE:
+            remove_tree(directory)
+            raise Refusal(409, f'run {held["id"]} is still {held["status"]} there; one run at a time', 'run_active',
+                          run=held['id'])
+        write_json(slot, {'run': identifier})
         write_json(directory / 'run.json', data)
         if client is not None:
             write_json(key_path(by, client), {'run': identifier})
+            write_json(project_key_path('clients', root.name, client), {'run': identifier})
     if target == 'test':
-        update_session(data['project'], active_run=identifier)
+        update_session(data['project'], data['session'], active_run=identifier)
     if kind == 'snapshot':
         return snapshot_worker(identifier), True
-    update_run(identifier, worker=detach('run-worker', '--id', identifier))
+    update_run(identifier, ACTIVE, worker=identity(detach('run-worker', f'--id={identifier}')))
     return public_run(find_run(identifier)), True
 
 
@@ -887,49 +1634,90 @@ def session_app(session):
 
 
 def external_app(data, log):
-    """The project's clone for stage/live runs, at the run's ref (one run at a time per project)."""
+    """The project's clone for stage/live runs at the trusted commit (one run at a time per project). The install of
+    the specs' dependencies (.generated/e2e) is kept from one run to the next."""
     root = build_root(data['project'])
     relative = docker_directory(root)
-    repo = EXTERNAL / data['project'] / 'repo'
-    commit = clone(root, repo, data['env_ref'], log)
-    shop = code_clone(root, repo, None, log)
+    base = EXTERNAL / data['project']
+    repo = base / 'repo'
+    cache = base / 'e2e-cache'
+    remove_tree(cache)
+    with contextlib.suppress(OSError):
+        if stat.S_ISDIR(os.lstat(repo / relative / '.generated/e2e').st_mode):
+            base.mkdir(parents=True, exist_ok=True)
+            os.rename(repo / relative / '.generated/e2e', cache)
+    git_dirs = clone(root, repo, data['env_commit'], log)
+    write_specs(repo, spec_files(repo, git_dirs, data['env_commit'], data['env_commit'], log))
+    shop = shop_code(root, repo, None, log, git_dirs, data['env_commit'])
     if shop:
         update_run(data['id'], shop_commit=shop)
     app = repo / relative
-    write_local_env(app, data['project'])
-    return app, commit
+    if cache.is_dir() and not cache.is_symlink():
+        real_directory_below(app, '.generated')
+        os.rename(cache, app / '.generated/e2e')
+    write_local_env(app, data['project'], settings())
+    return app
+
+
+def clear_directory(path):
+    """path as an empty directory of this account's (its contents removed)."""
+    remove_tree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def redact(text):
+    """Credentials out of a message: user:password@ of a URL, secrets in a query string, Cookie and Authorization."""
+    text = re.sub(r'(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+(?::[^/\s@]*)?@', r'\1***@', text)
+    text = re.sub(r'(?i)([?&;](?:[a-z0-9_.-]*(?:token|key|secret|password|passwd|pass|auth|sig|signature|session|code)'
+                  r'[a-z0-9_.-]*)=)[^&\s#\'"]+', r'\1***', text)
+    return re.sub(r'(?im)\b(authorization|cookie|set-cookie|x-api-key)(\s*[:=]\s*)\S[^\n]*', r'\1\2***', text)
+
+
+def message_of(error):
+    return redact(ANSI.sub('', str((error or {}).get('message') or (error or {}).get('value') or '')))[:MESSAGE_LIMIT] or None
 
 
 def run_worker(identifier):
-    data = update_run(identifier, status='running', started_at=now(), worker=os.getpid())
+    data = update_run(identifier, ('queued',), status='running', started_at=now(), worker=identity(os.getpid()))
+    if not data:
+        return  # cancelled before it started
     directory = run_dir(identifier)
     log = directory / 'log'
     limits = settings()
     step = 'prepare'
+
+    def advance(name):
+        if not update_run(identifier, ('running',), step=name):
+            raise Cancelled()
+
     try:
+        advance(step)
         if data['target'] == 'test':
-            app = session_app(find_session(data['session']))
+            session = find_session(data['session'])
+            if session['status'] != 'ready':
+                raise Refusal(409, f'session {session["id"]} is {session["status"]}')
+            app = session_app(session)
+            repo = session_dir(session['project']) / 'repo'
             results = app / '.generated/test/data/playwright'
+            clear_directory(results)
+            step = 'specs'
+            advance(step)
+            specs = spec_files(repo, session.get('git_dirs') or {}, session['tests_commit'], session['env_commit'], log)
+            if (directory / 'patch.diff').is_file():
+                specs = apply_patch(specs, (directory / 'patch.diff').read_text(), directory)
+            write_specs(repo, specs)
         else:
-            update_run(identifier, step='clone')
-            app, commit = external_app(data, log)
-            update_run(identifier, env_commit=commit)
+            step = 'clone'
+            advance(step)
+            app = external_app(data, log)
             results = directory / 'data'
-            results.mkdir(exist_ok=True)
-        step = 'patch'
-        update_run(identifier, step=step)
-        reset_tests(app)
-        if (directory / 'patch.diff').is_file():
-            apply_patch(app, directory / 'patch.diff')
+            clear_directory(results)
         step = 'e2e-install'
-        update_run(identifier, step=step)
-        if make(log, app, 'e2e-install', timeout=900):
+        advance(step)
+        if make(log, app, 'e2e-install', timeout=900, run=identifier):
             raise RuntimeError('make e2e-install failed')
         step = 'e2e'
-        update_run(identifier, step=step)
-        report = results / 'report.json'
-        with contextlib.suppress(OSError):
-            report.unlink()
+        advance(step)
         arguments = ['json=1', f'container={identifier}']
         if data.get('grep'):
             arguments.append(f'grep={data["grep"]}')
@@ -937,130 +1725,207 @@ def run_worker(identifier):
             arguments.append(f'grep_invert={data["grep_invert"]}')
         if data.get('files'):
             arguments.append('files=' + ' '.join(data['files']))
-        states = read_json(directory / 'states.json') or {}
-        if states:
-            arguments.append('storage_states=' + ' '.join(f'{role}={path}' for role, path in sorted(states.items())))
+        auth = directory / 'auth'
+        if auth.is_dir() and not auth.is_symlink():
+            arguments.append('storage_states=' + ' '.join(f'{path.stem}={path}' for path in sorted(auth.glob('*.json'))))
         if data['target'] != 'test':
             arguments += [f'url={data["url"]}', f'data={results}']
-        code = make(log, app, 'e2e', *arguments, timeout=limits['TEST_RUN_TIMEOUT_MINUTES'] * 60)
-        if (read_json(directory / 'run.json') or {}).get('status') == 'cancelled':
-            return  # cancel_run set the outcome
-        parsed = read_json(report)
-        if not isinstance(parsed, dict) or 'suites' not in parsed:
-            raise RuntimeError('Playwright wrote no report' + (' (timed out)' if code == 124 else f' (exit {code})'))
-        shutil.copyfile(report, directory / 'report.json')
-        summary, tests, artifacts = digest(parsed, results, directory / 'artifacts', limits['TEST_RUN_ARTIFACTS_MB'])
-        if code == 124:
-            status = 'error'
-        elif summary['failed']:
-            status = 'failed'
-        else:
-            status = 'passed' if code == 0 else 'error'
-        update_run(identifier, status=status, step=None, summary=summary, tests=tests, artifacts=artifacts,
-                   finished_at=now(), worker=None, error='the run timed out' if code == 124 else None)
+        code = make(log, app, 'e2e', *arguments, timeout=limits['TEST_RUN_TIMEOUT_MINUTES'] * 60, run=identifier,
+                    quota=(results, limits['TEST_RUN_DISK_MB'] * 1024 * 1024))
+        if code == 130:
+            raise Cancelled()
+        outcome = outcome_of(code, results, directory, limits)
+        update_run(identifier, ('running',), step=None, finished_at=now(), worker=None, **outcome)
+    except Cancelled:
+        pass
     except Exception as error:  # noqa: BLE001 - the run must never stay "running"
-        message = error.answer['error'] if isinstance(error, Refusal) else str(error)
+        message = redact(error.answer['error'] if isinstance(error, Refusal) else str(error))
         say(log, f'error at {step}: {message}')
-        if (read_json(directory / 'run.json') or {}).get('status') != 'cancelled':
-            update_run(identifier, status='error', step=step, error=message, finished_at=now(), worker=None)
+        update_run(identifier, ('running',), status='error', step=step, error=message, finished_at=now(), worker=None,
+                   executed=False)
     finally:
-        if data['target'] == 'test':
+        finish_run(identifier)
+        if data['target'] != 'test':
+            remove_tree(directory / 'data')  # traces and the HTML report: the artifacts kept are in artifacts/
+
+
+def finish_run(identifier):
+    """What a run leaves when it ends, whatever the outcome: its container, its storage states, its slot."""
+    data = read_json(run_dir(identifier) / 'run.json') or {}
+    remove_container(identifier)
+    remove_tree(run_dir(identifier) / 'auth')
+    if data:
+        release_scope(data)
+        if data.get('session'):
             with contextlib.suppress(Refusal, OSError):
                 session = find_session(data['session'])
                 if session.get('active_run') == identifier:
-                    update_session(session['project'], active_run=None)
+                    update_session(session['project'], session['id'], active_run=None)
 
 
-def walk_specs(suite, titles, file):
+def outcome_of(code, results, directory, limits):
+    """The status, summary, tests, artifacts, errors and executed of a finished make e2e, from its report."""
+    data = read_inside(results, 'report.json', REPORT_LIMIT)
+    try:
+        report = json.loads(data) if data is not None else None
+    except ValueError:
+        report = None
+    note = {124: ' (timed out)', 125: f' (over TEST_RUN_DISK_MB, {limits["TEST_RUN_DISK_MB"]} MB)'}.get(code, f' (exit {code})')
+    if not isinstance(report, dict):
+        return {'status': 'error', 'error': 'Playwright wrote no report' + note, 'executed': False}
+    write_private(directory / 'report.json', data.decode(errors='replace'))
+    errors = [message_of(item) for item in (report.get('errors') or [])[:20] if isinstance(item, dict)]
+    errors = [item for item in errors if item]
+    summary, tests, artifacts = digest(report, results, directory / 'artifacts', limits['TEST_RUN_ARTIFACTS_MB'])
+    executed = summary['passed'] + summary['failed'] + summary['flaky'] > 0
+    if code in (124, 125):
+        status, error = 'error', ('the run timed out' if code == 124 else 'the run went over its disk quota')
+    elif summary['failed']:
+        status, error = 'failed', None
+    elif not executed:
+        status, error = 'error', errors[0] if errors else 'no test ran: nothing matched the selection (grep, files, tags)'
+    elif code == 0 and not errors:
+        status, error = 'passed', None
+    else:
+        status, error = 'error', errors[0] if errors else f'Playwright ended with exit {code}'
+    return {'status': status, 'error': error, 'errors': errors or None, 'summary': summary, 'tests': tests,
+            'artifacts': artifacts, 'executed': executed}
+
+
+def walk_specs(suite, titles, file, depth=0):
     """(spec, its title path, its file) of a report suite: a file's suite, its describe blocks within."""
+    if not isinstance(suite, dict) or depth > 50:
+        return
     for spec in suite.get('specs') or []:
-        yield spec, titles + [spec.get('title', '')], spec.get('file') or file
+        if isinstance(spec, dict):
+            yield spec, titles + [str(spec.get('title', ''))], spec.get('file') or file
     for child in suite.get('suites') or []:
-        yield from walk_specs(child, titles + [child.get('title', '')], child.get('file') or file)
+        if isinstance(child, dict):
+            yield from walk_specs(child, titles + [str(child.get('title', ''))], child.get('file') or file, depth + 1)
 
 
-def failed_step(steps):
+def failed_step(steps, depth=0):
     for item in steps or []:
-        inner = failed_step(item.get('steps'))
+        if not isinstance(item, dict) or depth > 50:
+            continue
+        inner = failed_step(item.get('steps'), depth + 1)
         if inner:
             return inner
         if item.get('error'):
-            return item.get('title')
+            return str(item.get('title'))[:300]
     return None
 
 
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 
 
+def number(value):
+    try:
+        return max(0, int(float(value or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def digest(report, results, target, limit_mb):
-    """(summary, the tests that did not pass, the artifacts copied) of a Playwright JSON report."""
-    stats = report.get('stats') or {}
-    summary = {'passed': int(stats.get('expected') or 0), 'failed': int(stats.get('unexpected') or 0),
-               'flaky': int(stats.get('flaky') or 0), 'skipped': int(stats.get('skipped') or 0),
-               'duration_s': round(float(stats.get('duration') or 0) / 1000, 1)}
-    tests, artifacts, budget, number = [], [], limit_mb * 1024 * 1024, 0
+    """(summary, the tests that did not pass (at most TESTS_LIMIT), the artifacts copied) of a Playwright JSON report.
+    An attachment is copied only from inside the results directory (/e2e/data/… there), a regular file reached without
+    a symlink, within ARTIFACTS_LIMIT files and limit_mb MB in all."""
+    stats = report.get('stats') if isinstance(report.get('stats'), dict) else {}
+    summary = {'passed': number(stats.get('expected')), 'failed': number(stats.get('unexpected')),
+               'flaky': number(stats.get('flaky')), 'skipped': number(stats.get('skipped')),
+               'duration_s': round(number(stats.get('duration')) / 1000, 1)}
+    tests, artifacts, budget = [], [], limit_mb * 1024 * 1024
     target.mkdir(exist_ok=True)
-    for suite in report.get('suites') or []:
-        for spec, titles, file in walk_specs(suite, [], suite.get('file') or suite.get('title')):  # a file's suite: no title
-            for test in spec.get('tests') or []:
-                status = {'unexpected': 'failed', 'flaky': 'flaky', 'skipped': 'skipped'}.get(test.get('status'))
-                if not status:
-                    continue
-                results_list = test.get('results') or []
-                last = results_list[-1] if results_list else {}
-                error = last.get('error') or next((item.get('error') for item in results_list if item.get('error')), None) or {}
-                message = ANSI.sub('', str(error.get('message') or ''))[:4000] or None
-                names = []
-                for result in results_list:
-                    for attachment in result.get('attachments') or []:
-                        source = attachment.get('path') or ''
-                        if not source.startswith('/e2e/data/'):
-                            continue
-                        path = results / source[len('/e2e/data/'):]
-                        try:
-                            size = path.stat().st_size
-                        except OSError:
-                            continue
-                        if size > budget:
-                            continue
-                        number += 1
-                        name = f'{number:03d}-' + re.sub(r'[^A-Za-z0-9._-]+', '-', path.name)[:120]
-                        shutil.copyfile(path, target / name)
-                        budget -= size
-                        names.append(name)
-                        artifacts.append({'name': name, 'size': size, 'content_type': attachment.get('contentType'),
-                                          'test_id': None})
-                title = ' › '.join(part for part in titles if part)
-                test_id = f'{file} › {title}'
-                for item in artifacts[len(artifacts) - len(names):]:
-                    item['test_id'] = test_id
-                location = error.get('location') or {}
-                tests.append({'test_id': test_id, 'file': file, 'title': title, 'status': status,
-                              'attempts': max(1, len(results_list)), 'error': message,
-                              'step': failed_step(last.get('steps')) or (f'{str(location.get("file", file)).removeprefix("/e2e/tests/")}:{location["line"]}'
-                                                                         if location.get('line') else None),
-                              'artifacts': names, 'project': test.get('projectName') or None})
+    try:
+        results_fd = open_directory(results, ())
+    except OSError:
+        results_fd = None
+    output_fd = open_directory(target, ())
+    try:
+        for suite in report.get('suites') or []:
+            if not isinstance(suite, dict):
+                continue
+            for spec, titles, file in walk_specs(suite, [], suite.get('file') or suite.get('title')):
+                for test in spec.get('tests') or []:
+                    if not isinstance(test, dict) or len(tests) >= TESTS_LIMIT:
+                        continue
+                    status = {'unexpected': 'failed', 'flaky': 'flaky', 'skipped': 'skipped'}.get(test.get('status'))
+                    if not status:
+                        continue
+                    results_list = [item for item in (test.get('results') or []) if isinstance(item, dict)]
+                    last = results_list[-1] if results_list else {}
+                    error = last.get('error') or next((item.get('error') for item in results_list if item.get('error')), None)
+                    error = error if isinstance(error, dict) else {}
+                    names = []
+                    for result in results_list:
+                        for attachment in result.get('attachments') or []:
+                            if results_fd is None or len(artifacts) >= ARTIFACTS_LIMIT or not isinstance(attachment, dict):
+                                continue
+                            copied = copy_attachment(results_fd, output_fd, attachment, len(artifacts) + 1, budget)
+                            if copied:
+                                budget -= copied['size']
+                                names.append(copied['name'])
+                                artifacts.append(copied)
+                    title = ' › '.join(part for part in titles if part)
+                    test_id = f'{file} › {title}'
+                    for item in artifacts[len(artifacts) - len(names):]:
+                        item['test_id'] = test_id
+                    location = error.get('location') if isinstance(error.get('location'), dict) else {}
+                    line = location.get('line') if isinstance(location.get('line'), int) else None
+                    tests.append({'test_id': test_id[:1000], 'file': str(file)[:300], 'title': title[:1000], 'status': status,
+                                  'attempts': max(1, len(results_list)), 'error': message_of(error),
+                                  'step': failed_step(last.get('steps')) or (
+                                      f'{str(location.get("file", file)).removeprefix("/e2e/tests/")}:{line}' if line else None),
+                                  'artifacts': names, 'project': str(test.get('projectName') or '')[:100] or None})
+    finally:
+        os.close(output_fd)
+        if results_fd is not None:
+            os.close(results_fd)
     return summary, tests, artifacts
 
 
+def copy_attachment(results_fd, output_fd, attachment, index, budget):
+    source = attachment.get('path')
+    if not isinstance(source, str) or not source.startswith('/e2e/data/'):
+        return None
+    relative = source[len('/e2e/data/'):]
+    parts = PurePosixPath(relative).parts
+    if not parts or any(part in ('', '.', '..') for part in parts) or '\\' in relative:
+        return None
+    try:
+        descriptor, size = open_regular(results_fd, relative)
+    except OSError:
+        return None
+    with os.fdopen(descriptor, 'rb') as handle:
+        if size > budget:
+            return None
+        name = f'{index:03d}-' + re.sub(r'[^A-Za-z0-9._-]+', '-', parts[-1])[:120]
+        written = 0
+        out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o640, dir_fd=output_fd)
+        with os.fdopen(out, 'wb') as target:
+            while written < size:
+                chunk = handle.read(min(1024 * 1024, size - written))
+                if not chunk:
+                    break
+                target.write(chunk)
+                written += len(chunk)
+    content_type = attachment.get('contentType')
+    return {'name': name, 'size': written, 'test_id': None,
+            'content_type': content_type if isinstance(content_type, str) and len(content_type) < 100 else None}
+
+
 def cancel_run(identifier, why, by=None):
-    """Stop a queued or running run: its worker, its Playwright container; status cancelled. A finished run is left as it
-    is (cancelling is idempotent). The run as it is afterwards."""
-    data = read_json(run_dir(identifier) / 'run.json')
-    if not data or data.get('status') in TERMINAL:
-        return data
-    data = update_run(identifier, status='cancelled', error=why, finished_at=now(), cancelled_by=by)
-    if data.get('worker') and alive(data['worker']):
-        with contextlib.suppress(OSError):
-            os.killpg(int(data['worker']), signal.SIGTERM)
-    subprocess.run(['docker', 'stop', '--time', '5', identifier], capture_output=True)
-    data = update_run(identifier, worker=None)
-    if data.get('session'):
-        with contextlib.suppress(Refusal, OSError):
-            session = find_session(data['session'])
-            if session.get('active_run') == identifier:
-                update_session(session['project'], active_run=None)
-    return data
+    """Stop a queued or running run: status cancelled (under the lock, so a run that has just finished keeps its
+    outcome), then its worker, its command and its container. A finished run is left as it is (cancelling is
+    idempotent). The run as it is afterwards."""
+    data = update_run(identifier, ACTIVE, status='cancelled', error=why, finished_at=now(), cancelled_by=by,
+                      executed=False)
+    if not data:
+        return read_json(run_dir(identifier) / 'run.json')
+    kill_group(data.get('worker'), signal.SIGTERM)
+    stop_command(data.get('command'), identifier)
+    finish_run(identifier)
+    return read_json(run_dir(identifier) / 'run.json')
 
 
 # --- Snapshots -------------------------------------------------------------------------------------
@@ -1070,14 +1935,30 @@ const path = require('node:path');
 const { chromium } = require('@playwright/test');
 const [, , target, output, limit] = process.argv;
 (async () => {
-  const browser = await chromium.launch();
-  const context = await browser.newContext({ ignoreHTTPSErrors: true, baseURL: process.env.BASE_URL });
-  const page = await context.newPage();
+  const base = new URL(process.env.BASE_URL);
   const result = { requested: target };
+  const browser = await chromium.launch();
   try {
-    const response = await page.goto(target, { waitUntil: 'load', timeout: 60000 });
+    const wanted = new URL(target, base);
+    if (wanted.origin !== base.origin) throw new Error(`${wanted.origin} is not the site`);
+    const context = await browser.newContext({ ignoreHTTPSErrors: true, baseURL: base.href, serviceWorkers: 'block' });
+    // One site only: every request elsewhere (another host, port or scheme; a redirect's sub-requests) is aborted.
+    await context.route('**/*', (route) => {
+      let origin = null;
+      try { origin = new URL(route.request().url()).origin; } catch (error) { origin = null; }
+      return origin === base.origin ? route.continue() : route.abort('blockedbyclient');
+    });
+    if (context.routeWebSocket) {
+      await context.routeWebSocket(/.*/, (socket) => {
+        const url = new URL(socket.url());
+        if (url.host === base.host) socket.connectToServer(); else socket.close();
+      });
+    }
+    const page = await context.newPage();
+    const response = await page.goto(wanted.href, { waitUntil: 'load', timeout: 60000 });
     result.status = response ? response.status() : null;
     result.url = page.url();
+    if (new URL(page.url()).origin !== base.origin) throw new Error(`the page went to ${new URL(page.url()).origin}, not the site`);
     result.title = await page.title();
     result.aria = await page.locator('body').ariaSnapshot();
     const dom = await page.evaluate(() => {
@@ -1102,6 +1983,7 @@ const [, , target, output, limit] = process.argv;
     result.dom = dom.slice(0, cap);
     await page.screenshot({ path: path.join(output, 'screenshot.png'), fullPage: true });
   } catch (error) {
+    for (const key of ['title', 'aria', 'dom', 'dom_truncated']) delete result[key];
     result.error = String(error && error.message || error).slice(0, 2000);
   }
   await browser.close();
@@ -1112,80 +1994,103 @@ const [, , target, output, limit] = process.argv;
 
 def snapshot_worker(identifier):
     """A snapshot runs while the API waits: the page's ARIA snapshot, its trimmed DOM and a screenshot artifact."""
-    data = update_run(identifier, status='running', started_at=now())
+    data = update_run(identifier, ('queued',), status='running', started_at=now(), worker=identity(os.getpid()))
+    if not data:
+        return public_run(find_run(identifier))
     directory = run_dir(identifier)
     log = directory / 'log'
+    limits = settings()
     try:
         if data['target'] == 'test':
-            app = session_app(find_session(data['session']))
+            session = find_session(data['session'])
+            app = session_app(session)
             results = app / '.generated/test/data/playwright'
             extra = []
         else:
-            app, commit = external_app(data, log)
-            update_run(identifier, env_commit=commit)
+            app = external_app(data, log)
             results = directory / 'data'
-            results.mkdir(exist_ok=True)
             extra = [f'url={data["url"]}', f'data={results}']
+        clear_directory(results)  # nothing a spec left there (a node_modules) is found by the script
         work = results / f'ops-{identifier}'
-        work.mkdir(parents=True, exist_ok=True)
-        (work / 'snapshot.cjs').write_text(SNAPSHOT_SCRIPT)
+        work.mkdir()
+        write_private(work / 'snapshot.cjs', SNAPSHOT_SCRIPT)
+        os.chmod(work / 'snapshot.cjs', 0o644)
         inside = f'/e2e/data/ops-{identifier}'
-        command = f'node {inside}/snapshot.cjs {data["path"]} {inside} {DOM_LIMIT}'
+        command = shlex.join(['node', f'{inside}/snapshot.cjs', data['path'], inside, str(DOM_LIMIT)])
         code = make(log, app, 'e2e', f'cmd={command}', f'container={identifier}', *extra,
-                    timeout=settings()['TEST_SNAPSHOT_TIMEOUT'])
-        result = read_json(work / 'snapshot.json')
+                    timeout=limits['TEST_SNAPSHOT_TIMEOUT'], run=identifier,
+                    quota=(results, limits['TEST_RUN_DISK_MB'] * 1024 * 1024))
+        if code == 130:
+            raise Cancelled()
+        raw = read_inside(results, 'snapshot.json', DOM_LIMIT * 4 + 1024 * 1024, (f'ops-{identifier}',))
+        result = json.loads(raw) if raw else None
         if not isinstance(result, dict):
             raise RuntimeError(f'the snapshot gave no result (exit {code})')
         artifacts = []
         (directory / 'artifacts').mkdir(exist_ok=True)
-        if (work / 'screenshot.png').is_file():
-            shutil.copyfile(work / 'screenshot.png', directory / 'artifacts/screenshot.png')
-            artifacts.append({'name': 'screenshot.png', 'size': (work / 'screenshot.png').stat().st_size,
-                              'content_type': 'image/png'})
-        remove_tree(work)
+        picture = read_inside(results, 'screenshot.png', limits['TEST_RUN_ARTIFACTS_MB'] * 1024 * 1024, (f'ops-{identifier}',))
+        if picture and not result.get('error'):
+            write_private(directory / 'artifacts/screenshot.png', '')
+            (directory / 'artifacts/screenshot.png').write_bytes(picture)
+            artifacts.append({'name': 'screenshot.png', 'size': len(picture), 'content_type': 'image/png'})
         snapshot = {key: result.get(key) for key in ('requested', 'url', 'status', 'title', 'aria', 'dom', 'dom_truncated',
                                                      'error')}
-        data = update_run(identifier, status='error' if result.get('error') else 'done', step=None, finished_at=now(),
-                          artifacts=artifacts, snapshot=snapshot, error=result.get('error'))
+        if isinstance(snapshot.get('error'), str):
+            snapshot['error'] = redact(snapshot['error'])
+        update_run(identifier, ('running',), status='error' if result.get('error') else 'done', step=None, finished_at=now(),
+                   artifacts=artifacts, snapshot=snapshot, error=snapshot.get('error'), executed=not result.get('error'),
+                   worker=None)
+    except Cancelled:
+        pass
     except Exception as error:  # noqa: BLE001
-        message = error.answer['error'] if isinstance(error, Refusal) else str(error)
-        data = update_run(identifier, status='error', error=message, finished_at=now())
+        message = redact(error.answer['error'] if isinstance(error, Refusal) else str(error))
+        update_run(identifier, ('running',), status='error', error=message, finished_at=now(), executed=False, worker=None)
     finally:
-        if data['target'] == 'test':
-            with contextlib.suppress(Refusal, OSError):
-                update_session(data['project'], active_run=None)
-    return public_run(data)
+        finish_run(identifier)
+        remove_tree(directory / 'data')
+        with contextlib.suppress(Exception):
+            remove_tree(results / f'ops-{identifier}')
+    return public_run(find_run(identifier))
 
 
 # --- Reconcile -------------------------------------------------------------------------------------
 def reconcile():
-    """Expire sessions, end the work of crashed workers, remove orphaned session containers and old runs."""
+    """Expire sessions (here, not in a worker: the timer's unit would kill a worker it left), end the work of crashed
+    workers, remove orphaned session containers, run containers without an active run, and old runs."""
     limits, done = settings(), []
     for data in sessions():
         moment = now()
-        if data['status'] in ('creating', 'ready', 'failed') and moment >= data.get('expires_at', 0):
-            destroy(data['id'], 'reconcile', 'expired')
-            done.append(f'expired {data["id"]}')
-        elif data['status'] == 'creating' and not alive(data.get('worker')) and moment - data['created_at'] > 60:
-            update_session(data['project'], status='failed', error='the creating process ended without a result',
-                           ended_at=moment)
-            teardown(data, session_dir(data['project']) / 'log')
-            done.append(f'failed {data["id"]} (crashed)')
-        elif data['status'] == 'destroying' and not alive(data.get('worker')):
-            destroy_worker(data['id'], 'destroyed')
-            done.append(f'destroyed {data["id"]} (finished)')
-        elif data['status'] in ('destroyed', 'expired') and moment - (data.get('ended_at') or moment) > 86400:
-            remove_tree(session_dir(data['project']))
-            done.append(f'removed {data["id"]}')
-    live = {compose_project(session_dir(item['project'])) for item in sessions()
+        try:
+            if data['status'] in ('creating', 'ready', 'failed') and moment >= data.get('expires_at', 0):
+                destroy(data['id'], 'reconcile', 'expired', wait=True)
+                done.append(f'expired {data["id"]}')
+            elif data['status'] == 'creating' and not alive(data.get('worker')) and moment - data['created_at'] > 60:
+                if update_session(data['project'], data['id'], ('creating',), status='destroying', end_reason='failed',
+                                  error='the creating process ended without a result'):
+                    destroy_worker(data['id'])
+                done.append(f'failed {data["id"]} (crashed)')
+            elif data['status'] == 'destroying' and not alive(data.get('worker')):
+                destroy_worker(data['id'])
+                done.append(f'ended {data["id"]} ({find_session(data["id"])["status"]})')
+            elif data['status'] in ('destroyed', 'expired') and moment - (data.get('ended_at') or moment) > 86400:
+                remove_tree(session_dir(data['project']))
+                done.append(f'removed {data["id"]}')
+        except (Refusal, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            done.append(f'{data["id"]}: {error}')
+    live = {item.get('compose_project') or compose_name(session_dir(item['project']) / 'repo/app') for item in sessions()
             if item['status'] in ('creating', 'ready', 'destroying')}
-    listing = subprocess.run(['docker', 'ps', '-a', '--format', '{{.Label "com.docker.compose.project"}}\t'
-                              '{{.Label "com.docker.compose.project.working_dir"}}'], capture_output=True, text=True)
-    orphans = set()
+    listing = subprocess.run(['docker', 'ps', '-a', '--format', '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t'
+                              '{{.Label "com.docker.compose.project.working_dir"}}'], capture_output=True, text=True,
+                             env=child_environment())
+    orphans, containers = set(), set()
     for line in listing.stdout.splitlines():
-        name, _, working = line.partition('\t')
+        names, _, rest = line.partition('\t')
+        name, _, working = rest.partition('\t')
         if name and working.startswith(str(SESSIONS) + '/') and name not in live:
             orphans.add(name)
+        for container in names.split(','):
+            if RUN_ID.fullmatch(container):
+                containers.add(container)
     for name in sorted(orphans):
         subprocess.run(['docker', 'compose', '-p', name, 'down', '--volumes', '--remove-orphans', '--timeout', '10'],
                        capture_output=True, env=child_environment(), timeout=300)
@@ -1193,25 +2098,90 @@ def reconcile():
     for path in RUNS.glob('*/run.json') if RUNS.is_dir() else []:
         data = read_json(path) or {}
         moment = now()
-        if data.get('status') in ('queued', 'running') and data.get('kind') == 'run':
+        if not RUN_ID.fullmatch(str(data.get('id'))):
+            continue
+        if data.get('status') in ACTIVE:
             if not alive(data.get('worker')) and moment - data.get('created_at', moment) > 60:
-                update_run(data['id'], status='error', error='the run\'s process ended without a result', finished_at=moment,
-                           worker=None)
+                if update_run(data['id'], ACTIVE, status='error', error='the run\'s process ended without a result',
+                              finished_at=moment, worker=None, executed=False):
+                    stop_command(data.get('command'), data['id'])
+                    finish_run(data['id'])
                 done.append(f'ended {data["id"]} (crashed)')
             elif moment - (data.get('started_at') or moment) > limits['TEST_RUN_TIMEOUT_MINUTES'] * 60 + 300:
                 cancel_run(data['id'], 'the run exceeded TEST_RUN_TIMEOUT_MINUTES')
                 done.append(f'cancelled {data["id"]} (timeout)')
-        elif data.get('status') in TERMINAL and moment - (data.get('finished_at') or moment) > limits['TEST_RUN_KEEP_DAYS'] * 86400:
-            remove_tree(path.parent)
-            done.append(f'removed {path.parent.name}')
+        elif data.get('status') in TERMINAL:
+            if data['id'] in containers or (path.parent / 'auth').exists():
+                finish_run(data['id'])
+                done.append(f'cleaned {data["id"]}')
+            if moment - (data.get('finished_at') or moment) > limits['TEST_RUN_KEEP_DAYS'] * 86400:
+                remove_tree(path.parent)
+                done.append(f'removed {path.parent.name}')
+    for container in sorted(containers):
+        if not (run_dir(container) / 'run.json').is_file():
+            remove_container(container)
+            done.append(f'removed container {container}')
+    done += prune_runs(limits['TEST_RUNS_TOTAL_MB'] * 1024 * 1024)
     for key in (RUNS / 'keys').glob('*.json') if (RUNS / 'keys').is_dir() else []:
         known = read_json(key) or {}
         if not (run_dir(str(known.get('run'))) / 'run.json').is_file():
             key.unlink(missing_ok=True)
+    for kind in ('clients', 'tombstones'):
+        for key in (RUNS / kind).glob('*.json') if (RUNS / kind).is_dir() else []:
+            known = read_json(key) or {}
+            if (kind == 'tombstones' and now() - int(known.get('at') or 0) >= TOMBSTONE_SECONDS) or \
+                    (kind == 'clients' and not (run_dir(str(known.get('run'))) / 'run.json').is_file()):
+                key.unlink(missing_ok=True)
+    for slot in (RUNS / 'active').glob('*') if (RUNS / 'active').is_dir() else []:
+        held = read_json(run_dir(str((read_json(slot) or {}).get('run'))) / 'run.json') or {}
+        if held.get('status') not in ACTIVE:
+            slot.unlink(missing_ok=True)
     return {'reconciled': done}
 
 
+def prune_runs(budget):
+    """The oldest finished runs removed until all of them take at most budget bytes."""
+    finished = []
+    for path in RUNS.glob('*/run.json') if RUNS.is_dir() else []:
+        data = read_json(path) or {}
+        if data.get('status') in TERMINAL and RUN_ID.fullmatch(str(data.get('id'))):
+            finished.append((data.get('finished_at') or 0, path.parent, tree_size(path.parent)))
+    total, removed = sum(size for _, _, size in finished), []
+    for _, directory, size in sorted(finished, key=lambda item: item[0]):
+        if total <= budget:
+            break
+        remove_tree(directory)
+        total -= size
+        removed.append(f'removed {directory.name} (TEST_RUNS_TOTAL_MB)')
+    return removed
+
+
 # --- Entry -----------------------------------------------------------------------------------------
+PUBLIC = ('create', 'list', 'show', 'extend', 'destroy', 'run', 'run-show', 'runs', 'artifact', 'snapshot', 'cancel',
+          'cancel-key', 'reconcile')
+INTERNAL = ('create-worker', 'destroy-worker', 'run-worker')
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise Refusal(400, f'arguments: {message}')
+
+
+def parser(internal):
+    found = Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter, allow_abbrev=False,
+                   add_help=False)
+    found.add_argument('command', choices=PUBLIC + (INTERNAL if internal else ()))
+    for option in ('--project', '--db', '--env-ref', '--shop-ref', '--id', '--session', '--name', '--client-run-id'):
+        found.add_argument(option)
+    found.add_argument('--ttl', type=int)
+    found.add_argument('--minutes', type=int)
+    found.add_argument('--by', default='-')
+    found.add_argument('--manage', action='store_true', help='the caller has "Test environments: manage"')
+    if internal:
+        found.add_argument('--checked', action='store_true', help=argparse.SUPPRESS)  # stdin: {request, states} root read
+    return found
+
+
 def as_account_options():
     if os.geteuid() != 0:
         return None
@@ -1221,59 +2191,54 @@ def as_account_options():
                      'SETUP_SERVER_USER': ACCOUNT, 'SETUP_SERVER_CONFIG': str(CONFIG)}, cwd='/')
 
 
-def read_request(path):
-    if not path:
-        raise Refusal(400, 'a request is needed')
+def read_request(stream):
+    """The JSON object on stdin, at most REQUEST_LIMIT bytes."""
+    text = stream.read(REQUEST_LIMIT + 1)
+    if len(text) > REQUEST_LIMIT:
+        raise Refusal(413, f'the request may be at most {REQUEST_LIMIT} bytes')
     try:
-        text = sys.stdin.read() if path == '-' else Path(path).read_text()
         request = json.loads(text)
-    except (OSError, ValueError):
+    except ValueError:
         raise Refusal(400, 'the request is not JSON') from None
     if not isinstance(request, dict):
         raise Refusal(400, 'the request must be a JSON object')
     return request
 
 
+def normalized(options):
+    """The options as --OPTION=VALUE arguments (a value such as --help stays a value)."""
+    given = [options.command]
+    for key in ('project', 'db', 'env_ref', 'shop_ref', 'id', 'session', 'name', 'client_run_id', 'ttl', 'minutes', 'by'):
+        value = getattr(options, key)
+        if value is not None:
+            given.append(f'--{key.replace("_", "-")}={value}')
+    if options.manage:
+        given.append('--manage')
+    return given
+
+
 def main(arguments):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=('create', 'list', 'show', 'extend', 'destroy', 'run', 'run-show', 'runs',
-                                            'artifact', 'snapshot', 'cancel', 'reconcile', 'create-worker', 'destroy-worker',
-                                            'run-worker'))
-    parser.add_argument('--project')
-    parser.add_argument('--db')
-    parser.add_argument('--env-ref')
-    parser.add_argument('--shop-ref')
-    parser.add_argument('--ttl', type=int)
-    parser.add_argument('--minutes', type=int)
-    parser.add_argument('--id')
-    parser.add_argument('--session')
-    parser.add_argument('--name')
-    parser.add_argument('--by', default='-')
-    parser.add_argument('--manage', action='store_true', help='the caller has "Test environments: manage"')
-    parser.add_argument('--request', help='run, snapshot: the JSON request (a file, or - for stdin)')
-    parser.add_argument('--states', help=argparse.SUPPRESS)  # root's checked storage states, for the account's run
-    parser.add_argument('--reason', default='destroyed')
-    options = parser.parse_args(arguments)
-    if options.by != '-' and not CALLER.fullmatch(options.by):
-        return answer({'error': 'by: a caller name', 'status': 400})
+    root = os.geteuid() == 0
     try:
-        if options.command in ('run', 'snapshot') and options.states is None:
-            # As root: the request (once) and the storage states, which only root may look at, then the account's part.
-            request = read_request(options.request)
-            target = request.get('target')
-            states = storage_states(request, TARGETS.get(target) if target in TARGETS else None)
+        options = parser(internal=not root).parse_args(arguments)
+        if options.by != '-' and not CALLER.fullmatch(options.by):
+            raise Refusal(400, 'by: a caller name')
+        if root:
+            # As root: only the public commands; a run's request (once, bounded) and the storage states only root may
+            # read; then the account's part with what was checked, on stdin.
             account = as_account_options()
-            if account is not None:
-                given = [item for index, item in enumerate(arguments)
-                         if item != '--request' and (index == 0 or arguments[index - 1] != '--request')]
-                return subprocess.run([sys.executable, os.path.realpath(__file__), *given, '--states', json.dumps(states),
-                                       '--request', '-'], input=json.dumps(request).encode(), **account).returncode
-            options.states = json.dumps(states)
-            options.request_data = request
-        elif as_account_options() is not None:
-            # Output (an artifact's bytes too) goes straight through.
-            return subprocess.run([sys.executable, os.path.realpath(__file__), *arguments], stdin=subprocess.DEVNULL,
-                                  **as_account_options()).returncode
+            payload = b''
+            given = normalized(options)
+            if options.command in ('run', 'snapshot'):
+                request = read_request(sys.stdin.buffer)
+                target = request.get('target')
+                # A known client_run_id returns its run as it is: its storage states are not looked at again.
+                states = {} if known_run(options.by, request.get('client_run_id')) else \
+                    read_storage_states(request, TARGETS.get(target) if target in TARGETS else None)
+                payload = json.dumps({'request': request, 'states': states}).encode()
+                given.append('--checked')
+            return subprocess.run([sys.executable, os.path.realpath(__file__), *given], input=payload,
+                                  **account).returncode
         return dispatch(options)
     except Refusal as refusal:
         return answer(refusal.answer)
@@ -1298,13 +2263,20 @@ def dispatch(options):
     if command == 'destroy':
         return answer({'session': destroy(options.id, options.by)})
     if command in ('run', 'snapshot'):
-        request = getattr(options, 'request_data', None) or read_request(options.request)
-        states = json.loads(options.states or '{}')
+        if getattr(options, 'checked', False):
+            payload = read_request(sys.stdin.buffer)
+            request, states = payload.get('request'), payload.get('states') or {}
+        else:  # this account itself (no root, so no storage state can be read)
+            request, states = read_request(sys.stdin.buffer), {}
+            if request.get('storage_states'):
+                raise Refusal(403, 'storage_states are read by root only (through the sudo rule)')
         data, created = start_run(request, options.by, options.manage, states, 'run' if command == 'run' else 'snapshot')
         return answer({'run': data, 'created': created})
     if command == 'cancel':
         find_run(options.id)
         return answer({'run': public_run(cancel_run(options.id, f'cancelled by {options.by}', options.by))})
+    if command == 'cancel-key':
+        return answer(cancel_by_key(options.project, options.client_run_id, options.by))
     if command == 'run-show':
         return answer({'run': public_run(find_run(options.id))})
     if command == 'runs':
@@ -1313,18 +2285,31 @@ def dispatch(options):
         find_run(options.id)
         if not ARTIFACT.fullmatch(options.name or ''):
             raise Refusal(400, 'name: an artifact name of the run')
-        path = run_dir(options.id) / 'artifacts' / options.name
-        if path.is_symlink() or not path.is_file():
-            raise Refusal(404, f'run {options.id} has no artifact {options.name}')
-        with open(path, 'rb') as handle:
-            shutil.copyfileobj(handle, sys.stdout.buffer)
+        try:
+            directory = open_directory(run_dir(options.id), ('artifacts',))
+            try:
+                descriptor, size = open_regular(directory, options.name)
+            finally:
+                os.close(directory)
+        except OSError:
+            raise Refusal(404, f'run {options.id} has no artifact {options.name}') from None
+        sys.stdout.buffer.write(json.dumps({'artifact': {'size': size}}).encode() + b'\n')
+        with os.fdopen(descriptor, 'rb') as handle:
+            remaining = size
+            while remaining > 0:
+                chunk = handle.read(min(65536, remaining))
+                if not chunk:
+                    break
+                sys.stdout.buffer.write(chunk)
+                remaining -= len(chunk)
+        sys.stdout.buffer.flush()
         return 0
     if command == 'reconcile':
         return answer(reconcile())
     if command == 'create-worker':
         create_worker(options.id)
     elif command == 'destroy-worker':
-        destroy_worker(options.id, options.reason)
+        destroy_worker(options.id)
     elif command == 'run-worker':
         run_worker(options.id)
     return 0

@@ -1,5 +1,6 @@
 """Developer access to the deploy targets through this worker: the forced command bin/server-access."""
 
+import hermetic  # noqa: F401  first: no test touches the installed server (tests/hermetic.py)
 import json
 import os
 from pathlib import Path

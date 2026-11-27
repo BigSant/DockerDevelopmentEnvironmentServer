@@ -5,6 +5,7 @@ stdin and runs the real status helper behind it (as this user, with docker, syst
 stubbed); Bitbucket is a fake API on 127.0.0.1. No root, no network.
 """
 
+import hermetic  # noqa: F401  first: no test touches the installed server (tests/hermetic.py)
 import atexit
 import base64
 import contextlib
@@ -42,30 +43,19 @@ ROOT_COMMANDS = ("add-project", "remove-project", "install-backups", "install-me
                  "test-session", "tool-access", "update-setup")
 
 
-# bin/update runs these tests on an installed server as its health check, as the administrator: bin/web-ui's paths
-# (STATE_DIRECTORY, SETUP_SERVER_ROOT, SETUP_SERVER_LIBRARY) default to the installed UI's, whose state directory
-# (/var/lib/setup-server-ui, setup-ui 0700) that account cannot read. Every in-process copy of the UI therefore gets its
-# own temporary tree, and INSTALLED below may not be touched by any test (HermeticStateTest).
-HERMETIC = Path(tempfile.mkdtemp(prefix="web-ui-hermetic-"))
-atexit.register(shutil.rmtree, HERMETIC, True)
+# Every in-process copy of the UI gets its own temporary tree (hermetic.HERMETIC); nothing of hermetic.INSTALLED may be
+# touched by any test (tests/hermetic.py, HermeticStateTest).
+from hermetic import HERMETIC as HERMETIC_ROOT, touches_installed  # noqa: E402
+
+
+def fixture_patch():
+    """A patch of the specs (tests/fixtures/test_session_project.py), which stage refuses all the same."""
+    sys.path.insert(0, str(ROOT / "tests/fixtures"))
+    import test_session_project
+    return test_session_project.FIX_PATCH
+HERMETIC = HERMETIC_ROOT / "web-ui"
 HERMETIC_PATHS = {"STATE_DIRECTORY": HERMETIC / "state", "SETUP_SERVER_ROOT": HERMETIC / "root",
                   "SETUP_SERVER_LIBRARY": HERMETIC / "lib"}
-INSTALLED = ("/var/lib/setup-server-ui", "/var/lib/private/setup-server-ui", "/srv/setup-server", "/usr/local/lib/setup-server")
-
-
-def touches_installed(path):
-    text = os.path.abspath(os.fsdecode(path)) if isinstance(path, (str, bytes, os.PathLike)) else ""
-    return any(text == place or text.startswith(place + "/") for place in INSTALLED)
-
-
-def refuse_installed(event, arguments):
-    """An audit hook: a test that opens, lists, makes or removes anything of the installed UI fails at once."""
-    if event in ("open", "os.listdir", "os.scandir", "os.mkdir", "os.remove", "os.rmdir", "os.rename", "os.chmod",
-                 "shutil.rmtree") and arguments and touches_installed(arguments[0]):
-        raise AssertionError(f"a test touched the installed UI: {event} {arguments[0]}")
-
-
-sys.addaudithook(refuse_installed)
 
 
 def load_web_ui():
@@ -89,7 +79,7 @@ echo "$*" >> "$STUB_DIR/sudo.calls"
 while [ $# -gt 0 ]; do case "$1" in -u) shift 2;; -*) shift;; *) break;; esac; done
 case "$1" in
   */server-status) shift; exec "$SERVER_STATUS" "$@";;
-  */test-session) shift; exec "$TEST_SESSION" "$@";;
+  */test-session) shift; SETUP_SERVER_PROC="$TS_PROC" SETUP_SERVER_PATH="$TS_PATH" exec "$TEST_SESSION" "$@";;
 esac
 input=$(cat)
 printf '%s\n----\n' "$input" >> "$STUB_DIR/sudo.stdin"
@@ -101,6 +91,7 @@ exit "$(cat "$STUB_DIR/exit" 2>/dev/null || echo 0)"
 # Docker: the project containers of the default context (compose label, name, state, status).
 DOCKER_STUB = r'''
 echo "$*" >> "$STUB_DIR/docker.calls"
+case "$1" in info) echo /; exit 0;; rm|image|compose) exit 0;; esac
 case " $* " in *" logs "*) for last; do :; done; echo "2026-10-12T00:00:01Z first line of $last"
   echo "2026-10-12T00:00:02Z second line of $last" >&2; exit 0;; esac
 printf 'alpha-prod\talpha-prod-secrets\trunning\tUp 3 hours\n'
@@ -878,7 +869,9 @@ class WebUiTest(Worker):
                 "SETUP_SERVER_HANDOFF": str(self.root / "handoff"), "UI_USER": "admin", "UI_PASSWORD_HASH": PASSWORD_HASH,
                 "UI_PORT": "0", "BITBUCKET_API": f"http://127.0.0.1:{self.api.server_port}/2.0",
                 "BITBUCKET_ACCESS_TOKEN_ALPHA_SHOP": PROJECT_TOKEN, "BITBUCKET_ACCESS_TOKEN": GENERAL_TOKEN,
-                "SETUP_SERVER_SBIN": str(self.sbin), "SETUP_SERVER_CONFIG": str(self.root / "config"), **settings}
+                "SETUP_SERVER_SBIN": str(self.sbin), "SETUP_SERVER_CONFIG": str(self.root / "config"),
+                # bin/test-session only (the sudo stub): its /proc (MemAvailable) and its PATH, whose git hangs in a clone.
+                "TS_PROC": str(self.root / "tsproc"), "TS_PATH": f"{self.root / 'tsbin'}:{self.bin}:{os.environ['PATH']}", **settings}
 
     def start(self, **settings):
         self.stderr = self.root / "ui.stderr"
@@ -1381,70 +1374,117 @@ class WebUiTest(Worker):
         self.assertEqual(document["openapi"], "3.1.0")
         self.assertEqual(sorted(document["paths"]), sorted({"/api/v1" + route for route in routes} | {"/api/v1" + route for _, route in writes}))
         self.assertEqual(sorted(document["paths"]["/api/v1/test-sessions/{session}"]), ["delete", "get"])
+        schemas = document["components"]["schemas"]
+        self.assertEqual(sorted(schemas["Error"]["properties"]["reason"]["enum"])[:2], ["cancelled", "deploy_locked"])
+        self.assertEqual(schemas["Error"]["properties"]["capacity"]["type"], "boolean")
+        self.assertEqual(schemas["Run"]["properties"]["executed"]["type"], "boolean")
+        self.assertIn("status", schemas["Run"]["required"])
+        cancel = document["paths"]["/api/v1/runs/{run}/cancel"]["post"]
+        self.assertNotIn("requestBody", cancel, "a cancel takes no body")
+        self.assertEqual(sorted(cancel["responses"]), ["200", "400", "401", "403", "404", "503"])
+        self.assertIn("409", document["paths"]["/api/v1/runs"]["post"]["responses"])
+        self.assertNotIn("409", document["paths"]["/api/v1/runs/{run}"]["get"]["responses"])
+        self.assertEqual(document["paths"]["/api/v1/runs/cancel"]["post"]["responses"]["200"]["content"]["application/json"]
+                         ["schema"]["required"], ["cancelled", "run"])
         operations = [operation["operationId"] for path in document["paths"].values() for operation in path.values()]
         self.assertEqual(len(operations), len(set(operations)))
         self.assertEqual(document["paths"]["/api/v1/projects/{project}"]["get"]["parameters"][0]["name"], "project")
 
     def test_the_test_environments_api_needs_its_own_permission_and_logs_every_change(self):
         build = self.tree.projects / "alpha_shop"
-        for arguments in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "x"]):
+        (build / "app/env/stage.env.example").write_text("DOMAIN=stage.alpha.example\n")  # of the trusted commit
+        for arguments in (["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "-m", "x"],
+                          ["update-ref", "refs/remotes/origin/master", "HEAD"],
+                          ["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/master"]):
             subprocess.run(["git", "-C", str(build), *arguments], check=True, capture_output=True)
-        (build / "app/env/stage.env.example").write_text("DOMAIN=stage.alpha.example\n")
+        (self.root / "tsproc").mkdir()
+        (self.root / "tsproc/meminfo").write_text("MemAvailable: 9000000 kB\n")
+        (self.root / "tsbin").mkdir()
+        (self.root / "tsbin/git").write_text('#!/bin/sh\ncase " $* " in *" clone "*) sleep 60;; esac\nexec /usr/bin/git "$@"\n')
+        (self.root / "tsbin/git").chmod(0o755)
         reader, _ = self.new_token("reader", [self.agents_group(projects="view")])
         self.assertEqual(self.api_call("/api/v1/test-sessions", reader)[0], 403)
         self.assertEqual(self.api_call("/api/v1/runs", reader, method="POST")[0], 403)
+        for method in ("POST", "DELETE", "PUT"):  # no credentials: 401 first, whatever the path or method
+            self.assertEqual(self.request(method, "/api/v1/no-such-path", login=None)[0], 401, method)
         form = {"csrf": self.csrf(), "group": "", "title": "Testers", "level:testenv": "view"}
         self.assertEqual(self.request("POST", "/groups/save", form)[0], 303)
-        viewer, _ = self.new_token("viewer", ["testers"])
-        status, _, body = self.api_call("/api/v1/test-sessions", viewer)
-        self.assertEqual((status, body), (200, {"sessions": []}))
-        self.assertEqual(self.api_call("/api/v1/test-sessions", viewer, method="POST")[0], 403)
-        form.update(group="testers", **{"level:testenv": "manage"})
+        watcher, _ = self.new_token("watcher", ["testers"])
+        form = {"csrf": self.csrf(), "group": "", "title": "Testmakers", "level:testenv": "manage"}
         self.assertEqual(self.request("POST", "/groups/save", form)[0], 303)
+        viewer, _ = self.new_token("viewer", ["testmakers"])
+        status, _, body = self.api_call("/api/v1/test-sessions", watcher)
+        self.assertEqual((status, body), (200, {"sessions": []}))
+        self.assertEqual(self.api_call("/api/v1/test-sessions", watcher, method="POST")[0], 403)
         post = lambda path, body, method="POST": self.json_call(method, path, viewer, body)
         self.assertEqual(post("/api/v1/test-sessions", {"project": "alpha_shop", "db": "backup:prod"})[0], 400)
         self.assertEqual(post("/api/v1/test-sessions", {"project": "nope", "db": "dataset:dev"})[0], 404)
         self.assertEqual(post("/api/v1/test-sessions", {"project": "alpha_shop", "db": "dataset:dev", "ttl_minutes": "x"})[0], 400)
+        for body in ({"project": "--help", "db": "dataset:dev"}, {"project": "alpha_shop", "db": "dataset:dev", "env_ref": "--manage"}):
+            status, _, answer = post("/api/v1/test-sessions", body)
+            self.assertEqual(status, 400, answer)  # a value is a value, never an option (was 503)
         self.assertEqual(self.json_call("POST", "/api/v1/runs", viewer, None, raw=b"{not json")[0], 400)
         self.assertEqual(self.json_call("POST", "/api/v1/runs", viewer, None, raw=b"{}", length=3 * 1024 * 1024)[0], 413)
         self.assertEqual(post("/api/v1/test-sessions/ts-0123456789ab", {}, "DELETE")[0], 404)
         self.assertEqual(self.api_call("/api/v1/test-sessions", viewer, method="PUT")[0], 405)
+        for body in ({"project": "alpha_shop", "environment": "prod", "path": "/"},  # /snapshots names stage or live
+                     {"project": "alpha_shop", "environment": "stage", "path": "//169.254.169.254/latest/meta-data"},
+                     {"project": "alpha_shop", "environment": "live", "path": "/", "patch": fixture_patch()}):
+            status, _, answer = post("/api/v1/snapshots", body)
+            self.assertEqual(status, 400, answer)
+        self.assertEqual(post("/api/v1/test-sessions/ts-0123456789ab/snapshot", {"path": "/"})[0], 404)
         status, _, body = post("/api/v1/runs", {"target": "stage", "project": "alpha_shop", "client_run_id": "ci-7", "grep": "@cart",
-                                                "patch": "diff --git a/public/x b/public/x\n--- a/public/x\n+++ b/public/x\n"})
-        self.assertEqual(status, 400, body)
+                                                "patch": fixture_patch()})
+        self.assertEqual((status, body.get("error", "")[:30]), (400, "patch goes with target test on"), body)
         status, _, body = post("/api/v1/runs", {"target": "stage", "project": "alpha_shop", "client_run_id": "ci-7", "grep": "@cart"})
         self.assertEqual(status, 202, body)
         run = body["run"]
-        self.assertEqual((run["url"], run["grep"], run["status"]), ("https://stage.alpha.example", "^(?=.*(?:@stage(?![\\w-])))(?=.*(?:@cart))", "queued"))
+        self.assertEqual((run["url"], run["grep"], run["grep_invert"], run["status"]),
+                         ("https://stage.alpha.example", "^(?=.*(?:(?<!\\S)@stage(?!\\S)))(?=.*(?:@cart))",
+                          "(?:(?<!\\S)@stage\\-write(?!\\S))", "queued"))
         status, _, again = post("/api/v1/runs", {"target": "stage", "project": "alpha_shop", "client_run_id": "ci-7"})
         self.assertEqual((status, again["run"]["id"], again["created"]), (200, run["id"], False))
-        for _ in range(2):  # stopping is idempotent: a finished run comes back as it is
-            status, _, stopped = post(f"/api/v1/runs/{run['id']}/cancel", {})
-            self.assertEqual(status, 200, stopped)
-            self.assertIn(stopped["run"]["status"], ("cancelled", "error"))
+        # The worker hangs in its git clone (tsbin/git): the cancel stops a run that is still going, every time.
+        for _ in range(2):  # stopping is idempotent: the second answer is the same cancelled run
+            status, _, stopped = self.json_call("POST", f"/api/v1/runs/{run['id']}/cancel", viewer, None, raw=b"")
+            self.assertEqual((status, stopped["run"]["status"], stopped["run"]["executed"]), (200, "cancelled", False), stopped)
         self.assertEqual(post("/api/v1/runs/run-000000000000/cancel", {})[0], 404)
+        time.sleep(0.5)
         status, _, shown = self.api_call(f"/api/v1/runs/{run['id']}", viewer)
-        self.assertEqual((status, shown["run"]["id"]), (200, run["id"]))
-        # The run's worker finds no setup here and ends with an error; then an artifact streams with its size and type.
-        for _ in range(200):
-            if self.api_call(f"/api/v1/runs/{run['id']}", viewer)[2]["run"]["status"] not in ("queued", "running"):
-                break
-            time.sleep(0.05)
-        self.assertIn(self.api_call(f"/api/v1/runs/{run['id']}", viewer)[2]["run"]["status"], ("error", "cancelled"))
+        self.assertEqual((status, shown["run"]["id"], shown["run"]["status"]), (200, run["id"], "cancelled"))
+        # A cancel by client_run_id that comes before its run: the run is never started.
+        status, _, tomb = post("/api/v1/runs/cancel", {"project": "alpha_shop", "client_run_id": "registry-9"})
+        self.assertEqual((status, tomb), (200, {"cancelled": True, "run": None}))
+        status, _, late = post("/api/v1/runs", {"target": "stage", "project": "alpha_shop", "client_run_id": "registry-9"})
+        self.assertEqual((status, late["reason"], "capacity" in late), (409, "cancelled", False), late)
+        self.assertEqual(post("/api/v1/runs/cancel", {"project": "alpha_shop", "client_run_id": "registry-9"})[2], tomb)
+        # An artifact streams with its size and type, once the helper has opened it; a run with roles needs "manage".
         artifacts = self.tree.root / "test-runs" / run["id"] / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
         (artifacts / "001-test-failed-1.png").write_bytes(b"PNG fake!")
         record = json.loads((artifacts.parent / "run.json").read_text())
-        record["artifacts"] = [{"name": "001-test-failed-1.png", "size": 9, "content_type": "image/png"}]
+        record["artifacts"] = [{"name": "001-test-failed-1.png", "size": 9, "content_type": "image/png"},
+                               {"name": "002-gone.zip", "size": 3, "content_type": "application/zip"}]
         (artifacts.parent / "run.json").write_text(json.dumps(record))
         status, headers, data = self.request("GET", f"/api/v1/runs/{run['id']}/artifacts/001-test-failed-1.png", login=None,
-                                             headers={"Authorization": f"Bearer {viewer}"})
-        self.assertEqual((status, headers["Content-Type"], data), (200, "image/png", "PNG fake!"))
+                                             headers={"Authorization": f"Bearer {watcher}"})
+        self.assertEqual((status, headers["Content-Type"], headers["Content-Length"], data), (200, "image/png", "9", "PNG fake!"))
         self.assertEqual(self.api_call(f"/api/v1/runs/{run['id']}/artifacts/other.zip", viewer)[0], 404)
-        actions = self.log.read_text()
-        self.assertIn(f"user=token:viewer client=127.0.0.1 testenv run project=alpha_shop target=stage id={run['id']}", actions)
-        self.assertIn("testenv create project=nope db=dataset:dev id=- status=404", actions)
-        self.assertNotIn("diff --git", actions + self.everything_written(), "a patch is never logged")
+        status, _, missing = self.api_call(f"/api/v1/runs/{run['id']}/artifacts/002-gone.zip", viewer)
+        self.assertEqual(status, 404, "listed but not there: a 404, not a 200 without a body")
+        record["roles"] = ["customer"]
+        (artifacts.parent / "run.json").write_text(json.dumps(record))
+        self.assertEqual(self.api_call(f"/api/v1/runs/{run['id']}/artifacts/001-test-failed-1.png", watcher)[0], 403)
+        self.assertEqual(self.request("GET", f"/api/v1/runs/{run['id']}/artifacts/001-test-failed-1.png", login=None,
+                                      headers={"Authorization": f"Bearer {viewer}"})[0], 200)
+        actions = self.log.read_text().splitlines()
+        asked = next(index for index, line in enumerate(actions) if "testenv POST /runs " in line and "client_run_id=ci-7" in line)
+        done = next(index for index, line in enumerate(actions) if f"testenv run project=alpha_shop target=stage id={run['id']}" in line)
+        self.assertLess(asked, done, "what is asked is logged before it is done")
+        self.assertIn("user=token:viewer client=127.0.0.1", actions[done])
+        self.assertTrue(any("testenv create project=nope db=dataset:dev id=- status=404" in line for line in actions))
+        self.assertTrue(any("testenv cancel-key project=alpha_shop client_run_id=registry-9" in line for line in actions))
+        self.assertNotIn("diff --git", "\n".join(actions) + self.everything_written(), "a patch is never logged")
 
     def json_call(self, method, path, token, body, raw=None, length=None):
         """(status, headers, JSON) of an API request with a JSON body (or raw bytes; length: a Content-Length to claim)."""
@@ -3046,9 +3086,19 @@ class HermeticStateTest(unittest.TestCase):
 
     def test_touching_the_installed_state_fails_the_test(self):
         for path in ("/var/lib/setup-server-ui/jobs", "/srv/setup-server/ui-actions.log"):
-            with self.subTest(path=path), self.assertRaisesRegex(AssertionError, "touched the installed UI"):
+            with self.subTest(path=path), self.assertRaisesRegex(AssertionError, "touched the installed server"):
                 open(path)
+        for check in (os.path.exists, os.path.isdir, lambda path: Path(path).is_dir(), os.stat, os.lstat):
+            with self.subTest(check=check), self.assertRaisesRegex(AssertionError, "touched the installed server"):
+                check("/var/lib/setup-server-ui/jobs")
         self.assertFalse(touches_installed("/var/lib/setup-server-ui-other"))
+
+    def test_every_test_module_imports_the_guard_first(self):
+        """The guard holds for a module run alone (cd tests; python3 -m unittest test_x) only when it imports it first."""
+        for path in sorted(Path(__file__).resolve().parent.glob("test_*.py")):
+            imports = [line for line in path.read_text().splitlines() if re.match(r"(import |from )\S", line)]
+            with self.subTest(module=path.name):
+                self.assertTrue(imports and imports[0].startswith("import hermetic"), imports[:1])
 
     def test_an_unreadable_jobs_directory_is_logged_not_a_crashed_page(self):
         web_ui = load_web_ui()
@@ -3064,4 +3114,12 @@ class HermeticStateTest(unittest.TestCase):
             self.assertEqual(web_ui.jobs(), [])
             self.assertIsNone(web_ui.running_job())
         self.assertIn("cannot read the jobs", errors.getvalue())
+        with self.assertRaises(PermissionError, msg="no job starts beside one that cannot be seen"):
+            web_ui.start_job(None, "20261127T000000Z-abcdef", "admin", "127.0.0.1")
+
+    def test_only_administrators_see_the_test_environments_on_a_new_install(self):
+        web_ui = load_web_ui()
+        self.assertEqual(web_ui.DEFAULT_GROUPS["administrators"]["sections"]["testenv"], "manage")
+        for group in ("operators", "viewers"):
+            self.assertNotIn("testenv", web_ui.DEFAULT_GROUPS[group]["sections"], group)
 

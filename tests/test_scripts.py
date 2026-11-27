@@ -5,6 +5,7 @@ Ubuntu container and confirms the Java package the runner needs is installable t
 runner (a stand-in archive) for systemd-analyze verify of its unit.
 """
 
+import hermetic  # noqa: F401  first: no test touches the installed server (tests/hermetic.py)
 import getpass
 import os
 from pathlib import Path

@@ -5,6 +5,7 @@ B level (opt-in, SETUP_SERVER_UBUNTU_IMAGE=ubuntu:22.04): install-backups for re
 container, systemd-analyze verify of its units, and the sudo path the "backup now" pipeline uses.
 """
 
+import hermetic  # noqa: F401  first: no test touches the installed server (tests/hermetic.py)
 from datetime import datetime, timedelta
 import importlib.machinery
 import importlib.util

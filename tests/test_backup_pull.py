@@ -1,5 +1,6 @@
 """Developer downloads of the newest backup: the forced command (bin/backup-pull) and its keys (bin/add-backup-key)."""
 
+import hermetic  # noqa: F401  first: no test touches the installed server (tests/hermetic.py)
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -197,8 +198,9 @@ class AddBackupKeyTest(unittest.TestCase):
         self.root = Path(temporary.name)
         self.key = self.root / "tomas.pub"
         self.key.write_text(KEY + "\n")
+        # Its configuration too: a test read the installed server's /etc/setup-server/tool-access.json (tests/hermetic.py).
         environment = {"SETUP_SERVER_ROOT": str(self.root / "home"), "SETUP_SERVER_SBIN": str(self.root / "sbin"),
-                       "SETUP_SERVER_USER": pwd.getpwuid(os.getuid()).pw_name}
+                       "SETUP_SERVER_USER": pwd.getpwuid(os.getuid()).pw_name, "SETUP_SERVER_CONFIG": str(self.root / "etc")}
         with patch.dict(os.environ, environment):
             self.module = load("add_backup_key", ROOT / "bin/add-backup-key")
         (self.root / "home/.ssh").mkdir(parents=True)

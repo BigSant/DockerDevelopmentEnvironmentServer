@@ -1,5 +1,6 @@
 """Automatic updates against real local Git remotes, including failures and interrupted transactions."""
 
+import hermetic  # noqa: F401  first: no test touches the installed server (tests/hermetic.py)
 import fcntl
 import getpass
 import json

@@ -198,7 +198,8 @@ Environment=SETUP_SERVER_ROOT=$ROOT
 Environment=SETUP_SERVER_USER=$ACCOUNT
 Environment=SETUP_SERVER_CONFIG=$CONFIG
 ExecStart=$LIBRARY/bin/test-session reconcile
-TimeoutStartSec=600
+# An expired session is torn down within this run (a process it left would be killed with the unit).
+TimeoutStartSec=1800
 EOF
 cat > "$staging/test-sessions.timer" <<EOF
 [Unit]

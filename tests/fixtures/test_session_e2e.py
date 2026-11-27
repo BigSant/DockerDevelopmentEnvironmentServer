@@ -1,0 +1,201 @@
+"""The whole test-session cycle against this machine's Docker, as the account running it (docker group):
+
+    python3 tests/fixtures/test_session_e2e.py SETUP [--lock-file FILE] [--keep]
+
+SETUP is a setup checkout with test-session-v2. In a temporary $ROOT: the fixture project (test_session_project.py) as
+a build root with origin/HEAD, a branch whose Makefile would run on the host (it must not), then: a session from the
+data set dev; a run with a failing test; the patch that fixes it; a cancel; snapshots (one leaving the site is refused);
+the session's isolation (no published port, an internal network, Playwright bounded and not root); a stage run against
+a local site on Docker's bridge; expiry and reconcile, after which nothing of the session is left. Prints each check
+and exits 1 on the first that fails.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = Path(__file__).resolve().parent
+PROGRAM = HERE.parents[1] / 'bin/test-session'
+sys.path.insert(0, str(HERE))
+import test_session_project as fixture  # noqa: E402
+
+
+def check(condition, text, detail=''):
+    print(('ok   ' if condition else 'FAIL ') + text + (f' — {detail}' if detail and not condition else ''), flush=True)
+    if not condition:
+        sys.exit(1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('setup')
+    parser.add_argument('--lock-file')
+    parser.add_argument('--keep', action='store_true', help='keep the temporary tree')
+    options = parser.parse_args()
+    base = Path(tempfile.mkdtemp(prefix='ts-e2e-'))
+    root, config = base / 'root', base / 'config'
+    (root / 'projects').mkdir(parents=True)
+    config.mkdir()
+    (root / 'setup').symlink_to(Path(options.setup).resolve())
+    environment = {**os.environ, 'SETUP_SERVER_ROOT': str(root), 'SETUP_SERVER_CONFIG': str(config)}
+
+    def ts(*arguments, stdin=None, expect=None):
+        result = subprocess.run([sys.executable, str(PROGRAM), *arguments], input=json.dumps(stdin) if stdin is not None else '',
+                                capture_output=True, text=True, env=environment, timeout=900)
+        try:
+            return json.loads(result.stdout)
+        except ValueError:
+            check(False, f'test-session {arguments[0]} answers JSON', result.stdout[-500:] + result.stderr[-500:])
+
+    def wait_run(identifier, limit=900):
+        for _ in range(limit // 3):
+            run = ts('run-show', f'--id={identifier}')['run']
+            if run['status'] not in ('queued', 'running'):
+                return run
+            time.sleep(3)
+        check(False, f'run {identifier} ends')
+
+    (base / 'work').mkdir()
+    work = fixture.build(base / 'work', options.setup, lock_file=options.lock_file)
+    origin = base / 'origin.git'
+    subprocess.run(['git', 'init', '-q', '--bare', '-b', 'master', str(origin)], check=True)
+    fixture.git(work, 'remote', 'add', 'origin', str(origin))
+    fixture.git(work, 'push', '-q', 'origin', 'master')
+    fixture.git(work, 'checkout', '-q', '-b', 'evil')
+    (work / 'app/Makefile').write_text(f'test-init build test-prepare e2e-install e2e:\n\ttouch {base}/pwned\n')
+    (work / 'app/tests/playwright/fixme.spec.ts').write_text(fixture.SPECS['fixme.spec.ts'].replace("'broken'", "'ready'"))
+    fixture.git(work, 'commit', '-q', '-am', 'a branch that would run code on the host')
+    fixture.git(work, 'push', '-q', 'origin', 'evil')
+    build = root / 'projects' / fixture.NAME
+    subprocess.run(['git', 'clone', '-q', str(origin), str(build)], check=True)
+    started = time.time()
+
+    # A session of the untrusted branch: its specs, the deploy branch's Makefile.
+    made = ts('create', f'--project={fixture.NAME}', '--db=dataset:dev', '--env-ref=evil', '--by=e2e')
+    check('session' in made, 'create answers a session', made)
+    session = made['session']
+    for _ in range(400):
+        session = ts('show', f'--id={session["id"]}')['session']
+        if session['status'] != 'creating':
+            break
+        time.sleep(3)
+    log = root / 'test-sessions' / fixture.NAME / 'log'
+    check(session['status'] == 'ready', f'the session is ready ({int(time.time() - started)} s)',
+          f'{session} {log.read_text()[-3000:] if log.exists() else ""}')
+    check(not (base / 'pwned').exists(), "the branch's Makefile never ran on the host")
+    check(session['env_commit'] != session['tests_commit'], 'host tree from master, specs from the branch')
+    name = f'{fixture.NAME}-test'
+    network = subprocess.run(['docker', 'network', 'inspect', f'{name}-network', '--format', '{{.Internal}}'],
+                             capture_output=True, text=True).stdout.strip()
+    check(network == 'true', 'the session network is internal', network)
+    ports = subprocess.run(['docker', 'ps', '--filter', f'label=com.docker.compose.project={name}', '--format', '{{.Ports}}'],
+                           capture_output=True, text=True).stdout
+    check('->' not in ports, 'nothing of the session is published on the host', ports)
+
+    # The branch fixed fixme.spec.ts: a run of the session passes it; the trusted tree's own specs would fail.
+    run = ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'files': ['fixme.spec.ts']})['run']
+    run = wait_run(run['id'])
+    check(run['status'] == 'passed' and run['executed'], "the branch's spec runs (passed)", run)
+
+    # Back to the trusted specs: recreate from master, then a failing test, a patch, a cancel.
+    ts('destroy', f'--id={session["id"]}', '--by=e2e')
+    for _ in range(100):
+        if ts('show', f'--id={session["id"]}')['session']['status'] in ('destroyed', 'failed'):
+            break
+        time.sleep(3)
+    session = ts('create', f'--project={fixture.NAME}', '--db=dataset:dev', '--by=e2e')['session']
+    for _ in range(400):
+        session = ts('show', f'--id={session["id"]}')['session']
+        if session['status'] != 'creating':
+            break
+        time.sleep(3)
+    check(session['status'] == 'ready', 'a session of master is ready', session)
+    run = wait_run(ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id']})['run']['id'])
+    titles = {test['title']: test['status'] for test in run.get('tests', [])}
+    check(run['status'] == 'failed' and titles.get('status says ready') == 'failed', 'a failing test fails the run', run)
+    check(run['summary']['passed'] >= 2 and run['artifacts'], 'the others pass; artifacts are kept', run.get('summary'))
+    artifact = run['artifacts'][0]['name']
+    raw = subprocess.run([sys.executable, str(PROGRAM), 'artifact', f'--id={run["id"]}', f'--name={artifact}'],
+                         capture_output=True, env=environment).stdout
+    head, _, body = raw.partition(b'\n')
+    check(json.loads(head)['artifact']['size'] == len(body) > 0, 'an artifact streams after its header')
+    fixed = ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'patch': fixture.FIX_PATCH})
+    fixed = wait_run(fixed['run']['id'])
+    check(fixed['status'] == 'passed', 'the patch fixes it', fixed)
+    bad = ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'patch': fixture.OUTSIDE_PATCH})
+    check(bad.get('status') == 400, 'a patch outside the specs is refused', bad)
+    long = ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id']})['run']
+    for _ in range(100):
+        if ts('run-show', f'--id={long["id"]}')['run'].get('step') == 'e2e':
+            break
+        time.sleep(1)
+    time.sleep(4)
+    stopped = ts('cancel', f'--id={long["id"]}', '--by=e2e')['run']
+    check(stopped['status'] == 'cancelled', 'a cancel stops a running run', stopped)
+    time.sleep(2)
+    left = subprocess.run(['docker', 'ps', '-a', '--filter', f'name=^{long["id"]}$', '-q'], capture_output=True, text=True).stdout
+    check(not left.strip(), 'its container is gone', left)
+    check(ts('run-show', f'--id={long["id"]}')['run']['status'] == 'cancelled', 'and it stays cancelled')
+
+    # Snapshots: the page, and a path that would leave the site.
+    snap = ts('snapshot', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'path': '/'})
+    check(snap.get('run', {}).get('status') == 'done' and snap['run']['snapshot']['title'] == 'Fixture shop', 'a snapshot of /', snap)
+    away = ts('snapshot', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'path': '//172.17.0.1:9102/'})
+    check(away.get('status') == 400, 'a scheme-relative path is refused', away)
+
+    # stage: the trusted suite against a site in a container on Docker's bridge (a host firewall may keep containers
+    # from the host itself), served by the Playwright image's node.
+    image = subprocess.run(['docker', 'image', 'ls', '--filter', 'label=setup.service=playwright', '--format',
+                            '{{.Repository}}:{{.Tag}}'], capture_output=True, text=True).stdout.split()[0]
+    site = f'ts-e2e-site-{base.name[-8:].lower()}'
+    page = '<!doctype html><title>Fixture</title><h1>Fixture shop</h1>'
+    subprocess.run(['docker', 'run', '-d', '--rm', '--name', site, '--network', 'bridge', '--user', '1000:1000',
+                    '--entrypoint', 'node', image, '-e',
+                    f"require('http').createServer((q, s) => s.end({json.dumps(page)})).listen(8080)"],
+                   check=True, capture_output=True)
+    try:
+        address = subprocess.run(['docker', 'inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', site],
+                                 capture_output=True, text=True).stdout.strip()
+        check(bool(address), 'the site container has an address', address)
+        (config / 'test-sessions.env').write_text(f'TEST_URL_{fixture.NAME.upper().replace("-", "_")}_STAGE=http://{address}:8080\n')
+        stage = ts('run', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME})
+        check('run' in stage, 'a stage run starts', stage)
+        stage = wait_run(stage['run']['id'])
+        check(stage['status'] == 'passed' and stage['summary']['passed'] == 2, 'stage runs its 2 @stage tests (not @stage-write)',
+              stage)
+        check(not (root / 'test-runs' / stage['id'] / 'data').exists(), "a stage run's traces and report are not kept")
+        again = wait_run(ts('run', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME})['run']['id'])
+        install = (root / 'test-runs' / again['id'] / 'log').read_text()
+        check(again['status'] == 'passed' and 'is up to date' in install, 'the next stage run reuses the dependency install')
+        snap = ts('snapshot', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME, 'path': '/'})
+        check(snap.get('run', {}).get('status') == 'done', 'a snapshot of stage', snap)
+        patched = ts('run', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME, 'patch': fixture.FIX_PATCH})
+        check(patched.get('status') == 400, 'stage takes no patch', patched)
+    finally:
+        subprocess.run(['docker', 'rm', '-f', site], capture_output=True)
+
+    # Expiry: reconcile tears it down; nothing of it is left.
+    record = root / 'test-sessions' / fixture.NAME / 'session.json'
+    data = json.loads(record.read_text())
+    data['expires_at'] = int(time.time()) - 1
+    record.write_text(json.dumps(data))
+    done = ts('reconcile')
+    check(f'expired {session["id"]}' in done['reconciled'], 'reconcile expires the session', done)
+    check(ts('show', f'--id={session["id"]}')['session']['status'] == 'expired', 'its status is expired')
+    rest = subprocess.run(['docker', 'ps', '-a', '--filter', f'label=com.docker.compose.project={name}', '-q'],
+                          capture_output=True, text=True).stdout
+    check(not rest.strip(), 'no container of the session is left', rest)
+    print(f'all checks passed in {int(time.time() - started)} s')
+    if not options.keep:
+        subprocess.run([sys.executable, str(PROGRAM), 'reconcile'], env=environment, capture_output=True)
+        shutil.rmtree(base, ignore_errors=True)
+
+
+if __name__ == '__main__':
+    main()
