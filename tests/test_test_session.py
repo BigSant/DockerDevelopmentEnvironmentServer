@@ -521,6 +521,7 @@ class CancelTest(Base):
         pid_file = self.root / "child.pid"
         identifier = "run-0000000000aa"
         self.ts.write_json(self.ts.run_dir(identifier) / "run.json", {"id": identifier, "status": "running"})
+        self.ts.PROC = Path("/proc")  # this process's children, as they are (in CI it may be PID 1: no reaper)
         command = ["sh", "-c", f"trap '' TERM; sleep 60 & echo $! > {pid_file}; wait"]
         self.assertEqual(self.ts.run_logged(log, command, timeout=2, run=identifier), 124)
         child = int(pid_file.read_text())
