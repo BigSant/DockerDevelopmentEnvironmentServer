@@ -52,6 +52,12 @@ case "$1 $2" in
     exit 0;;
   "network inspect") cat "$here/network.json" 2>/dev/null || echo '[{"Name": "net1", "Internal": true, "Options": {"com.docker.network.bridge.gateway_mode_ipv4": "isolated", "com.docker.network.bridge.gateway_mode_ipv6": "isolated"}, "IPAM": {"Config": [{"Subnet": "10.0.0.0/24"}]}}]';;
   "ps -a") cat "$here/ps.txt" 2>/dev/null;;
+  "image ls") cat "$here/images.txt" 2>/dev/null; exit 0;;
+  "image rm")
+    [ -f "$here/image-rm.fail" ] && exit 1
+    grep -vxF -- "$3" "$here/images.txt" > "$here/images.new" 2>/dev/null; mv "$here/images.new" "$here/images.txt" 2>/dev/null
+    exit 0;;
+  "builder prune") echo "Total:	1.2GB";;
   "compose -p")
     case "$*" in *" down "*) exit "$(cat "$here/down.exit" 2>/dev/null || echo 0)";; esac;;
 esac
@@ -727,6 +733,81 @@ class WorkerTest(Base):
         self.assertEqual((data["status"], data["step"]), ("failed", "build"))
         self.assertIn(f"compose -p alpha-{made['id'][3:]}-test down --volumes --remove-orphans --timeout 20", self.docker_calls())
         self.assertNotEqual(self.ts.create(self.options())[0]["id"], made["id"])
+
+
+class SessionImagesTest(Base):
+    """The first real session: a failure after test-init says the session's domain, and a teardown removes the images
+    the session built (named after it), never another stack's, and bounds BuildKit's cache."""
+
+    def make_failing_at(self, step):
+        def fake_make(log, directory, target, *arguments, **keywords):
+            budget(directory, target)
+            if target == "test-init":
+                with open(directory / "env/test.env", "a") as handle:
+                    handle.write("DOMAIN=alpha-0.test.local\n")
+            return 2 if target == step else 0
+        return fake_make
+
+    def test_a_failed_session_says_its_domain_and_leaves_no_image_of_its_own(self):
+        made = self.ts.create(self.options())[0]
+        own = f"alpha-{made['id'][3:]}"
+        images = self.root / "fakebin/images.txt"
+        kept = ["php-fpm-base-local-8.4-3.4.0-2.8-0f1e2d:latest", "playwright-1.49.1:latest", "alpha-php-fpm-prod:latest",
+                "alpha-0123456789ab-php-fpm-local:latest", "alpha-php-fpm-local:latest"]
+        images.write_text("\n".join([f"{own}-php-fpm-local:latest", f"{own}-php-fpm-core-local:latest",
+                                     f"{own}-php-fpm-test:latest", *kept]) + "\n")
+        with patch.object(self.ts, "make", self.make_failing_at("test-prepare")):
+            self.ts.create_worker(made["id"])
+        data = self.ts.find_session(made["id"])
+        self.assertEqual((data["status"], data["step"]), ("failed", "test-prepare"))
+        self.assertEqual(data["domain"], "alpha-0.test.local", "known from test-init on, not only when ready")
+        self.assertEqual(self.ts.public_session(data)["domain"], "alpha-0.test.local")
+        self.assertEqual(images.read_text().split(), kept, "only the images named after this session")
+        self.assertIn("builder prune --force --max-used-space 10gb", self.docker_calls())
+        self.assertIn("removed the session's images", (self.ts.SESSIONS / "alpha/log").read_text())
+
+    def test_the_build_cache_is_pruned_only_once_the_session_has_ended(self):
+        made = self.ts.create(self.options())[0]
+        seen = []
+        prune = self.ts.bound_build_cache
+        with patch.object(self.ts, "make", self.make_failing_at("build")), \
+                patch.object(self.ts, "bound_build_cache",
+                             lambda log: seen.append(self.ts.find_session(made["id"])["status"]) or prune(log)):
+            self.ts.create_worker(made["id"])
+        self.assertEqual(seen, ["failed"], "a long prune never keeps the session destroying (and the next one waiting)")
+
+    def test_a_teardown_is_not_done_while_an_image_of_the_session_is_left(self):
+        self.config("TEST_BUILD_CACHE_GB=0\n")
+        made = self.ts.create(self.options())[0]
+        images = self.root / "fakebin/images.txt"
+        images.write_text(f"alpha-{made['id'][3:]}-php-fpm-local:latest\n")
+        (self.root / "fakebin/image-rm.fail").write_text("")
+        with patch.object(self.ts, "make", self.make_failing_at("build")):
+            self.ts.create_worker(made["id"])
+        data = self.ts.find_session(made["id"])
+        self.assertEqual(data["status"], "destroying", "tried again, never reported as done")
+        self.assertIn("not complete", data["cleanup"])
+        (self.root / "fakebin/image-rm.fail").unlink()
+        self.ts.destroy_worker(made["id"])
+        self.assertEqual(self.ts.find_session(made["id"])["status"], "failed")
+        self.assertEqual(images.read_text().split(), [])
+        self.assertFalse([call for call in self.docker_calls() if call.startswith("builder prune")], "0: the cache is left alone")
+
+    def test_shop_ref_used_is_the_code_repositorys_current_branch_not_a_guess(self):
+        code = self.root / "work/code"
+        code.mkdir(parents=True)
+        (code / "index.php").write_text("<?php 1;")
+        git(code, "init", "-q", "-b", "main")
+        git(code, "add", "-A")
+        git(code, "commit", "-q", "-m", "c")
+        git(code, "checkout", "-q", "-b", "production")
+        subprocess.run(["git", "clone", "-q", str(code), str(self.project / "app/public")], check=True)
+        self.assertEqual(self.ts.default_shop_ref(self.project, {"env_branch": "master"}), "production")
+        head = git(self.project / "app/public", "rev-parse", "HEAD")
+        git(self.project / "app/public", "checkout", "-q", "--detach")
+        self.assertEqual(self.ts.default_shop_ref(self.project, {"env_branch": "master"}), head, "detached: its commit")
+        shutil.rmtree(self.project / "app/public")
+        self.assertEqual(self.ts.default_shop_ref(self.project, {"env_branch": "master"}), "master", "one repository")
 
 
 class DigestTest(Base):

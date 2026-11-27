@@ -1,6 +1,6 @@
 """The whole test-session cycle against this machine's Docker, as the account running it (docker group):
 
-    python3 tests/fixtures/test_session_e2e.py SETUP [--lock-file FILE] [--keep]
+    python3 tests/fixtures/test_session_e2e.py SETUP [--lock-file FILE] [--keep] [--prestashop]
 
 SETUP is a setup checkout with test-session-v2. In a temporary $ROOT: the fixture project (test_session_project.py) as
 a build root with origin/HEAD, a branch whose Makefile would run on the host (it must not), then: a session from the
@@ -8,6 +8,10 @@ data set dev; a run with a failing test; the patch that fixes it; a cancel; snap
 the session's isolation (no published port, an internal network, Playwright bounded and not root); a stage run against
 a local site on Docker's bridge; expiry and reconcile, after which nothing of the session is left. Prints each check
 and exits 1 on the first that fails.
+
+--prestashop instead: a PrestaShop project in two repositories whose shop repository lacks the release paths
+(test_session_project.build_prestashop; PS 8.2.9, its official image the release): the session is ready with the
+release layer in its copy (a spec checks the page), and its destroy leaves none of the images it built.
 """
 
 import argparse
@@ -155,7 +159,10 @@ def main():
     parser.add_argument('setup')
     parser.add_argument('--lock-file')
     parser.add_argument('--keep', action='store_true', help='keep the temporary tree')
+    parser.add_argument('--prestashop', action='store_true', help='the PrestaShop release-layer cycle instead')
     options = parser.parse_args()
+    if options.prestashop:
+        return prestashop_cycle(options)
     base = Path(tempfile.mkdtemp(prefix='ts-e2e-'))
     root, config = base / 'root', base / 'config'
     (root / 'projects').mkdir(parents=True)
@@ -182,7 +189,9 @@ def main():
     (base / 'work').mkdir()
     work = fixture.build(base / 'work', options.setup, lock_file=options.lock_file, services='playwright metrics cron backup')
     # This machine shares its host with the sessions knowingly (a production host gets its own filesystem and daemon).
-    (config / 'test-sessions.env').write_text('TEST_RUN_DISK_MB=200\nTEST_SESSIONS_SHARE_PRODUCTION_HOST=accept-risk\n')
+    # TEST_BUILD_CACHE_GB above this machine's own cache: the prune runs, a developer's cache stays.
+    (config / 'test-sessions.env').write_text('TEST_RUN_DISK_MB=200\nTEST_SESSIONS_SHARE_PRODUCTION_HOST=accept-risk\n'
+                                          'TEST_BUILD_CACHE_GB=500\n')
     origin = base / 'origin.git'
     subprocess.run(['git', 'init', '-q', '--bare', '-b', 'master', str(origin)], check=True)
     fixture.git(work, 'remote', 'add', 'origin', str(origin))
@@ -366,6 +375,92 @@ http.createServer((q, s) => {
     print(f'all checks passed in {int(time.time() - started)} s')
     if not options.keep:
         subprocess.run([sys.executable, str(PROGRAM), 'reconcile'], env=environment, capture_output=True)
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def prestashop_cycle(options):
+    """A session of a PrestaShop shop built from the official release, as the first production session was."""
+    base = Path(tempfile.mkdtemp(prefix='ts-e2e-ps-'))
+    root, config = base / 'root', base / 'config'
+    (root / 'projects').mkdir(parents=True)
+    config.mkdir()
+    (root / 'setup').symlink_to(Path(options.setup).resolve())
+    environment = {**os.environ, 'SETUP_SERVER_ROOT': str(root), 'SETUP_SERVER_CONFIG': str(config)}
+    # This machine's own build cache is far over the default bound: a bound above it still runs the prune.
+    (config / 'test-sessions.env').write_text('TEST_SESSIONS_SHARE_PRODUCTION_HOST=accept-risk\nTEST_BUILD_CACHE_GB=500\n')
+
+    def ts(*arguments, stdin=None):
+        result = subprocess.run([sys.executable, str(PROGRAM), *arguments], input=json.dumps(stdin) if stdin is not None else '',
+                                capture_output=True, text=True, env=environment, timeout=900)
+        try:
+            return json.loads(result.stdout)
+        except ValueError:
+            check(False, f'test-session {arguments[0]} answers JSON', result.stdout[-500:] + result.stderr[-500:])
+
+    (base / 'work').mkdir()
+    work, code = fixture.build_prestashop(base / 'work', options.setup, lock_file=options.lock_file)
+    tracked = subprocess.run(['git', '-C', str(code), 'ls-files'], capture_output=True, text=True).stdout.split()
+    check(not any(path.startswith(('vendor/', 'config/', 'themes/', 'bin/')) for path in tracked),
+          'the shop repository has none of the release paths', tracked)
+    origins = {}
+    for name, repository in (('env', work), ('code', code)):
+        origins[name] = base / f'{name}.git'
+        subprocess.run(['git', 'init', '-q', '--bare', '-b', 'master', str(origins[name])], check=True)
+        fixture.git(repository, 'remote', 'add', 'origin', str(origins[name]))
+        fixture.git(repository, 'push', '-q', 'origin', 'master')
+    build = root / 'projects' / fixture.PS_NAME
+    subprocess.run(['git', 'clone', '-q', str(origins['env']), str(build)], check=True)
+    subprocess.run(['git', 'clone', '-q', str(origins['code']), str(build / 'app/public')], check=True)
+    started = time.time()
+    session = ts('create', f'--project={fixture.PS_NAME}', '--db=dataset:dev', '--by=e2e')
+    check('session' in session, 'create answers a session', session)
+    session = session['session']
+    for _ in range(600):
+        session = ts('show', f'--id={session["id"]}')['session']
+        if session['status'] != 'creating':
+            break
+        time.sleep(3)
+    log = root / 'test-sessions' / fixture.PS_NAME / 'log'
+    text = log.read_text() if log.exists() else ''
+    check(session['status'] == 'ready', f'the PrestaShop session is ready ({int(time.time() - started)} s)',
+          f'{session} {text[-4000:]}')
+    check(session.get('domain') and session.get('shop_ref_used') == 'master', 'it says its domain and the shop ref it used',
+          session)
+    check('PrestaShop 8.2.9 release paths into the test copy' in text and 'Release: vendor -> vendor' in text,
+          'make test-prepare copied the release paths into the test copy')
+    copy = root / 'test-sessions' / fixture.PS_NAME / 'repo/app/.generated/test/app'
+    for path in ('vendor/autoload.php', 'bin/console', 'config/defines.inc.php', 'themes/classic/config/theme.yml', 'composer.lock',
+                 'modules/fixture/fixture.php', 'index.php'):
+        check((copy / path).is_file(), f'the test copy has {path}')
+    check(not (root / 'test-sessions' / fixture.PS_NAME / 'content/public/vendor').exists(),
+          "the caller's shop code (content/public) is left as it came")
+    prefix = f'{fixture.PS_NAME}-{session["id"][3:]}-'
+    built = [line for line in subprocess.run(['docker', 'image', 'ls', '--format', '{{.Repository}}:{{.Tag}}'], capture_output=True,
+                                             text=True).stdout.split() if line.startswith(prefix)]
+    check(bool(built), f'the session built its own images ({", ".join(built)})')
+    run = ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id']})['run']
+    for _ in range(300):
+        run = ts('run-show', f'--id={run["id"]}')['run']
+        if run['status'] not in ('queued', 'running', 'cancelling'):
+            break
+        time.sleep(3)
+    check(run['status'] == 'passed', 'a spec sees the release layer on the page (release complete, the official defines)', run)
+    ts('destroy', f'--id={session["id"]}', '--by=e2e')
+    for _ in range(100):
+        if ts('show', f'--id={session["id"]}')['session']['status'] in ('destroyed', 'failed'):
+            break
+        time.sleep(3)
+    check(ts('show', f'--id={session["id"]}')['session']['status'] == 'destroyed', 'the session is destroyed')
+    left = [line for line in subprocess.run(['docker', 'image', 'ls', '--format', '{{.Repository}}:{{.Tag}}'], capture_output=True,
+                                            text=True).stdout.split() if line.startswith(prefix)]
+    check(not left, 'none of its images is left', left)
+    for _ in range(60):  # once the session has ended, so just after its status says so
+        if 'build cache bounded' in log.read_text():
+            break
+        time.sleep(2)
+    check('build cache bounded' in log.read_text(), 'the build cache was bounded once the session had ended')
+    print(f'all checks passed in {int(time.time() - started)} s')
+    if not options.keep:
         shutil.rmtree(base, ignore_errors=True)
 
 

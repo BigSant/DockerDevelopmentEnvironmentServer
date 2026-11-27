@@ -119,7 +119,8 @@ DEFAULTS = {'TEST_SESSION_RESERVE_MB': 2048, 'TEST_SESSION_DISK_MB': 5120, 'TEST
             'TEST_RUN_DISK_MB': 1024, 'TEST_RUN_ARTIFACTS_MB': 200, 'TEST_RUNS_TOTAL_MB': 2048, 'TEST_RUN_KEEP_DAYS': 7,
             'TEST_STORAGE_STATE_MAX_AGE': 900, 'TEST_SNAPSHOT_TIMEOUT': 240, 'TEST_SPECS_FILES': 5000, 'TEST_SPECS_MB': 50,
             'TEST_CONTENT_FILES': 400000, 'TEST_CONTENT_MB': 4096, 'TEST_DISK_FLOOR_MB': 4096, 'TEST_LOG_MB': 20,
-            'TEST_WORKER_MEMORY_MB': 1536, 'TEST_TOMBSTONES': 200, 'TEST_SESSION_TREE_MB': 12288}
+            'TEST_WORKER_MEMORY_MB': 1536, 'TEST_TOMBSTONES': 200, 'TEST_SESSION_TREE_MB': 12288,
+            'TEST_BUILD_CACHE_GB': 10}
 # The container limits of a session's services (env/test.env, MB): what the memory gate counts for a session, with
 # TEST_RUN_MEMORY_MB for its Playwright container. A service the project does not use costs nothing but is counted.
 # DOCTRINE: setup's php-doctrine-migrations, fixed at 512 MB (not a setting); METRICS is never in a session.
@@ -695,8 +696,8 @@ def make(log, directory, target, *arguments, timeout=3600, run=None, quota=None,
 def require_setup():
     result = subprocess.run(['make', '-s', '-f', str(ROOT / 'setup/docker/project.mk'), 'setup-capabilities'],
                             capture_output=True, text=True, env=child_environment())
-    if 'test-session-v4' not in result.stdout.split():
-        raise Refusal(503, f'setup in {ROOT / "setup"} is too old for test sessions (no test-session-v4, 5.10.0+): '
+    if 'test-session-v5' not in result.stdout.split():
+        raise Refusal(503, f'setup in {ROOT / "setup"} is too old for test sessions (no test-session-v5, 5.11.0+): '
                            'bin/update-setup', 'gate_unknown')
 
 
@@ -1494,7 +1495,7 @@ def session_name(data):
 
 
 def content_settings(content, data=None):
-    """setup's test-session mode (5.10.0+, test-session-v4): the specs, their configuration and the shop code come from
+    """setup's test-session mode (5.11.0+, test-session-v5): the specs, their configuration and the shop code come from
     these data directories outside the tree, ENV=test is confined from its rendered model, labelled with the session's
     id and under the tests' slice; the stacks are named after the session."""
     text = (f'TEST_SESSION=on\nE2E_TESTS_DIRECTORY={content / "tests"}\nE2E_CONFIG_DIRECTORY={content / "config"}\n'
@@ -1678,6 +1679,8 @@ def create_worker(identifier):
                 shop_ref_used=data.get('shop_ref') or default_shop_ref(root, data))
         if make(log, app, 'test-init'):
             raise RuntimeError('make test-init failed (see the session log)')
+        # The session's domain as soon as test-init wrote it into env/test.env (a failure after it still says it).
+        advance('test-init', domain=env_value(app / 'env/test.env', 'DOMAIN'))
         check_budget(app, limits)
         for step, target, arguments in (('test-prepare', 'test-prepare', (f'set={dataset}',)),
                                         ('e2e-install', 'e2e-install', (f'container={identifier}',))):
@@ -1791,6 +1794,8 @@ def teardown(data, log):
         if owned_containers('setup.session', data['id']) or owned_containers('setup.owner', data['id']):
             say(log, 'a container of this session is still there; tried again')
             return False
+        if current.get('base_name') and name.endswith('-test') and not remove_session_images(name[:-len('-test')], log):
+            return False
     for path in (directory / 'repo', directory / 'content'):
         with contextlib.suppress(OSError, RuntimeError):
             remove_tree(path)
@@ -1798,6 +1803,51 @@ def teardown(data, log):
             say(log, f'{path} could not be removed (files of another account, no image to remove them with); tried again')
             return False
     return True
+
+
+def remove_session_images(prefix, log):
+    """The images a session built: named after its PROJECT_NAME (<project>-<12 hex of its id>-php-fpm-local, …-core-…,
+    …-test), so no other stack's. The images named by their content (php-fpm-base-…, nginx-proxy-…, the database,
+    Playwright) are shared by every session of those versions and stay; bound_build_cache bounds the rest. True when
+    none of the session's is left."""
+    def tagged():
+        listing = subprocess.run(['docker', 'image', 'ls', '--format', '{{.Repository}}:{{.Tag}}'], capture_output=True,
+                                 text=True, timeout=120, env=child_environment())
+        return None if listing.returncode else sorted({line for line in listing.stdout.split()
+                                                       if line.startswith(prefix + '-')})
+    images = tagged()
+    if images is None:
+        say(log, 'docker image ls failed: the teardown waits for the daemon')
+        return False
+    for image in images:
+        # Not forced: Docker refuses an image a container still uses (none of this session's is left by now).
+        subprocess.run(['docker', 'image', 'rm', image], capture_output=True, timeout=300, env=child_environment())
+    left = tagged()
+    if left:
+        say(log, f'images of this session are still there ({", ".join(left)}); tried again')
+        return False
+    if images:
+        say(log, f'removed the session\'s images: {", ".join(images)}')
+    return left is not None
+
+
+def bound_build_cache(log):
+    """BuildKit's cache, which make build fills on this host (sessions and the project's own builds alike) and no
+    session limit bounds: pruned down to TEST_BUILD_CACHE_GB (10; 0: not pruned), the least recently used first, once a
+    session has ended (its teardown complete, the next session of the project free to start). A failure is logged and
+    changes nothing else."""
+    limit = settings()['TEST_BUILD_CACHE_GB']
+    if not limit:
+        return
+    for option in ('--max-used-space', '--keep-storage'):  # the newer name, then the one older Docker CLIs have
+        result = subprocess.run(['docker', 'builder', 'prune', '--force', option, f'{limit}gb'], capture_output=True,
+                                text=True, timeout=600, env=child_environment())
+        if result.returncode == 0:
+            say(log, f'build cache bounded to {limit} GB ({(result.stdout.strip().splitlines() or [""])[-1]})')
+            return
+        if 'unknown flag' not in result.stderr:
+            break
+    say(log, f'docker builder prune failed: {redact(result.stderr.strip()[-300:])}')
 
 
 def destroy(identifier, by, reason='destroyed', wait=False):
@@ -1843,6 +1893,8 @@ def destroy_worker(identifier):
             try_update_session(data['project'], identifier, ('destroying',), status=final,
                                step=data.get('step') if final == 'failed' else None,  # a failure keeps where it failed
                                worker=None, command=None, ended_at=now(), active_run=None, cleanup=None)
+            # After the session has ended: a long prune never holds the project's next session back.
+            bound_build_cache(log)
         else:
             try_update_session(data['project'], identifier, ('destroying',), worker=None,
                                attempts=int(data.get('attempts') or 0) + 1,

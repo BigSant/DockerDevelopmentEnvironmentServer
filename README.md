@@ -813,9 +813,9 @@ the commands for manual recovery are printed.
 A server installed before the API (e.g. 2026-11-06) is updated by hand, in this order:
 
 1. **Look first** (as the clone's owner, no sudo): `cd ~/setup-server && bin/update --check --server-ref origin/master
-   --setup-ref v5.10.0` – setup must be 5.10.0 or newer for test sessions (`test-session-v4`).
+   --setup-ref v5.11.0` – setup must be 5.11.0 or newer for test sessions (`test-session-v5`).
 2. **Update** (no sudo; it asks for the password of its own `sudo` calls): `bin/update --server-ref origin/master
-   --setup-ref v5.10.0`. It fetches and switches both checkouts, rewrites the installed copies
+   --setup-ref v5.11.0`. It fetches and switches both checkouts, rewrites the installed copies
    (`install-backups`, `install-metrics`, `add-backup-key` and `install-ui --refresh`: `/usr/local/sbin/setup-server-*` and
    every command in `/usr/local/lib/setup-server/bin/`, `bin/test-session` too), restarts the UI, runs the health check
    (these tests, the setup checkout, the runners' PIDs) and returns everything on a failure. It never changes units,
@@ -833,7 +833,7 @@ sudo bin/install-ui --check | grep -E 'would|differs' || echo "install-ui: nothi
 systemctl list-timers setup-server-test-sessions.timer --no-pager      # next run within a minute
 sudo journalctl -u setup-server-test-sessions --since -5min --no-pager  # {"reconciled": []}
 sudo -u setup-ui sudo -n /usr/local/lib/setup-server/bin/test-session list   # {"sessions": []}
-sudo -u setup make -s -f /srv/setup-server/setup/docker/project.mk setup-capabilities  # … test-session-v4
+sudo -u setup make -s -f /srv/setup-server/setup/docker/project.mk setup-capabilities  # … test-session-v5
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9102/api/v1          # 401 without a token
 curl -s -H "Authorization: Bearer $OPS_TOKEN" http://127.0.0.1:9102/api/v1 | jq '[.endpoints[] | select(.needs == "testenv: manage")] | length'  # 8
 ```
@@ -1487,7 +1487,7 @@ and runs itself again as the `setup` account; on a systemd host every command ru
 `setup_server_tests.slice` with `MemoryMax=TEST_WORKER_MEMORY_MB` (1536), no swap and at most 1024 tasks, which its
 background workers stay in; root makes the scope and `setpriv --init-groups` drops to `setup` inside it (its own groups,
 the docker group among them, none of root's). The slice (bin/install-ui: `MemoryMax` 6G, `CPUWeight` and `IOWeight`
-20) also holds every session container (`cgroup_parent`) and the timer's unit. Needs setup 5.10.0+ (`test-session-v4`)
+20) also holds every session container (`cgroup_parent`) and the timer's unit. Needs setup 5.11.0+ (`test-session-v5`)
 and Docker Engine 28.2+ (an isolated network gateway; else `503 gate_unknown`).
 
 **Sessions are refused (`503 host_unconfigured`) until the operator has chosen where they run**: either
@@ -1508,8 +1508,10 @@ separate filesystem, or point `TEST_DOCKER_HOST=unix:///…|tcp://…|ssh://…`
 resource-limited VM without the production deploy keys is the operator's strongest option). Both are settings in
 `/etc/setup-server/test-sessions.env`; nothing else changes. Without them, what stays shared: the Docker daemon and its
 data root (images, the session's volumes and containers' writable layers), the disk under `$ROOT`, the kernel, the
-build cache of `docker compose build` (BuildKit is not bounded by these limits), and the build root's Git objects
-(read only).
+build cache of `docker compose build` (BuildKit is not bounded by these limits: once a session has ended it is pruned to
+`TEST_BUILD_CACHE_GB`, 10, least recently used first, the project's own builds' cache included; `0` leaves it alone), the
+images named by their content (`php-fpm-base-…`, `nginx-proxy-…`, the database, Playwright: one per version, shared by
+every session and kept), and the build root's Git objects (read only).
 
 **Trust.** This runs as `setup` (docker group: root-equivalent, deploy keys), so what a caller sends or chooses is never
 trusted:
@@ -1529,6 +1531,16 @@ trusted:
   `tests/playwright`'s `package.json`, `package-lock.json` and `.npmrc` are always the trusted commit's; `make
   e2e-install` runs `npm ci --ignore-scripts` in a one-off, bounded Playwright container into `.generated/e2e/`, which
   every run mounts read-only over the specs' `node_modules`.
+- *A PrestaShop shop whose core is the official release* (`PS_RELEASE=on`; the `PS_RELEASE_PATHS` – `vendor/`,
+  `config/defines.inc.php`, the default themes … – ignored in the shop repository): the caller's shop code has none of
+  them, so setup's `make test-prepare` copies them into ENV=test's copy from the release in the session's php-fpm
+  image, as `make app-prepare` does for ENV=local. That release is `PS_VERSION`'s, baked in by the session's `make
+  build` from the trusted commit's settings (the official `prestashop/prestashop:<version>` image, or for 1.6 the GitHub
+  zip checked against `PS_RELEASE_SHA256`): the build is the only step with a network (pulls from Docker Hub/GitHub,
+  bounded by the 60-minute timeout of the session's `make build`, cached in Docker's image layers and build cache, so a
+  second session of that version downloads nothing). The copy runs in a one-off ENV=test container of the session
+  (confined, no network) and replaces whatever the caller's code had at those paths, so nothing of the caller's takes
+  the release's place. A project with `config/composer/composer.json` (Composer would need the network) is refused.
 - *stage and live* run only the trusted commit's suite: no `patch` (`400`), and `env_ref` only when it is trusted. Their
   clone holds the specs only (no shop code).
 - *Confinement* (setup's session mode, derived from the rendered ENV=test model and checked again): every network is
@@ -1580,8 +1592,9 @@ create is running too, so a destroy or the timer stops it.
   `DELETE`, or by the timer when free space under `$WORK` or Docker's data root fell below `TEST_DISK_FLOOR_MB` (4096) or
   the session's tree grew over `TEST_SESSION_TREE_MB` (12288; what `setup` can read of it) – `error` says why.
   **`failed`**: creating stopped (`step` and `error` say where and why) and was torn down. A teardown (its run
-  cancelled, its command stopped, `docker compose down --volumes` of its `-test` and `-local` projects, its images
-  removed (only containers with this session's label), `repo/` and `content/` deleted) that does not complete stays
+  cancelled, its command stopped, `docker compose down --volumes` of its `-test` and `-local` projects (only containers with this session's
+  label), the images it built removed (those named after its `PROJECT_NAME`, `<project>-<12 hex of its id>-…`; the
+  teardown is not done while one is left), `repo/` and `content/` deleted) that does not complete stays
   `destroying` (with `cleanup`, `error` keeps the reason) and is tried again
   every minute; it is never reported as done. One cleaner per session. A destroyed or expired session stays readable
   (`GET` answers it with its final status) for 24 h, then `404`.
@@ -1697,7 +1710,10 @@ schemas):
   repeat with the same `client_run_id`, which returns the run if it was created.
 
 Session fields beyond those: `step`, `error` (credentials redacted), `env_branch`, `shop_commit`, `shop_dropped`,
-`client_run_id`, `ready_at`, `ended_at`, `created_by`, `active_run`, `domain`, `reachable`. Run fields beyond those:
+`client_run_id`, `ready_at`, `ended_at`, `created_by`, `active_run`, `domain` (from `make test-init` on, so a session
+that failed after it says it too), `reachable`, `shop_ref_used` (the ref the shop code came from: `shop_ref`, else, in
+one repository, the deploy branch, with a code repository of its own that repository's current branch in the build
+root – its `HEAD` as `git symbolic-ref` reads it, the commit when detached; never assumed). Run fields beyond those:
 `step`, `session`/`environment`, `url`, `tests_commit`, `shop_commit`, `cancelled_by`, `grep`/`grep_invert` (what
 Playwright got), `files`, `deploy_check`, `stage_write_safe`, `patch_sha256`, `patch_files`, `client_run_id`, `roles`,
 `created_by`, `started_at`, `finished_at`, and when done `summary` `{passed, failed, flaky, skipped, duration_s}`,
