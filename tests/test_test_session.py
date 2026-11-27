@@ -38,7 +38,19 @@ FAKE_DOCKER = r'''#!/bin/sh
 here=$(dirname "$0")
 printf '%s\n' "$*" >> "$here/docker.log"
 case "$1 $2" in
-  "info --format") cat "$here/root.txt";;
+  "info --format") case "$*" in *"{{.ID}}"*) echo "FAKE:DAEMON:ID";; *) cat "$here/root.txt";; esac;;
+  "version --format") cat "$here/version.txt" 2>/dev/null || echo 29.0.0;;
+  "network ls") echo net1;;
+  "ps -aq")
+    # containers.txt: the names this fake daemon has; a name filter answers the one it names.
+    name=$(printf '%s' "$*" | sed -n 's/.*name=^\([^$]*\)\$.*/\1/p')
+    [ -n "$name" ] && grep -x -- "$name" "$here/containers.txt" 2>/dev/null
+    exit 0;;
+  "rm --force")
+    [ -f "$here/rm.fail" ] && exit 1
+    for id; do sed -i "/^$id\$/d" "$here/containers.txt" 2>/dev/null; done
+    exit 0;;
+  "network inspect") cat "$here/network.json" 2>/dev/null || echo '[{"Name": "net1", "Internal": true, "Options": {"com.docker.network.bridge.gateway_mode_ipv4": "isolated", "com.docker.network.bridge.gateway_mode_ipv6": "isolated"}, "IPAM": {"Config": [{"Subnet": "10.0.0.0/24"}]}}]';;
   "ps -a") cat "$here/ps.txt" 2>/dev/null;;
   "compose -p")
     case "$*" in *" down "*) exit "$(cat "$here/down.exit" 2>/dev/null || echo 0)";; esac;;
@@ -65,6 +77,14 @@ def git(directory, *arguments):
 SPEC = "import { test } from '@playwright/test';\ntest('home', async () => {});\n"
 
 
+def budget(directory, target, memory=3000, cpus=6):
+    """What setup's test-init writes from the rendered model (tests replace make)."""
+    if target == "test-init":
+        (directory / ".generated/test").mkdir(parents=True, exist_ok=True)
+        (directory / ".generated/test/session-budget.json").write_text(
+            json.dumps({"memory_mb": memory, "cpus": cpus, "services": ["php-fpm"]}))
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -73,6 +93,8 @@ class Base(unittest.TestCase):
         for name in ("srv/projects", "etc", "proc", "handoff/prod", "handoff/stage", "fakebin", "dockerroot"):
             (self.root / name).mkdir(parents=True)
         (self.root / "proc/meminfo").write_text("MemTotal: 16000000 kB\nMemAvailable: 9000000 kB\n")
+        # This machine's tests share it knowingly (the host_separation gate has its own test).
+        self.config("")
         (self.root / "proc/locks").write_text("")
         docker = self.root / "fakebin/docker"
         docker.write_text(FAKE_DOCKER)
@@ -90,6 +112,11 @@ class Base(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.project, self.work = self.build_root("alpha")
+
+    def config(self, text):
+        """$CONFIG/test-sessions.env with text; this machine's tests share the host knowingly (host_separation has
+        its own test)."""
+        (self.root / "etc/test-sessions.env").write_text("TEST_SESSIONS_SHARE_PRODUCTION_HOST=accept-risk\n" + text)
 
     def docker_calls(self):
         log = self.root / "fakebin/docker.log"
@@ -157,16 +184,17 @@ class Base(unittest.TestCase):
         master = git(self.project, "rev-parse", "origin/master")
         data = {"id": "ts-0123456789ab", "project": "alpha", "status": status, "db": "dataset:dev", "created_at": moment,
                 "expires_at": moment + 7200, "domain": "alpha.test.local", "env_commit": master, "tests_commit": master,
-                "env_ref": "master", "compose_project": "alpha-test", **fields}
+                "env_ref": "master", "compose_project": "alpha-test", "format": self.ts.SESSION_FORMAT, **fields}
         self.ts.write_json(directory / "session.json", data)
         return data
 
     def ready_session(self, env_ref=None):
         """A session made by create and its worker for real (git), with make replaced: (session, make calls)."""
         calls = []
-        made = self.ts.create(self.options(env_ref=env_ref))
+        made = self.ts.create(self.options(env_ref=env_ref))[0]
 
         def fake_make(log, directory, target, *arguments, **keywords):
+            budget(directory, target)
             content = self.ts.SESSIONS / "alpha/content"
             calls.append((target, arguments, keywords, sorted(str(path.relative_to(content)) for path in content.rglob("*")
                                                               if path.is_file()) if content.is_dir() else []))
@@ -195,7 +223,8 @@ class TrustTest(Base):
         self.assertEqual(self.ts.trusted_commit(self.project), (master, "master"))
         session, calls = self.ready_session(env_ref="evil")
         self.assertEqual((session["status"], session["env_commit"], session["tests_commit"]), ("ready", master, evil), session)
-        self.assertEqual(session["compose_project"], "alpha-test", "the name is kept for a teardown without the clone")
+        self.assertEqual(session["compose_project"], f"alpha-{session['id'][3:]}-test",
+                         "named after the session (no other stack's), kept for a teardown without the clone")
         repo = self.ts.SESSIONS / "alpha/repo"
         app = repo / "app"
         self.assertEqual((app / "Makefile").read_text(), "include $(SETUP_DIRECTORY)/docker/project.mk\n")
@@ -219,7 +248,7 @@ class TrustTest(Base):
             self.assertIn(line + "\n", test_env)
         self.assertEqual([call[0] for call in calls], ["build", "test-init", "test-prepare", "e2e-install"])
         self.assertEqual(calls[0][3], [], "the images are built before anything of the caller's is written")
-        (self.root / "etc/test-sessions.env").write_text("TEST_TRUSTED_REFS_ALPHA=evil\n")
+        self.config("TEST_TRUSTED_REFS_ALPHA=evil\n")
         self.assertEqual(self.ts.trusted_commit(self.project, "evil"), (evil, "evil"), "the operator's allowlist")
 
     def test_stage_and_live_run_only_a_trusted_commit_and_never_a_patch(self):
@@ -462,8 +491,9 @@ class GateTest(Base):
         limits = self.ts.settings()
         text = self.ts.session_env(limits, self.root / "content")
         written = sum(int(value) for value in re.findall(r"^[A-Z]+_MEMORY=(\d+)m$", text, re.M))
-        self.assertEqual(written, self.ts.session_memory_mb(limits))
-        self.assertEqual(self.ts.session_memory_mb(limits), 2208 + 1024)
+        self.assertEqual(written + 512, self.ts.session_memory_mb(limits), "with setup's fixed 512 MB doctrine runner")
+        self.assertEqual(self.ts.session_memory_mb(limits), 2208 + 512 + 1024, "the doctrine runner (512 MB) counts")
+        self.assertEqual(self.ts.session_budget(limits), (3744, 7.75))
 
     def test_gates_fail_closed_and_guard_every_run(self):
         (self.root / "proc/meminfo").unlink()
@@ -487,10 +517,15 @@ class GateTest(Base):
         for index in range(3):
             identifier = f"run-00000000000{index}"
             self.ts.write_json(self.ts.run_dir(identifier) / "run.json", {"id": identifier, "status": "passed",
-                                                                           "finished_at": int(time.time()) - 100 + index})
+                                                                           "finished_at": int(time.time()) - 90000 + index})
             (self.ts.run_dir(identifier) / "report.json").write_bytes(b"x" * 1024 * 1024)
         removed = self.ts.prune_runs(int(2.5 * 1024 * 1024))
         self.assertEqual(removed, ["removed run-000000000000 (TEST_RUNS_TOTAL_MB)"])
+        self.ts.write_json(self.ts.run_dir("run-0000000000a1") / "run.json", {"id": "run-0000000000a1", "status": "passed",
+                                                                               "finished_at": int(time.time()) - 60})
+        (self.ts.run_dir("run-0000000000a1") / "report.json").write_bytes(b"x" * 3 * 1024 * 1024)
+        self.ts.prune_runs(1024 * 1024)
+        self.assertTrue(self.ts.run_dir("run-0000000000a1").exists(), "a run finished a minute ago stays readable (24 h)")
 
     def test_a_run_over_its_disk_quota_is_stopped(self):
         quota = self.root / "results"
@@ -532,6 +567,7 @@ class CancelTest(Base):
         pid_file = self.root / "child.pid"
         identifier = "run-0000000000aa"
         self.ts.write_json(self.ts.run_dir(identifier) / "run.json", {"id": identifier, "status": "running"})
+        (self.root / "fakebin/containers.txt").write_text(identifier + "\n")
         self.ts.PROC = Path("/proc")  # this process's children, as they are (in CI it may be PID 1: no reaper)
         command = ["sh", "-c", f"trap '' TERM; sleep 60 & echo $! > {pid_file}; wait"]
         self.assertEqual(self.ts.run_logged(log, command, timeout=2, run=identifier), 124)
@@ -553,6 +589,7 @@ class CancelTest(Base):
             self.ts.write_json(self.ts.run_dir(identifier) / "run.json", {"id": identifier, "project": "alpha", **data})
         self.ts.write_json(self.ts.RUNS / "active/ts-0123456789ab", {"run": "snap-00000000000d"})
         (self.root / "fakebin/ps.txt").write_text("run-00000000000a\t\t\nrun-00000000000b\t\t\nrun-00000000000c\t\t\n")
+        (self.root / "fakebin/containers.txt").write_text("run-00000000000a\nrun-00000000000b\nrun-00000000000c\n")
         done = self.ts.reconcile()["reconciled"]
         calls = self.docker_calls()
         self.assertIn("rm --force --volumes run-00000000000a", calls)
@@ -581,20 +618,20 @@ class SessionLifecycleTest(Base):
         self.ts.reconcile()
         data = self.ts.find_session("ts-0123456789ab")
         self.assertEqual((data["status"], data["end_reason"]), ("destroying", "expired"))
-        self.assertIn("teardown is not complete", data["error"])
+        self.assertIn("teardown is not complete", data["cleanup"])
         (self.root / "fakebin/down.exit").write_text("0")
         self.ts.reconcile()
         self.assertEqual(self.ts.find_session("ts-0123456789ab")["status"], "expired")
 
     def test_a_failed_session_is_replaced_and_a_live_one_is_no_capacity_refusal(self):
         self.session(status="failed")
-        made = self.ts.create(self.options())
+        made = self.ts.create(self.options())[0]
         self.assertNotEqual(made["id"], "ts-0123456789ab")
         answer = self.refused(409, self.ts.create, self.options(), reason="session_exists")
         self.assertNotIn("capacity", answer)
 
     def test_destroy_while_creating_is_not_undone_by_the_worker(self):
-        made = self.ts.create(self.options())
+        made = self.ts.create(self.options())[0]
         self.ts.destroy(made["id"], "t")
         self.assertEqual(self.ts.find_session(made["id"])["status"], "destroying")
         with patch.object(self.ts, "make", lambda *a, **k: self.fail("nothing is built for an ended session")):
@@ -683,13 +720,13 @@ class WorkerTest(Base):
         self.assertEqual((left["status"], left.get("artifacts")), ("error", []))
 
     def test_a_create_that_fails_is_torn_down_and_can_be_replaced(self):
-        made = self.ts.create(self.options())
+        made = self.ts.create(self.options())[0]
         with patch.object(self.ts, "make", lambda log, directory, target, *a, **k: 2 if target == "build" else 0):
             self.ts.create_worker(made["id"])
         data = self.ts.find_session(made["id"])
         self.assertEqual((data["status"], data["step"]), ("failed", "build"))
-        self.assertIn("compose -p alpha-test down --volumes --remove-orphans --timeout 20", self.docker_calls())
-        self.assertNotEqual(self.ts.create(self.options())["id"], made["id"])
+        self.assertIn(f"compose -p alpha-{made['id'][3:]}-test down --volumes --remove-orphans --timeout 20", self.docker_calls())
+        self.assertNotEqual(self.ts.create(self.options())[0]["id"], made["id"])
 
 
 class DigestTest(Base):
@@ -827,9 +864,9 @@ class SessionApiTest(Base):
         self.refused(400, self.ts.create, self.options(db="dev"))
         self.refused(404, self.ts.create, self.options(project="nope"))
         self.refused(400, self.ts.create, self.options(ttl=361))
-        (self.root / "etc/test-sessions.env").write_text("TEST_SESSION_DISK_MB=999999999\n")
+        self.config("TEST_SESSION_DISK_MB=999999999\n")
         self.refused(409, self.ts.create, self.options(), reason="disk")
-        (self.root / "etc/test-sessions.env").unlink()
+        self.config("")
         lock = self.project / "app/.generated/release/stage/deploy.lock"
         lock.parent.mkdir(parents=True)
         lock.write_text("")
@@ -838,7 +875,7 @@ class SessionApiTest(Base):
             f"1: FLOCK  ADVISORY  WRITE 1234 {os.major(details.st_dev):02x}:{os.minor(details.st_dev):02x}:{details.st_ino} 0 EOF\n")
         self.refused(409, self.ts.create, self.options(), reason="deploy_locked")
         (self.root / "proc/locks").write_text("")
-        made = self.ts.create(self.options())
+        made = self.ts.create(self.options())[0]
         self.assertEqual((made["status"], made["project"], made["created_by"]), ("creating", "alpha", "token:agent"))
         self.assertEqual(self.detached, [("create-worker", f"--id={made['id']}")])
 
@@ -846,7 +883,7 @@ class SessionApiTest(Base):
         master = git(self.project, "rev-parse", "origin/master")
         self.assertEqual(self.ts.environment_url(self.project, "stage", master), "https://stage.alpha.example")
         self.refused(404, self.ts.environment_url, self.project, "demo", master)
-        (self.root / "etc/test-sessions.env").write_text("TEST_URL_ALPHA_PROD=http://10.0.0.5:8080/\n")
+        self.config("TEST_URL_ALPHA_PROD=http://10.0.0.5:8080/\n")
         self.assertEqual(self.ts.environment_url(self.project, "prod", master), "http://10.0.0.5:8080")
 
 
@@ -889,12 +926,12 @@ class RoundThreeTest(Base):
     def test_a_branchs_blobs_are_counted_before_one_is_read(self):
         self.push_branch("big", {"app/tests/playwright/big.txt": "x" * (2 * 1024 * 1024)})
         commit = git(self.project, "rev-parse", "origin/big")
-        (self.root / "etc/test-sessions.env").write_text("TEST_SPECS_MB=1\n")
+        self.config("TEST_SPECS_MB=1\n")
         with patch.object(self.ts, "stream_objects", lambda files: self.fail("nothing is read before the count")):
             answer = self.refused(400, self.ts.tree_files, self.project, {}, commit, "app/tests/playwright", self.root / "log",
                                   reason="content_too_large")
-        self.assertIn("TEST_CONTENT", answer["error"])
-        (self.root / "etc/test-sessions.env").write_text("TEST_CONTENT_MB=1\n")
+        self.assertIn("TEST_SPECS", answer["error"])
+        self.config("TEST_CONTENT_MB=1\n")
         with patch.object(self.ts, "stream_objects", lambda files: self.fail("nothing is read before the count")):
             self.refused(400, self.ts.export_tree, self.project, {}, commit, "app", self.root / "srv/test-sessions/x", self.root / "log")
 
@@ -911,7 +948,7 @@ class RoundThreeTest(Base):
 
     def test_a_log_is_bounded_and_a_quick_command_over_its_quota_is_caught(self):
         log = self.root / "log"
-        (self.root / "etc/test-sessions.env").write_text("TEST_LOG_MB=1\n")
+        self.config("TEST_LOG_MB=1\n")
         self.assertEqual(self.ts.run_logged(log, ["sh", "-c", "head -c 3000000 /dev/zero | tr '\\0' x"]), 0)
         self.assertLess(log.stat().st_size, 1024 * 1024 + 4096)
         quota = self.root / "results"
@@ -934,17 +971,22 @@ class RoundThreeTest(Base):
         module = load(self.root)
         with patch.object(module.os.path, "isdir", lambda path: path == "/run/systemd/system"), \
                 patch.object(module.shutil, "which", lambda name: "/usr/bin/" + name), \
-                patch.object(module.pwd, "getpwnam", lambda name: type("A", (), {"pw_gid": 1234})()):
+                patch.object(module.pwd, "getpwnam", lambda name: type("A", (), {"pw_uid": 4321, "pw_gid": 1234})()):
             scope = module.worker_scope("run")
-            self.assertEqual(module.worker_scope("list"), [])
-        self.assertEqual(scope[:3], ["systemd-run", "--scope", "--quiet"])
+            reading = module.worker_scope("list")
+        self.assertEqual(reading, scope, "the read commands are bounded too")
+        self.assertEqual(scope[:4], ["systemd-run", "--scope", "--quiet", "--collect"])
+        self.assertIn("--slice=setup_server_tests.slice", scope)
         self.assertIn("MemoryMax=1536M", scope)
         self.assertIn("MemorySwapMax=0", scope)
-        self.assertIn("--uid=setup", scope)
+        self.assertNotIn("--uid", " ".join(scope), "systemd-run --uid sets no supplementary groups on 249-257")
+        self.assertEqual(scope[scope.index("setpriv"):], ["setpriv", "--reuid=4321", "--regid=1234", "--init-groups", "--"])
 
     # 6
     def test_a_cancel_keeps_the_slot_until_the_run_has_stopped(self):
+        self.ts.PROC = Path("/proc")  # real processes: a killed one not yet reaped must count as stopped
         run, _ = self.ts.start_run({"target": "stage", "project": "alpha"}, "t", True, {})
+        (self.root / "fakebin/containers.txt").write_text(run["id"] + "\n")
         worker = group(["sh", "-c", "trap '' TERM; sleep 60"])
         command = group(["sh", "-c", "trap '' TERM; sleep 60"])
         self.addCleanup(lambda: [process.kill() for process in (worker, command)])
@@ -996,6 +1038,7 @@ class RoundThreeTest(Base):
 
     # 8
     def test_destroy_stops_a_creating_sessions_worker_and_command_once(self):
+        self.ts.PROC = Path("/proc")
         worker = group(["sleep", "60"])
         command = group(["sleep", "60"])
         self.addCleanup(lambda: [process.kill() for process in (worker, command)])
@@ -1089,8 +1132,8 @@ class RoundThreeTest(Base):
         self.assertEqual(self.ts.build_root("beta"), root)
         run, _ = self.ts.start_run({"target": "stage", "project": "beta"}, "t", True, {})
         self.assertEqual(run["url"], "https://stage.beta.example")
-        made = self.ts.create(self.options(project="beta"))
-        with patch.object(self.ts, "make", lambda log, directory, target, *a, **k: 0):
+        made = self.ts.create(self.options(project="beta"))[0]
+        with patch.object(self.ts, "make", lambda log, directory, target, *a, **k: budget(directory, target) or 0):
             self.ts.create_worker(made["id"])
         session = self.ts.find_session(made["id"])
         self.assertEqual(session["status"], "ready", (self.ts.SESSIONS / "beta/log").read_text())
@@ -1112,7 +1155,7 @@ class RoundThreeTest(Base):
 
     # 16
     def test_tombstones_are_bounded_per_project(self):
-        (self.root / "etc/test-sessions.env").write_text("TEST_TOMBSTONES=3\n")
+        self.config("TEST_TOMBSTONES=3\n")
         for index in range(3):
             self.ts.cancel_by_key("alpha", f"k{index}", "t")
         self.ts.cancel_by_key("alpha", "k0", "t")  # an existing one is no new tombstone
@@ -1190,6 +1233,381 @@ class RoundThreeTest(Base):
             options = self.ts.parser(internal=True).parse_args(["artifact", f"--id={run['id']}", f"--name={name}"])
             with self.subTest(name=name), contextlib.redirect_stdout(io.StringIO()):
                 self.refused(400, self.ts.dispatch, options)
+
+
+class RoundFourTest(Base):
+    """Review round 3 (T1–T24): each test fails without its fix (the mutant it kills is in its name)."""
+
+    def ready(self, name="alpha"):
+        made = self.ts.create(self.options(project=name))[0]
+        with patch.object(self.ts, "make", lambda log, directory, target, *a, **k: budget(directory, target) or 0):
+            self.ts.create_worker(made["id"])
+        session = self.ts.find_session(made["id"])
+        self.assertEqual(session["status"], "ready", (self.ts.SESSIONS / name / "log").read_text())
+        return session
+
+    # T1
+    def test_a_tag_stored_under_a_remote_branch_name_trusts_nothing(self):
+        evil = self.push_branch("evil", {"app/Makefile": "all:\n\ttouch /tmp/pwned\n"})
+        self.config("TEST_TRUSTED_REFS_ALPHA=release\n")
+        git(self.project, "tag", "refs/remotes/origin/release", evil)  # stored as refs/tags/refs/remotes/origin/release
+        self.assertIsNotNone(git(self.project, "rev-parse", "--verify", "refs/remotes/origin/release^{commit}"),
+                             "Git's name lookup finds the tag")
+        self.assertIsNone(self.ts.exact_commit(self.project, "refs/remotes/origin/release"))
+        self.assertEqual(self.ts.trusted_commit(self.project, evil), (None, None))
+        self.refused(400, self.ts.start_run, {"target": "stage", "project": "alpha", "env_ref": evil}, "t", True, {})
+
+    # T2
+    def test_the_engine_must_isolate_a_networks_gateway(self):
+        (self.root / "fakebin/version.txt").write_text("27.5.1\n")
+        self.refused(503, self.ts.create, self.options(), reason="gate_unknown")
+        (self.root / "fakebin/version.txt").write_text("28.2.0\n")
+        (self.root / "fakebin/network.json").write_text(json.dumps([{"Name": "net1", "Internal": True, "Options": {},
+                                                                     "IPAM": {"Config": [{"Gateway": "10.0.0.1"}]}}]))
+        with self.assertRaisesRegex(RuntimeError, "isolated gateway"):
+            self.ts.check_networks("alpha-x-test")
+
+    # T3
+    def test_a_stop_that_is_not_confirmed_keeps_the_run_cancelling(self):
+        run, _ = self.ts.start_run({"target": "stage", "project": "alpha"}, "t", True, {})
+        (self.root / "fakebin/containers.txt").write_text(run["id"] + "\n")
+        (self.root / "fakebin/rm.fail").write_text("")
+        shown = self.ts.cancel_run(run["id"], "x", "t")
+        self.assertEqual(shown["status"], "cancelling", "a failed docker rm is no confirmation")
+        self.refused(409, self.ts.start_run, {"target": "live", "project": "alpha"}, "t", True, {}, reason="run_active")
+        (self.root / "fakebin/rm.fail").unlink()
+        self.ts.update_run(run["id"], cancel_asked_at=int(time.time()) - 600)
+        self.ts.reconcile()
+        self.assertEqual(self.ts.find_run(run["id"])["status"], "cancelled")
+        self.assertFalse((self.ts.RUNS / "active/external-alpha").exists())
+
+    def test_a_crashed_run_goes_through_cancelling_and_keeps_its_slot_until_stopped(self):
+        run, _ = self.ts.start_run({"target": "stage", "project": "alpha"}, "t", True, {})
+        self.ts.update_run(run["id"], status="running", worker=999999999, created_at=int(time.time()) - 600, suite_started=True)
+        (self.root / "fakebin/containers.txt").write_text(run["id"] + "\n")
+        (self.root / "fakebin/rm.fail").write_text("")
+        self.ts.reconcile()
+        self.assertEqual(self.ts.find_run(run["id"])["status"], "cancelling")
+        self.assertTrue((self.ts.RUNS / "active/external-alpha").exists(), "the slot stays while its container is there")
+        (self.root / "fakebin/rm.fail").unlink()
+        self.ts.update_run(run["id"], cancel_asked_at=int(time.time()) - 600)
+        self.ts.reconcile()
+        final = self.ts.find_run(run["id"])
+        self.assertEqual((final["status"], final["executed"]), ("error", True), "launched: tests may have run")
+
+    def test_every_git_and_make_process_of_a_worker_is_recorded(self):
+        seen = []
+        self.ts.RECORDER["record"] = seen.append
+        self.addCleanup(self.ts.RECORDER.clear)
+        self.ts.run_logged(self.root / "log", ["true"])
+        self.assertEqual([item is not None for item in seen], [True, False], "recorded while it runs, cleared after")
+
+    # T4
+    def test_a_teardown_removes_only_the_sessions_own_containers(self):
+        (self.root / "fakebin/ps.txt").write_text(f"ts-ffffffffffff\t{self.root}/elsewhere\n")
+        self.assertFalse(self.ts.compose_down("alpha-0123456789ab-test", self.root / "log", "ts-0123456789ab",
+                                              self.ts.SESSIONS / "alpha"))
+        self.assertFalse(any(" down " in f" {line} " for line in self.docker_calls()), "nothing of another stack is removed")
+        (self.root / "fakebin/ps.txt").write_text("ts-0123456789ab\t/x\n")
+        self.assertTrue(self.ts.compose_down("alpha-0123456789ab-test", self.root / "log", "ts-0123456789ab",
+                                             self.ts.SESSIONS / "alpha"))
+        session = self.ready()
+        self.assertEqual(session["compose_project"], f"alpha-{session['id'][3:]}-test")
+        local_env = (self.ts.SESSIONS / "alpha/repo/app/env/test.env").read_text()
+        self.assertIn(f"PROJECT_NAME=alpha-{session['id'][3:]}\n", local_env)
+        self.assertIn(f"TEST_SESSION_ID={session['id']}\n", local_env)
+
+    # T5
+    def test_a_patch_that_copies_is_refused_and_half_made_runs_are_removed(self):
+        directory = self.ts.run_dir("run-0000000000c1")
+        directory.mkdir(parents=True)
+        copy = ("diff --git a/tests/playwright/fixme.spec.ts b/tests/playwright/copy.spec.ts\nsimilarity index 100%\n"
+                "copy from tests/playwright/fixme.spec.ts\ncopy to tests/playwright/copy.spec.ts\n")
+        self.refused(400, self.ts.patch_paths, copy, directory)
+        rename_out = ("diff --git a/public/x.php b/tests/playwright/x.spec.ts\nsimilarity index 100%\n"
+                      "rename from public/x.php\nrename to tests/playwright/x.spec.ts\n")
+        self.refused(400, self.ts.patch_paths, rename_out, directory)
+        old = time.time() - 3600
+        os.utime(directory, (old, old))
+        self.assertIn("removed half-made run-0000000000c1", self.ts.reconcile()["reconciled"])
+
+    # T6
+    def test_a_report_cannot_make_a_huge_record(self):
+        results = self.root / "results"
+        results.mkdir()
+        long = "x" * 8000
+        report = {"suites": [{"title": long, "file": long, "specs": [{"title": long, "tests": [{"status": "unexpected",
+                  "results": [{"status": "failed", "error": {"message": long, "location": {"file": long, "line": 1}}}]}]}
+                  for _ in range(500)]}]}
+        (results / "report.json").write_text(json.dumps(report))
+        directory = self.root / "run"
+        directory.mkdir()
+        outcome = self.ts.outcome_of(1, results, directory, self.ts.settings(), launched=True)
+        self.assertLessEqual(len(json.dumps(outcome)), self.ts.RECORD_LIMIT)
+        self.assertTrue(all(len(test["test_id"]) <= 800 and len(test["file"]) <= 300 for test in outcome["tests"]))
+        self.ts.write_json(self.ts.run_dir("run-0000000000c2") / "run.json", {"id": "run-0000000000c2", "status": "failed",
+                                                                               "tests": outcome["tests"], "artifacts": []})
+        listed = self.ts.runs()
+        self.assertNotIn("tests", listed[0], "a list answers summaries")
+
+    # T7
+    def test_on_a_full_disk_the_teardown_comes_before_the_record(self):
+        self.session()
+        torn = []
+        with patch.object(self.ts, "free_disk_mb", lambda: 10), \
+                patch.object(self.ts, "update_session", side_effect=OSError(28, "No space left on device")), \
+                patch.object(self.ts, "teardown", lambda data, log: torn.append(data["id"]) or True):
+            self.ts.reconcile()
+        self.assertEqual(torn, ["ts-0123456789ab"], "torn down although its record could not be written")
+
+    # T9
+    def test_the_final_model_must_fit_the_budget_and_the_slot_comes_first(self):
+        app = self.root / "app"
+        budget(app, "test-init", memory=99999)
+        with self.assertRaisesRegex(RuntimeError, "over the budget"):
+            self.ts.check_budget(app, self.ts.settings())
+        session = self.ready()
+        nested = []
+
+        def second_request(*arguments):
+            nested.append(self.refused(409, self.ts.start_run, {"target": "test", "session": session["id"]}, "t", True, {},
+                                       reason="run_active"))
+            raise self.ts.Refusal(400, "stop here")
+        with patch.object(self.ts, "apply_patch", second_request):
+            self.refused(400, self.ts.start_run, {"target": "test", "session": session["id"], "patch": fixture.FIX_PATCH},
+                         "t", True, {})
+        self.assertEqual(len(nested), 1, "the slot was taken before the patch was prepared")
+        self.assertEqual(list(self.ts.RUNS.glob("run-*")), [], "a refused preparation leaves nothing")
+
+    # T11
+    def test_a_shop_ref_is_fetched_into_the_session_never_into_the_build_root(self):
+        code = self.root / "work/code"
+        code.mkdir(parents=True)
+        (code / "index.php").write_text("<?php 1;")
+        git(code, "init", "-q", "-b", "master")
+        git(code, "add", "-A")
+        git(code, "commit", "-q", "-m", "c")
+        origin = self.root / "origins/code.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(code), str(origin)], check=True)
+        subprocess.run(["git", "clone", "-q", str(origin), str(self.project / "app/public")], check=True)
+        git(code, "checkout", "-q", "-b", "feat")
+        (code / "index.php").write_text("<?php 2;")
+        git(code, "commit", "-q", "-am", "feat")
+        git(code, "push", "-q", str(origin), "feat")
+        feat = git(code, "rev-parse", "HEAD")
+        content = self.ts.SESSIONS / "alpha/content"
+        commit, _, source = self.ts.shop_code(self.project, self.project, "feat", content, self.root / "log", {}, None)
+        self.assertEqual((commit, source), (feat, "branch"))
+        self.assertEqual((content / "public/index.php").read_text(), "<?php 2;")
+        missing = subprocess.run(["git", "-C", str(self.project / "app/public"), "cat-file", "-e", feat], capture_output=True)
+        self.assertNotEqual(missing.returncode, 0, "the build root's objects are not touched")
+
+    # T12
+    def test_sessions_need_their_own_host_or_an_explicit_acceptance(self):
+        (self.root / "etc/test-sessions.env").write_text("")
+        self.refused(503, self.ts.create, self.options(), reason="host_unconfigured")
+        (self.root / "etc/test-sessions.env").write_text("TEST_DOCKER_HOST=ssh://bad host\nTEST_SESSIONS_SHARE_PRODUCTION_HOST=accept-risk\n")
+        answer = self.refused(503, self.ts.create, self.options(), reason="host_unconfigured")
+        self.assertIn("not a valid", answer["error"])
+        (self.root / "etc/test-sessions.env").write_text("TEST_DOCKER_HOST=ssh://tests@vm:2222\nTEST_DOCKER_ID=OTHER\n")
+        self.refused(503, self.ts.create, self.options(), reason="host_unconfigured")
+        self.assertEqual(self.ts.docker_host(), "ssh://tests@vm:2222")
+        self.config("")
+        self.assertEqual(self.ts.create(self.options())[0]["status"], "creating")
+
+    # T14
+    def test_session_history_and_repeats_follow_the_contract(self):
+        first = self.ts.create(self.options(client_run_id="order-1"))[0]
+        again, created = self.ts.create(self.options(client_run_id="order-1"))
+        self.assertEqual((again["id"], created), (first["id"], False), "the same client_run_id: the session it made")
+        self.ts.update_session("alpha", first["id"], status="destroying")
+        self.refused(503, self.ts.create, self.options(), reason="cleanup_pending")
+        self.ts.update_session("alpha", first["id"], status="destroyed", ended_at=int(time.time()))
+        second = self.ts.create(self.options())[0]
+        self.assertEqual(self.ts.find_session(first["id"])["status"], "destroyed", "the old id answers 24 h, not 404")
+        self.assertNotEqual(second["id"], first["id"])
+        self.ts.update_session("alpha", second["id"], status="failed", ended_at=int(time.time()), expires_at=1)
+        self.ts.reconcile()
+        self.assertEqual(self.ts.find_session(second["id"])["status"], "failed", "failed is final, never expired")
+
+    def test_a_run_rechecks_its_session_under_the_lock(self):
+        session = self.ready()
+
+        def ended(limits):
+            self.ts.update_session("alpha", session["id"], status="destroying")
+        with patch.object(self.ts, "run_gates", ended):
+            self.refused(409, self.ts.start_run, {"target": "test", "session": session["id"]}, "t", True, {},
+                         reason="session_not_ready")
+        self.assertEqual(list(self.ts.RUNS.glob("run-*")), [])
+
+    # T15
+    def test_a_cancel_of_existing_work_is_kept_whatever_the_bound(self):
+        run, _ = self.ts.start_run({"target": "stage", "project": "alpha", "client_run_id": "live-1"}, "t", True, {})
+        self.config("TEST_TOMBSTONES=1\n")
+        self.ts.cancel_by_key("alpha", "unknown-1", "t")
+        answer = self.ts.cancel_by_key("alpha", "live-1", "t")
+        self.assertEqual(answer["run"]["id"], run["id"])
+        self.refused(409, self.ts.cancel_by_key, "alpha", "unknown-2", "t", reason="tombstones_full")
+
+    # T16
+    def test_a_launched_suite_without_a_report_may_have_run(self):
+        directory = self.root / "run"
+        directory.mkdir()
+        results = self.root / "results"
+        results.mkdir()
+        self.assertTrue(self.ts.outcome_of(1, results, directory, self.ts.settings(), launched=True)["executed"])
+        self.assertFalse(self.ts.outcome_of(1, results, directory, self.ts.settings(), launched=False)["executed"])
+
+    # T17
+    def test_a_session_of_an_older_format_is_ended_before_a_run(self):
+        self.session(format=None)
+        self.refused(409, self.ts.start_run, {"target": "test", "session": "ts-0123456789ab"}, "t", True, {},
+                     reason="session_ended")
+        self.assertEqual(self.ts.find_session("ts-0123456789ab")["status"], "destroying")
+
+    # T18
+    def test_a_snapshot_without_an_image_creates_nothing_and_reads_no_state(self):
+        self.refused(503, self.ts.start_run, {"target": "stage", "project": "alpha", "path": "/"}, "t", True, {"a": "{}"},
+                     kind="snapshot", reason="gate_unknown")
+        self.assertEqual(list(self.ts.RUNS.glob("snap-*")), [])
+        self.assertIn("routeWebSocket(/.*/, (socket) => { result.blocked += 1; socket.close(); })", self.ts.SNAPSHOT_SCRIPT)
+
+    # T19
+    def test_the_work_log_keeps_no_query_string(self):
+        log = self.root / "log"
+        self.ts.run_logged(log, ["echo", "cmd=node /e2e/x.cjs /checkout?token=SECRET-1 https://a.example/p?k=SECRET-2"])
+        text = log.read_text()
+        self.assertNotIn("SECRET-1", text.splitlines()[0])
+        self.assertNotIn("SECRET-2", text.splitlines()[0])
+        self.assertIn("/checkout?…", text)
+        shown = self.ts.public_run({"id": "snap-000000000001", "status": "done", "path": "/a?t=SECRET-3",
+                                    "snapshot": {"requested": "/a?t=SECRET-3", "url": "https://h/a?t=SECRET-3"}})
+        self.assertNotIn("SECRET-3", json.dumps(shown))
+
+    # T20
+    def test_a_branch_name_gives_the_remotes_branch_never_a_stale_copy_or_a_tag(self):
+        old = self.push_branch("feature", {"app/tests/playwright/x.spec.ts": "// A\n"})
+        git(self.work, "checkout", "-q", "feature")
+        (self.work / "app/tests/playwright/x.spec.ts").write_text("// B\n")
+        git(self.work, "commit", "-q", "-am", "B")
+        git(self.work, "push", "-q", "origin", "feature")
+        new = git(self.work, "rev-parse", "HEAD")
+        git(self.work, "checkout", "-q", "master")
+        git(self.project, "tag", "feature", old)
+        origin = git(self.project, "config", "--get", "remote.origin.url")
+        self.assertEqual(self.ts.fetch_ref(self.project, "feature", origin, self.root / "log"), (new, "branch"))
+        commit, source = self.ts.fetch_ref(self.project, "feature", str(self.root / "gone.git"), self.root / "log")
+        self.assertEqual(commit, old)
+        self.assertIn("could not be asked", source, "the stale copy is said")
+
+    # T21
+    def test_the_session_says_what_it_used_and_keeps_its_reason(self):
+        made = self.ts.create(self.options())[0]
+        self.assertRegex(made["tests_commit"], r"^[0-9a-f]{40}$", "known before the 202 when the specs are the trusted commit's")
+        self.ts.update_session("alpha", made["id"], status="destroyed", ended_at=int(time.time()))
+        session = self.ready()
+        self.assertEqual((session["shop_ref_used"], session["shop_commit"]), ("master", session["env_commit"]))
+        self.ts.update_session("alpha", session["id"], status="destroying", error="free disk 10 MB is below TEST_DISK_FLOOR_MB")
+        self.ts.destroy_worker(session["id"])
+        ended = self.ts.find_session(session["id"])
+        self.assertEqual(ended["status"], "destroyed")
+        self.assertIn("TEST_DISK_FLOOR_MB", ended["error"], "the reason stays")
+        shutil.rmtree(self.project / "app/env")
+        self.refused(503, self.ts.docker_directory, self.project, reason="project_unconfigured")
+
+    # T22: guards a mutation removed without a failing test
+    def test_teardown_downs_the_sessions_local_project_too(self):
+        session = self.ready()
+        self.ts.destroy(session["id"], "t", wait=True)
+        self.assertIn(f"compose -p alpha-{session['id'][3:]}-local down --volumes --remove-orphans --timeout 20",
+                      self.docker_calls())
+
+    def test_one_cleaner_at_a_time(self):
+        self.session(status="destroying")
+        lock = open(self.ts.SESSIONS / ".alpha.destroy.lock", "a")
+        self.addCleanup(lock.close)
+        import fcntl
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        with patch.object(self.ts, "teardown", lambda *a: self.fail("a second cleaner ran")):
+            self.ts.destroy_worker("ts-0123456789ab")
+
+    def test_the_export_has_a_disk_gate(self):
+        master = git(self.project, "rev-parse", "origin/master")
+
+        def full(needed, what=None):
+            raise self.ts.Refusal(409, "disk", "disk")
+        with patch.object(self.ts, "disk_gate", full):
+            self.refused(409, self.ts.export_tree, self.project, {}, master, "app", self.ts.SESSIONS / "alpha/content/public",
+                         self.root / "log", reason="disk")
+
+    def test_teardown_is_not_done_while_content_remains(self):
+        self.session()
+        (self.ts.SESSIONS / "alpha/content").mkdir(parents=True)
+        real = self.ts.remove_tree
+        with patch.object(self.ts, "remove_tree", lambda path: None if Path(path).name == "content" else real(path)):
+            self.assertFalse(self.ts.teardown(self.ts.find_session("ts-0123456789ab"), self.root / "log"))
+
+    def test_an_oversized_session_tree_is_destroyed(self):
+        self.session()
+        (self.ts.SESSIONS / "alpha/big").write_bytes(b"x" * 3 * 1024 * 1024)
+        self.config("TEST_SESSION_TREE_MB=1\n")
+        done = self.ts.reconcile()["reconciled"]
+        self.assertTrue(any("TEST_SESSION_TREE_MB" in item for item in done), done)
+
+    def test_reconcile_finishes_a_crashed_creating_session(self):
+        self.session(status="creating", worker=999999999, created_at=int(time.time()) - 600)
+        self.assertIn("failed ts-0123456789ab (crashed)", self.ts.reconcile()["reconciled"])
+        self.assertEqual(self.ts.find_session("ts-0123456789ab")["status"], "failed")
+
+    def test_a_stage_runs_data_is_removed_when_it_ends(self):
+        run, _ = self.ts.start_run({"target": "stage", "project": "alpha"}, "t", True, {})
+        (self.ts.run_dir(run["id"]) / "data/trace").mkdir(parents=True)
+        self.ts.cancel_run(run["id"], "x")
+        self.assertFalse((self.ts.run_dir(run["id"]) / "data").exists())
+
+    def test_the_slot_is_not_freed_while_cancelling(self):
+        run, _ = self.ts.start_run({"target": "stage", "project": "alpha"}, "t", True, {})
+        self.ts.update_run(run["id"], status="cancelling")
+        self.ts.finish_run(run["id"])
+        self.assertTrue((self.ts.RUNS / "active/external-alpha").exists())
+
+    # T23
+    def test_one_bad_run_does_not_stop_reconcile(self):
+        for index in range(2):
+            self.ts.write_json(self.ts.run_dir(f"run-00000000000{index}") / "run.json",
+                               {"id": f"run-00000000000{index}", "status": "passed", "finished_at": 1})
+        real = self.ts.reconcile_run
+
+        def failing(path, limits, containers):
+            if path.parent.name.endswith("0"):
+                raise OSError("broken")
+            return real(path, limits, containers)
+        with patch.object(self.ts, "reconcile_run", failing):
+            done = self.ts.reconcile()["reconciled"]
+        self.assertIn("run-000000000000: broken", done)
+        self.assertIn("removed run-000000000001", done)
+
+    # T24
+    def test_the_run_contract(self):
+        session = self.ready()
+        first, created = self.ts.start_run({"target": "test", "session": session["id"], "client_run_id": "c-1",
+                                            "unknown_field": 1, "grep": "home"}, "t", True, {})
+        self.assertTrue(created)
+        self.assertEqual(set(first) & {"id", "status", "target", "project", "session", "env_commit"},
+                         {"id", "status", "target", "project", "session", "env_commit"})
+        again, created_again = self.ts.start_run({"target": "test", "session": session["id"], "client_run_id": "c-1"},
+                                                 "t", True, {})
+        self.assertEqual((again["id"], created_again), (first["id"], False))
+        self.ts.update_run(first["id"], status="cancelling")
+        self.assertEqual(self.ts.cancel_run(first["id"], "x")["status"], "cancelled", "a cancelling run is finished, never 409")
+        self.assertEqual(self.ts.cancel_run(first["id"], "x")["status"], "cancelled", "a final run comes back as it is")
+        (self.ts.run_dir(first["id"]) / "artifacts").mkdir(exist_ok=True)
+        (self.ts.run_dir(first["id"]) / "artifacts/001-a.png").write_bytes(b"png")
+        self.ts.destroy(session["id"], "t", wait=True)
+        self.assertEqual(self.ts.find_run(first["id"])["status"], "cancelled", "a run outlives its session")
+        self.assertTrue((self.ts.run_dir(first["id"]) / "artifacts/001-a.png").exists())
+        for status in ("queued", "running", "cancelling", "passed", "failed", "error", "cancelled", "done"):
+            self.assertIn(status, self.ts.TERMINAL + self.ts.ACTIVE)
 
 
 if __name__ == "__main__":

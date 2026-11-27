@@ -122,8 +122,9 @@ DEFAULTS = {'TEST_SESSION_RESERVE_MB': 2048, 'TEST_SESSION_DISK_MB': 5120, 'TEST
             'TEST_WORKER_MEMORY_MB': 1536, 'TEST_TOMBSTONES': 200, 'TEST_SESSION_TREE_MB': 12288}
 # The container limits of a session's services (env/test.env, MB): what the memory gate counts for a session, with
 # TEST_RUN_MEMORY_MB for its Playwright container. A service the project does not use costs nothing but is counted.
+# DOCTRINE: setup's php-doctrine-migrations, fixed at 512 MB (not a setting); METRICS is never in a session.
 SESSION_MEMORY_MB = {'PHP': 512, 'DATABASE': 768, 'WEBSERVER': 192, 'PROXY': 96, 'CRON': 128, 'MEMCACHED': 64,
-                     'REDIS': 64, 'MAILPIT': 64, 'PMA': 128, 'DBMONITOR': 64, 'METRICS': 64, 'BACKUP': 64}
+                     'REDIS': 64, 'MAILPIT': 64, 'PMA': 128, 'DBMONITOR': 64, 'METRICS': 64, 'BACKUP': 64, 'DOCTRINE': 512}
 DOM_LIMIT = 200_000
 TERMINAL = ('passed', 'failed', 'error', 'cancelled', 'done')
 # cancelling: a cancel was asked and the run's processes and container are being stopped; it keeps its slot.
@@ -292,9 +293,9 @@ def open_directory(base, parts):
 def relative_parts(relative):
     """The components of a relative path, each one plain name; OSError for an absolute path (/ and the POSIX root
     form //, with which os.open would ignore dir_fd), '', '.', '..' or a name with a slash or NUL."""
-    if not isinstance(relative, str) or not relative or PurePosixPath(relative).anchor or relative.startswith('/'):
+    if not isinstance(relative, str) or not relative:
         raise OSError(f'bad path {relative!r}')
-    parts = relative.split('/')
+    parts = relative.split('/')  # an absolute path or // begins with an empty component, refused below
     if any(part in ('', '.', '..') or '\0' in part for part in parts):
         raise OSError(f'bad path {relative!r}')
     return parts
@@ -372,10 +373,12 @@ def alive(recorded):
         os.kill(int(pid), 0)
     except (OSError, TypeError, ValueError):
         return False
-    with contextlib.suppress(OSError, ValueError, IndexError):  # a zombie (killed, not yet reaped) is no longer running
-        text = (PROC / str(int(pid)) / 'stat').read_text()
-        if text[text.rindex(')') + 2] in 'ZX':
-            return False
+    for proc in dict.fromkeys((PROC, Path('/proc'))):  # a zombie (killed, not yet reaped) is no longer running
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            text = (proc / str(int(pid)) / 'stat').read_text()
+            if text[text.rindex(')') + 2] in 'ZX':
+                return False
+            break
     return start is None or process_start(pid) == start
 
 
@@ -389,19 +392,47 @@ def kill_group(recorded, signal_number):
 
 
 def remove_container(name):
-    """docker rm -f of a run's container (by its exact name; nothing when there is none)."""
-    if RUN_ID.fullmatch(name or ''):
-        subprocess.run(['docker', 'rm', '--force', '--volumes', name], capture_output=True, timeout=120, env=child_environment())
+    """docker rm -f of every container of an owner (a run's or a session's id): the one named after it and those
+    labelled setup.owner=<id>. True only when the daemon confirms none is left (a failed rm or an unreachable daemon is
+    not a confirmation)."""
+    if not (RUN_ID.fullmatch(name or '') or SESSION_ID.fullmatch(name or '')):
+        return True
+    try:
+        named = subprocess.run(['docker', 'ps', '-aq', '--filter', f'name=^{name}$'], capture_output=True, text=True,
+                               timeout=60, env=child_environment())
+        labelled = subprocess.run(['docker', 'ps', '-aq', '--filter', f'label=setup.owner={name}'], capture_output=True,
+                                  text=True, timeout=60, env=child_environment())
+        if named.returncode or labelled.returncode:
+            return False
+        ids = sorted(set(named.stdout.split()) | set(labelled.stdout.split()))
+        if ids and subprocess.run(['docker', 'rm', '--force', '--volumes', *ids], capture_output=True, timeout=120,
+                                  env=child_environment()).returncode:
+            return False
+        left = subprocess.run(['docker', 'ps', '-aq', '--filter', f'name=^{name}$'], capture_output=True, text=True,
+                              timeout=60, env=child_environment())
+        return left.returncode == 0 and not left.stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def stop_command(recorded, container):
-    """A command's process group: SIGTERM, then SIGKILL after STOP_GRACE seconds; then its container."""
+    """A command's process group: SIGTERM, then SIGKILL after STOP_GRACE seconds; then its owner's containers. True only
+    when both are confirmed gone."""
     kill_group(recorded, signal.SIGTERM)
     deadline = time.monotonic() + STOP_GRACE
     while alive(recorded) and time.monotonic() < deadline:
         time.sleep(0.5)
     kill_group(recorded, signal.SIGKILL)
-    remove_container(container)
+    deadline = time.monotonic() + 5
+    while alive(recorded) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    removed = remove_container(container) if container else True
+    return removed and not alive(recorded)
+
+
+def logged(argument):
+    """An argument as the work log shows it: a URL's or path's query string left out (a one-time link stays off disk)."""
+    return re.sub(r"((?:https?://[^\s?'\"]*|(?<![\w(])/[^\s?'\"]*))\?[^\s'\"]*", r'\1?…', str(argument))
 
 
 def log_limit():
@@ -439,7 +470,9 @@ def run_logged(log, command, cwd=None, env=None, timeout=None, run=None, quota=N
     125 when quota (directory, bytes) is exceeded (looked at while it runs and once more when it ends), 130 when run
     (an id) is being cancelled; in those cases its process group and the run's container are stopped. The group is
     recorded (in the run, or through record) so a cancel or a destroy can stop it."""
-    say(log, '$ ' + ' '.join(command))
+    run = run or RECORDER.get('run')
+    record = record or RECORDER.get('record')
+    say(log, '$ ' + ' '.join(logged(item) for item in command))
     try:
         process = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                    stdin=subprocess.DEVNULL, start_new_session=True)
@@ -524,7 +557,7 @@ def docker_directory(root):
     for relative in ('app', 'app/docker'):
         if (root / relative / 'Makefile').is_file() and (root / relative / 'env').is_dir():
             return relative
-    raise Refusal(503, f'{root} has no setup project (app/Makefile)')
+    raise Refusal(503, f'{root} has no setup project (app/Makefile)', 'project_unconfigured')
 
 
 def env_value(path, key):
@@ -580,7 +613,7 @@ def environment_url(root, environment, commit):
             host = re.split(r'[\s,]+', domain)[0]
             if re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?', host):
                 return f'https://{host}'
-    raise Refusal(503, f'{root.name} {environment}: no DOMAIN in env/{environment}.env')
+    raise Refusal(503, f'{root.name} {environment}: no DOMAIN in env/{environment}.env', 'project_unconfigured')
 
 
 def read_text_safe(path):
@@ -620,8 +653,8 @@ def docker_host():
     except OSError:
         return None
     value = env_value_of(text, 'TEST_DOCKER_HOST')
-    return value if value and re.fullmatch(r'(?:unix:///[A-Za-z0-9._/-]+|tcp://[A-Za-z0-9.-]+:[0-9]{1,5}|ssh://[A-Za-z0-9._@-]+)',
-                                           value) else None
+    return value if value and re.fullmatch(r'(?:unix:///[A-Za-z0-9._/-]+|tcp://[A-Za-z0-9.-]+:[0-9]{1,5}|'
+                                           r'ssh://(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9.-]+(?::[0-9]{1,5})?)', value) else None
 
 
 def child_environment():
@@ -662,8 +695,8 @@ def make(log, directory, target, *arguments, timeout=3600, run=None, quota=None,
 def require_setup():
     result = subprocess.run(['make', '-s', '-f', str(ROOT / 'setup/docker/project.mk'), 'setup-capabilities'],
                             capture_output=True, text=True, env=child_environment())
-    if 'test-session-v3' not in result.stdout.split():
-        raise Refusal(503, f'setup in {ROOT / "setup"} is too old for test sessions (no test-session-v3, 5.9.0+): '
+    if 'test-session-v4' not in result.stdout.split():
+        raise Refusal(503, f'setup in {ROOT / "setup"} is too old for test sessions (no test-session-v4, 5.10.0+): '
                            'bin/update-setup', 'gate_unknown')
 
 
@@ -674,7 +707,8 @@ def deploy_branch(root):
     found = git(env_repo(root), 'symbolic-ref', '-q', 'refs/remotes/origin/HEAD', check=False)
     branch = found[len('refs/remotes/origin/'):] if found.startswith('refs/remotes/origin/') else ''
     if not REF.fullmatch(branch):
-        raise Refusal(503, f'{root.name}: the build root has no deploy branch (origin/HEAD); git remote set-head origin -a')
+        raise Refusal(503, f'{root.name}: the build root has no deploy branch (origin/HEAD); git remote set-head origin -a',
+                      'project_unconfigured')
     return branch
 
 
@@ -684,42 +718,55 @@ def trusted_branches(root):
     return [deploy_branch(root), *[name for name in extra.split() if REF.fullmatch(name)]]
 
 
-def resolve(directory, ref):
-    """The commit of ref among what directory already has, each form by its exact name (a full commit id,
-    refs/remotes/origin/<ref>, refs/heads/<ref>, refs/tags/<ref>), never by Git's ambiguous short-name rules (a tag
-    named like a branch would win them); None if none."""
-    if COMMIT.fullmatch(ref or ''):
-        candidates = [ref]
-    else:
-        candidates = [f'refs/remotes/origin/{ref}', f'refs/heads/{ref}', f'refs/tags/{ref}', f'refs/remotes/{ref}']
-    for candidate in candidates:
-        found = git(directory, 'rev-parse', '--verify', '-q', '--end-of-options', f'{candidate}^{{commit}}', check=False)
-        if COMMIT.fullmatch(found or ''):
-            return found
-    return None
-
-
-def exact_commit(directory, name):
-    """The commit a full reference name points at (no short-name lookup), or None."""
-    found = git(directory, 'rev-parse', '--verify', '-q', '--end-of-options', f'{name}^{{commit}}', check=False)
+def peel(directory, oid, git_dir=None):
+    """The commit a 40-hex object id is (or, for an annotated tag, points at); None if none. Only an id is ever given."""
+    if not COMMIT.fullmatch(oid or ''):
+        return None
+    found = git(directory, 'rev-parse', '--verify', '-q', '--end-of-options', f'{oid}^{{commit}}', check=False, git_dir=git_dir)
     return found if COMMIT.fullmatch(found or '') else None
+
+
+def exact_commit(directory, name, git_dir=None):
+    """The commit of one full reference name, read with git show-ref --verify (no name lookup at all: a tag stored as
+    refs/tags/refs/remotes/origin/x is not refs/remotes/origin/x), or None."""
+    if not name.startswith('refs/'):
+        return None
+    found = git(directory, 'show-ref', '--verify', '--hash', '--', name, check=False, git_dir=git_dir)
+    return peel(directory, found.split()[0] if found else '', git_dir)
+
+
+def resolve(directory, ref):
+    """The commit of ref among what directory already has: a full commit id, else refs/remotes/origin/<ref>,
+    refs/heads/<ref>, refs/tags/<ref>, refs/remotes/<ref>, each read by its exact name. None if none."""
+    if COMMIT.fullmatch(ref or ''):
+        return peel(directory, ref)
+    for candidate in (f'refs/remotes/origin/{ref}', f'refs/heads/{ref}', f'refs/tags/{ref}', f'refs/remotes/{ref}'):
+        commit = exact_commit(directory, candidate)
+        if commit:
+            return commit
+    return None
 
 
 def trusted_commit(root, ref=None):
     """(commit, branch) of a trusted ref of the build root: the tip of origin/<deploy branch> when ref is None, else ref's
-    commit when a trusted branch (origin/<branch>) contains it. (None, None) when ref is not trusted. Nothing fetched."""
+    commit when a trusted branch contains it. Every branch tip is read with show-ref --verify by its full name
+    (refs/remotes/origin/<branch>); a branch the build root lacks trusts nothing; only 40-hex ids reach merge-base.
+    (None, None) when ref is not trusted. Nothing fetched."""
     branches = trusted_branches(root)
+    repository = env_repo(root)
     if ref is None:
-        commit = exact_commit(env_repo(root), f'refs/remotes/origin/{branches[0]}')
+        commit = exact_commit(repository, f'refs/remotes/origin/{branches[0]}')
         if not commit:
-            raise Refusal(503, f'{root.name}: origin/{branches[0]} is not in the build root')
+            raise Refusal(503, f'{root.name}: origin/{branches[0]} is not in the build root', 'project_unconfigured')
         return commit, branches[0]
-    commit = resolve(env_repo(root), ref)
+    commit = resolve(repository, ref)
     if not commit:
         return None, None
     for branch in branches:
-        tip = f'refs/remotes/origin/{branch}'
-        result = subprocess.run(['git', *GIT_HARDENING, '-C', str(env_repo(root)), 'merge-base', '--is-ancestor', commit, tip],
+        tip = exact_commit(repository, f'refs/remotes/origin/{branch}')
+        if not tip:
+            continue
+        result = subprocess.run(['git', *GIT_HARDENING, '-C', str(repository), 'merge-base', '--is-ancestor', '--', commit, tip],
                                 capture_output=True, env=git_environment())
         if result.returncode == 0:
             return commit, branch
@@ -736,8 +783,10 @@ def clone(source, destination, commit, log):
                   env=git_environment(), timeout=900):
         raise RuntimeError('git clone of the build root failed')
     # Every ref and tag of the build root (its remote branches too), for the commits a session may name.
-    git(destination, 'fetch', '-q', 'origin', '+refs/remotes/origin/*:refs/remotes/build/*', '+refs/tags/*:refs/tags/*',
-        check=False)
+    run_logged(log, ['git', *GIT_HARDENING, '-C', str(destination), 'fetch', '-q', 'origin',
+                     '+refs/remotes/origin/*:refs/remotes/build/*'], env=git_environment(), timeout=600)
+    if not COMMIT.fullmatch(commit or ''):
+        raise RuntimeError('a clone is checked out at a 40-hex commit only')
     git(destination, 'checkout', '-q', '--detach', commit)
     if (destination / '.gitmodules').is_file():
         names = git(destination, 'config', '-f', '.gitmodules', '--get-regexp', r'^submodule\..*\.path$', check=False)
@@ -770,20 +819,47 @@ def submodule_dirs(repository):
 
 
 def fetch_ref(repository, ref, origin, log):
-    """The commit of a caller's ref (files only: specs or shop code) in repository: what it has, else fetched from
-    origin (the remote of the build root). None when there is none."""
-    commit = resolve(repository, ref) or resolve(repository, f'build/{ref}')
-    if commit or not origin:
-        return commit
-    if run_logged(log, ['git', *GIT_HARDENING, '-C', str(repository), 'fetch', '-q', '--no-tags', '--', origin,
-                        f'+{ref}:refs/setup/fetched'], env=git_environment(), timeout=300):
-        return None
-    return exact_commit(repository, 'refs/setup/fetched')
+    """(commit, source) of a caller's ref (files only: specs or shop code), fetched into repository (the session's own
+    copy, never the build root). A commit id: the object itself (fetched by its id when it is missing). A name: the
+    remote's refs/heads/<ref> first, else its refs/tags/<ref> (a tag never stands in for an existing branch); only when
+    the remote cannot be asked, the copy the build root had (source says so). (None, None) when there is no such ref."""
+    if COMMIT.fullmatch(ref or ''):
+        commit = peel(repository, ref)
+        if not commit and origin and not run_logged(log, ['git', *GIT_HARDENING, '-C', str(repository), 'fetch', '-q',
+                                                          '--no-tags', '--', origin, ref], env=git_environment(), timeout=300):
+            commit = peel(repository, ref)
+        return commit, 'commit'
+    if origin:
+        listing = subprocess.run(['git', *GIT_HARDENING, '-C', str(repository), 'ls-remote', '--', origin, f'refs/heads/{ref}',
+                                  f'refs/tags/{ref}'], capture_output=True, text=True, env=git_environment(), timeout=120)
+        if listing.returncode == 0:
+            names = [line.split('\t')[1] for line in listing.stdout.splitlines() if '\t' in line]
+            for name, source in ((f'refs/heads/{ref}', 'branch'), (f'refs/tags/{ref}', 'tag')):
+                if name in names:
+                    if run_logged(log, ['git', *GIT_HARDENING, '-C', str(repository), 'fetch', '-q', '--no-tags', '--', origin,
+                                        f'+{name}:refs/setup/fetched'], env=git_environment(), timeout=300):
+                        raise RuntimeError(f'git fetch of {name} failed')
+                    return exact_commit(repository, 'refs/setup/fetched'), source
+            return None, None
+        say(log, f'the remote could not be asked for {ref}: the build root\'s copy is used')
+    for name in (f'refs/remotes/build/{ref}', f'refs/remotes/origin/{ref}'):
+        commit = exact_commit(repository, name)
+        if commit:
+            return commit, 'the build root\'s copy (the remote could not be asked)'
+    return None, None
 
 
-def tree_listing(repository, git_dirs, commit, prefix):
-    """[(git dir, mode, object, size, path below prefix)] of every entry of commit under prefix, across submodules
-    (git ls-tree -r -l: the sizes are known before a single object is read)."""
+def ensure_commit(repository, git_dir, revision, log):
+    """A submodule's commit in its git dir (one of the session's own), fetched there when missing (recorded, bounded)."""
+    if peel(repository, revision, git_dir) is None:
+        run_logged(log, ['git', *GIT_HARDENING, '--git-dir', git_dir, 'fetch', '-q', '--no-tags', 'origin', revision],
+                   env=git_environment(), timeout=300)
+
+
+def tree_listing(repository, git_dirs, commit, prefix, log=os.devnull):
+    """[(git dir, mode, object, size, path below prefix)] of every entry of commit under prefix, across the submodules
+    git_dirs names (git ls-tree -r -l: the sizes are known before a single object is read). A submodule git_dirs does
+    not name is listed as one entry of mode 160000 (left out, and said so)."""
     found = []
 
     def walk(git_dir, revision, inside, base):
@@ -801,9 +877,9 @@ def tree_listing(repository, git_dirs, commit, prefix):
             if mode == '160000':
                 nested = git_dirs.get(str(PurePosixPath(base, path)))
                 if not nested:
-                    raise RuntimeError(f'submodule {PurePosixPath(base, path)} is not checked out')
-                if git(repository, 'cat-file', '-e', f'{obj}^{{commit}}', check=False, raw=True, git_dir=nested) is None:
-                    git(repository, 'fetch', '-q', 'origin', obj, check=False, git_dir=nested)
+                    found.append((git_dir, mode, obj, 0, relative))
+                    continue
+                ensure_commit(repository, nested, obj, log)
                 before = len(found)
                 walk(nested, obj, '', str(PurePosixPath(base, path)))
                 for index in range(before, len(found)):
@@ -822,14 +898,13 @@ def tree_listing(repository, git_dirs, commit, prefix):
             if not match:
                 break
             revision, git_dir, base = match[1].decode(), git_dirs[submodule], submodule
-            if git(repository, 'cat-file', '-e', f'{revision}^{{commit}}', check=False, raw=True, git_dir=git_dir) is None:
-                git(repository, 'fetch', '-q', 'origin', revision, check=False, git_dir=git_dir)
+            ensure_commit(repository, git_dir, revision, log)
             inside = inside[len(submodule):].lstrip('/')
     walk(git_dir, revision, inside, base)
     return found
 
 
-def select_files(listing, prefix, max_files, max_bytes, skip_modules):
+def select_files(listing, prefix, max_files, max_bytes, skip_modules, names='the limits'):
     """(the regular files of a listing, what was left out {reason: count}); a Refusal when they exceed the limits."""
     files, dropped, total = [], {}, 0
     for git_dir, mode, obj, size, relative in listing:
@@ -842,14 +917,14 @@ def select_files(listing, prefix, max_files, max_bytes, skip_modules):
             dropped['node_modules'] = dropped.get('node_modules', 0) + 1
             continue
         if mode not in ('100644', '100755'):
-            reason = 'symlink' if mode == '120000' else f'mode {mode}'
+            reason = {'120000': 'symlink', '160000': 'submodule'}.get(mode, f'mode {mode}')
             dropped[reason] = dropped.get(reason, 0) + 1
             continue
         files.append((git_dir, mode, obj, size, '/'.join(parts)))
         total += size
     if len(files) > max_files or total > max_bytes:
         raise Refusal(400, f'{prefix}: {len(files)} files, {total} bytes: more than {max_files} files or {max_bytes} bytes '
-                           '(TEST_CONTENT_FILES, TEST_CONTENT_MB)', 'content_too_large')
+                           f'({names})', 'content_too_large')
     return files, dropped
 
 
@@ -891,9 +966,9 @@ def tree_files(repository, git_dirs, commit, prefix, log, max_files=None, max_by
     """{path below prefix: (bytes, executable)} of the regular files of commit under prefix (the specs: small),
     node_modules and special files left out (and logged); refused before anything is read when over the limits."""
     limits = settings()
-    files, dropped = select_files(tree_listing(repository, git_dirs, commit, prefix), prefix,
+    files, dropped = select_files(tree_listing(repository, git_dirs, commit, prefix, log), prefix,
                                   max_files or limits['TEST_SPECS_FILES'], max_bytes or limits['TEST_SPECS_MB'] * 1024 * 1024,
-                                  skip_modules=True)
+                                  skip_modules=True, names='TEST_SPECS_FILES, TEST_SPECS_MB')
     if dropped:
         say(log, f'{prefix}: left out {dropped} (only regular files outside node_modules are written)')
     found = {}
@@ -907,8 +982,9 @@ def export_tree(repository, git_dirs, commit, prefix, destination, log):
     of a session. Counted from the listing first (TEST_CONTENT_FILES, TEST_CONTENT_MB; twice that free on the disk, as
     ENV=test copies it once more). Symlinks and special files are left out: {reason: count}."""
     limits = settings()
-    files, dropped = select_files(tree_listing(repository, git_dirs, commit, prefix), prefix, limits['TEST_CONTENT_FILES'],
-                                  limits['TEST_CONTENT_MB'] * 1024 * 1024, skip_modules=False)
+    files, dropped = select_files(tree_listing(repository, git_dirs, commit, prefix, log), prefix, limits['TEST_CONTENT_FILES'],
+                                  limits['TEST_CONTENT_MB'] * 1024 * 1024, skip_modules=False,
+                                  names='TEST_CONTENT_FILES, TEST_CONTENT_MB')
     needed = 2 * sum(item[3] for item in files) // (1024 * 1024) + limits['TEST_SESSION_DISK_MB']
     disk_gate(needed, 'the shop code of a session')
     if dropped:
@@ -1023,6 +1099,11 @@ def patch_paths(text, directory):
     node_modules, no package.json, package-lock.json or .npmrc."""
     if 'GIT binary patch' in text or re.search(r'^Binary files ', text, re.M):
         raise Refusal(400, 'patch: binary changes are not allowed')
+    # A copy makes content the patch does not carry (a 16 kB patch could copy a 49 MB file many times): never.
+    if re.search(r'^(?:copy from|copy to) ', text, re.M):
+        raise Refusal(400, 'patch: copies are not allowed (only changes, new files, deletions and renames)')
+    # git apply --numstat -z names only the destination of a rename: its source is checked from the header as well.
+    header_paths = {match[1] for match in re.finditer(r'^rename (?:from|to) (.+)$', text, re.M)}
     for match in re.finditer(r'^(?:new file mode|deleted file mode|old mode|new mode|index [0-9a-f]+\.\.[0-9a-f]+)\s*(\S*)',
                              text, re.M):
         if match[1] and match[1] not in ('100644', '100755'):
@@ -1055,6 +1136,7 @@ def patch_paths(text, directory):
         modes = re.findall(r'\b(1[0-9]{5})\b', line)
         if any(mode not in ('100644', '100755') for mode in modes):
             raise Refusal(400, f'patch: {line.strip()[:200]}: only regular files may be written')
+    paths |= header_paths
     paths.discard('')
     if not paths:
         raise Refusal(400, 'patch: no file changes found (a unified diff, as git diff writes it)')
@@ -1088,6 +1170,15 @@ def apply_patch(specs, text, directory):
         if result.returncode:
             raise Refusal(400, 'patch does not apply: ' +
                           (result.stderr.decode(errors='replace').strip().splitlines() or ['?'])[0][:300])
+        limits = settings()
+        count = total = 0
+        for folder, _, names in os.walk(staging):
+            for entry in names:
+                count += 1
+                total += os.lstat(os.path.join(folder, entry)).st_size
+        if count > limits['TEST_SPECS_FILES'] or total > limits['TEST_SPECS_MB'] * 1024 * 1024:
+            raise Refusal(400, f'patch: the patched specs have {count} files, {total} bytes: more than TEST_SPECS_FILES or '
+                               'TEST_SPECS_MB', 'content_too_large')
         patched = {}
         for root in PATCH_ROOTS:
             files = {}
@@ -1104,9 +1195,6 @@ def apply_patch(specs, text, directory):
                     if not stat.S_ISREG(details.st_mode):
                         raise Refusal(400, f'patch: {root}/{relative} is not a regular file')
                     files[relative] = (full.read_bytes(), bool(details.st_mode & 0o100))
-            for name in PACKAGE_FILES if root == 'tests/playwright' else ():
-                if files.get(name) != specs[root].get(name):
-                    raise Refusal(400, f'patch: {root}/{name}: dependencies come from the trusted commit')
             patched[root] = files
         return patched
     finally:
@@ -1181,13 +1269,24 @@ def run_gates(limits):
 
 
 # --- Sessions --------------------------------------------------------------------------------------
+SESSION_FORMAT = 4  # session.json of this program's layout (content/ data directories, setup's session mode, owner label)
+
+
 def session_dir(project):
     return SESSIONS / project
 
 
-def sessions():
+def history_dir():
+    """Where an ended session's record and log stay (by its id) for 24 h after it ended, whatever comes next."""
+    return SESSIONS / '.history'
+
+
+def sessions(history=False):
     found = []
-    for path in sorted(SESSIONS.glob('*/session.json')) if SESSIONS.is_dir() else []:
+    paths = sorted(SESSIONS.glob('*/session.json')) if SESSIONS.is_dir() else []
+    if history and history_dir().is_dir():
+        paths += sorted(history_dir().glob('ts-*.json'))
+    for path in paths:
         data = read_json(path)
         if isinstance(data, dict) and SESSION_ID.fullmatch(str(data.get('id', ''))):
             found.append(data)
@@ -1195,18 +1294,39 @@ def sessions():
 
 
 def find_session(identifier):
+    """A session by its id: the project's live one, else its record in the history (24 h after it ended)."""
     if not SESSION_ID.fullmatch(identifier or ''):
         raise Refusal(400, 'id: a session id (ts-…)')
     for data in sessions():
         if data['id'] == identifier:
             return data
+    archived = read_json(history_dir() / f'{identifier}.json')
+    if isinstance(archived, dict) and archived.get('id') == identifier:
+        return archived
     raise Refusal(404, f'there is no session {identifier}')
+
+
+def archive_session(project):
+    """Under the sessions' lock: the project's ended session's record and log into the history; its directory removed.
+    False when the directory cannot be removed yet."""
+    directory = session_dir(project)
+    data = read_json(directory / 'session.json')
+    if isinstance(data, dict) and SESSION_ID.fullmatch(str(data.get('id', ''))):
+        history_dir().mkdir(parents=True, exist_ok=True)
+        write_json(history_dir() / f'{data["id"]}.json', data)
+        with contextlib.suppress(OSError):
+            shutil.copyfile(directory / 'log', history_dir() / f'{data["id"]}.log')
+    with contextlib.suppress(OSError, RuntimeError):
+        remove_tree(directory)
+    return not os.path.lexists(directory)
 
 
 def public_session(data):
     shown = {key: data.get(key) for key in ('id', 'project', 'status', 'db', 'env_ref', 'env_commit', 'env_branch',
-                                            'tests_commit', 'shop_ref', 'shop_commit', 'step', 'error', 'created_by',
-                                            'active_run', 'domain', 'client_run_id')}
+                                            'tests_commit', 'tests_source', 'shop_ref', 'shop_ref_used', 'shop_commit',
+                                            'shop_source',
+                                            'shop_dropped', 'step', 'error', 'created_by', 'active_run', 'domain',
+                                            'client_run_id')}
     shown.update(created_at=iso(data.get('created_at')), expires_at=iso(data.get('expires_at')),
                  ready_at=iso(data.get('ready_at')), ended_at=iso(data.get('ended_at')),
                  max_expires_at=iso(data.get('created_at', 0) + settings()['TEST_SESSION_MAX_MINUTES'] * 60),
@@ -1230,6 +1350,68 @@ def update_session(project, identifier=None, expect=None, **fields):
     return data
 
 
+def try_update_session(project, identifier=None, expect=None, **fields):
+    """update_session, its failure (a full disk) logged instead of raised: the caller's teardown comes first."""
+    try:
+        return update_session(project, identifier, expect, **fields)
+    except OSError as error:
+        sys.stderr.write(f'test-session: the record of {identifier or project} cannot be written ({error.strerror})\n')
+        return None
+
+
+def same_filesystem(first, second):
+    try:
+        return os.stat(first).st_dev == os.stat(second).st_dev
+    except OSError:
+        return True  # cannot be told: as if shared
+
+
+def host_separation():
+    """A Refusal (503 host_unconfigured) unless the operator has chosen where sessions run: TEST_WORK_DIRECTORY on a
+    filesystem of its own AND TEST_DOCKER_HOST (another daemon, whose id TEST_DOCKER_ID names), or the explicit
+    acceptance TEST_SESSIONS_SHARE_PRODUCTION_HOST=accept-risk. An invalid TEST_DOCKER_HOST is refused, never ignored."""
+    text = config_text()
+    given = env_value_of(text, 'TEST_DOCKER_HOST')
+    if given and not docker_host():
+        raise Refusal(503, 'TEST_DOCKER_HOST is not a valid unix:///, tcp://HOST:PORT or ssh://[USER@]HOST[:PORT] address: '
+                           'nothing is started on this host\'s daemon instead', 'host_unconfigured')
+    if given:
+        expected = env_value_of(text, 'TEST_DOCKER_ID') or ''
+        found = subprocess.run(['docker', 'info', '--format', '{{.ID}}'], capture_output=True, text=True, timeout=60,
+                               env=child_environment()).stdout.strip()
+        if not expected or found != expected:
+            raise Refusal(503, 'TEST_DOCKER_ID does not name the daemon TEST_DOCKER_HOST reaches (docker info --format '
+                               '{{.ID}} there)', 'host_unconfigured')
+    if env_value_of(text, 'TEST_SESSIONS_SHARE_PRODUCTION_HOST') == 'accept-risk':
+        return
+    separate = given and configured('TEST_WORK_DIRECTORY') and not same_filesystem(WORK, ROOT)
+    if not separate:
+        raise Refusal(503, 'test sessions run client code: give them their own filesystem (TEST_WORK_DIRECTORY) and Docker '
+                           'daemon (TEST_DOCKER_HOST, TEST_DOCKER_ID), or accept sharing this production host with '
+                           'TEST_SESSIONS_SHARE_PRODUCTION_HOST=accept-risk (README: Test environments)', 'host_unconfigured')
+
+
+GATEWAY_ISOLATION = (28, 2)  # Docker Engine with com.docker.network.bridge.gateway_mode_ipv4/6=isolated
+
+
+def require_engine():
+    """503 gate_unknown unless the daemon can isolate a network's gateway (no address on the host)."""
+    found = subprocess.run(['docker', 'version', '--format', '{{.Server.Version}}'], capture_output=True, text=True,
+                           timeout=60, env=child_environment()).stdout.strip()
+    match = re.match(r'(\d+)\.(\d+)', found)
+    if not match or (int(match[1]), int(match[2])) < GATEWAY_ISOLATION:
+        raise Refusal(503, f'Docker Engine {found or "?"} cannot isolate a session network\'s gateway (needs '
+                           f'{".".join(map(str, GATEWAY_ISOLATION))}+)', 'gate_unknown')
+
+
+def session_budget(limits):
+    """(memory MB, CPUs) a session may take at most: what its env/test.env and setup's fixed limits give every service
+    it may run, and its Playwright container. Admission counts the memory; the final model must fit both."""
+    memory = sum(SESSION_MEMORY_MB.values()) + limits['TEST_RUN_MEMORY_MB']
+    cpus = sum(float(value) for value in SESSION_CPUS.values()) + float(limits['TEST_RUN_CPUS'])
+    return memory, round(cpus, 2)
+
+
 def create(options):
     limits = settings()
     root = build_root(options.project)
@@ -1248,14 +1430,22 @@ def create(options):
     if not 1 <= ttl <= limits['TEST_SESSION_MAX_MINUTES']:
         raise Refusal(400, f'ttl_minutes: 1–{limits["TEST_SESSION_MAX_MINUTES"]}')
     docker_directory(root)
+    host_separation()
     require_setup()
+    require_engine()
     # The host-side tree: env_ref itself when trusted, else the deploy branch's tip with env_ref's specs on it.
     commit, branch = trusted_commit(root, options.env_ref) if options.env_ref else (None, None)
+    trusted_ref = bool(commit)
     if not commit:
         commit, branch = trusted_commit(root)
     with locked(SESSIONS / '.lock'), locked(RUNS / '.lock'):
         refuse_tombstone(options.project, client)
         existing = read_json(session_dir(options.project) / 'session.json')
+        if existing and client is not None and existing.get('client_run_id') == client:
+            return public_session(existing), False  # the same request again: the session it made
+        if existing and existing.get('status') == 'destroying':
+            raise Refusal(503, f'the previous session of {options.project} ({existing["id"]}) is still being torn down',
+                          'cleanup_pending', session=existing['id'])
         if existing and existing.get('status') not in ('destroyed', 'expired', 'failed'):
             raise Refusal(409, f'{options.project} has a test session already ({existing["id"]}, {existing["status"]})',
                           'session_exists', session=existing['id'])
@@ -1263,55 +1453,64 @@ def create(options):
             raise Refusal(409, f'a deploy of {options.project} is running; try again when it has finished', 'deploy_locked')
         session_gates(limits, sum(1 for item in sessions() if item.get('status') == 'creating'))
         directory = session_dir(options.project)
-        try:
-            remove_tree(directory)  # a failed session's containers went with its teardown
-        except (OSError, RuntimeError) as error:
-            raise Refusal(503, f'the previous session of {options.project} cannot be removed yet ({error}); reconcile '
-                               'retries', 'cleanup_pending') from None
-        if directory.exists():
+        if not archive_session(options.project):
             raise Refusal(503, f'the previous session of {options.project} is still being removed', 'cleanup_pending')
         directory.mkdir(parents=True, mode=0o750)
         moment = now()
         data = {'id': 'ts-' + secrets.token_hex(6), 'project': options.project, 'status': 'creating', 'db': options.db,
                 'env_ref': options.env_ref or branch, 'env_commit': commit, 'env_branch': branch,
+                # Known now when env_ref is trusted (the specs are that commit's); else once creating has fetched them.
+                'tests_commit': commit if (trusted_ref or not options.env_ref) else None,
                 'shop_ref': options.shop_ref, 'created_at': moment, 'expires_at': moment + ttl * 60,
-                'created_by': options.by, 'step': 'queued', 'client_run_id': client}
+                'created_by': options.by, 'step': 'queued', 'client_run_id': client, 'format': SESSION_FORMAT}
         write_json(directory / 'session.json', data)
         data['worker'] = identity(detach('create-worker', f'--id={data["id"]}'))
         write_json(directory / 'session.json', data)
-    return public_session(data)
+    return public_session(data), True
 
 
 def detach(*arguments):
     """This program with these arguments in the background, in its own session (it outlives the UI's request; the UI's
     service stops only its own process, KillMode=process; under root's systemd scope when there is one)."""
-    log = open(os.devnull, 'w')
-    process = subprocess.Popen([sys.executable, os.path.realpath(__file__), *arguments], stdin=subprocess.DEVNULL,
-                               stdout=log, stderr=log, start_new_session=True,
-                               env={**child_environment(), **{key: os.environ[key] for key in os.environ
-                                                              if key.startswith('SETUP_SERVER_')}})
+    with open(os.devnull, 'w') as log:
+        process = subprocess.Popen([sys.executable, os.path.realpath(__file__), *arguments], stdin=subprocess.DEVNULL,
+                                   stdout=log, stderr=log, start_new_session=True,
+                                   env={**child_environment(), **{key: os.environ[key] for key in os.environ
+                                                                  if key.startswith('SETUP_SERVER_')}})
     return process.pid
 
 
 # CPU limits a session writes (the memory ones are SESSION_MEMORY_MB): what its containers may use at most together.
 SESSION_CPUS = {'PHP': '1', 'DATABASE': '1', 'WEBSERVER': '0.5', 'PROXY': '0.25', 'CRON': '0.25', 'MEMCACHED': '0.25',
-                'REDIS': '0.25', 'MAILPIT': '0.25', 'PMA': '0.25', 'DBMONITOR': '0.25', 'METRICS': '0.25', 'BACKUP': '0.25'}
+                'REDIS': '0.25', 'MAILPIT': '0.25', 'PMA': '0.25', 'DBMONITOR': '0.25', 'METRICS': '0.25', 'BACKUP': '0.25',
+                'DOCTRINE': '1'}
+CGROUP_SLICE = 'setup_server_tests.slice'  # bin/install-ui: its MemoryMax, CPUWeight and IOWeight bound all of it
 
 
-def content_settings(content):
-    """setup's test-session mode (5.9.0+, test-session-v3): the specs, their configuration and the shop code come from
-    these data directories outside the tree, ENV=test is confined from its rendered model."""
-    return (f'TEST_SESSION=on\nE2E_TESTS_DIRECTORY={content / "tests"}\nE2E_CONFIG_DIRECTORY={content / "config"}\n'
-            f'TEST_APP_SOURCE={content / "public"}\n')
+def session_name(data):
+    """The PROJECT_NAME of a session's stacks: the project's, with the session's id (its own Compose projects, container
+    names, networks and volumes, apart from the project's own ENV=local/test and from another session)."""
+    return f'{data["base_name"]}-{data["id"][3:]}'
 
 
-def session_env(limits, content):
+def content_settings(content, data=None):
+    """setup's test-session mode (5.10.0+, test-session-v4): the specs, their configuration and the shop code come from
+    these data directories outside the tree, ENV=test is confined from its rendered model, labelled with the session's
+    id and under the tests' slice; the stacks are named after the session."""
+    text = (f'TEST_SESSION=on\nE2E_TESTS_DIRECTORY={content / "tests"}\nE2E_CONFIG_DIRECTORY={content / "config"}\n'
+            f'TEST_APP_SOURCE={content / "public"}\nTEST_CGROUP_PARENT={CGROUP_SLICE}\n')
+    if data:
+        text += f'TEST_SESSION_ID={data["id"]}\nPROJECT_NAME={session_name(data)}\n'
+    return text
+
+
+def session_env(limits, content, data=None):
     """env/test.env of a session: no host route or published port, no cron schedule, its container limits, session mode."""
     lines = ['TEST_TLS=self-signed', 'TEST_HOST_ROUTE=off', 'CRON_SCHEDULE=off',
-             *[f'{name}_MEMORY={size}m' for name, size in SESSION_MEMORY_MB.items()],
-             *[f'{name}_CPUS={cpus}' for name, cpus in SESSION_CPUS.items()],
+             *[f'{name}_MEMORY={size}m' for name, size in SESSION_MEMORY_MB.items() if name != 'DOCTRINE'],
+             *[f'{name}_CPUS={cpus}' for name, cpus in SESSION_CPUS.items() if name != 'DOCTRINE'],
              f'PLAYWRIGHT_MEMORY={limits["TEST_RUN_MEMORY_MB"]}m', f'PLAYWRIGHT_CPUS={limits["TEST_RUN_CPUS"]}']
-    return '\n'.join(lines) + '\n' + content_settings(content)
+    return '\n'.join(lines) + '\n' + content_settings(content, data)
 
 
 def write_private(path, text):
@@ -1323,12 +1522,13 @@ def write_private(path, text):
         handle.write(text)
 
 
-def write_local_env(directory, project, limits, content):
+def write_local_env(directory, project, limits, content, data=None):
     """env/local.env of a clone: the committed example (no secrets), else the names the project would get locally, the
     Playwright limits and session mode."""
     example = directory / 'env/local.env.example'
     name = env_value(directory / 'env/common.env', 'PROJECT_NAME') or project
     text = example.read_text() if example.is_file() and not example.is_symlink() else ''
+    text = '\n'.join(line for line in text.splitlines() if not re.match(r'\s*(?:export\s+)?PROJECT_NAME\s*=', line))
     database = name.replace('-', '_')
     additions = {'DOMAIN': f'{name.replace("_", "-")}.local', 'DATABASE_NAME': database, 'DATABASE_USER': database,
                  'DATABASE_PASSWORD': secrets.token_hex(16), 'DATABASE_ROOT_PASSWORD': secrets.token_hex(16)}
@@ -1336,12 +1536,17 @@ def write_local_env(directory, project, limits, content):
         if not re.search(rf'^\s*{key}\s*=', text, re.M):
             text += f'{"" if not text or text.endswith(chr(10)) else chr(10)}{key}={value}\n'
     text += f'PLAYWRIGHT_MEMORY={limits["TEST_RUN_MEMORY_MB"]}m\nPLAYWRIGHT_CPUS={limits["TEST_RUN_CPUS"]}\n'
-    write_private(directory / 'env/local.env', text + content_settings(content))
+    write_private(directory / 'env/local.env', text + content_settings(content, data))
+
+
+def base_name(app):
+    name = env_value(app / 'env/common.env', 'PROJECT_NAME')
+    return name if name and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,50}', name) else None
 
 
 def compose_name(app):
-    name = env_value(app / 'env/common.env', 'PROJECT_NAME')
-    return f'{name}-test' if name and re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,63}', name) else None
+    name = base_name(app)
+    return f'{name}-test' if name else None
 
 
 def prepare_tree(root, tree, commit, log):
@@ -1357,29 +1562,40 @@ def prepare_tree(root, tree, commit, log):
 
 
 def shop_code(root, clone_dir, shop_ref, content, log, git_dirs, trusted):
-    """content/public: the shop code (code that runs only in the session's containers), as regular files only, from
-    app/public's own repository at shop_ref (fetched from its remote when the build root lacks it) or at its current
-    commit, or in one repository from app/public of shop_ref (else of the trusted commit). (commit, what was left out)."""
+    """content/public: the shop code (code that runs only in the session's containers), as regular files only.
+    app/public as its own repository: from a bare copy of it in the session (content/.code.git; anything a shop_ref
+    needs is fetched there, never into the build root), at shop_ref or the build root's code commit; its submodules
+    are left out (and said so). In one repository: app/public of shop_ref, else of the trusted commit.
+    (commit or None, what was left out, where shop_ref came from)."""
     code = root / 'app/public'
     target = content / 'public'
     if (code / '.git').exists():
-        commit = resolve(code, shop_ref) if shop_ref else git(code, 'rev-parse', 'HEAD')
-        if not commit and shop_ref:
+        mirror = code_mirror(code, content, log)
+        if shop_ref:
             origin = git(code, 'config', '--get', 'remote.origin.url', check=False)
-            commit = fetch_ref(code_mirror(code, content, log), shop_ref, origin, log)
-            repository = content / '.code.git'
+            commit, source = fetch_ref(mirror, shop_ref, origin, log)
         else:
-            repository = code
-        if not COMMIT.fullmatch(commit or ''):
+            commit, source = peel(mirror, git(code, 'rev-parse', 'HEAD')), None
+        if not commit:
             raise Refusal(400, f'shop_ref {shop_ref} is not a commit, tag or branch of the code repository')
-        return commit, export_tree(repository, submodule_dirs(code), commit, '', target, log)
-    commit = trusted
+        return commit, export_tree(mirror, {}, commit, '', target, log), source
+    commit, source = trusted, None
     if shop_ref:
         origin = git(env_repo(root), 'config', '--get', 'remote.origin.url', check=False)
-        commit = fetch_ref(clone_dir, shop_ref, origin, log)
+        commit, source = fetch_ref(clone_dir, shop_ref, origin, log)
         if not commit:
             raise Refusal(400, f'shop_ref {shop_ref} is not a commit, tag or branch of the repository')
-    return (commit if shop_ref else None), export_tree(clone_dir, git_dirs, commit, in_repo(root, 'app/public'), target, log)
+    return commit, export_tree(clone_dir, git_dirs, commit, in_repo(root, 'app/public'), target, log), source
+
+
+def default_shop_ref(root, data):
+    """The ref a session's shop code came from when no shop_ref was given: in one repository the trusted branch; with
+    its own code repository that repository's current branch (or, detached, its commit). Never a guess such as master."""
+    code = root / 'app/public'
+    if not (code / '.git').exists():
+        return data.get('env_branch')
+    branch = git(code, 'symbolic-ref', '-q', 'HEAD', check=False)
+    return branch[len('refs/heads/'):] if branch.startswith('refs/heads/') else git(code, 'rev-parse', 'HEAD', check=False)
 
 
 def code_mirror(code, content, log):
@@ -1392,18 +1608,36 @@ def code_mirror(code, content, log):
     return mirror
 
 
+RECORDER = {}  # what this worker records its processes in: {'record': callable} (a session) or {'run': id}
+
+
+def session_recorder(project, identifier):
+    return lambda recorded: try_update_session(project, identifier, command=recorded)
+
+
+def check_budget(app, limits):
+    """The final ENV=test model (every service, one-off runners too, as setup rendered it) within the session budget."""
+    budget = read_json(app / '.generated/test/session-budget.json')
+    memory, cpus = session_budget(limits)
+    if not isinstance(budget, dict):
+        raise RuntimeError('setup wrote no session budget (.generated/test/session-budget.json)')
+    if budget.get('memory_mb', 0) > memory or budget.get('cpus', 0) > cpus:
+        raise RuntimeError(f'the session\'s services take {budget.get("memory_mb")} MB and {budget.get("cpus")} CPUs, over the '
+                           f'budget of {memory} MB and {cpus} CPUs: {", ".join(budget.get("services") or [])}')
+
+
 def create_worker(identifier):
     data = find_session(identifier)
     project, directory = data['project'], session_dir(data['project'])
     log = directory / 'log'
     if not update_session(project, identifier, ('creating',), worker=identity(os.getpid())):
         return
+    RECORDER['record'] = session_recorder(project, identifier)
     limits = settings()
     root = build_root(project)
     tree, content = directory / 'repo', directory / 'content'
     dataset = DATASET.fullmatch(data['db'])[1]
     step = 'clone'
-    record = lambda recorded: update_session(project, identifier, command=recorded)
 
     def advance(name, **fields):
         nonlocal step
@@ -1414,37 +1648,43 @@ def create_worker(identifier):
     try:
         advance(step)
         app, clone_dir, git_dirs = prepare_tree(root, tree, data['env_commit'], log)
-        name = compose_name(app)
+        name = base_name(app)
         if not name:
             raise RuntimeError('env/common.env of the trusted commit has no PROJECT_NAME')
+        data['base_name'] = name
         for part in ('tests', 'config', 'public'):
             real_directory_below(content, part)
-        advance('env', compose_project=name, git_dirs=git_dirs, clone=str(clone_dir.relative_to(directory)),
-                spec_prefix=in_repo(root, 'app'))
-        write_local_env(app, project, limits, content)
-        write_private(app / 'env/test.env', session_env(limits, content))
+        advance('env', base_name=name, compose_project=f'{session_name(data)}-test', git_dirs=git_dirs,
+                clone=str(clone_dir.relative_to(directory)), spec_prefix=in_repo(root, 'app'))
+        write_local_env(app, project, limits, content, data)
+        write_private(app / 'env/test.env', session_env(limits, content, data))
         # The images are built from the trusted tree alone, before anything of the caller's is written anywhere.
         advance('build')
-        if make(log, app, 'build', record=record):
+        if make(log, app, 'build'):
             raise RuntimeError('make build failed (see the session log)')
         step = 'specs'
         origin = git(env_repo(root), 'config', '--get', 'remote.origin.url', check=False)
-        tests = data['env_commit']
+        tests, source = data['env_commit'], None
         if data.get('env_ref') and data['env_ref'] != data.get('env_branch'):
-            tests = fetch_ref(clone_dir, data['env_ref'], origin, log)
+            tests, source = fetch_ref(clone_dir, data['env_ref'], origin, log)
             if not tests:
                 raise Refusal(400, f'env_ref {data["env_ref"]} is not a commit, tag or branch of the environment repository')
-        advance(step, tests_commit=tests)
+        advance(step, tests_commit=tests, tests_source=source)
         write_specs(content, spec_files(clone_dir, git_dirs, tests, data['env_commit'], log, in_repo(root, 'app')))
         step = 'shop'
         advance(step)
-        shop, dropped = shop_code(root, clone_dir, data.get('shop_ref'), content, log, git_dirs, data['env_commit'])
-        advance('test-init', shop_commit=shop, shop_dropped=dropped or None)
-        for step, target, arguments in (('test-init', 'test-init', ()), ('test-prepare', 'test-prepare', (f'set={dataset}',)),
-                                        ('e2e-install', 'e2e-install', ())):
+        shop, dropped, shop_source = shop_code(root, clone_dir, data.get('shop_ref'), content, log, git_dirs, data['env_commit'])
+        advance('test-init', shop_commit=shop, shop_dropped=dropped or None, shop_source=shop_source,
+                shop_ref_used=data.get('shop_ref') or default_shop_ref(root, data))
+        if make(log, app, 'test-init'):
+            raise RuntimeError('make test-init failed (see the session log)')
+        check_budget(app, limits)
+        for step, target, arguments in (('test-prepare', 'test-prepare', (f'set={dataset}',)),
+                                        ('e2e-install', 'e2e-install', (f'container={identifier}',))):
             advance(step)
-            if make(log, app, target, *arguments, record=record):
+            if make(log, app, target, *arguments):
                 raise RuntimeError(f'make {target} failed (see the session log)')
+        check_networks(f'{session_name(data)}-test')
         domain = env_value(app / 'env/test.env', 'DOMAIN')
         if not update_session(project, identifier, ('creating',), status='ready', step=None, ready_at=now(), domain=domain,
                               worker=None, command=None):
@@ -1454,15 +1694,48 @@ def create_worker(identifier):
     except Exception as error:  # noqa: BLE001 - the session must never stay "creating"
         message = redact(error.answer['error'] if isinstance(error, Refusal) else str(error))
         say(log, f'failed at {step}: {message}')
-        if not update_session(project, identifier, ('creating',), step=step, error=message, worker=None, command=None):
-            return
-        current = read_json(directory / 'session.json') or data
-        cleaned = teardown(current, log)
-        update_session(project, identifier, ('creating',), status='failed' if cleaned else 'destroying',
-                       end_reason='failed', ended_at=now())
+        # As a destroy does: destroying first (nobody else starts a teardown), then the one cleaner (its lock).
+        if update_session(project, identifier, ('creating',), status='destroying', step=step, error=message, worker=None,
+                          end_reason='failed'):
+            destroy_worker(identifier)
 
 
-def compose_down(name, log):
+def check_networks(project_name):
+    """Every network of a session's Compose project as setup made it: internal, its gateway isolated (no address on the
+    host). Anything else and the session is not made ready."""
+    names = subprocess.run(['docker', 'network', 'ls', '-q', '--filter', f'label=com.docker.compose.project={project_name}'],
+                           capture_output=True, text=True, timeout=60, env=child_environment()).stdout.split()
+    if not names:
+        raise RuntimeError(f'{project_name} has no network to check')
+    details = json.loads(subprocess.run(['docker', 'network', 'inspect', *names], capture_output=True, text=True, timeout=60,
+                                        env=child_environment()).stdout or '[]')
+    for network in details:
+        options = network.get('Options') or {}
+        gateways = [item.get('Gateway') for item in (network.get('IPAM') or {}).get('Config') or [] if item.get('Gateway')]
+        if not network.get('Internal') or options.get('com.docker.network.bridge.gateway_mode_ipv4') != 'isolated' or gateways:
+            raise RuntimeError(f'network {network.get("Name")} is not internal with an isolated gateway (engine too old?)')
+
+
+def owned_containers(label, value):
+    return subprocess.run(['docker', 'ps', '-aq', '--filter', f'label={label}={value}'], capture_output=True, text=True,
+                          timeout=60, env=child_environment()).stdout.split()
+
+
+def compose_down(name, log, identifier, directory):
+    """docker compose down of one of a session's Compose projects, after checking each of its containers is this
+    session's (the label setup.session, or for an older session no label and a working dir in its own directory).
+    True when it ran and nothing of the project is left."""
+    listing = subprocess.run(['docker', 'ps', '-a', '--filter', f'label=com.docker.compose.project={name}', '--format',
+                              '{{.Label "setup.session"}}\t{{.Label "com.docker.compose.project.working_dir"}}'],
+                             capture_output=True, text=True, timeout=60, env=child_environment())
+    if listing.returncode:
+        say(log, f'docker ps for {name} failed: the teardown waits for the daemon')
+        return False
+    for line in listing.stdout.splitlines():
+        owner, _, working = line.partition('\t')
+        if owner != identifier and not (not owner and (working == str(directory) or working.startswith(str(directory) + '/'))):
+            say(log, f'{name} has a container that is not this session\'s (setup.session={owner or "-"}): not removed')
+            return False
     images = subprocess.run(['docker', 'compose', '-p', name, 'images', '--quiet'], capture_output=True, text=True,
                             env=child_environment(), timeout=120).stdout.split()
     code = run_logged(log, ['docker', 'compose', '-p', name, 'down', '--volumes', '--remove-orphans', '--timeout', '20'],
@@ -1479,20 +1752,45 @@ def compose_down(name, log):
     return True
 
 
+def stop_worker(recorded):
+    """A worker's process group: SIGTERM, SIGKILL after STOP_GRACE seconds. True when it is gone."""
+    kill_group(recorded, signal.SIGTERM)
+    deadline = time.monotonic() + STOP_GRACE
+    while alive(recorded) and time.monotonic() < deadline:
+        time.sleep(0.5)
+    kill_group(recorded, signal.SIGKILL)
+    deadline = time.monotonic() + 5
+    while alive(recorded) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    return not alive(recorded)
+
+
 def teardown(data, log):
-    """Stop a session's run and its command, remove its ENV=test (and ENV=local) containers, networks, volumes and
-    images, delete its tree. True only when all of that is gone (else a retry runs it again)."""
+    """Stop a session's run, its worker and its commands, remove its containers (its own, checked by label), networks,
+    volumes and images, delete its tree. True only when all of that is confirmed gone (else a retry runs it again)."""
     directory = session_dir(data['project'])
     run = data.get('active_run')
     if run:
         cancel_run(run, 'the session ended')
+        if (read_json(run_dir(run) / 'run.json') or {}).get('status') in ACTIVE:
+            say(log, f'its run {run} is not stopped yet; tried again')
+            return False
     current = read_json(directory / 'session.json') or data
-    stop_command(current.get('command'), None)
+    if current.get('worker') and current.get('status') != 'destroying':
+        stop_worker(current.get('worker'))
+    if not stop_command((read_json(directory / 'session.json') or current).get('command'), data['id']):
+        return False
     name = current.get('compose_project') or compose_name(directory / 'repo/app') or compose_name(directory / 'repo/app/docker')
     if name:
-        for project in (name, name[:-len('-test')] + '-local' if name.endswith('-test') else None):
-            if project and not compose_down(project, log):
+        projects = [name]
+        if current.get('base_name') and name.endswith('-test'):
+            projects.append(name[:-len('-test')] + '-local')  # named after the session too: no other stack's
+        for project in projects:
+            if not compose_down(project, log, data['id'], directory):
                 return False
+        if owned_containers('setup.session', data['id']) or owned_containers('setup.owner', data['id']):
+            say(log, 'a container of this session is still there; tried again')
+            return False
     for path in (directory / 'repo', directory / 'content'):
         with contextlib.suppress(OSError, RuntimeError):
             remove_tree(path)
@@ -1503,25 +1801,28 @@ def teardown(data, log):
 
 
 def destroy(identifier, by, reason='destroyed', wait=False):
-    """End a session: status destroying, its creating worker and command stopped, then its teardown (in the background,
-    or here with wait, as reconcile does: a worker it left would be killed with the timer's unit). One cleaner per
-    session: a destroy while one runs returns the session as it is."""
+    """End a session: status destroying, its creating worker and command stopped (SIGTERM, then SIGKILL), then its
+    teardown (in the background, or here with wait, as reconcile does: a worker it left would be killed with the
+    timer's unit). One cleaner per session: a destroy while one runs returns the session as it is."""
     data = find_session(identifier)
-    if data['status'] in ('destroyed', 'expired'):
+    if data['status'] in ('destroyed', 'expired', 'failed'):
         return public_session(data)
     if data['status'] == 'destroying' and alive(data.get('worker')) and not wait:
         return public_session(data)
-    if data['status'] == 'creating':
-        kill_group(data.get('worker'), signal.SIGTERM)
-    data = update_session(data['project'], identifier, ('creating', 'ready', 'failed', 'destroying'), status='destroying',
+    creating = data['status'] == 'creating'
+    data = update_session(data['project'], identifier, ('creating', 'ready', 'destroying'), status='destroying',
                           step='destroy', destroyed_by=by, end_reason=data.get('end_reason') if data['status'] == 'destroying'
-                          else reason, worker=None) or data
-    stop_command((read_json(session_dir(data['project']) / 'session.json') or {}).get('command'), None)
+                          else reason) or data
+    if creating:
+        stop_worker(data.get('worker'))
+    # Its command too (a clone, make), here and now: the background teardown must not race a make that still runs.
+    stop_command((read_json(session_dir(data['project']) / 'session.json') or data).get('command'), identifier)
+    update_session(data['project'], identifier, ('destroying',), worker=None)
     if wait:
         destroy_worker(identifier)
         return public_session(find_session(identifier))
     update_session(data['project'], identifier, ('destroying',), worker=identity(detach('destroy-worker', f'--id={identifier}')))
-    return public_session(data)
+    return public_session(find_session(identifier))
 
 
 def destroy_worker(identifier):
@@ -1537,11 +1838,15 @@ def destroy_worker(identifier):
             return
         log = directory / 'log'
         if teardown(data, log):
-            update_session(data['project'], identifier, ('destroying',), status=data.get('end_reason') or 'destroyed',
-                           step=None, worker=None, command=None, ended_at=now(), active_run=None, error=None)
+            # The reason stays in error (a floor breach, a tree too large, a failed step).
+            final = data.get('end_reason') or 'destroyed'
+            try_update_session(data['project'], identifier, ('destroying',), status=final,
+                               step=data.get('step') if final == 'failed' else None,  # a failure keeps where it failed
+                               worker=None, command=None, ended_at=now(), active_run=None, cleanup=None)
         else:
-            update_session(data['project'], identifier, ('destroying',), worker=None,
-                           attempts=int(data.get('attempts') or 0) + 1, error='the teardown is not complete; reconcile tries again')
+            try_update_session(data['project'], identifier, ('destroying',), worker=None,
+                               attempts=int(data.get('attempts') or 0) + 1,
+                               cleanup='the teardown is not complete; reconcile tries again')
 
 
 def extend(identifier, minutes):
@@ -1666,7 +1971,7 @@ def read_storage_states(request, environment):
             raise Refusal(409, f'storage state of {role} is not a JSON file of at most {STATE_LIMIT} bytes',
                           'storage_state_missing') from None
         found[role] = text
-        if sum(len(item) for item in found.values()) > STATES_LIMIT:
+        if sum(len(item.encode()) for item in found.values()) > STATES_LIMIT:  # bytes, not characters
             raise Refusal(413, f'storage_states: at most {STATES_LIMIT} bytes together')
     return found
 
@@ -1695,6 +2000,12 @@ def public_run(data, full=True):
                  finished_at=iso(data.get('finished_at')), cancelled_by=data.get('cancelled_by'),
                  # true: Playwright ran tests and reported them (some may have failed); false: no test ran.
                  executed=executed if data.get('status') in TERMINAL else None)
+    # A page path comes back without its query string (a one-time link's value is not kept in answers).
+    if shown.get('path'):
+        shown['path'] = logged(shown['path'])
+    if isinstance(shown.get('snapshot'), dict):
+        shown['snapshot'] = {**shown['snapshot'], **{key: logged(shown['snapshot'][key]) for key in ('requested', 'url')
+                                                     if isinstance(shown['snapshot'].get(key), str)}}
     if not full and data.get('roles'):
         shown = {key: shown.get(key) for key in VIEW_ONLY}
     return {key: value for key, value in shown.items() if value is not None}
@@ -1722,6 +2033,13 @@ def update_run(identifier, expect=None, **fields):
     return data
 
 
+LIST_LEAVES_OUT = ('tests', 'artifacts', 'snapshot', 'errors')  # a list answers summaries: GET /runs/{id} has the rest
+
+
+def summary_of(shown):
+    return {key: value for key, value in shown.items() if key not in LIST_LEAVES_OUT}
+
+
 def runs(session=None, limit=200, full=True):
     found = []
     entries = []
@@ -1731,7 +2049,7 @@ def runs(session=None, limit=200, full=True):
     for _, path in sorted(entries, reverse=True):
         data = read_json(path)
         if data and (session is None or data.get('session') == session):
-            found.append(public_run(data, full=full))
+            found.append(summary_of(public_run(data, full=full)))
             if len(found) >= limit:
                 break
     return found
@@ -1767,7 +2085,13 @@ def cancel_by_key(project, client, by):
         raise Refusal(400, 'client_run_id: 1–100 letters, digits, . _ : -')
     with locked(RUNS / '.lock'):
         path = project_key_path('tombstones', project, client)
-        if not tombstone(project, client):
+        known = read_json(project_key_path('clients', project, client)) or {}
+        # A cancel of work that exists is always kept (its own index entry); the bound is for keys of nothing yet.
+        owns_work = RUN_ID.fullmatch(str(known.get('run'))) or any(
+            item['project'] == project and item.get('client_run_id') == client for item in sessions())
+        if not tombstone(project, client) and owns_work:
+            write_json(path, {'project': project, 'client_run_id': client, 'by': by, 'at': now()})
+        elif not tombstone(project, client):
             held = sum(1 for item in (RUNS / 'tombstones').glob('*.json') if (read_json(item) or {}).get('project') == project
                        and now() - int((read_json(item) or {}).get('at') or 0) < TOMBSTONE_SECONDS) \
                 if (RUNS / 'tombstones').is_dir() else 0
@@ -1848,8 +2172,10 @@ def start_run(request, by, manage, states, kind='run'):
     if existing:
         return public_run(existing, full=manage), False
     limits = settings()
+    if kind == 'snapshot':
+        states = {}  # a snapshot is a guest's: no storage state is read or kept for it
     data = {'kind': kind, 'target': target, 'project': root.name, 'created_by': by, 'created_at': now(),
-            'status': 'queued', 'step': 'queued', 'client_run_id': client, 'roles': sorted(states) or None}
+            'status': 'queued', 'step': 'prepare', 'client_run_id': client, 'roles': sorted(states) or None}
     if kind == 'run':
         grep, invert = selection(target, request, manage)
         data.update(grep=grep, grep_invert=invert, files=check_files(request.get('files')) or None,
@@ -1875,11 +2201,7 @@ def start_run(request, by, manage, states, kind='run'):
     if target == 'test':
         if request.get('env_ref') is not None:
             raise Refusal(400, 'env_ref goes with the session (POST /test-sessions), not with its runs')
-        session = find_session(request.get('session') or '')
-        if session['project'] != root.name:
-            raise Refusal(400, f'session {session["id"]} is of project {session["project"]}')
-        if session['status'] != 'ready':
-            raise Refusal(409, f'session {session["id"]} is {session["status"]}', 'session_not_ready')
+        session = usable_session(request.get('session') or '', root.name)
         data['session'] = session['id']
         data['url'] = f'https://{session["domain"]}' if session.get('domain') else None
         data.update(env_ref=session.get('env_ref'), env_commit=session.get('env_commit'),
@@ -1898,43 +2220,50 @@ def start_run(request, by, manage, states, kind='run'):
         data.update(environment=environment, url=environment_url(root, environment, commit), env_ref=ref or branch,
                     env_commit=commit, tests_commit=commit)
     run_gates(limits)
+    if kind == 'snapshot' and target != 'test' and not playwright_image():
+        raise Refusal(503, 'no Playwright image on this host yet: a session or a stage/live run builds it', 'gate_unknown')
     identifier = ('run-' if kind == 'run' else 'snap-') + secrets.token_hex(6)
     data['id'] = identifier
     directory = run_dir(identifier)
     RUNS.mkdir(parents=True, exist_ok=True)
-    directory.mkdir(mode=0o750)
+    # The slot first, so no two requests prepare a patch for the same place; its record says it is being prepared.
+    with locked(RUNS / '.lock'):
+        existing = existing_run(root.name, client, target, kind)
+        if existing:
+            return public_run(existing, full=manage), False
+        if target == 'test':
+            usable_session(data['session'], root.name, end_old=False)  # again, under the lock: still ready
+        slot = scope_path(data)
+        holder = read_json(slot) or {}
+        held = read_json(run_dir(str(holder.get('run'))) / 'run.json') if RUN_ID.fullmatch(str(holder.get('run'))) else None
+        if held and held.get('status') in ACTIVE:
+            raise Refusal(409, f'run {held["id"]} is still {held["status"]} there; one run at a time', 'run_active',
+                          run=held['id'])
+        directory.mkdir(mode=0o750)
+        write_json(directory / 'run.json', data)
+        write_json(slot, {'run': identifier})
     try:
         if patch is not None:
             specs = session_specs(find_session(data['session']), directory / 'log')
-            data['patch_files'] = patch_paths(patch, directory)
+            patch_files = patch_paths(patch, directory)
             apply_patch(specs, patch, directory)  # a patch that does not apply is a 400 now
             write_private(directory / 'patch.diff', patch)
+            update_run(identifier, patch_files=patch_files)
         if states:
             auth = directory / 'auth'
             auth.mkdir(mode=0o700)
             for role, text in states.items():
                 write_private(auth / f'{role}.json', text)
     except BaseException:
-        remove_tree(directory)
+        # Nothing was created: the record and its slot go again (a crash here is cleaned by reconcile).
+        with locked(RUNS / '.lock'):
+            with contextlib.suppress(OSError):
+                if (read_json(slot) or {}).get('run') == identifier:
+                    slot.unlink()
+            remove_tree(directory)
         raise
+    update_run(identifier, step='queued')
     with locked(RUNS / '.lock'):
-        try:
-            existing = existing_run(root.name, client, target, kind)
-        except Refusal:
-            remove_tree(directory)
-            raise
-        if existing:
-            remove_tree(directory)
-            return public_run(existing, full=manage), False
-        slot = scope_path(data)
-        holder = read_json(slot) or {}
-        held = read_json(run_dir(str(holder.get('run'))) / 'run.json') if RUN_ID.fullmatch(str(holder.get('run'))) else None
-        if held and held.get('status') in ACTIVE:
-            remove_tree(directory)
-            raise Refusal(409, f'run {held["id"]} is still {held["status"]} there; one run at a time', 'run_active',
-                          run=held['id'])
-        write_json(slot, {'run': identifier})
-        write_json(directory / 'run.json', data)
         if client is not None:
             write_json(project_key_path('clients', root.name, client), {'run': identifier})
     if target == 'test':
@@ -1944,6 +2273,23 @@ def start_run(request, by, manage, states, kind='run'):
         return (public_run(find_run(identifier), full=manage) if not manage else shown), True
     update_run(identifier, ('queued', 'running'), worker=identity(detach('run-worker', f'--id={identifier}')))
     return public_run(find_run(identifier), full=manage), True
+
+
+def usable_session(identifier, project, end_old=True):
+    """A session a run may use: of this project, ready, of the current format (an older one is ended: its project
+    would read specs from where this program no longer writes them)."""
+    session = find_session(identifier)
+    if session['project'] != project:
+        raise Refusal(400, f'session {session["id"]} is of project {session["project"]}')
+    if session['status'] != 'ready':
+        raise Refusal(409, f'session {session["id"]} is {session["status"]}', 'session_not_ready')
+    if session.get('format') != SESSION_FORMAT:
+        if end_old:  # never under the runs' lock (the sessions' lock comes first everywhere)
+            update_session(session['project'], session['id'], ('ready',), error='made by an older version: ended')
+            destroy(session['id'], 'upgrade')
+        raise Refusal(409, f'session {session["id"]} was made by an older version and is ended; create a new one',
+                      'session_ended')
+    return session
 
 
 def session_app(session):
@@ -2001,6 +2347,7 @@ def run_worker(identifier):
     data = update_run(identifier, ('queued',), status='running', started_at=now(), worker=identity(os.getpid()))
     if not data:
         return  # cancelled before it started
+    RECORDER['run'] = identifier  # every process this worker starts is recorded in the run
     directory = run_dir(identifier)
     log = directory / 'log'
     limits = settings()
@@ -2013,9 +2360,7 @@ def run_worker(identifier):
     try:
         advance(step)
         if data['target'] == 'test':
-            session = find_session(data['session'])
-            if session['status'] != 'ready':
-                raise Refusal(409, f'session {session["id"]} is {session["status"]}')
+            session = usable_session(data['session'], data['project'], end_old=False)
             app = session_app(session)
             results = app / '.generated/test/data/playwright'
             clear_directory(results)
@@ -2033,11 +2378,10 @@ def run_worker(identifier):
             clear_directory(results)
         step = 'e2e-install'
         advance(step)
-        if make(log, app, 'e2e-install', timeout=900, run=identifier):
+        if make(log, app, 'e2e-install', f'container={identifier}', timeout=900, run=identifier):
             raise RuntimeError('make e2e-install failed')
         step = 'e2e'
-        if not update_run(identifier, ('running',), step=step, suite_started=True):
-            raise Cancelled()
+        advance(step)
         arguments = ['json=1', f'container={identifier}']
         if data.get('grep'):
             arguments.append(f'grep={data["grep"]}')
@@ -2050,19 +2394,22 @@ def run_worker(identifier):
             arguments.append('storage_states=' + ' '.join(f'{path.stem}={path}' for path in sorted(auth.glob('*.json'))))
         if data['target'] != 'test':
             arguments += [f'url={data["url"]}', f'data={results}']
+        # Launched once make e2e runs (recorded by the process itself): from then on some tests may have run.
         code = make(log, app, 'e2e', *arguments, timeout=limits['TEST_RUN_TIMEOUT_MINUTES'] * 60, run=identifier,
-                    quota=(results, limits['TEST_RUN_DISK_MB'] * 1024 * 1024))
+                    quota=(results, limits['TEST_RUN_DISK_MB'] * 1024 * 1024),
+                    record=lambda recorded: recorded and update_run(identifier, suite_started=True))
         if code == 130:
             raise Cancelled()
-        outcome = outcome_of(code, results, directory, limits)
+        outcome = outcome_of(code, results, directory, limits, launched=True)
         update_run(identifier, ('running',), step=None, finished_at=now(), worker=None, **outcome)
     except Cancelled:
         pass
     except Exception as error:  # noqa: BLE001 - the run must never stay "running"
         message = redact(error.answer['error'] if isinstance(error, Refusal) else str(error))
         say(log, f'error at {step}: {message}')
+        launched = bool((read_json(directory / 'run.json') or {}).get('suite_started'))
         update_run(identifier, ('running',), status='error', step=step, error=message, finished_at=now(), worker=None,
-                   executed=False)
+                   executed=launched)
     finally:
         finish_run(identifier)
 
@@ -2093,8 +2440,12 @@ def finish_run(identifier):
                     update_session(session['project'], session['id'], active_run=None)
 
 
-def outcome_of(code, results, directory, limits):
-    """The status, summary, tests, artifacts, errors and executed of a finished make e2e, from its report."""
+RECORD_LIMIT = 2 * 1024 * 1024  # a run's record at most (its tests are cut to fit, tests_truncated says so)
+
+
+def outcome_of(code, results, directory, limits, launched=False):
+    """The status, summary, tests, artifacts, errors and executed of a finished make e2e, from its report. Without a
+    report a launched suite says executed: true (a test may have acted and died before the report was written)."""
     data = read_inside(results, 'report.json', REPORT_LIMIT)
     try:
         report = json.loads(data) if data is not None else None
@@ -2103,9 +2454,9 @@ def outcome_of(code, results, directory, limits):
     note = {124: ' (timed out)', 125: f' (over TEST_RUN_DISK_MB, {limits["TEST_RUN_DISK_MB"]} MB)'}.get(code, f' (exit {code})')
     if not isinstance(report, dict):
         if code == 125:
-            return {'status': 'error', 'executed': False,
+            return {'status': 'error', 'executed': launched,
                     'error': f'the run went over its disk quota (TEST_RUN_DISK_MB, {limits["TEST_RUN_DISK_MB"]} MB) and was stopped'}
-        return {'status': 'error', 'error': 'Playwright wrote no report' + note, 'executed': False}
+        return {'status': 'error', 'error': 'Playwright wrote no report' + note, 'executed': launched}
     write_private(directory / 'report.json', data.decode(errors='replace'))
     errors = [message_of(item) for item in (report.get('errors') or [])[:20] if isinstance(item, dict)]
     errors = [item for item in errors if item]
@@ -2121,8 +2472,12 @@ def outcome_of(code, results, directory, limits):
         status, error = 'passed', None
     else:
         status, error = 'error', errors[0] if errors else f'Playwright ended with exit {code}'
-    return {'status': status, 'error': error, 'errors': errors or None, 'summary': summary, 'tests': tests,
-            'artifacts': artifacts, 'executed': executed}
+    outcome = {'status': status, 'error': error, 'errors': errors or None, 'summary': summary, 'tests': tests,
+               'artifacts': artifacts, 'executed': executed}
+    while tests and len(json.dumps(outcome)) > RECORD_LIMIT:
+        del tests[len(tests) // 2:]  # the summary keeps the counts
+        outcome['tests_truncated'] = True
+    return outcome
 
 
 def walk_specs(suite, titles, file, depth=0):
@@ -2199,16 +2554,18 @@ def digest(report, results, target, limit_mb):
                                 budget -= copied['size']
                                 names.append(copied['name'])
                                 artifacts.append(copied)
-                    title = ' › '.join(part for part in titles if part)
-                    test_id = f'{file} › {title}'
+                    # Every string taken from the report is cut (the report is the container's, so its size too).
+                    file = str(file)[:300]
+                    title = ' › '.join(str(part)[:200] for part in titles if part)[:500]
+                    test_id = f'{file} › {title}'[:800]
                     for item in artifacts[len(artifacts) - len(names):]:
                         item['test_id'] = test_id
                     location = error.get('location') if isinstance(error.get('location'), dict) else {}
                     line = location.get('line') if isinstance(location.get('line'), int) else None
-                    tests.append({'test_id': test_id[:1000], 'file': str(file)[:300], 'title': title[:1000], 'status': status,
+                    tests.append({'test_id': test_id, 'file': file, 'title': title, 'status': status,
                                   'attempts': max(1, len(results_list)), 'error': message_of(error),
                                   'step': failed_step(last.get('steps')) or (
-                                      f'{str(location.get("file", file)).removeprefix("/e2e/tests/")}:{line}' if line else None),
+                                      f'{str(location.get("file", file))[:300].removeprefix("/e2e/tests/")}:{line}' if line else None),
                                   'artifacts': names, 'project': str(test.get('projectName') or '')[:100] or None})
     finally:
         os.close(output_fd)
@@ -2247,14 +2604,15 @@ def copy_attachment(results_fd, output_fd, attachment, index, budget):
             'content_type': content_type if isinstance(content_type, str) and len(content_type) < 100 else None}
 
 
-def cancel_run(identifier, why, by=None):
+def cancel_run(identifier, why, by=None, final='cancelled'):
     """Stop a queued or running run. Status cancelling first (under the lock: a run that has just finished keeps its
     outcome; the slot stays the run's), then the worker is asked to stop its command (it looks every 2 s) and, if it
-    has not within STOP_GRACE + 15 s, killed, the record read again and the command it recorded last stopped, the
-    container removed; only then status cancelled and the slot freed (under the lock, by its owner). executed tells
-    whether the suite had been started (some tests may have run). Idempotent. The run as it is afterwards."""
+    has not within STOP_GRACE + 15 s, killed, the record read again and the command it recorded last stopped, its
+    containers removed. Only when the processes and containers are confirmed gone: status cancelled, the slot freed
+    (under the lock, by its owner); otherwise it stays cancelling and the timer tries again. executed: whether the suite
+    had been launched (some tests may have run). Idempotent. The run as it is afterwards."""
     data = update_run(identifier, ('queued', 'running'), status='cancelling', error=why, cancelled_by=by,
-                      cancel_asked_at=now())
+                      cancel_asked_at=now(), final_status=final)
     if not data:
         data = read_json(run_dir(identifier) / 'run.json') or {}
         if data.get('status') != 'cancelling':
@@ -2264,11 +2622,15 @@ def cancel_run(identifier, why, by=None):
         time.sleep(0.5)
     if alive(data.get('worker')):
         kill_group(data.get('worker'), signal.SIGKILL)
+        time.sleep(0.5)
     fresh = read_json(run_dir(identifier) / 'run.json') or data
-    stop_command(fresh.get('command'), identifier)
-    remove_container(identifier)
-    update_run(identifier, ('cancelling',), status='cancelled', finished_at=now(), worker=None, command=None,
-               executed=bool(fresh.get('suite_started')))
+    stopped = stop_command(fresh.get('command'), identifier) and not alive(data.get('worker'))
+    if not stopped:
+        update_run(identifier, ('cancelling',), cleanup='its processes or containers are not confirmed gone; the timer '
+                                                        'tries again')
+        return read_json(run_dir(identifier) / 'run.json')
+    update_run(identifier, ('cancelling',), status=fresh.get('final_status') or 'cancelled', finished_at=now(), worker=None,
+               command=None, executed=bool(fresh.get('suite_started')), cleanup=None)
     finish_run(identifier)
     return read_json(run_dir(identifier) / 'run.json')
 
@@ -2334,6 +2696,9 @@ const [, , target, output, limit] = process.argv;
       result.blocked += 1;
       return route.abort('blockedbyclient');
     });
+    // No WebSocket at all (inside an HTTPS tunnel the proxy cannot tell it from a GET): a snapshot needs none.
+    if (!context.routeWebSocket) throw new Error('this Playwright cannot close WebSockets (routeWebSocket, 1.48+)');
+    await context.routeWebSocket(/.*/, (socket) => { result.blocked += 1; socket.close(); });
     const page = await context.newPage();
     const response = await page.goto(wanted.href, { waitUntil: 'load', timeout: 60000 });
     result.status = response ? response.status() : null;
@@ -2397,13 +2762,14 @@ def snapshot_worker(identifier):
     data = update_run(identifier, ('queued',), status='running', started_at=now(), worker=identity(os.getpid()))
     if not data:
         return public_run(find_run(identifier))
+    RECORDER['run'] = identifier
     directory = run_dir(identifier)
     log = directory / 'log'
     limits = settings()
     results = None
     try:
         if data['target'] == 'test':
-            session = find_session(data['session'])
+            session = usable_session(data['session'], data['project'], end_old=False)
             app = session_app(session)
             results = app / '.generated/test/data/playwright'
             clear_directory(results)  # nothing a spec left there (a node_modules) is found by the script
@@ -2462,39 +2828,22 @@ def snapshot_worker(identifier):
 
 # --- Reconcile -------------------------------------------------------------------------------------
 def reconcile():
-    """Expire sessions (here, not in a worker: the timer's unit would kill a worker it left), end the work of crashed
-    workers, remove orphaned session containers, run containers without an active run, and old runs."""
+    """Expire sessions (here, not in a worker: the timer's unit would kill a worker it left), tear sessions down when the
+    disk is short, end the work of crashed workers, remove orphaned session containers, run containers without an
+    active run, half-made run directories and old runs. One item's error never stops the rest."""
     limits, done = settings(), []
     floor = disk_floor_reached(limits)
     for data in sessions():
-        moment = now()
         try:
-            over = data['status'] in ('creating', 'ready') and (floor or session_too_large(data, limits))
-            if data['status'] in ('creating', 'ready', 'failed') and moment >= data.get('expires_at', 0):
-                destroy(data['id'], 'reconcile', 'expired', wait=True)
-                done.append(f'expired {data["id"]}')
-            elif over:
-                update_session(data['project'], data['id'], ('creating', 'ready'), error=over)
-                destroy(data['id'], 'reconcile', 'destroyed', wait=True)
-                done.append(f'destroyed {data["id"]} ({over})')
-            elif data['status'] == 'creating' and not alive(data.get('worker')) and moment - data['created_at'] > 60:
-                if update_session(data['project'], data['id'], ('creating',), status='destroying', end_reason='failed',
-                                  error='the creating process ended without a result'):
-                    destroy_worker(data['id'])
-                done.append(f'failed {data["id"]} (crashed)')
-            elif data['status'] == 'destroying' and not alive(data.get('worker')):
-                destroy_worker(data['id'])
-                done.append(f'ended {data["id"]} ({find_session(data["id"])["status"]})')
-            elif data['status'] in ('destroyed', 'expired') and moment - (data.get('ended_at') or moment) > 86400:
-                remove_tree(session_dir(data['project']))
-                done.append(f'removed {data["id"]}')
-        except (Refusal, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            done += reconcile_session(data, limits, floor)
+        except (Refusal, RuntimeError, OSError, subprocess.SubprocessError, ValueError) as error:
             done.append(f'{data["id"]}: {error}')
+    done += reconcile_history()
     live = set()
     for item in sessions():
         if item['status'] in ('creating', 'ready', 'destroying'):
             name = item.get('compose_project') or compose_name(session_dir(item['project']) / 'repo/app') or ''
-            live |= {name, name[:-len('-test')] + '-local' if name.endswith('-test') else name}
+            live |= {name, name[:-len('-test')] + '-local' if name.endswith('-test') else name, item['id']}
     listing = subprocess.run(['docker', 'ps', '-a', '--format', '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t'
                               '{{.Label "com.docker.compose.project.working_dir"}}'], capture_output=True, text=True,
                              env=child_environment())
@@ -2505,55 +2854,121 @@ def reconcile():
         if name and working.startswith(str(SESSIONS) + '/') and name not in live:
             orphans.add(name)
         for container in names.split(','):
-            if RUN_ID.fullmatch(container):
+            if RUN_ID.fullmatch(container) or (SESSION_ID.fullmatch(container) and container not in live):
                 containers.add(container)
     for name in sorted(orphans):
         subprocess.run(['docker', 'compose', '-p', name, 'down', '--volumes', '--remove-orphans', '--timeout', '10'],
                        capture_output=True, env=child_environment(), timeout=300)
         done.append(f'removed orphan {name}')
     for path in RUNS.glob('*/run.json') if RUNS.is_dir() else []:
-        data = read_json(path) or {}
-        moment = now()
-        if not RUN_ID.fullmatch(str(data.get('id'))):
-            continue
-        if data.get('status') == 'cancelling':
-            if moment - int(data.get('cancel_asked_at') or moment) > STOP_GRACE + 60:
-                cancel_run(data['id'], data.get('error') or 'cancelled', data.get('cancelled_by'))
-                done.append(f'cancelled {data["id"]} (finished its cancel)')
-        elif data.get('status') in ACTIVE:
-            if not alive(data.get('worker')) and moment - data.get('created_at', moment) > 60:
-                if update_run(data['id'], ACTIVE, status='error', error='the run\'s process ended without a result',
-                              finished_at=moment, worker=None, executed=False):
-                    stop_command(data.get('command'), data['id'])
-                    finish_run(data['id'])
-                done.append(f'ended {data["id"]} (crashed)')
-            elif moment - (data.get('started_at') or moment) > limits['TEST_RUN_TIMEOUT_MINUTES'] * 60 + 300:
-                cancel_run(data['id'], 'the run exceeded TEST_RUN_TIMEOUT_MINUTES')
-                done.append(f'cancelled {data["id"]} (timeout)')
-        elif data.get('status') in TERMINAL:
-            if data['id'] in containers or (path.parent / 'auth').exists():
-                finish_run(data['id'])
-                done.append(f'cleaned {data["id"]}')
-            if moment - (data.get('finished_at') or moment) > limits['TEST_RUN_KEEP_DAYS'] * 86400:
-                remove_tree(path.parent)
-                done.append(f'removed {path.parent.name}')
+        try:
+            done += reconcile_run(path, limits, containers)
+        except (Refusal, RuntimeError, OSError, subprocess.SubprocessError, ValueError) as error:
+            done.append(f'{path.parent.name}: {error}')
     for container in sorted(containers):
-        if not (run_dir(container) / 'run.json').is_file():
-            remove_container(container)
-            done.append(f'removed container {container}')
+        if SESSION_ID.fullmatch(container) or not (run_dir(container) / 'run.json').is_file():
+            if remove_container(container):
+                done.append(f'removed container {container}')
+    done += remove_half_made_runs()
     done += prune_runs(limits['TEST_RUNS_TOTAL_MB'] * 1024 * 1024)
-    for kind in ('clients', 'tombstones'):
-        for key in (RUNS / kind).glob('*.json') if (RUNS / kind).is_dir() else []:
-            known = read_json(key) or {}
-            if (kind == 'tombstones' and now() - int(known.get('at') or 0) >= TOMBSTONE_SECONDS) or \
-                    (kind == 'clients' and not (run_dir(str(known.get('run'))) / 'run.json').is_file()):
-                key.unlink(missing_ok=True)
-    with locked(RUNS / '.lock'):  # the slots: read and freed under the writers' lock
+    with locked(RUNS / '.lock'):  # the indexes, tombstones and slots: read and removed under the writers' lock
+        for kind in ('clients', 'tombstones'):
+            for key in (RUNS / kind).glob('*.json') if (RUNS / kind).is_dir() else []:
+                known = read_json(key) or {}
+                if (kind == 'tombstones' and now() - int(known.get('at') or 0) >= TOMBSTONE_SECONDS) or \
+                        (kind == 'clients' and not (run_dir(str(known.get('run'))) / 'run.json').is_file()):
+                    key.unlink(missing_ok=True)
         for slot in (RUNS / 'active').glob('*') if (RUNS / 'active').is_dir() else []:
             held = read_json(run_dir(str((read_json(slot) or {}).get('run'))) / 'run.json') or {}
             if held.get('status') not in ACTIVE:
                 slot.unlink(missing_ok=True)
     return {'reconciled': done}
+
+
+def reconcile_session(data, limits, floor):
+    moment, project, identifier = now(), data['project'], data['id']
+    over = data['status'] in ('creating', 'ready') and (floor or session_too_large(data, limits))
+    if over:
+        # The teardown comes first: on a full disk the record may not be writable until it has freed the space.
+        if try_update_session(project, identifier, ('creating', 'ready'), status='destroying', end_reason='destroyed',
+                              error=over, step='destroy'):
+            if data['status'] == 'creating':
+                stop_worker(data.get('worker'))
+            destroy_worker(identifier)
+        else:
+            teardown(data, session_dir(project) / 'log')
+        return [f'destroyed {identifier} ({over})']
+    if data['status'] in ('creating', 'ready') and moment >= data.get('expires_at', 0):
+        destroy(identifier, 'reconcile', 'expired', wait=True)
+        return [f'expired {identifier}']
+    if data['status'] == 'creating' and not alive(data.get('worker')) and moment - data['created_at'] > 60:
+        if update_session(project, identifier, ('creating',), status='destroying', end_reason='failed',
+                          error='the creating process ended without a result'):
+            destroy_worker(identifier)
+        return [f'failed {identifier} (crashed)']
+    if data['status'] == 'destroying' and not alive(data.get('worker')):
+        destroy_worker(identifier)
+        return [f'ended {identifier} ({find_session(identifier)["status"]})']
+    if data['status'] in ('destroyed', 'expired', 'failed') and moment - (data.get('ended_at') or moment) > 86400:
+        with locked(SESSIONS / '.lock'):
+            current = read_json(session_dir(project) / 'session.json') or {}
+            if current.get('id') == identifier and current.get('status') == data['status']:
+                archive_session(project)
+                return [f'archived {identifier}']
+    return []
+
+
+def reconcile_history():
+    """Ended sessions' records and logs are kept 24 h after they ended."""
+    removed = []
+    for path in sorted(history_dir().glob('ts-*.json')) if history_dir().is_dir() else []:
+        data = read_json(path) or {}
+        if now() - int(data.get('ended_at') or data.get('created_at') or 0) > 86400:
+            path.unlink(missing_ok=True)
+            path.with_suffix('.log').unlink(missing_ok=True)
+            removed.append(f'forgot {path.stem}')
+    return removed
+
+
+def reconcile_run(path, limits, containers):
+    data, moment = read_json(path) or {}, now()
+    if not RUN_ID.fullmatch(str(data.get('id'))):
+        return []
+    if data.get('status') == 'cancelling':
+        if moment - int(data.get('cancel_asked_at') or moment) > STOP_GRACE + 60:
+            final = cancel_run(data['id'], data.get('error') or 'cancelled', data.get('cancelled_by')) or {}
+            return [f'{final.get("status")} {data["id"]} (finished its stop)']
+        return []
+    if data.get('status') in ACTIVE:
+        if not alive(data.get('worker')) and moment - data.get('created_at', moment) > 60:
+            # As a cancel: cancelling (its slot kept) until its processes and containers are confirmed gone, then error.
+            cancel_run(data['id'], 'the run\'s process ended without a result', None, final='error')
+            return [f'ended {data["id"]} (crashed)']
+        if moment - (data.get('started_at') or moment) > limits['TEST_RUN_TIMEOUT_MINUTES'] * 60 + 300:
+            cancel_run(data['id'], 'the run exceeded TEST_RUN_TIMEOUT_MINUTES')
+            return [f'cancelled {data["id"]} (timeout)']
+        return []
+    done = []
+    if data.get('status') in TERMINAL:
+        if data['id'] in containers or (path.parent / 'auth').exists() or (path.parent / 'data').exists():
+            finish_run(data['id'])
+            done.append(f'cleaned {data["id"]}')
+        if moment - (data.get('finished_at') or moment) > limits['TEST_RUN_KEEP_DAYS'] * 86400:
+            remove_tree(path.parent)
+            done.append(f'removed {path.parent.name}')
+    return done
+
+
+def remove_half_made_runs():
+    """A run directory without run.json older than 10 minutes (a request whose preparation was killed) is removed."""
+    removed = []
+    for directory in RUNS.glob('*') if RUNS.is_dir() else []:
+        with contextlib.suppress(OSError, RuntimeError):
+            if RUN_ID.fullmatch(directory.name) and not (directory / 'run.json').exists() and \
+                    time.time() - os.lstat(directory).st_mtime > 600:
+                remove_tree(directory)
+                removed.append(f'removed half-made {directory.name}')
+    return removed
 
 
 def disk_floor_reached(limits):
@@ -2581,9 +2996,11 @@ def prune_runs(budget):
         if data.get('status') in TERMINAL and RUN_ID.fullmatch(str(data.get('id'))):
             finished.append((data.get('finished_at') or 0, path.parent, tree_size(path.parent)))
     total, removed = sum(size for _, _, size in finished), []
-    for _, directory, size in sorted(finished, key=lambda item: item[0]):
+    for finished_at, directory, size in sorted(finished, key=lambda item: item[0]):
         if total <= budget:
             break
+        if now() - int(finished_at or 0) < 86400:
+            break  # a finished run stays readable at least 24 h, whatever the budget (the disk floor guards the disk)
         remove_tree(directory)
         total -= size
         removed.append(f'removed {directory.name} (TEST_RUNS_TOTAL_MB)')
@@ -2621,14 +3038,18 @@ HANDOVER_LIMIT = 2 * (REQUEST_LIMIT + STATES_LIMIT) + 65536  # root's checked re
 
 
 def worker_scope(command):
-    """systemd-run --scope with memory and task limits for a command that can start workers (they stay in its scope,
-    so a runaway clone, export or make is bounded): on a systemd host only, else nothing."""
-    if command not in ('create', 'destroy', 'run', 'snapshot', 'cancel', 'cancel-key') or \
-            not os.path.isdir('/run/systemd/system') or not shutil.which('systemd-run'):
+    """On a systemd host every command runs in a transient scope of the tests' slice (bin/install-ui gives the slice its
+    total MemoryMax, CPUWeight and IOWeight) with MemoryMax=TEST_WORKER_MEMORY_MB, no swap and at most 1024 tasks; the
+    background workers stay in it. root makes the scope; inside it setpriv drops to the account with the account's own
+    groups (--init-groups: the docker group, none of root's; systemd-run --uid sets no supplementary groups on
+    systemd 249-257). Elsewhere nothing (the caller drops to the account itself)."""
+    if not os.path.isdir('/run/systemd/system') or not shutil.which('systemd-run') or not shutil.which('setpriv'):
         return []
+    account = pwd.getpwnam(ACCOUNT)
     limit = settings()['TEST_WORKER_MEMORY_MB']
-    return ['systemd-run', '--scope', '--quiet', '--collect', '-p', f'MemoryMax={limit}M', '-p', 'MemorySwapMax=0',
-            '-p', 'TasksMax=1024', f'--uid={ACCOUNT}', f'--gid={pwd.getpwnam(ACCOUNT).pw_gid}', '--']
+    return ['systemd-run', '--scope', '--quiet', '--collect', f'--slice={CGROUP_SLICE}', '-p', f'MemoryMax={limit}M',
+            '-p', 'MemorySwapMax=0', '-p', 'TasksMax=1024', '--',
+            'setpriv', f'--reuid={account.pw_uid}', f'--regid={account.pw_gid}', '--init-groups', '--']
 
 
 def as_account_options():
@@ -2685,13 +3106,15 @@ def main(arguments):
                 # A cancelled or known client_run_id starts nothing: its storage states are not read.
                 settled = project and CLIENT_RUN_ID.fullmatch(str(client or '')) and \
                     (tombstone(project, client) or known_run(project, client))
-                states = {} if settled else read_storage_states(request, TARGETS.get(target) if target in TARGETS else None)
-                payload = json.dumps({'request': request, 'states': states}).encode()
+                # A snapshot is a guest's: its storage states are never read either.
+                states = {} if settled or options.command == 'snapshot' else \
+                    read_storage_states(request, TARGETS.get(target) if target in TARGETS else None)
+                payload = json.dumps({'request': request, 'states': states}, ensure_ascii=False).encode()
                 if len(payload) > HANDOVER_LIMIT:
                     raise Refusal(413, f'the request and its storage states may be at most {HANDOVER_LIMIT} bytes')
                 given.append('--checked')
             scope = worker_scope(options.command)
-            if scope:  # root makes the scope; systemd-run runs the command in it as the account (its groups too)
+            if scope:  # root makes the scope; setpriv drops to the account inside it (its own groups)
                 account = {key: account[key] for key in ('env', 'cwd')}
             return subprocess.run([*scope, sys.executable, os.path.realpath(__file__), *given], input=payload,
                                   **account).returncode
@@ -2708,7 +3131,8 @@ def answer(data):
 def dispatch(options):
     command = options.command
     if command == 'create':
-        return answer({'session': create(options)})
+        session, created = create(options)
+        return answer({'session': session, 'created': created})
     if command == 'list':
         return answer({'sessions': [public_session(item) for item in sessions()]})
     if command == 'show':

@@ -198,12 +198,26 @@ Environment=SETUP_SERVER_ROOT=$ROOT
 Environment=SETUP_SERVER_USER=$ACCOUNT
 Environment=SETUP_SERVER_CONFIG=$CONFIG
 ExecStart=$LIBRARY/bin/test-session reconcile
+Slice=setup_server_tests.slice
 # An expired session is torn down within this run (a process it left would be killed with the unit).
 TimeoutStartSec=1800
 # Its git, export and teardown work is bounded like the UI's workers (bin/test-session worker_scope).
 MemoryMax=1536M
 MemorySwapMax=0
 TasksMax=1024
+EOF
+# Every test session's containers (cgroup_parent), the helper's scopes and their workers sit in this slice: together at
+# most this memory, and a low CPU and I/O weight next to the production stacks (README: Test environments).
+cat > "$staging/tests.slice" <<EOF
+[Unit]
+Description=setup-server test sessions and runs (bounded next to production)
+
+[Slice]
+MemoryMax=${SETUP_SERVER_TESTS_MEMORY:-6G}
+MemorySwapMax=0
+CPUWeight=20
+IOWeight=20
+TasksMax=4096
 EOF
 cat > "$staging/test-sessions.timer" <<EOF
 [Unit]
@@ -266,7 +280,7 @@ if [ "$refresh" = 1 ]; then
     place_library
     place "$staging/install.env" "$LIBRARY/install.env" 0644 quiet
     for file in "service:$SYSTEMD/$NAME.service" "sudoers:$SUDOERS/$NAME" "test-sessions.service:$SYSTEMD/setup-server-test-sessions.service" \
-                "test-sessions.timer:$SYSTEMD/setup-server-test-sessions.timer"; do
+                "test-sessions.timer:$SYSTEMD/setup-server-test-sessions.timer" "tests.slice:$SYSTEMD/setup_server_tests.slice"; do
         cmp -s "$staging/${file%%:*}" "${file#*:}" 2>/dev/null \
             || echo "==> note: ${file#*:} differs from this version; apply it with: sudo bin/install-ui"
     done
@@ -360,6 +374,7 @@ place "$staging/service" "$SYSTEMD/$NAME.service" 0644
 place "$staging/sudoers" "$SUDOERS/$NAME" 0440
 place "$staging/test-sessions.service" "$SYSTEMD/setup-server-test-sessions.service" 0644
 place "$staging/test-sessions.timer" "$SYSTEMD/setup-server-test-sessions.timer" 0644
+place "$staging/tests.slice" "$SYSTEMD/setup_server_tests.slice" 0644
 names=$(printf '%s\n' "$tokens" | sed -n 's/^\(BITBUCKET_ACCESS_TOKEN[A-Z0-9_]*\)=.\{1,\}$/\1/p' | paste -sd ' ')
 listen="http://$ADDRESS:$port/ for $user; Bitbucket tokens: ${names:-none}"
 

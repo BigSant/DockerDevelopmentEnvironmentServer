@@ -61,6 +61,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -5753,6 +5754,7 @@ TESTENV_ARTIFACT = r'[A-Za-z0-9][A-Za-z0-9._-]{0,150}'
 TESTENV_BODY_LIMIT = 2 * 1024 * 1024  # a patch may be 1 MiB (bin/test-session refuses a larger one with 413)
 TESTENV_TIMEOUT, TESTENV_SNAPSHOT_TIMEOUT = 120, 300
 TESTENV_STATUSES = (400, 403, 404, 409, 413, 503)
+TESTENV_ANSWER_LIMIT = 16 * 1024 * 1024
 # (method, path, level, what it does, its answers): the dispatcher, the index and the OpenAPI document come from this list.
 TESTENV_ROUTES = (
     ('GET', '/test-sessions', 'view', 'Every test session (an isolated ENV=test of a project in its own clone on this server).',
@@ -5762,32 +5764,37 @@ TESTENV_ROUTES = (
                                           'tree is always a trusted commit (env_ref when trusted, else the deploy branch); an '
                                           'untrusted env_ref gives only its tests/playwright and config/playwright. 409 with '
                                           'reason memory, disk or deploy_locked (capacity: retry later), session_exists or '
-                                          'cancelled (no capacity).', (202, 400, 404, 409, 503)),
+                                          'cancelled (no capacity). The same client_run_id again: 200 with the session it '
+                                          'made ("created": false).', (200, 202, 400, 404, 409, 413, 500, 503)),
     ('GET', '/test-sessions/{session}', 'view', 'One session and its runs.', (200, 400, 404, 503)),
     ('POST', '/test-sessions/{session}/extend', 'manage', 'Extend a session: {minutes?} (default 120), never past 6 h from '
-                                                          'its creation.', (200, 400, 404, 409, 503)),
+                                                          'its creation.', (200, 400, 404, 409, 413, 500, 503)),
     ('DELETE', '/test-sessions/{session}', 'manage', 'Destroy a session (its run is cancelled): 202, status destroying.',
-     (202, 400, 404, 503)),
+     (202, 400, 404, 500, 503)),
     ('POST', '/test-sessions/{session}/snapshot', 'manage', 'A page of the session as an agent needs it: {path, role?: '
                                                             '"guest"} → its ARIA snapshot, trimmed DOM and a screenshot artifact. '
                                                             'path is a path of the site (one leading /); the page may load '
-                                                            'nothing of another origin.', (200, 400, 404, 409, 503)),
+                                                            'nothing of another origin.', (200, 400, 404, 409, 413, 500, 503)),
     ('POST', '/snapshots', 'manage', 'The same of a real site: {project, environment: "stage"|"live", path, role?} '
-                                     '(one GET navigation, nothing submitted, nothing of another origin).', (200, 400, 404, 409, 503)),
+                                     '(one GET navigation, nothing submitted, nothing of another origin).',
+     (200, 400, 404, 409, 413, 500, 503)),
     ('GET', '/runs', 'view', 'The newest runs (?session=<id> for one session\'s).', (200, 400, 503)),
     ('POST', '/runs', 'manage', 'Start a Playwright run: {target: test|stage|live, project, session? (test), grep?, '
                                 'grep_invert?, files?, patch? (test only), deploy_check?, stage_write_safe?, client_run_id?, '
                                 'env_ref? (stage/live: a trusted commit only), storage_states?} → 202 {run, created} (200 with '
                                 'the existing run for a client_run_id given again; 409 reason cancelled when that '
-                                'client_run_id was cancelled first).', (200, 202, 400, 403, 404, 409, 413, 503)),
+                                'client_run_id was cancelled first).', (200, 202, 400, 403, 404, 409, 413, 500, 503)),
     ('POST', '/runs/cancel', 'manage', 'Cancel by {project, client_run_id}, also before the run exists: OPS keeps the key '
                                        'cancelled for 48 h and refuses a later POST /runs (or POST /test-sessions) with it '
-                                       '(409, reason cancelled). → 200 {cancelled: true, run: {…}|null}; idempotent.',
-     (200, 400, 404, 503)),
+                                       '(409, reason cancelled). → 200 {cancelled: true, run: {…}|null}; idempotent. 409 '
+                                       'tombstones_full only for a key that names no work yet.',
+     (200, 400, 404, 409, 413, 503)),
     ('GET', '/runs/{run}', 'view', 'A run: status, summary {passed, failed, flaky, skipped, duration_s}, executed, errors and '
                                    'each test that did not pass.', (200, 400, 404, 503)),
-    ('POST', '/runs/{run}/cancel', 'manage', 'Stop a run: status cancelled. Idempotent: a finished (or already cancelled) run is '
-                                             'returned as it is, 200 either way. No body.', (200, 400, 404, 503)),
+    ('POST', '/runs/{run}/cancel', 'manage', 'Stop a run: 200 {run} with status cancelled, or cancelling while its '
+                                             'processes and containers are not confirmed gone (the timer finishes it). '
+                                             'Idempotent: a final or cancelling run is returned as it is, 200; never 409. '
+                                             'No body.', (200, 400, 404, 503)),
     ('GET', '/runs/{run}/artifacts/{name}', 'view', 'One artifact of a run (trace, screenshot, video, error context); of a run '
                                                     'with storage states (roles) only with "manage".', (200, 400, 403, 404, 503)),
 )
@@ -5823,14 +5830,21 @@ def test_session_helper(arguments, payload=None, timeout=TESTENV_TIMEOUT):
     argv = ['sudo', '-n', str(LIBRARY / 'bin/test-session'), arguments[0],
             *[item if isinstance(item, str) else f'{item[0]}={item[1]}' for item in arguments[1:]]]
     try:
-        result = subprocess.run(argv, input=json.dumps(payload).encode() if payload is not None else b'', capture_output=True,
-                                timeout=timeout, env=child_environment())
+        # The helper's answer is read up to TESTENV_ANSWER_LIMIT and no further (a run record is at most 2 MiB).
+        with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+            result = subprocess.run(argv, input=json.dumps(payload).encode() if payload is not None else b'', stdout=output,
+                                    stderr=errors, timeout=timeout, env=child_environment())
+            if output.tell() > TESTENV_ANSWER_LIMIT:
+                return 503, {'error': f'test-session: an answer of more than {TESTENV_ANSWER_LIMIT} bytes', 'status': 503}
+            output.seek(0)
+            errors.seek(0)
+            stdout, stderr = output.read(), errors.read(4096)
     except (OSError, subprocess.TimeoutExpired) as error:
         return 503, {'error': f'test-session: {error}', 'status': 503}
     try:
-        data = json.loads(result.stdout)
-    except ValueError:
-        return 503, {'error': f'test-session: exit {result.returncode}, no JSON ({result.stderr.decode(errors="replace").strip()[:200]})',
+        data = json.loads(stdout)
+    except (ValueError, RecursionError):
+        return 503, {'error': f'test-session: exit {result.returncode}, no JSON ({stderr.decode(errors="replace").strip()[:200]})',
                      'status': 503}
     if not isinstance(data, dict):
         return 503, {'error': 'test-session: unexpected answer', 'status': 503}
@@ -5890,7 +5904,8 @@ def testenv_request(method, route, places, query, body, caller, manage=True):
             arguments.append(('--ttl', str(body['ttl_minutes'])))
         status, data = test_session_helper(arguments)
         made = (data.get('session') or {}).get('id')
-        return (202 if status == 200 else status), data, \
+        # 202: made now; 200 with "created": false: the session this client_run_id made already.
+        return (202 if status == 200 and data.get('created', True) else status), data, \
             f'create project={body.get("project")} db={body.get("db")} id={made or "-"} status={status}'
     if route == '/test-sessions/{session}/extend':
         minutes = body.get('minutes', 120)
@@ -5935,7 +5950,8 @@ TESTENV_SCHEMAS = {
         'reason': {'type': 'string', 'enum': ['memory', 'disk', 'run_active', 'deploy_locked', 'session_exists',
                                               'session_not_ready', 'session_ended', 'storage_state_missing',
                                               'storage_state_expired', 'gate_unknown', 'cancelled', 'cleanup_pending',
-                                              'content_too_large', 'client_run_id_conflict', 'tombstones_full'],
+                                              'content_too_large', 'client_run_id_conflict', 'tombstones_full',
+                                              'host_unconfigured', 'project_unconfigured'],
                    'description': 'a 409/503 the client can act on'},
         'capacity': {'type': 'boolean', 'description': 'true: no room now (memory, disk, run_active, deploy_locked); retry '
                                                        'later. Absent otherwise: retrying the same request does not help.'},
@@ -6237,9 +6253,13 @@ def handler(accounts):
                 try:
                     record(caller, self.caller(), 'testenv', testenv_intent(method, route, places, body))
                 except OSError as error:
-                    self.api_logged(kind, name, 500)
-                    return self.json_reply(500, {'error': f'the action log cannot be written ({error.strerror}): nothing was done',
-                                                 'status': 500})
+                    # Stopping work frees resources (a full disk is when it matters most): a destroy and a cancel go on
+                    # without their first audit line, everything else is refused before anything is done.
+                    if not (method == 'DELETE' or route.endswith('/cancel')):
+                        self.api_logged(kind, name, 500)
+                        return self.json_reply(500, {'error': f'the action log cannot be written ({error.strerror}): nothing '
+                                                              'was done', 'status': 500})
+                    log(f'ui-actions.log: {error.strerror}; {method} {route} goes on without its audit line')
             manage = PERMISSION_LEVELS.index(permissions.get('testenv', '')) >= PERMISSION_LEVELS.index('manage')
             code, data, audit = testenv_request(method, route, places, query, body, caller, manage)
             if audit:
@@ -6256,16 +6276,16 @@ def handler(accounts):
             cookies in its traces: its artifacts need "manage"."""
             code, data = test_session_helper(['run-show', ('--id', run), '--manage'])  # the roles decide below, here
             shown = (data.get('run') or {}) if code == 200 else {}
+            if shown.get('roles') and not manage:  # before the artifact is looked for: no existence oracle for "view"
+                self.api_logged(kind, name, 403)
+                return self.json_reply(403, {'error': 'this run used storage states: its artifacts need the permission "manage" '
+                                                      'of Test environments', 'status': 403})
             listed = next((item for item in (shown.get('artifacts') or []) if item.get('name') == artifact), None)
             if listed is None:
                 code = code if code != 200 else 404
                 self.api_logged(kind, name, code)
                 return self.json_reply(code, data if code != 404 or 'error' in data else
                                        {'error': f'run {run} has no artifact {artifact}', 'status': 404})
-            if shown.get('roles') and not manage:
-                self.api_logged(kind, name, 403)
-                return self.json_reply(403, {'error': 'this run used storage states: its artifacts need the permission "manage" '
-                                                      'of Test environments', 'status': 403})
             argv = ['sudo', '-n', str(LIBRARY / 'bin/test-session'), 'artifact', f'--id={run}', f'--name={artifact}']
             try:
                 process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,

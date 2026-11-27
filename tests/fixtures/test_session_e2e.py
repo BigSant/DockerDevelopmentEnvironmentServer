@@ -11,6 +11,8 @@ and exits 1 on the first that fails.
 """
 
 import argparse
+import http.server
+import threading
 import json
 import os
 from pathlib import Path
@@ -39,7 +41,8 @@ def confined(name):
     check(bool(ids), 'the session has containers')
     details = json.loads(subprocess.run(['docker', 'inspect', *ids], capture_output=True, text=True).stdout)
     services = sorted(item['Config']['Labels'].get('com.docker.compose.service', '?') for item in details)
-    check('metrics' not in services and 'cron' in services, f'services {services}: no metrics, cron kept')
+    check('metrics' not in services and 'cron' in services and 'backup' in services,
+          f'services {services}: no metrics; cron and backup kept')
     networks = set()
     for item in details:
         host = item['HostConfig']
@@ -55,6 +58,55 @@ def confined(name):
         internal = subprocess.run(['docker', 'network', 'inspect', network, '--format', '{{.Internal}}'],
                                   capture_output=True, text=True).stdout.strip()
         check(internal == 'true', f'network {network} is internal', internal)
+
+
+def image_of(name):
+    return subprocess.run(['docker', 'image', 'ls', '--filter', 'label=setup.service=playwright', '--format',
+                           '{{.Repository}}:{{.Tag}}'], capture_output=True, text=True).stdout.split()[0]
+
+
+def gateway_check(name, php, image):
+    """T2: a listener on 0.0.0.0 of this host is reachable at a plain internal network's gateway (the control, with this
+    host's firewall opened for its port when sudo allows), and not from the session (its networks have no gateway on
+    the host at all)."""
+    listener = http.server.ThreadingHTTPServer(('0.0.0.0', 0), http.server.SimpleHTTPRequestHandler)
+    port = listener.server_address[1]
+    threading.Thread(target=listener.serve_forever, daemon=True).start()
+    opened = subprocess.run(['sudo', '-n', 'iptables', '-I', 'INPUT', '-p', 'tcp', '--dport', str(port), '-j', 'ACCEPT'],
+                            capture_output=True).returncode == 0
+    control = f'ts-e2e-control-{port}'
+    try:
+        subprocess.run(['docker', 'network', 'create', '--internal', control], check=True, capture_output=True)
+        gateway = subprocess.run(['docker', 'network', 'inspect', control, '--format', '{{(index .IPAM.Config 0).Gateway}}'],
+                                 capture_output=True, text=True).stdout.strip()
+        probe = "fetch(process.argv[1], {signal: AbortSignal.timeout(5000)}).then(r => console.log('reached')).catch(e => console.log('blocked'))"
+        reached = subprocess.run(['docker', 'run', '--rm', '--network', control, '--entrypoint', 'node', image, '-e', probe,
+                                  f'http://{gateway}:{port}/'], capture_output=True, text=True, timeout=60).stdout.strip()
+        if opened:
+            check(reached == 'reached', f'control: a plain internal network reaches the host at its gateway {gateway}:{port}',
+                  reached)
+        else:
+            print(f'note control not shown: no sudo to open this host\'s firewall for {port} (it answered {reached})')
+        networks = subprocess.run(['docker', 'network', 'ls', '-q', '--filter', f'label=com.docker.compose.project={name}'],
+                                  capture_output=True, text=True).stdout.split()
+        for network in json.loads(subprocess.run(['docker', 'network', 'inspect', *networks], capture_output=True,
+                                                 text=True).stdout):
+            subnet = network['IPAM']['Config'][0]['Subnet']
+            first = subnet.split('/')[0].rsplit('.', 1)[0] + '.1'
+            check(not any(item.get('Gateway') for item in network['IPAM']['Config']),
+                  f'session network {network["Name"]} has no gateway address on the host')
+            for target in (first, gateway):
+                answer = subprocess.run(['docker', 'exec', php, 'php', '-r',
+                                         f'echo @file_get_contents("http://{target}:{port}/", false, stream_context_create(["http" '
+                                         '=> ["timeout" => 5]])) === false ? "blocked" : "reached";'],
+                                        capture_output=True, text=True, timeout=60).stdout.strip()
+                check(answer == 'blocked', f'the shop cannot reach a host listener on 0.0.0.0 at {target}:{port}', answer)
+    finally:
+        subprocess.run(['docker', 'network', 'rm', control], capture_output=True)
+        if opened:
+            subprocess.run(['sudo', '-n', 'iptables', '-D', 'INPUT', '-p', 'tcp', '--dport', str(port), '-j', 'ACCEPT'],
+                           capture_output=True)
+        listener.shutdown()
 
 
 def new_file_patch(path, text):
@@ -128,8 +180,9 @@ def main():
         check(False, f'run {identifier} ends')
 
     (base / 'work').mkdir()
-    work = fixture.build(base / 'work', options.setup, lock_file=options.lock_file, services='playwright metrics cron')
-    (config / 'test-sessions.env').write_text('TEST_RUN_DISK_MB=200\n')
+    work = fixture.build(base / 'work', options.setup, lock_file=options.lock_file, services='playwright metrics cron backup')
+    # This machine shares its host with the sessions knowingly (a production host gets its own filesystem and daemon).
+    (config / 'test-sessions.env').write_text('TEST_RUN_DISK_MB=200\nTEST_SESSIONS_SHARE_PRODUCTION_HOST=accept-risk\n')
     origin = base / 'origin.git'
     subprocess.run(['git', 'init', '-q', '--bare', '-b', 'master', str(origin)], check=True)
     fixture.git(work, 'remote', 'add', 'origin', str(origin))
@@ -157,7 +210,7 @@ def main():
           f'{session} {log.read_text()[-3000:] if log.exists() else ""}')
     check(not (base / 'pwned').exists(), "the branch's Makefile never ran on the host")
     check(session['env_commit'] != session['tests_commit'], 'host tree from master, specs from the branch')
-    name = f'{fixture.NAME}-test'
+    name = session['compose_project'] if 'compose_project' in session else f'{fixture.NAME}-{session["id"][3:]}-test'
     network = subprocess.run(['docker', 'network', 'inspect', f'{name}-network', '--format', '{{.Internal}}'],
                              capture_output=True, text=True).stdout.strip()
     check(network == 'true', 'the session network is internal', network)
@@ -167,7 +220,10 @@ def main():
     confined(name)
     gateway = subprocess.run(['docker', 'network', 'inspect', 'bridge', '--format', '{{(index .IPAM.Config 0).Gateway}}'],
                              capture_output=True, text=True).stdout.strip()
-    php = f'{name}-php-fpm'
+    php = next(line for line in subprocess.run(['docker', 'ps', '--format', '{{.Names}}', '--filter',
+                                                f'label=com.docker.compose.project={name}'], capture_output=True,
+                                               text=True).stdout.split() if line.endswith('-php-fpm'))
+    gateway_check(name, php, image_of(name))
     for url in ('http://1.1.1.1/', f'http://{gateway}:9102/', 'http://169.254.169.254/latest/meta-data/'):
         reached = subprocess.run(['docker', 'exec', php, 'php', '-r',
                                   f'echo @file_get_contents("{url}", false, stream_context_create(["http" => ["timeout" => 5]])) '
@@ -192,6 +248,8 @@ def main():
             break
         time.sleep(3)
     check(session['status'] == 'ready', 'a session of master is ready', session)
+    name = f'{fixture.NAME}-{session["id"][3:]}-test'
+    confined(name)
     run = wait_run(ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id']})['run']['id'])
     titles = {test['title']: test['status'] for test in run.get('tests', [])}
     check(run['status'] == 'failed' and titles.get('status says ready') == 'failed', 'a failing test fails the run', run)
