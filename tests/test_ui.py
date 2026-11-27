@@ -1375,7 +1375,13 @@ class WebUiTest(Worker):
         self.assertEqual(sorted(document["paths"]), sorted({"/api/v1" + route for route in routes} | {"/api/v1" + route for _, route in writes}))
         self.assertEqual(sorted(document["paths"]["/api/v1/test-sessions/{session}"]), ["delete", "get"])
         schemas = document["components"]["schemas"]
-        self.assertEqual(sorted(schemas["Error"]["properties"]["reason"]["enum"])[:2], ["cancelled", "deploy_locked"])
+        self.assertTrue({"cancelled", "deploy_locked", "client_run_id_conflict", "tombstones_full"} <=
+                        set(schemas["Error"]["properties"]["reason"]["enum"]))
+        self.assertIn("cancelling", schemas["Run"]["properties"]["status"]["enum"])
+        for path, item in document["paths"].items():
+            for method, operation in item.items():
+                if "test-sessions" in path or "/runs" in path or "snapshots" in path:
+                    self.assertIn("403", operation["responses"], f"{method} {path}")
         self.assertEqual(schemas["Error"]["properties"]["capacity"]["type"], "boolean")
         self.assertEqual(schemas["Run"]["properties"]["executed"]["type"], "boolean")
         self.assertIn("status", schemas["Run"]["required"])
@@ -1424,10 +1430,11 @@ class WebUiTest(Worker):
             status, _, answer = post("/api/v1/test-sessions", body)
             self.assertEqual(status, 400, answer)  # a value is a value, never an option (was 503)
         self.assertEqual(self.json_call("POST", "/api/v1/runs", viewer, None, raw=b"{not json")[0], 400)
+        self.assertEqual(self.json_call("POST", "/api/v1/runs", viewer, None, raw=b"[" * 200000 + b"]" * 200000)[0], 400)
         self.assertEqual(self.json_call("POST", "/api/v1/runs", viewer, None, raw=b"{}", length=3 * 1024 * 1024)[0], 413)
         self.assertEqual(post("/api/v1/test-sessions/ts-0123456789ab", {}, "DELETE")[0], 404)
         self.assertEqual(self.api_call("/api/v1/test-sessions", viewer, method="PUT")[0], 405)
-        for body in ({"project": "alpha_shop", "environment": "prod", "path": "/"},  # /snapshots names stage or live
+        for body in ({"project": "alpha_shop", "environment": "prod", "path": "/?token=sekret"},  # stage or live only
                      {"project": "alpha_shop", "environment": "stage", "path": "//169.254.169.254/latest/meta-data"},
                      {"project": "alpha_shop", "environment": "live", "path": "/", "patch": fixture_patch()}):
             status, _, answer = post("/api/v1/snapshots", body)
@@ -1473,7 +1480,12 @@ class WebUiTest(Worker):
         status, _, missing = self.api_call(f"/api/v1/runs/{run['id']}/artifacts/002-gone.zip", viewer)
         self.assertEqual(status, 404, "listed but not there: a 404, not a 200 without a body")
         record["roles"] = ["customer"]
+        record["tests"] = [{"title": "Cookie: sid=1"}]
         (artifacts.parent / "run.json").write_text(json.dumps(record))
+        status, _, viewed = self.api_call(f"/api/v1/runs/{run['id']}", watcher)
+        self.assertEqual(status, 200)
+        self.assertNotIn("tests", viewed["run"], "view sees only the numbers of a run with storage states")
+        self.assertIn("tests", self.api_call(f"/api/v1/runs/{run['id']}", viewer)[2]["run"])
         self.assertEqual(self.api_call(f"/api/v1/runs/{run['id']}/artifacts/001-test-failed-1.png", watcher)[0], 403)
         self.assertEqual(self.request("GET", f"/api/v1/runs/{run['id']}/artifacts/001-test-failed-1.png", login=None,
                                       headers={"Authorization": f"Bearer {viewer}"})[0], 200)
@@ -1485,6 +1497,8 @@ class WebUiTest(Worker):
         self.assertTrue(any("testenv create project=nope db=dataset:dev id=- status=404" in line for line in actions))
         self.assertTrue(any("testenv cancel-key project=alpha_shop client_run_id=registry-9" in line for line in actions))
         self.assertNotIn("diff --git", "\n".join(actions) + self.everything_written(), "a patch is never logged")
+        self.assertNotIn("sekret", "\n".join(actions), "a snapshot path is logged without its query string")
+        self.assertTrue(any("path=/ " in line or line.endswith("path=/ (asked)") for line in actions))
 
     def json_call(self, method, path, token, body, raw=None, length=None):
         """(status, headers, JSON) of an API request with a JSON body (or raw bytes; length: a Content-Length to claim)."""
