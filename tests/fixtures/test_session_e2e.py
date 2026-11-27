@@ -32,6 +32,72 @@ def check(condition, text, detail=''):
         sys.exit(1)
 
 
+def confined(name):
+    """Every container of the session's Compose project as setup's session overlay leaves it."""
+    ids = subprocess.run(['docker', 'ps', '-q', '--filter', f'label=com.docker.compose.project={name}'], capture_output=True,
+                         text=True).stdout.split()
+    check(bool(ids), 'the session has containers')
+    details = json.loads(subprocess.run(['docker', 'inspect', *ids], capture_output=True, text=True).stdout)
+    services = sorted(item['Config']['Labels'].get('com.docker.compose.service', '?') for item in details)
+    check('metrics' not in services and 'cron' in services, f'services {services}: no metrics, cron kept')
+    networks = set()
+    for item in details:
+        host = item['HostConfig']
+        label = item['Config']['Labels'].get('com.docker.compose.service')
+        check('ALL' in (host.get('CapDrop') or []) and 'no-new-privileges:true' in (host.get('SecurityOpt') or [])
+              and (host.get('PidsLimit') or 0) > 0 and host.get('Memory', 0) > 0 and host.get('MemorySwap') == host.get('Memory')
+              and not host.get('PortBindings') and not host.get('Privileged')
+              and not any('host-gateway' in entry or 'host.docker.internal' in entry for entry in host.get('ExtraHosts') or [])
+              and not any('docker.sock' in mount.get('Source', '') for mount in item.get('Mounts', [])),
+              f'{label}: no capabilities beyond the few, no-new-privileges, pids/memory/swap limits, no ports or socket')
+        networks |= set(item['NetworkSettings']['Networks'])
+    for network in sorted(networks):
+        internal = subprocess.run(['docker', 'network', 'inspect', network, '--format', '{{.Internal}}'],
+                                  capture_output=True, text=True).stdout.strip()
+        check(internal == 'true', f'network {network} is internal', internal)
+
+
+def new_file_patch(path, text):
+    """A unified diff that adds a file (relative to app/)."""
+    lines = text.splitlines()
+    return (f'diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{len(lines)} @@\n'
+            + ''.join(f'+{line}\n' for line in lines))
+
+
+ESCAPE_SPEC = """import { test, expect } from '@playwright/test';
+import fs from 'node:fs';
+import path from 'node:path';
+
+for (const url of ['http://1.1.1.1/', 'https://example.com/', 'http://GATEWAY:9102/', 'http://169.254.169.254/']) {
+  test(`cannot reach ${url}`, async () => {
+    await expect(fetch(url, { signal: AbortSignal.timeout(8000) })).rejects.toThrow();
+  });
+}
+
+test('filling /tmp ends at its tmpfs', async () => {
+  const block = Buffer.alloc(16 * 1024 * 1024);
+  let error = null;
+  try { for (let i = 0; i < 100; i += 1) fs.writeFileSync(`/tmp/fill-${i}`, block); } catch (caught) { error = caught; }
+  expect(error && error.code).toBe('ENOSPC');
+});
+
+test('the root filesystem is read-only', async () => {
+  expect(() => fs.writeFileSync('/e2e/x', 'x')).toThrow();
+});
+"""
+FILL_SPEC = """import { test } from '@playwright/test';
+import fs from 'node:fs';
+import path from 'node:path';
+
+test('fills the results directory', async () => {
+  test.setTimeout(120000);
+  const block = Buffer.alloc(16 * 1024 * 1024);
+  for (let i = 0; i < 40; i += 1) fs.writeFileSync(path.join(process.env.PLAYWRIGHT_DATA_DIR, `fill-${i}`), block);
+  await new Promise((resolve) => setTimeout(resolve, 60000));
+});
+"""
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('setup')
@@ -56,13 +122,14 @@ def main():
     def wait_run(identifier, limit=900):
         for _ in range(limit // 3):
             run = ts('run-show', f'--id={identifier}')['run']
-            if run['status'] not in ('queued', 'running'):
+            if run['status'] not in ('queued', 'running', 'cancelling'):
                 return run
             time.sleep(3)
         check(False, f'run {identifier} ends')
 
     (base / 'work').mkdir()
-    work = fixture.build(base / 'work', options.setup, lock_file=options.lock_file)
+    work = fixture.build(base / 'work', options.setup, lock_file=options.lock_file, services='playwright metrics cron')
+    (config / 'test-sessions.env').write_text('TEST_RUN_DISK_MB=200\n')
     origin = base / 'origin.git'
     subprocess.run(['git', 'init', '-q', '--bare', '-b', 'master', str(origin)], check=True)
     fixture.git(work, 'remote', 'add', 'origin', str(origin))
@@ -97,6 +164,15 @@ def main():
     ports = subprocess.run(['docker', 'ps', '--filter', f'label=com.docker.compose.project={name}', '--format', '{{.Ports}}'],
                            capture_output=True, text=True).stdout
     check('->' not in ports, 'nothing of the session is published on the host', ports)
+    confined(name)
+    gateway = subprocess.run(['docker', 'network', 'inspect', 'bridge', '--format', '{{(index .IPAM.Config 0).Gateway}}'],
+                             capture_output=True, text=True).stdout.strip()
+    php = f'{name}-php-fpm'
+    for url in ('http://1.1.1.1/', f'http://{gateway}:9102/', 'http://169.254.169.254/latest/meta-data/'):
+        reached = subprocess.run(['docker', 'exec', php, 'php', '-r',
+                                  f'echo @file_get_contents("{url}", false, stream_context_create(["http" => ["timeout" => 5]])) '
+                                  '=== false ? "blocked" : "reached";'], capture_output=True, text=True, timeout=60).stdout
+        check(reached.strip() == 'blocked', f'the shop (php-fpm) cannot reach {url}', reached)
 
     # The branch fixed fixme.spec.ts: a run of the session passes it; the trusted tree's own specs would fail.
     run = ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'files': ['fixme.spec.ts']})['run']
@@ -143,6 +219,16 @@ def main():
     check(not left.strip(), 'its container is gone', left)
     check(ts('run-show', f'--id={long["id"]}')['run']['status'] == 'cancelled', 'and it stays cancelled')
 
+    check(stopped['executed'] is True, 'a cancel during the suite says tests may have run (executed)', stopped)
+    gateway_spec = ESCAPE_SPEC.replace('GATEWAY', gateway)
+    escape = wait_run(ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'files': ['escape.spec.ts'],
+                                                                'patch': new_file_patch('tests/playwright/escape.spec.ts', gateway_spec)})['run']['id'])
+    check(escape['status'] == 'passed' and escape['summary']['passed'] == 6,
+          'a spec reaches neither the internet, the host gateway nor metadata; /tmp is bounded; the root is read-only', escape)
+    filled = wait_run(ts('run', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'files': ['fill.spec.ts'],
+                                                                'patch': new_file_patch('tests/playwright/fill.spec.ts', FILL_SPEC)})['run']['id'])
+    check(filled['status'] == 'error' and 'disk quota' in (filled.get('error') or ''), 'a run over its disk quota is stopped', filled)
+
     # Snapshots: the page, and a path that would leave the site.
     snap = ts('snapshot', '--by=e2e', '--manage', stdin={'target': 'test', 'session': session['id'], 'path': '/'})
     check(snap.get('run', {}).get('status') == 'done' and snap['run']['snapshot']['title'] == 'Fixture shop', 'a snapshot of /', snap)
@@ -153,32 +239,60 @@ def main():
     # from the host itself), served by the Playwright image's node.
     image = subprocess.run(['docker', 'image', 'ls', '--filter', 'label=setup.service=playwright', '--format',
                             '{{.Repository}}:{{.Tag}}'], capture_output=True, text=True).stdout.split()[0]
-    site = f'ts-e2e-site-{base.name[-8:].lower()}'
-    page = '<!doctype html><title>Fixture</title><h1>Fixture shop</h1>'
+    site, other = (f'ts-e2e-{kind}-{base.name[-8:].lower()}' for kind in ('site', 'other'))
+    counter = """const http = require('http'); const seen = [];
+http.createServer((q, s) => {
+  if (q.url === '/seen') { s.setHeader('content-type', 'application/json'); return s.end(JSON.stringify(seen)); }
+  seen.push(q.method + ' ' + q.url);
+  if (q.url === '/go') { s.writeHead(302, { location: process.env.OTHER + '/stolen' }); return s.end(); }
+  s.setHeader('content-type', 'text/html');
+  if (q.url === '/form') return s.end('<!doctype html><title>Form</title><form id="f" method="post" action="/order">'
+                                      + '<input name="x" value="1"></form><script>document.getElementById("f").submit()</script>');
+  s.end('<!doctype html><title>Fixture</title><h1>Fixture shop</h1><img src="' + (process.env.OTHER || '') + '/pixel">'
+        + '<script>fetch("/order", { method: "POST", body: "x=1" }).catch(() => {})</script>');
+}).listen(8080);"""
+    subprocess.run(['docker', 'run', '-d', '--rm', '--name', other, '--network', 'bridge', '--user', '1000:1000',
+                    '--entrypoint', 'node', image, '-e', counter], check=True, capture_output=True)
+    other_address = subprocess.run(['docker', 'inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', other],
+                                   capture_output=True, text=True).stdout.strip()
     subprocess.run(['docker', 'run', '-d', '--rm', '--name', site, '--network', 'bridge', '--user', '1000:1000',
-                    '--entrypoint', 'node', image, '-e',
-                    f"require('http').createServer((q, s) => s.end({json.dumps(page)})).listen(8080)"],
+                    '--env', f'OTHER=http://{other_address}:8080', '--entrypoint', 'node', image, '-e', counter],
                    check=True, capture_output=True)
+
+    def seen(container):
+        return json.loads(subprocess.run(['docker', 'exec', container, 'node', '-e',
+                                          "fetch('http://127.0.0.1:8080/seen').then(r => r.text()).then(console.log)"],
+                                         capture_output=True, text=True).stdout or '[]')
     try:
         address = subprocess.run(['docker', 'inspect', '--format', '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', site],
                                  capture_output=True, text=True).stdout.strip()
         check(bool(address), 'the site container has an address', address)
-        (config / 'test-sessions.env').write_text(f'TEST_URL_{fixture.NAME.upper().replace("-", "_")}_STAGE=http://{address}:8080\n')
+        with open(config / 'test-sessions.env', 'a') as handle:
+            handle.write(f'TEST_URL_{fixture.NAME.upper().replace("-", "_")}_STAGE=http://{address}:8080\n')
         stage = ts('run', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME})
         check('run' in stage, 'a stage run starts', stage)
         stage = wait_run(stage['run']['id'])
-        check(stage['status'] == 'passed' and stage['summary']['passed'] == 2, 'stage runs its 2 @stage tests (not @stage-write)',
+        check(stage['summary']['passed'] + stage['summary']['failed'] == 2, 'stage runs its 2 @stage tests (not @stage-write)',
               stage)
         check(not (root / 'test-runs' / stage['id'] / 'data').exists(), "a stage run's traces and report are not kept")
         again = wait_run(ts('run', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME})['run']['id'])
         install = (root / 'test-runs' / again['id'] / 'log').read_text()
-        check(again['status'] == 'passed' and 'is up to date' in install, 'the next stage run reuses the dependency install')
+        check('is up to date' in install, 'the next stage run reuses the dependency install')
+        before, other_before = len(seen(site)), len(seen(other))  # the runs before were free to load the pixel
         snap = ts('snapshot', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME, 'path': '/'})
-        check(snap.get('run', {}).get('status') == 'done', 'a snapshot of stage', snap)
+        check(snap.get('run', {}).get('status') == 'done' and snap['run']['snapshot']['blocked'] >= 2,
+              'a snapshot of stage: the page, its POST and its image from another host blocked', snap)
+        form = ts('snapshot', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME, 'path': '/form'})
+        check(form.get('run', {}).get('status') == 'error', 'a page that submits a form gives an error, not the result', form)
+        away = ts('snapshot', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME, 'path': '/go'})
+        check(away.get('run', {}).get('status') == 'error', 'a redirect to another host gives an error, no page', away)
+        site_seen, other_seen = seen(site)[before:], seen(other)[other_before:]
+        check(not any(item.startswith('POST') for item in site_seen), f'the site received no POST from a snapshot: {site_seen}')
+        check(other_seen == [], f'the other server received nothing from the snapshots (pixel, redirect hop): {other_seen}')
         patched = ts('run', '--by=e2e', '--manage', stdin={'target': 'stage', 'project': fixture.NAME, 'patch': fixture.FIX_PATCH})
         check(patched.get('status') == 400, 'stage takes no patch', patched)
     finally:
-        subprocess.run(['docker', 'rm', '-f', site], capture_output=True)
+        subprocess.run(['docker', 'rm', '-f', site, other], capture_output=True)
 
     # Expiry: reconcile tears it down; nothing of it is left.
     record = root / 'test-sessions' / fixture.NAME / 'session.json'

@@ -200,6 +200,10 @@ Environment=SETUP_SERVER_CONFIG=$CONFIG
 ExecStart=$LIBRARY/bin/test-session reconcile
 # An expired session is torn down within this run (a process it left would be killed with the unit).
 TimeoutStartSec=1800
+# Its git, export and teardown work is bounded like the UI's workers (bin/test-session worker_scope).
+MemoryMax=1536M
+MemorySwapMax=0
+TasksMax=1024
 EOF
 cat > "$staging/test-sessions.timer" <<EOF
 [Unit]

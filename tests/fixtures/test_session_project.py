@@ -119,7 +119,7 @@ def git(root, *arguments):
                     *arguments], check=True, capture_output=True)
 
 
-def build(parent, setup, lock=False, lock_file=None):
+def build(parent, setup, lock=False, lock_file=None, services='playwright'):
     """The fixture under parent; returns its root (the environment repository)."""
     sys.path[:0] = [str(setup), str(Path(setup) / 'docker')]
     import contextlib
@@ -132,7 +132,7 @@ def build(parent, setup, lock=False, lock_file=None):
         subprocess.run(['rm', '-rf', str(root)], check=True)
     with contextlib.redirect_stdout(io.StringIO()):
         app = scaffold(NAME, parent, complete_options({'profile': 'generic', 'php_version': '8.4', 'database': 'mysql',
-                                                      'database_version': '8.4', 'services': 'playwright'}))
+                                                      'database_version': '8.4', 'services': services}))
     common = app / 'env/common.env'
     # The versions of setup's own PHP 8.4 test images, so a machine that ran setup's tests builds nothing new.
     common.write_text(common.read_text() + 'XDEBUG_VERSION=3.5.3\nCOMPOSER_VERSION=2.10.3\nSCHEMA_DIRECTORY=app/database/schema\n'

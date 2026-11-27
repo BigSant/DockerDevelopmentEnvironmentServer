@@ -84,8 +84,8 @@ class Base(unittest.TestCase):
         self.ts = load(self.root)
         self.assertTrue(str(self.ts.ROOT).startswith(str(self.root)))
         self.detached = []
-        for name, value in (("detach", lambda *arguments: self.detached.append(arguments) or os.getpid()),
-                            ("require_setup", lambda: None), ("STOP_GRACE", 1)):
+        for name, value in (("detach", lambda *arguments: self.detached.append(arguments) or 999999999),
+                            ("require_setup", lambda: None), ("STOP_GRACE", 1), ("worker_scope", lambda command: [])):
             patcher = patch.object(self.ts, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -167,7 +167,9 @@ class Base(unittest.TestCase):
         made = self.ts.create(self.options(env_ref=env_ref))
 
         def fake_make(log, directory, target, *arguments, **keywords):
-            calls.append((target, arguments, keywords))
+            content = self.ts.SESSIONS / "alpha/content"
+            calls.append((target, arguments, keywords, sorted(str(path.relative_to(content)) for path in content.rglob("*")
+                                                              if path.is_file()) if content.is_dir() else []))
             if target == "test-init":
                 with open(directory / "env/test.env", "a") as handle:
                     handle.write("DOMAIN=alpha.test.local\n")
@@ -198,16 +200,25 @@ class TrustTest(Base):
         app = repo / "app"
         self.assertEqual((app / "Makefile").read_text(), "include $(SETUP_DIRECTORY)/docker/project.mk\n")
         self.assertEqual((app / "env/common.env").read_text(), "PROJECT_NAME=alpha\n")
-        self.assertEqual((app / "tests/playwright/home.spec.ts").read_text(), "// the branch's spec\n")
-        self.assertEqual((app / "config/playwright/playwright.config.cjs").read_text(), "// branch config\n")
-        self.assertEqual((app / "tests/playwright/package.json").read_text(), '{"name": "reviewed"}\n')
-        self.assertFalse((app / "tests/playwright/.npmrc").exists(), "the package files are the trusted commit's only")
-        self.assertFalse(os.path.lexists(app / "tests/playwright/link.ts"), "no symlink is written")
-        self.assertEqual(list((app / "tests/playwright/node_modules").iterdir()), [], "an empty mount point only")
+        content = self.ts.SESSIONS / "alpha/content"
+        # The trusted tree keeps its own specs; the branch's are data directories outside it.
+        self.assertEqual((app / "tests/playwright/home.spec.ts").read_text(), SPEC)
+        self.assertEqual((content / "tests/home.spec.ts").read_text(), "// the branch's spec\n")
+        self.assertEqual((content / "config/playwright.config.cjs").read_text(), "// branch config\n")
+        self.assertEqual((content / "tests/package.json").read_text(), '{"name": "reviewed"}\n')
+        self.assertFalse((content / "tests/.npmrc").exists(), "the package files are the trusted commit's only")
+        self.assertFalse(os.path.lexists(content / "tests/link.ts"), "no symlink is written")
+        self.assertEqual(list((content / "tests/node_modules").iterdir()), [], "an empty mount point only")
+        self.assertFalse((content / "tests/node_modules/ms").exists())
+        local_env = (app / "env/local.env").read_text()
+        for line in ("TEST_SESSION=on", f"E2E_TESTS_DIRECTORY={content}/tests", f"TEST_APP_SOURCE={content}/public"):
+            self.assertIn(line + "\n", local_env)
+            self.assertIn(line + "\n", (app / "env/test.env").read_text())
         test_env = (app / "env/test.env").read_text()
         for line in ("TEST_HOST_ROUTE=off", "CRON_SCHEDULE=off", "PLAYWRIGHT_MEMORY=1024m", "PHP_MEMORY=512m"):
             self.assertIn(line + "\n", test_env)
-        self.assertEqual([call[0] for call in calls], ["test-init", "build", "test-prepare", "e2e-install"])
+        self.assertEqual([call[0] for call in calls], ["build", "test-init", "test-prepare", "e2e-install"])
+        self.assertEqual(calls[0][3], [], "the images are built before anything of the caller's is written")
         (self.root / "etc/test-sessions.env").write_text("TEST_TRUSTED_REFS_ALPHA=evil\n")
         self.assertEqual(self.ts.trusted_commit(self.project, "evil"), (evil, "evil"), "the operator's allowlist")
 
@@ -449,7 +460,7 @@ class GateTest(Base):
 
     def test_the_session_estimate_is_the_sum_of_the_limits_it_writes(self):
         limits = self.ts.settings()
-        text = self.ts.session_env(limits)
+        text = self.ts.session_env(limits, self.root / "content")
         written = sum(int(value) for value in re.findall(r"^[A-Z]+_MEMORY=(\d+)m$", text, re.M))
         self.assertEqual(written, self.ts.session_memory_mb(limits))
         self.assertEqual(self.ts.session_memory_mb(limits), 2208 + 1024)
@@ -570,7 +581,7 @@ class SessionLifecycleTest(Base):
         self.ts.reconcile()
         data = self.ts.find_session("ts-0123456789ab")
         self.assertEqual((data["status"], data["end_reason"]), ("destroying", "expired"))
-        self.assertIn("compose down failed", data["error"])
+        self.assertIn("teardown is not complete", data["error"])
         (self.root / "fakebin/down.exit").write_text("0")
         self.ts.reconcile()
         self.assertEqual(self.ts.find_session("ts-0123456789ab")["status"], "expired")
@@ -631,7 +642,7 @@ class WorkerTest(Base):
         def fake_make(log, directory, target, *arguments, **keywords):
             made.append((target, arguments))
             if target == "e2e":
-                spec = (directory / "tests/playwright/fixme.spec.ts").read_text()
+                spec = (self.ts.SESSIONS / "alpha/content/tests/fixme.spec.ts").read_text()
                 self.report(directory / ".generated/test/data/playwright", passed="'ready'" in spec)
             return 0
         with patch.object(self.ts, "make", fake_make):
@@ -837,6 +848,348 @@ class SessionApiTest(Base):
         self.refused(404, self.ts.environment_url, self.project, "demo", master)
         (self.root / "etc/test-sessions.env").write_text("TEST_URL_ALPHA_PROD=http://10.0.0.5:8080/\n")
         self.assertEqual(self.ts.environment_url(self.project, "prod", master), "http://10.0.0.5:8080")
+
+
+def group(command):
+    """A process group of its own (as a worker or a command is), recorded as the program records one."""
+    process = subprocess.Popen(command, start_new_session=True)
+    return process
+
+
+class RoundThreeTest(Base):
+    """Review round 2: each guard below fails its test when removed."""
+
+    # 1
+    def test_an_attachment_in_the_posix_root_form_cannot_name_a_host_file(self):
+        results = self.root / "results"
+        results.mkdir()
+        (results / "ok.txt").write_text("ok")
+        secret = self.root / "prod.env"
+        secret.write_text("DATABASE_PASSWORD=secret\n")
+        for path in ("//" + str(secret).lstrip("/"), "/" + str(secret).lstrip("/"), "a//b", "./ok.txt", "ok.txt/", "a/\0"):
+            with self.subTest(path=path), self.assertRaises(OSError):
+                self.ts.relative_parts(path)
+        failed = {"status": "failed", "attachments": [{"path": "/e2e/data//" + str(secret).lstrip("/")},
+                                                      {"path": "/e2e/data/" + str(secret)}, {"path": "/e2e/data/ok.txt"}]}
+        report = {"suites": [{"title": "f", "specs": [{"title": "t", "tests": [{"status": "unexpected", "results": [failed]}]}]}]}
+        _, _, artifacts = self.ts.digest(report, results, self.root / "artifacts", 1)
+        self.assertEqual([item["name"] for item in artifacts], ["001-ok.txt"])
+
+    # 2
+    def test_a_tag_named_like_the_deploy_branch_does_not_choose_the_trusted_commit(self):
+        master = git(self.project, "rev-parse", "refs/remotes/origin/master")
+        evil = self.push_branch("evil", {"app/Makefile": "all:\n\ttouch /tmp/pwned\n"})
+        git(self.project, "tag", "origin/master", evil)
+        git(self.project, "tag", "master", evil)
+        self.assertEqual(self.ts.trusted_commit(self.project), (master, "master"))
+        self.assertEqual(self.ts.trusted_commit(self.project, "master"), (master, "master"))
+        self.assertEqual(self.ts.resolve(self.project, "master"), master)
+
+    # 5
+    def test_a_branchs_blobs_are_counted_before_one_is_read(self):
+        self.push_branch("big", {"app/tests/playwright/big.txt": "x" * (2 * 1024 * 1024)})
+        commit = git(self.project, "rev-parse", "origin/big")
+        (self.root / "etc/test-sessions.env").write_text("TEST_SPECS_MB=1\n")
+        with patch.object(self.ts, "stream_objects", lambda files: self.fail("nothing is read before the count")):
+            answer = self.refused(400, self.ts.tree_files, self.project, {}, commit, "app/tests/playwright", self.root / "log",
+                                  reason="content_too_large")
+        self.assertIn("TEST_CONTENT", answer["error"])
+        (self.root / "etc/test-sessions.env").write_text("TEST_CONTENT_MB=1\n")
+        with patch.object(self.ts, "stream_objects", lambda files: self.fail("nothing is read before the count")):
+            self.refused(400, self.ts.export_tree, self.project, {}, commit, "app", self.root / "srv/test-sessions/x", self.root / "log")
+
+    def test_the_shop_export_streams_regular_files_and_says_what_it_left_out(self):
+        self.push_branch("shop", {"app/public/index.php": "<?php echo 1;", "app/public/node_modules/a/i.js": "1",
+                                  "app/public/sub/deep.txt": "d"}, links=[("app/public/link", "/etc/passwd")])
+        commit = git(self.project, "rev-parse", "origin/shop")
+        target = self.ts.SESSIONS / "alpha/content/public"
+        dropped = self.ts.export_tree(self.project, {}, commit, "app/public", target, self.root / "log")
+        self.assertEqual(dropped, {"symlink": 1})
+        self.assertEqual(sorted(str(path.relative_to(target)) for path in target.rglob("*") if path.is_file()),
+                         ["index.php", "node_modules/a/i.js", "sub/deep.txt"], "a shop keeps its node_modules")
+        self.assertFalse(os.path.lexists(target / "link"))
+
+    def test_a_log_is_bounded_and_a_quick_command_over_its_quota_is_caught(self):
+        log = self.root / "log"
+        (self.root / "etc/test-sessions.env").write_text("TEST_LOG_MB=1\n")
+        self.assertEqual(self.ts.run_logged(log, ["sh", "-c", "head -c 3000000 /dev/zero | tr '\\0' x"]), 0)
+        self.assertLess(log.stat().st_size, 1024 * 1024 + 4096)
+        quota = self.root / "results"
+        quota.mkdir()
+        code = self.ts.run_logged(self.root / "log2", ["sh", "-c", f"head -c 3000000 /dev/zero > {quota}/big"],
+                                  quota=(quota, 1024 * 1024))
+        self.assertEqual(code, 125, "the last look after it ended")
+
+    def test_reconcile_destroys_sessions_below_the_disk_floor(self):
+        self.session()
+        with patch.object(self.ts, "free_disk_mb", lambda: 100):
+            done = self.ts.reconcile()["reconciled"]
+        self.assertTrue(any(item.startswith("destroyed ts-0123456789ab") for item in done), done)
+        data = self.ts.find_session("ts-0123456789ab")
+        self.assertEqual(data["status"], "destroyed")
+
+    def test_the_workers_run_in_a_bounded_scope_on_systemd(self):
+        real = self.ts.worker_scope.__wrapped__ if hasattr(self.ts.worker_scope, "__wrapped__") else None
+        self.assertIsNone(real)
+        module = load(self.root)
+        with patch.object(module.os.path, "isdir", lambda path: path == "/run/systemd/system"), \
+                patch.object(module.shutil, "which", lambda name: "/usr/bin/" + name), \
+                patch.object(module.pwd, "getpwnam", lambda name: type("A", (), {"pw_gid": 1234})()):
+            scope = module.worker_scope("run")
+            self.assertEqual(module.worker_scope("list"), [])
+        self.assertEqual(scope[:3], ["systemd-run", "--scope", "--quiet"])
+        self.assertIn("MemoryMax=1536M", scope)
+        self.assertIn("MemorySwapMax=0", scope)
+        self.assertIn("--uid=setup", scope)
+
+    # 6
+    def test_a_cancel_keeps_the_slot_until_the_run_has_stopped(self):
+        run, _ = self.ts.start_run({"target": "stage", "project": "alpha"}, "t", True, {})
+        worker = group(["sh", "-c", "trap '' TERM; sleep 60"])
+        command = group(["sh", "-c", "trap '' TERM; sleep 60"])
+        self.addCleanup(lambda: [process.kill() for process in (worker, command)])
+        self.ts.update_run(run["id"], status="running", worker=self.ts.identity(worker.pid), suite_started=True)
+        seen = []
+
+        def cancel():
+            seen.append(self.ts.cancel_run(run["id"], "cancelled by t", "t"))
+        thread = threading.Thread(target=cancel)
+        thread.start()
+        time.sleep(1)
+        self.ts.update_run(run["id"], command=self.ts.identity(command.pid))  # recorded after the cancel began
+        self.assertEqual(self.ts.find_run(run["id"])["status"], "cancelling")
+        self.refused(409, self.ts.start_run, {"target": "live", "project": "alpha"}, "t", True, {}, reason="run_active")
+        self.assertEqual(json.loads((self.ts.RUNS / "active/external-alpha").read_text())["run"], run["id"])
+        thread.join(60)
+        for process in (worker, command):
+            process.wait(5)
+        final = seen[0]
+        self.assertEqual((final["status"], final["executed"]), ("cancelled", True), "the suite had started")
+        self.assertFalse((self.ts.RUNS / "active/external-alpha").exists())
+        self.assertIn(f"rm --force --volumes {run['id']}", self.docker_calls())
+        again, _ = self.ts.start_run({"target": "live", "project": "alpha"}, "t", True, {})
+        self.assertNotEqual(again["id"], run["id"])
+
+    def test_a_slot_is_freed_only_by_its_owner(self):
+        self.ts.write_json(self.ts.RUNS / "active/external-alpha", {"run": "run-00000000000b"})
+        self.ts.release_scope({"id": "run-00000000000a", "project": "alpha"})
+        self.assertTrue((self.ts.RUNS / "active/external-alpha").exists())
+
+    # 7
+    def test_one_client_run_id_index_per_project_whoever_asks(self):
+        first, created = self.ts.start_run({"target": "stage", "project": "alpha", "client_run_id": "k"}, "token:a", True, {})
+        again, created_again = self.ts.start_run({"target": "stage", "project": "alpha", "client_run_id": "k"}, "token:b", True, {})
+        self.assertEqual((again["id"], created, created_again), (first["id"], True, False))
+        self.refused(409, self.ts.start_run, {"target": "live", "project": "alpha", "client_run_id": "k"}, "token:b", True, {},
+                     reason="client_run_id_conflict")
+        self.ts.cancel_by_key("alpha", "k", "token:c")
+        self.refused(409, self.ts.start_run, {"target": "stage", "project": "alpha", "client_run_id": "k"}, "token:a", True, {},
+                     reason="cancelled")
+
+    def test_the_tombstone_is_checked_again_under_the_lock(self):
+        def cancel_meanwhile(limits):
+            self.ts.cancel_by_key("alpha", "late", "token:b")
+        with patch.object(self.ts, "run_gates", cancel_meanwhile):
+            self.refused(409, self.ts.start_run, {"target": "stage", "project": "alpha", "client_run_id": "late"}, "token:a",
+                         True, {}, reason="cancelled")
+        self.assertEqual(list(self.ts.RUNS.glob("run-*")), [])
+
+    # 8
+    def test_destroy_stops_a_creating_sessions_worker_and_command_once(self):
+        worker = group(["sleep", "60"])
+        command = group(["sleep", "60"])
+        self.addCleanup(lambda: [process.kill() for process in (worker, command)])
+        self.session(status="creating", worker=self.ts.identity(worker.pid), command=self.ts.identity(command.pid))
+        self.ts.destroy("ts-0123456789ab", "t")
+        for process in (worker, command):
+            self.assertIsNotNone(process.wait(20), "stopped")
+        self.assertEqual(self.ts.find_session("ts-0123456789ab")["status"], "destroying")
+        cleaner = group(["sleep", "60"])
+        self.addCleanup(cleaner.kill)
+        self.ts.update_session("alpha", worker=self.ts.identity(cleaner.pid))
+        self.ts.destroy("ts-0123456789ab", "t")
+        self.assertEqual(len(self.detached), 1, "a destroy while one cleans starts no second cleaner")
+
+    # 9
+    def test_reconcile_keeps_a_live_sessions_local_project_and_downs_orphans(self):
+        self.session()
+        (self.root / "fakebin/ps.txt").write_text(
+            f"a-1\talpha-local\t{self.ts.SESSIONS}/alpha/repo/app\nb-1\talpha-test\t{self.ts.SESSIONS}/alpha/repo/app\n"
+            f"c-1\tgone-test\t{self.ts.SESSIONS}/gone/repo/app\nd-1\tprod\t/srv/elsewhere\n")
+        self.ts.reconcile()
+        downs = [line for line in self.docker_calls() if " down " in f" {line} "]
+        self.assertEqual(downs, ["compose -p gone-test down --volumes --remove-orphans --timeout 10"])
+
+    # 10
+    def test_a_tree_that_cannot_be_removed_is_no_finished_teardown(self):
+        self.session()
+        (self.ts.SESSIONS / "alpha/repo").mkdir(parents=True)
+        with patch.object(self.ts, "remove_tree", lambda path: None):
+            self.assertFalse(self.ts.teardown(self.ts.find_session("ts-0123456789ab"), self.root / "log"))
+        self.session(status="failed")
+        with patch.object(self.ts, "remove_tree", lambda path: None):
+            self.refused(503, self.ts.create, self.options(), reason="cleanup_pending")
+
+    # 11
+    def test_a_stage_snapshot_clones_nothing_and_runs_confined(self):
+        image = self.root / "fakebin/image.txt"
+        (self.root / "fakebin/docker").write_text(FAKE_DOCKER.replace('  "info --format")', '  "image ls") echo playwright-1:latest;;\n  "info --format")'))
+        with patch.object(self.ts, "clone", lambda *a, **k: self.fail("a snapshot of a real site clones nothing")):
+            shown, _ = self.ts.start_run({"target": "stage", "project": "alpha", "path": "/"}, "t", True, {}, kind="snapshot")
+        command = next(line for line in self.docker_calls() if line.startswith("run --rm --name snap-"))
+        for option in ("--read-only", "--cap-drop ALL", "--pids-limit 1024", "no-new-privileges:true", "--user"):
+            self.assertIn(option, command)
+        self.assertIn("BASE_URL=https://stage.alpha.example", command)
+        for guard in ("['GET', 'HEAD'].includes(route.request().method())", "proxy.on('connect'", "request.url !== allowed",
+                      "bypass: '<-loopback>'"):
+            self.assertIn(guard, self.ts.SNAPSHOT_SCRIPT)
+        self.assertFalse(image.exists())
+
+    # 12
+    def test_view_sees_only_numbers_of_a_run_with_storage_states(self):
+        run, _ = self.ts.start_run({"target": "stage", "project": "alpha"}, "t", True, {"customer": "{}"})
+        self.ts.update_run(run["id"], status="failed", tests=[{"title": "cookie=secret"}], errors=["Cookie: a"],
+                           summary={"passed": 1, "failed": 1}, error="x", executed=True)
+        data = self.ts.find_run(run["id"])
+        shown = self.ts.public_run(data, full=False)
+        self.assertEqual(sorted(shown), sorted(key for key in self.ts.VIEW_ONLY if key in shown))
+        self.assertNotIn("tests", shown)
+        self.assertIn("tests", self.ts.public_run(data, full=True))
+        self.assertIn("tests", self.ts.public_run({**data, "roles": None}, full=False), "a run without states is shown")
+        self.session(status="failed", error="clone of https://bot:token@git.example/x failed")
+        self.assertEqual(self.ts.public_session(self.ts.find_session("ts-0123456789ab"))["error"],
+                         "clone of https://***@git.example/x failed")
+
+    # 13
+    def test_a_two_repository_project_works(self):
+        env = self.root / "work/beta-env"
+        env.mkdir(parents=True)
+        (env / "env").mkdir()
+        (env / "Makefile").write_text("include $(SETUP_DIRECTORY)/docker/project.mk\n")
+        (env / "env/common.env").write_text("PROJECT_NAME=beta\n")
+        (env / "env/stage.env.example").write_text("DOMAIN=stage.beta.example\n")
+        (env / "tests/playwright").mkdir(parents=True)
+        (env / "tests/playwright/a.spec.ts").write_text(SPEC)
+        (env / "config/playwright").mkdir(parents=True)
+        (env / "config/playwright/c.cjs").write_text("1")
+        code = self.root / "work/beta-code"
+        code.mkdir()
+        (code / "index.php").write_text("<?php echo 'beta';")
+        (code / "link").symlink_to("/etc/passwd")
+        for repository in (env, code):
+            git(repository, "init", "-q", "-b", "master")
+            git(repository, "add", "-A")
+            git(repository, "commit", "-q", "-m", "init")
+        origin = self.root / "origins/beta.git"
+        subprocess.run(["git", "clone", "-q", "--bare", str(env), str(origin)], check=True)
+        root = self.ts.PROJECTS / "beta"
+        root.mkdir()
+        subprocess.run(["git", "clone", "-q", str(origin), str(root / "app")], check=True)
+        subprocess.run(["git", "clone", "-q", str(code), str(root / "app/public")], check=True)
+        self.assertEqual(self.ts.build_root("beta"), root)
+        run, _ = self.ts.start_run({"target": "stage", "project": "beta"}, "t", True, {})
+        self.assertEqual(run["url"], "https://stage.beta.example")
+        made = self.ts.create(self.options(project="beta"))
+        with patch.object(self.ts, "make", lambda log, directory, target, *a, **k: 0):
+            self.ts.create_worker(made["id"])
+        session = self.ts.find_session(made["id"])
+        self.assertEqual(session["status"], "ready", (self.ts.SESSIONS / "beta/log").read_text())
+        content = self.ts.SESSIONS / "beta/content"
+        self.assertEqual((content / "public/index.php").read_text(), "<?php echo 'beta';")
+        self.assertFalse(os.path.lexists(content / "public/link"), "a code clone is exported as regular files only")
+        self.assertEqual((content / "tests/a.spec.ts").read_text(), SPEC)
+        self.assertTrue((self.ts.SESSIONS / "beta/repo/app/Makefile").is_file())
+
+    # 15
+    def test_storage_states_have_their_own_bound(self):
+        uuids = [UUID.replace("0f8f", f"{index:04x}") for index in range(5)]
+        for uuid in uuids:
+            (self.root / "handoff/stage" / f"{uuid}.json").write_text('{"x": "' + "a" * 900_000 + '"}')
+        three = {"target": "stage", "project": "alpha", "storage_states": {f"r{index}": uuids[index] for index in range(3)}}
+        self.assertEqual(len(self.ts.read_storage_states(three, "stage")), 3, "three of 0.9 MB fit")
+        five = {**three, "storage_states": {f"r{index}": uuid for index, uuid in enumerate(uuids)}}
+        self.refused(413, self.ts.read_storage_states, five, "stage")
+
+    # 16
+    def test_tombstones_are_bounded_per_project(self):
+        (self.root / "etc/test-sessions.env").write_text("TEST_TOMBSTONES=3\n")
+        for index in range(3):
+            self.ts.cancel_by_key("alpha", f"k{index}", "t")
+        self.ts.cancel_by_key("alpha", "k0", "t")  # an existing one is no new tombstone
+        self.refused(409, self.ts.cancel_by_key, "alpha", "k3", "t", reason="tombstones_full")
+
+    # 17
+    def test_deeply_nested_json_is_a_400(self):
+        self.refused(400, self.ts.read_request, io.BytesIO(b"[" * 100000 + b"]" * 100000))
+
+    # 18
+    def test_a_session_has_a_cpu_budget(self):
+        text = self.ts.session_env(self.ts.settings(), self.root / "content")
+        total = sum(float(value) for value in re.findall(r"^[A-Z]+_CPUS=([0-9.]+)$", text, re.M))
+        self.assertLessEqual(total, 7)
+        self.assertIn("PHP_CPUS=1\n", text)
+
+    # Guards that survived a mutation
+    def test_git_runs_no_hook_fsmonitor_or_ext_transport(self):
+        marker = self.root / "ran"
+        hook = self.project / ".git/hooks/post-checkout"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        monitor = self.root / "monitor.sh"
+        monitor.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        monitor.chmod(0o755)
+        git(self.project, "config", "core.fsmonitor", str(monitor))
+        self.ts.git(self.project, "checkout", "-q", "-b", "other")
+        self.ts.git(self.project, "status", check=False)
+        self.ts.git(self.project, "fetch", f"ext::sh -c touch% {marker}", check=False)
+        self.assertFalse(marker.exists())
+
+    def test_a_run_needs_a_ready_session_of_its_project_and_no_env_ref(self):
+        self.session()
+        self.refused(400, self.ts.start_run, {"target": "test", "session": "ts-0123456789ab", "env_ref": "master"}, "t", True, {})
+        self.build_root("gamma")
+        self.refused(400, self.ts.start_run, {"target": "test", "project": "gamma", "session": "ts-0123456789ab"}, "t", True, {})
+        run, _ = self.ts.start_run({"target": "test", "session": "ts-0123456789ab"}, "t", True, {})
+        self.ts.update_session("alpha", status="destroying")
+        with patch.object(self.ts, "make", lambda *a, **k: self.fail("no run in an ended session")):
+            self.ts.run_worker(run["id"])
+        self.assertEqual(self.ts.find_run(run["id"])["status"], "error")
+
+    def test_a_runs_storage_states_are_removed_when_it_ends(self):
+        run, _ = self.ts.start_run({"target": "stage", "project": "alpha"}, "t", True, {"customer": "{}"})
+        self.assertTrue((self.ts.run_dir(run["id"]) / "auth/customer.json").is_file())
+        self.ts.cancel_run(run["id"], "x")
+        self.assertFalse((self.ts.run_dir(run["id"]) / "auth").exists())
+
+    def test_the_patch_result_is_checked_again(self):
+        directory = self.ts.run_dir("run-0000000000ef")
+        directory.mkdir(parents=True)
+        master = git(self.project, "rev-parse", "origin/master")
+        specs = self.ts.spec_files(self.project, {}, master, master, self.root / "log")
+        real = subprocess.run
+
+        def planting_apply(command, **keywords):
+            result = real(command, **keywords)
+            if "apply" in command and "--numstat" not in command:
+                (Path(keywords["cwd"]) / "tests/playwright/evil").symlink_to("/etc/passwd")
+            return result
+        with patch.object(self.ts.subprocess, "run", planting_apply):
+            self.refused(400, self.ts.apply_patch, specs, fixture.FIX_PATCH, directory)
+
+    def test_a_symlinked_directory_is_never_followed_when_reading_results(self):
+        (self.root / "outside").mkdir()
+        (self.root / "outside/snapshot.json").write_text("{}")
+        results = self.root / "results"
+        results.mkdir()
+        (results / "ops").symlink_to(self.root / "outside")
+        self.assertIsNone(self.ts.read_inside(results, "snapshot.json", 100, ("ops",)))
+
+    def test_an_artifact_name_is_one_plain_name(self):
+        run, _ = self.ts.start_run({"target": "stage", "project": "alpha"}, "t", True, {})
+        for name in ("../run.json", "/etc/passwd", ".hidden"):
+            options = self.ts.parser(internal=True).parse_args(["artifact", f"--id={run['id']}", f"--name={name}"])
+            with self.subTest(name=name), contextlib.redirect_stdout(io.StringIO()):
+                self.refused(400, self.ts.dispatch, options)
 
 
 if __name__ == "__main__":

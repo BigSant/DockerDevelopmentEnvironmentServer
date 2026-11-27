@@ -813,9 +813,9 @@ the commands for manual recovery are printed.
 A server installed before the API (e.g. 2026-11-06) is updated by hand, in this order:
 
 1. **Look first** (as the clone's owner, no sudo): `cd ~/setup-server && bin/update --check --server-ref origin/master
-   --setup-ref v5.8.0` – setup must be 5.8.0 or newer for test sessions (`test-session-v2`).
+   --setup-ref v5.9.0` – setup must be 5.9.0 or newer for test sessions (`test-session-v3`).
 2. **Update** (no sudo; it asks for the password of its own `sudo` calls): `bin/update --server-ref origin/master
-   --setup-ref v5.8.0`. It fetches and switches both checkouts, rewrites the installed copies
+   --setup-ref v5.9.0`. It fetches and switches both checkouts, rewrites the installed copies
    (`install-backups`, `install-metrics`, `add-backup-key` and `install-ui --refresh`: `/usr/local/sbin/setup-server-*` and
    every command in `/usr/local/lib/setup-server/bin/`, `bin/test-session` too), restarts the UI, runs the health check
    (these tests, the setup checkout, the runners' PIDs) and returns everything on a failure. It never changes units,
@@ -833,7 +833,7 @@ sudo bin/install-ui --check | grep -E 'would|differs' || echo "install-ui: nothi
 systemctl list-timers setup-server-test-sessions.timer --no-pager      # next run within a minute
 sudo journalctl -u setup-server-test-sessions --since -5min --no-pager  # {"reconciled": []}
 sudo -u setup-ui sudo -n /usr/local/lib/setup-server/bin/test-session list   # {"sessions": []}
-sudo -u setup make -s -f /srv/setup-server/setup/docker/project.mk setup-capabilities  # … test-session-v2
+sudo -u setup make -s -f /srv/setup-server/setup/docker/project.mk setup-capabilities  # … test-session-v3
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9102/api/v1          # 401 without a token
 curl -s -H "Authorization: Bearer $OPS_TOKEN" http://127.0.0.1:9102/api/v1 | jq '[.endpoints[] | select(.needs == "testenv: manage")] | length'  # 8
 ```
@@ -1483,177 +1483,223 @@ or against the real STAGE/LIVE site (a **run**), and looks at a page without a b
 work is done by `bin/test-session`, which the UI runs as root through its sudo rule. As root it accepts only the public
 commands (`create`, `list`, `show`, `extend`, `destroy`, `run`, `snapshot`, `run-show`, `runs`, `artifact`, `cancel`,
 `cancel-key`, `reconcile`; a run's request only on stdin, at most 2 MiB), reads the storage states only root may read,
-and runs itself again as the `setup` account with what it checked: every clone, `make`, `git` and Docker command runs
-with that account's rights.
+and runs itself again as the `setup` account; on a systemd host the commands that start work (`create`, `destroy`,
+`run`, `snapshot`, `cancel`, `cancel-key`) run in a transient scope with `MemoryMax=TEST_WORKER_MEMORY_MB` (1536),
+no swap and at most 1024 tasks, which their background workers stay in (the timer's unit has the same limits). Needs
+setup 5.9.0+ (`test-session-v3`).
 
-**Trust.** This runs on the production host, as `setup` (docker group: root-equivalent, deploy keys), so what a caller
-sends or chooses is never trusted:
-- *Code that runs on the host* – the environment repository's Makefile, `env/`, compose files and whatever `make` runs
-  here – comes only from a **trusted commit**: one reachable from the project's deploy branch (the build root's
-  `origin/HEAD`, as `git merge-base --is-ancestor` tells), or from a branch the operator lists in
-  `/etc/setup-server/test-sessions.env` as `TEST_TRUSTED_REFS_<PROJECT>=release next`. Nothing is fetched for it.
-- *Code the caller chooses* – the specs and their configuration (`tests/playwright/`, `config/playwright/`) of an
-  untrusted `env_ref` or of a `patch`, and the shop code of `shop_ref` – may come from any branch, but only as
-  **files** written onto the trusted tree (regular files only: no symlink, no `node_modules`; the session's Makefile,
-  env and compose files stay the trusted commit's) and it runs only **inside containers**. `tests/playwright`'s
-  `package.json`, `package-lock.json` and `.npmrc` are always the trusted commit's; `make e2e-install` runs
-  `npm ci --ignore-scripts` in the Playwright image into `.generated/e2e/`, which every run mounts read-only over
-  `tests/playwright/node_modules`, so nothing a spec or a patch writes is ever loaded as a dependency.
-- *stage and live* run only the trusted commit's suite: no `patch` (`400`), and `env_ref` only when it is trusted.
-- *What test code can reach.* In a session the Playwright container is on the session's own project network, which is
-  `internal` (no route out): the session's services (its site, PHP, database, mail catcher) and nothing else – not the
-  host, not another project, not the internet. Nothing of a session is published on the host (no port, whatever
-  `PUBLISH_ADDRESS` says). Against stage/live it runs on Docker's bridge network (it has to reach the site); a
-  snapshot's browser loads nothing of another origin. Every Playwright container runs as `setup` (never root), with
-  `TEST_RUN_MEMORY_MB` (1024) of memory and no swap beyond it, `TEST_RUN_CPUS` (2), at most 1024 processes, no
-  capabilities and `no-new-privileges`.
+**Where this runs, and what is a hard limit.** By default sessions share this host with the production shops: its
+Docker daemon, its disk, its memory. What is confined (below) keeps a session's code off the host and away from the
+network, and the limits keep it small, but **the only hard limits on disk are filesystems of their own**: put
+`TEST_WORK_DIRECTORY=/abs/path` (sessions, stage/live clones and runs; default `$ROOT`) and Docker's data root on a
+separate filesystem, or point `TEST_DOCKER_HOST=unix:///…|tcp://…|ssh://…` at another Docker daemon (a separate,
+resource-limited VM without the production deploy keys is the operator's strongest option). Both are settings in
+`/etc/setup-server/test-sessions.env`; nothing else changes. Without them, what stays shared: the Docker daemon and its
+data root (images, the session's volumes and containers' writable layers), the disk under `$ROOT`, the kernel, the
+build cache of `docker compose build` (BuildKit is not bounded by these limits), and the build root's Git objects
+(read only).
+
+**Trust.** This runs as `setup` (docker group: root-equivalent, deploy keys), so what a caller sends or chooses is never
+trusted:
+- *Code that runs on the host* – the environment repository's Makefile, `env/`, compose files, Dockerfiles and whatever
+  `make` runs here – comes only from a **trusted commit**: one reachable from the project's deploy branch (the build
+  root's `origin/HEAD`, read by its full name; every reference is resolved by its exact name
+  `refs/remotes/origin/<branch>`, never by a short name a tag could shadow, and the commit id is carried through), or
+  from a branch the operator lists as `TEST_TRUSTED_REFS_<PROJECT>=release next`. Nothing is fetched for it. The
+  session's tree is a clone of that commit and nothing of the caller's is ever written into it; its images are built
+  before anything of the caller's exists.
+- *Content the caller chooses* – the specs and their configuration (`tests/playwright/`, `config/playwright/`) of an
+  untrusted `env_ref` or of a `patch`, and the shop code of `shop_ref` – may come from any branch, but only as **data
+  directories outside the tree** (`$WORK/test-sessions/<project>/content/{tests,config,public}`; regular files only, no
+  symlink; the specs without `node_modules`, the shop code with them), and it runs only **inside the session's
+  containers**. setup's session mode (`TEST_SESSION=on`) mounts them read-only (the specs) or copies them into
+  ENV=test (the shop code) and refuses a compose file, `env_file`, build context or writable mount from them.
+  `tests/playwright`'s `package.json`, `package-lock.json` and `.npmrc` are always the trusted commit's; `make
+  e2e-install` runs `npm ci --ignore-scripts` in a one-off, bounded Playwright container into `.generated/e2e/`, which
+  every run mounts read-only over the specs' `node_modules`.
+- *stage and live* run only the trusted commit's suite: no `patch` (`400`), and `env_ref` only when it is trusted. Their
+  clone holds the specs only (no shop code).
+- *Confinement* (setup's session mode, derived from the rendered ENV=test model and checked again): every network is
+  `internal`; no service publishes a port, has `host.docker.internal`/`host-gateway`, mounts the Docker socket or a
+  host directory outside the session; the `metrics` service is left out; every service has `cap_drop: ALL` with at
+  most `CHOWN DAC_OVERRIDE FOWNER FSETID KILL NET_BIND_SERVICE SETGID SETUID` back (what the entrypoints need to drop to
+  their user), `no-new-privileges`, a process limit and memory equal to its memory-and-swap limit; Playwright runs as
+  `setup`, without capabilities, with a read-only root and a 256 MB `/tmp` (it counts against its memory). Services start as root where their images
+  need it (MySQL, Apache, PHP-FPM drop privileges themselves): a non-root user for every service is not enforced.
+- *What test and shop code can reach.* In a session: the session's own services (its site, PHP, database, mail catcher)
+  and nothing else – not the host, the bridge gateway, another project, cloud metadata or the internet (verified from
+  PHP-FPM and from a spec). Against stage/live a run's container is on Docker's bridge network (it has to reach the
+  site). A snapshot's browser reaches the network only through a proxy in its own process that connects to the site's
+  host and port alone, and its requests are only GET and HEAD of the site's origin: a redirect hop, an image or a form
+  aimed elsewhere never leaves the container, and a page that ends elsewhere gives `error` and nothing of it.
 
 **Permission.** A section of its own, *Test environments* (Users → a group): "view" reads sessions and runs, "manage"
-creates, extends and destroys sessions and starts runs and snapshots. On a new install only Administrators have it.
-The artifacts of a run that used storage states (its traces may hold their cookies) need "manage". Only a token or
-Basic auth counts (never the browser's cookie), so the writes need no CSRF token. Every change is two `testenv …` lines
-of `ui-actions.log`: what is asked, written before anything is done (if it cannot be written, nothing is done), then
-its outcome – never a patch (its sha256 only), a storage state or a password.
+creates, extends and destroys sessions and starts runs and snapshots. On a new install only Administrators have it. Of
+a run that used storage states (its titles, steps, errors and traces may hold text of an authenticated page) "view"
+sees only `id`, `kind`, `status`, `target`, `project`, `environment`, `session`, `client_run_id`, `summary`, `roles`,
+times, `executed` and the commits; its artifacts need "manage". Only a token or Basic auth counts (never the browser's
+cookie), so the writes need no CSRF token. Every change is two `testenv …` lines of `ui-actions.log`: what is asked,
+written before anything is done (if it cannot be written, nothing is done), then its outcome – never a patch (its
+sha256 only), a storage state, a password or a page path's query string.
 
-**A session** lives in `$ROOT/test-sessions/<project>/repo`: a clone of the build root at the trusted commit (`env_ref`
-when it is trusted, else the deploy branch's tip, `env_commit`), its submodules from the build root's own copies (else
-their remotes, with the setup account's keys), with the specs of `env_ref` (`tests_commit`) and the shop code of
-`shop_ref` written onto it. It never uses the build root's checkout and never takes the deploy lock. Its
-`env/local.env` is the committed `local.env.example` (else generated names, no secrets); its `env/test.env` is this
-program's: `TEST_TLS=self-signed`, `TEST_HOST_ROUTE=off` (no published port, an internal network), `CRON_SCHEDULE=off`
-and the container limits (PHP 512 MB, database 768 MB, web server 192 MB, proxy 96 MB, cron 128 MB, the optional services
-64–128 MB, Playwright `TEST_RUN_MEMORY_MB`: 3232 MB in all, what the memory gate counts). Then `make test-init`,
-`make build`, `make test-prepare set=<data set>` and `make e2e-install` run (setup with `test-session-v2`). Only
-`db: "dataset:<name>"`; `backup:prod` is refused (`400`) until anonymisation exists. One live session per project; a
-`failed` one is replaced by the next create. It expires after `ttl_minutes` (default 120); `extend` adds minutes up to 6 h
-after its creation. Its compose project name is kept in `session.json`, so it can be torn down even without the clone.
-- **`expired`**: the timer reached `expires_at` and tore the session down itself (its run cancelled; containers,
-  networks, volumes and its images removed with `docker compose -p <PROJECT_NAME>-test down --volumes`; the clone
-  deleted). **`destroyed`**: the same after a `DELETE`. **`failed`**: creating stopped (`step` and `error` say where and
-  why) and was torn down. A teardown whose `compose down` fails stays `destroying` (with `error`) and is tried again
-  every minute; it is never reported as done.
+**A session** lives in `$WORK/test-sessions/<project>/`: `repo/` (a clone of the environment repository at the trusted
+commit; a monorepo build root, or add-project's two-repository layout `projects/<p>/app` + `app/public`), its submodules
+from the build root's own copies (else their remotes), and `content/`. Its `env/local.env` is the committed
+`local.env.example` (else generated names, no secrets) and its `env/test.env` this program's: `TEST_TLS=self-signed`,
+`TEST_HOST_ROUTE=off`, `CRON_SCHEDULE=off`, session mode, and the container limits – memory: PHP 512 MB, database
+768 MB, web server 192 MB, proxy 96 MB, cron 128 MB, the optional services 64–128 MB, Playwright `TEST_RUN_MEMORY_MB`
+(1024): 3232 MB in all, what the memory gate counts; CPUs: PHP 1, database 1, web server 0.5, the rest 0.25 each,
+Playwright `TEST_RUN_CPUS` (2): at most 7 CPUs together. Then `make build`, the specs and the shop code are written,
+`make test-init`, `make test-prepare set=<data set>` and `make e2e-install`. The shop code of a branch is counted from
+the Git listing before anything is read (at most `TEST_CONTENT_FILES` 400 000 files, `TEST_CONTENT_MB` 4096; twice that
+free on the disk), the specs likewise (`TEST_SPECS_FILES` 5000, `TEST_SPECS_MB` 50); what was left out (symlinks,
+special files) is the session's `shop_dropped`. Only `db: "dataset:<name>"`; `backup:prod` is refused (`400`). One live
+session per project; a `failed` one is replaced by the next create (`503 cleanup_pending` while its tree cannot be
+removed yet). It expires after `ttl_minutes` (default 120); `extend` adds minutes up to 6 h after its creation (at that
+limit it answers `200` with the same `expires_at`). The compose project name is kept in `session.json`, the command a
+create is running too, so a destroy or the timer stops it.
+- **`expired`**: the timer reached `expires_at` and tore the session down itself. **`destroyed`**: the same after a
+  `DELETE`, or by the timer when free space under `$WORK` or Docker's data root fell below `TEST_DISK_FLOOR_MB` (4096) or
+  the session's tree grew over `TEST_SESSION_TREE_MB` (12288; what `setup` can read of it) – `error` says why.
+  **`failed`**: creating stopped (`step` and `error` say where and why) and was torn down. A teardown (its run
+  cancelled, its command stopped, `docker compose down --volumes` of its `-test` and `-local` projects, its images
+  removed, `repo/` and `content/` deleted) that does not complete stays `destroying` (with `error`) and is tried again
+  every minute; it is never reported as done. One cleaner per session. A destroyed or expired session stays readable
+  (`GET` answers it with its final status) for 24 h, then `404`.
 
-**Gates** (checked before every create, run and snapshot, and closed when they cannot be checked: `503 gate_unknown`):
-`memory` – MemAvailable minus the limits of each session still being created, minus what is asked (a session: 3232 MB;
-a run or snapshot: `TEST_RUN_MEMORY_MB`), must leave `TEST_SESSION_RESERVE_MB` (2048); `disk` – at least
-`TEST_SESSION_DISK_MB` (5120) for a session, `TEST_RUN_DISK_MB` + `TEST_RUN_ARTIFACTS_MB` for a run, free both under
-`$ROOT` and in Docker's data root; `deploy_locked` – a deploy of the project holds its lock (read from `/proc/locks`).
-The values are integers in `/etc/setup-server/test-sessions.env`; `TEST_URL_<PROJECT>_<ENV>=https://…` there gives a run
-another address than `https://<DOMAIN>`.
+**Gates** (before every create, run and snapshot; closed when they cannot be checked: `503 gate_unknown`): `memory` –
+MemAvailable minus the limits of each session still being created, minus what is asked (a session: 3232 MB; a run or
+snapshot: `TEST_RUN_MEMORY_MB`), must leave `TEST_SESSION_RESERVE_MB` (2048); `disk` – at least `TEST_SESSION_DISK_MB`
+(5120) for a session, `TEST_RUN_DISK_MB` (1024) + `TEST_RUN_ARTIFACTS_MB` (200) for a run, free under `$WORK` and in
+Docker's data root (with `TEST_DOCKER_HOST`: under `$WORK` only); `deploy_locked` – a deploy of the project holds its
+lock. Integers in `/etc/setup-server/test-sessions.env`; `TEST_URL_<PROJECT>_<ENV>=https://…` there gives a run another
+address than `https://<DOMAIN>`.
 
 **A run** is `make e2e json=1` with a selection built here, in a container named after the run. The **tag rule**
 cannot be widened by the caller: `test` runs everything but the tests tagged for another target only (`@stage`,
-`@stage-write`, `@live` without `@test`); `stage` runs `@stage` but never `@stage-write`, unless `stage_write_safe: true`
-(and "manage"); `live` runs `@live` but never `@stage-write`; `deploy_check: true` also requires `@deploy`. A tag counts
-only as a word of Playwright's grep text (whitespace or the start before it, whitespace or the end after it), so
-`jonas@live.com`, a path `@live/x.spec.ts` or `@stage.old` is no tag. The caller's `grep` is ANDed in, `grep_invert`
-ORed into the exclusions and `files` passed as spec filters: they only narrow. `test` runs in a ready session (its
-specs rebuilt from `tests_commit` before every run, then the patch); `stage`/`live` run from
-`$ROOT/test-external/<project>/repo` (the trusted commit; its dependency install is kept between runs) against the
-environment's address. One run at a time per session, and per project for stage/live (`409 run_active`).
+`@stage-write`, `@live` without `@test`); `stage` runs `@stage` but never `@stage-write`, unless `stage_write_safe:
+true` (and "manage"); `live` runs `@live` but never `@stage-write`; `deploy_check: true` also requires `@deploy`. A tag
+counts only as a word of Playwright's grep text. The caller's `grep` (a JavaScript regular expression, at most 1000
+characters, its parentheses balanced) is ANDed in, `grep_invert` ORed into the exclusions and `files` (spec paths,
+`FILE[:LINE]`, at most 100) passed as filters: they only narrow. `test` runs in a ready session (its specs rebuilt from
+`tests_commit` before every run, then the patch); `stage`/`live` from `$WORK/test-external/<project>/` (the trusted
+commit; its dependency install kept between runs; `env_ref` only a trusted ref). One run at a time per session, and per
+project for stage/live (`409 run_active`).
 - **Stopping.** A timeout (`TEST_RUN_TIMEOUT_MINUTES`, 60), a run over its disk quota (`TEST_RUN_DISK_MB` of results,
-  checked while it runs) or a cancel sends SIGTERM to the run's process group, SIGKILL after 15 s, and removes its
-  container (`docker rm -f`). A cancel that comes before the worker starts wins: the suite never starts. Every state
-  change is conditional under a lock, so a cancel never overwrites a finished outcome and a finished worker never
-  overwrites a cancel. The timer removes every run container without an active run and ends the runs and snapshots
-  whose process died.
+  looked at every 20 s and once more when it ends) or a cancel stops the run's command (SIGTERM, SIGKILL after 15 s) and
+  removes its container (`docker rm -f`). A **cancel** first sets `cancelling` (the run keeps its slot, no other run can
+  start there), lets the worker stop its command (it looks every 2 s), kills the worker if it has not stopped within
+  30 s, reads the record again and stops the command recorded last, removes the container, and only then sets
+  `cancelled` and frees the slot (under the lock, and only if the run still owns it). A cancel that comes before the
+  worker starts wins: the suite never starts. A cancel never overwrites a finished outcome. The timer finishes a cancel
+  whose canceller died, ends runs whose process died, and removes every run container without an active run.
 - **patch** (target `test` only, ≤ 1 MiB, else `413`): a unified diff relative to `app/` (as `git diff --relative=app`
-  writes it) under `tests/playwright/` or `config/playwright/`. It is judged by what `git apply` itself reads
-  (`--numstat --summary -p1`): no path outside those directories, no `node_modules`, no `package.json`,
-  `package-lock.json` or `.npmrc`, no mode but `100644`/`100755` (no symlink or submodule), no binary patch. It is
-  applied to a staging copy outside any repository, whose result is checked again (regular files only) before it is
-  written into the session. A patch that does not apply is a `400` when the run is asked for.
-- **client_run_id** (1–100 of `A-Za-z0-9._:-`): the idempotency key, per caller: a second POST returns the first run
-  (`200`, `"created": false`) before anything else is checked. `POST /runs/cancel` `{project, client_run_id}` cancels
-  what the key names in that project (whoever started it), **also before it exists**: the key is kept cancelled for 48 h,
-  and a `POST /runs` or `POST /test-sessions` with it that arrives later is refused (`409`, `reason: "cancelled"`, no
-  `capacity`), nothing started. A session created with `client_run_id` is destroyed by that cancel too.
-- **storage_states** `{role: operation_uuid}`: the seam for Vault. Each file `/run/vault-handoff/<env>/<uuid>.json`
-  (`env`: `stage` or `prod`; `test` for a session) must be a regular file (not a symlink, at most 1 MiB, JSON) written
-  within `TEST_STORAGE_STATE_MAX_AGE` (900 s), else `409 storage_state_missing` / `storage_state_expired`. Root reads it
-  (Vault writes them `0640 root:vault-handoff`; `setup` needs no group for it) and hands the run its own copy
-  (`$ROOT/test-runs/<id>/auth/<role>.json`, `0600 setup`, removed when the run ends), mounted read-only as
-  `/e2e/auth/<role>.json` (`E2E_STORAGE_STATE_<ROLE>`, all as JSON in `E2E_STORAGE_STATES`).
-- **Results**: `$ROOT/test-runs/<id>/` (`run.json`, `report.json`, `log`, the artifacts of the tests that did not pass).
-  The report and every attachment are read only inside the results directory (no symlink followed, regular files
-  only), the report at most 32 MiB, at most 500 tests, 200 artifacts and `TEST_RUN_ARTIFACTS_MB` (200) per run. A
-  stage/live run's traces and HTML report are deleted once its artifacts are copied. Finished runs are kept
-  `TEST_RUN_KEEP_DAYS` (7) and within `TEST_RUNS_TOTAL_MB` (2048; the oldest go first).
+  writes it) under `tests/playwright/` or `config/playwright/`, judged by what `git apply --numstat --summary -p1`
+  reads: no path outside them, no `node_modules`, no `package.json`/`package-lock.json`/`.npmrc`, no mode but
+  `100644`/`100755`, no binary patch. Applied to a staging copy outside any repository, whose result is checked again
+  (regular files only). A patch that does not apply is a `400` when the run is asked for.
+- **client_run_id** (1–100 of `A-Za-z0-9._:-`): **one index per project**, whoever asks. A second `POST /runs` with it
+  returns the first run (`200`, `"created": false`) – unless that run is of another target or kind (`409
+  client_run_id_conflict`) or the key was cancelled first (`409 cancelled`). `POST /runs/cancel {project,
+  client_run_id}` cancels what the key names, **also before it exists**: the key is kept cancelled for 48 h (at most
+  `TEST_TOMBSTONES` 200 per project, then `409 tombstones_full`), and a later `POST /runs` or `POST /test-sessions` with
+  it is refused (`409 cancelled`, no `capacity`), nothing started, no storage state read. A run with that key is
+  cancelled by it (synchronously: the answer's `run` is `cancelled`, or `cancelling` if the stop did not complete, which
+  the timer finishes), and a session created with that key is destroyed.
+- **storage_states** `{role: operation_uuid}`: each file `/run/vault-handoff/<env>/<uuid>.json` (`stage`, `prod`;
+  `test` for a session) must be a regular file (not a symlink, at most 1 MiB, JSON; 4 MiB together) written within
+  `TEST_STORAGE_STATE_MAX_AGE` (900 s), else `409 storage_state_missing` / `storage_state_expired`. Root reads it (Vault
+  writes them `0640 root:vault-handoff`; `setup` needs no group) and hands the run its own copy (`0600 setup`, removed
+  when the run ends), mounted read-only as `/e2e/auth/<role>.json`.
+- **Results**: `$WORK/test-runs/<id>/` (`run.json`, `report.json`, `log`, the artifacts of the tests that did not
+  pass). The report and every attachment are read only inside the results directory (no symlink followed, no absolute or
+  `//` path, regular files only), the report at most 32 MiB, at most 500 tests, 200 artifacts and
+  `TEST_RUN_ARTIFACTS_MB` (200) per run. Every log is at most `TEST_LOG_MB` (20). A stage/live run's traces and HTML
+  report are deleted when it ends, whatever the outcome. Finished runs are kept `TEST_RUN_KEEP_DAYS` (7) and within
+  `TEST_RUNS_TOTAL_MB` (2048).
 
-**A snapshot** (synchronous, up to 4 minutes): one GET navigation to `path` (a path of the site: one leading `/`, never
-`//`) in a fresh browser context that aborts every request to another origin and blocks service workers; a page that
-ends elsewhere after redirects gives `error` and nothing of it. Then the page's ARIA snapshot, its DOM without scripts,
-styles, comments, `style`/`on…` attributes and SVG contents (at most 200 000 characters, `dom_truncated`), and a
-full-page screenshot artifact. Only `role: "guest"`.
+**A snapshot** (synchronous, up to `TEST_SNAPSHOT_TIMEOUT`, 240 s): one GET navigation to `path` (one leading `/`, never
+`//`) in a fresh browser context confined as above; then the page's ARIA snapshot, its DOM without scripts, styles,
+comments, `style`/`on…` attributes and SVG contents (at most 200 000 characters, `dom_truncated`), a full-page screenshot
+artifact and `blocked` (how many requests were refused). Only `role: "guest"`. A stage/live snapshot runs the Playwright
+image directly (nothing is cloned or installed; `503 gate_unknown` when this host has no Playwright image yet).
 
-**The timer** `setup-server-test-sessions.timer` (every minute, `bin/test-session reconcile` as root → setup) tears
-expired sessions down itself (a process it left behind would be killed with its oneshot unit), retries failed
-teardowns, fails a session or run whose process died, cancels runs past their timeout, removes run containers without
-an active run and the containers of session Compose projects no session owns, and deletes old runs and tombstones.
+**The timer** `setup-server-test-sessions.timer` (every minute, `bin/test-session reconcile` as root → setup, bounded as
+above) tears expired and oversized sessions down itself, retries failed teardowns, fails a session whose creating
+process died, finishes cancels, ends runs whose process died, cancels runs past their timeout, removes run containers
+without an active run and the Compose projects under the sessions' directory that no live session owns (a live
+session's `-test` and `-local` projects are its own), and deletes old runs and tombstones.
 
-**Endpoints** (`/api/v1`; JSON bodies, `Content-Type: application/json`, at most 2 MiB; `/api/v1/openapi.json` has
-the schemas):
+**Endpoints** (`/api/v1`; JSON bodies, `Content-Type: application/json`, at most 2 MiB; `/api/v1/openapi.json` has the
+schemas):
 
 | Method, path | Needs | Answer |
 |---|---|---|
-| `GET /test-sessions` | testenv: view | `{"sessions": [Session…]}` |
-| `POST /test-sessions` | testenv: manage | `202 {"session": Session}` (status `creating`); `400`, `404`, `409` |
-| `GET /test-sessions/{id}` | testenv: view | `{"session": Session, "runs": [Run…]}` |
-| `POST /test-sessions/{id}/extend` | testenv: manage | `{"session": Session}`; body `{"minutes": 120}` |
-| `DELETE /test-sessions/{id}` | testenv: manage | `202 {"session": Session}` (status `destroying`) |
+| `GET /test-sessions` | testenv: view | `{"sessions": [Session…]}`: every project's sessions (each with `project`, `status`) |
+| `POST /test-sessions` | testenv: manage | `202 {"session": Session}` (status `creating`); `400`, `404`, `409`, `503` |
+| `GET /test-sessions/{id}` | testenv: view | `{"session": Session, "runs": [Run…]}` (each run with its `client_run_id`) |
+| `POST /test-sessions/{id}/extend` | testenv: manage | `200 {"session": Session}`; body `{"minutes": 120}` |
+| `DELETE /test-sessions/{id}` | testenv: manage | `202 {"session": Session}` (status `destroying`; later `destroyed`) |
 | `POST /test-sessions/{id}/snapshot` | testenv: manage | `200 {"run": Run}` with `snapshot`; body `{"path": "/", "role": "guest"}` |
 | `POST /snapshots` | testenv: manage | the same of a real site; body `{"project", "environment": "stage"\|"live", "path"}` |
 | `GET /runs[?session=ID]` | testenv: view | `{"runs": [Run…]}` (newest 200) |
 | `POST /runs` | testenv: manage | `202 {"run": Run, "created": true}`; `200 … "created": false` for a known `client_run_id` |
 | `POST /runs/cancel` | testenv: manage | `200 {"cancelled": true, "run": Run\|null}`; body `{"project", "client_run_id"}`; idempotent |
 | `GET /runs/{id}` | testenv: view | `{"run": Run}` |
-| `POST /runs/{id}/cancel` | testenv: manage | `200 {"run": Run}` (no body): a queued or running run ends `cancelled`; a finished one comes back unchanged |
-| `GET /runs/{id}/artifacts/{name}` | testenv: view (manage with roles) | the file (`Content-Type` by its extension, `Content-Disposition: attachment`) |
+| `POST /runs/{id}/cancel` | testenv: manage | `200 {"run": Run}` (no body): `cancelled` (or `cancelling` while the stop completes); a finished run unchanged |
+| `GET /runs/{id}/artifacts/{name}` | testenv: view (manage with roles) | the file |
 
-Session: `id` (`ts-` + 12 hex), `project`, `status` (`creating` → `ready`; `failed`, `destroying`, `destroyed`,
-`expired`), `step` (while creating: `clone`, `specs`, `env`, `test-init`, `build`, `test-prepare`, `e2e-install`),
-`error`, `db`, `env_ref`, `env_commit` (the trusted commit), `env_branch` (the trusted branch holding it),
-`tests_commit` (where the specs come from), `shop_ref`, `shop_commit`, `client_run_id`, `created_at`, `ready_at`,
-`expires_at`, `max_expires_at`, `ended_at`, `created_by`, `active_run`, `domain`, `url` (the in-network address) and
-`reachable`.
-Run: `id` (`run-`/`snap-` + 12 hex), `kind` (`run`/`snapshot`), `status` – `queued`, `running`, then one of: `passed`
-(tests ran, none failed, Playwright reported no error), `failed` (at least one test failed – including timed out and
-interrupted ones), `error` (see `error` and `errors`: the run could not be carried out, or no test ran – nothing
-matched the selection, a configuration or TypeScript error, a global timeout), `cancelled`; a snapshot ends `done` or
-`error`. `executed` (once finished): `true` when tests ran and were reported (also an `error` after a global timeout),
-`false` when none ran. `errors`: Playwright's own errors (e.g. `Error: No tests found`), credentials in URLs, query
-strings and Cookie/Authorization headers replaced by `***` there and in each test's `error`. Also `step`, `target`,
-`project`, `session` (test) or `environment` (stage/live), `url`, `env_ref`, `env_commit`, `tests_commit`,
-`shop_commit`, `cancelled_by`, `grep`/`grep_invert` (what Playwright got), `files`, `deploy_check`,
-`stage_write_safe`, `patch_sha256`, `patch_files`, `client_run_id`, `roles`, `created_by`, times, and when done
-`summary` `{passed, failed, flaky, skipped, duration_s}`, `tests` (each that did not pass: `test_id` = file + " › " +
-the full title, `file`, `title`, `status` `failed`|`flaky`|`skipped`, `attempts`, `error`, `step`, `artifacts`,
-`project`), `artifacts` (`name`, `size`, `content_type`, `test_id`).
+**What the API guarantees** (the runner relies on these):
+- A Session always has `id`, `project`, `status`, `db` (as given), `env_ref` (as given, else the deploy branch),
+  `shop_ref` (as given, or null), `env_commit` and `tests_commit` (40 hex), `created_at`, `expires_at`,
+  `max_expires_at`; once ready `url`. Statuses: `creating` → `ready`, then `destroying` → `destroyed` | `expired`, or
+  `failed`. Final: `destroyed`, `expired`, `failed`.
+- A Run always has `id`, `kind`, `status`, `target`, `project`, `created_at`; `env_commit` (40 hex). Statuses: `queued`,
+  `running`, `cancelling` (not final); `passed`, `failed`, `error`, `cancelled`, `done` (a snapshot) (final). **Every
+  final run carries `executed`**: `true` when tests ran and were reported (some may have failed; also an `error`
+  after a global timeout), or for a `cancelled` run when its suite had been started (some tests may have run, so a
+  repeat may not be safe); `false` when none ran. `error` is one sentence; `errors` (when present) is Playwright's own
+  list.
+- `POST /runs` takes `target` (`test`|`stage`|`live`), `project` (or `session` for `test`), `session`, `grep`,
+  `grep_invert`, `files`, `patch` (test), `deploy_check`, `stage_write_safe` (stage, "manage"), `client_run_id`,
+  `env_ref` (stage/live: a trusted ref only; test: refused, it belongs to the session), `storage_states`; it answers
+  `{run, created}`.
+- **Nothing was created** when the answer is `400`, `401`, `403`, `404`, `405`, `409`, `413`, or `503` with `reason`
+  (`gate_unknown`, `cleanup_pending`); a retry of the same request is then safe. `429` (too many wrong logins) also
+  creates nothing. A `503` **without** `reason` (the helper failed or timed out) or a lost connection leaves it open:
+  repeat with the same `client_run_id`, which returns the run if it was created.
+
+Session fields beyond those: `step`, `error` (credentials redacted), `env_branch`, `shop_commit`, `shop_dropped`,
+`client_run_id`, `ready_at`, `ended_at`, `created_by`, `active_run`, `domain`, `reachable`. Run fields beyond those:
+`step`, `session`/`environment`, `url`, `tests_commit`, `shop_commit`, `cancelled_by`, `grep`/`grep_invert` (what
+Playwright got), `files`, `deploy_check`, `stage_write_safe`, `patch_sha256`, `patch_files`, `client_run_id`, `roles`,
+`created_by`, `started_at`, `finished_at`, and when done `summary` `{passed, failed, flaky, skipped, duration_s}`,
+`tests` (each that did not pass: `test_id`, `file`, `title`, `status`, `attempts`, `error`, `step`, `artifacts`,
+`project`), `artifacts` (`name`, `size`, `content_type`, `test_id`), `snapshot`.
+
+Refusals are `{"error", "status", "reason"?, "capacity"?}`: `409` reasons `memory`, `disk`, `run_active`,
+`deploy_locked` carry `"capacity": true` (no room now, retry later); `session_exists`, `session_not_ready`,
+`session_ended`, `storage_state_missing`, `storage_state_expired`, `cancelled`, `client_run_id_conflict`,
+`tombstones_full` do not; `400 content_too_large` (a branch's specs or shop code over the limits).
 
 ```bash
 H=(-H "Authorization: Bearer $OPS_TOKEN" -H "Content-Type: application/json")
 curl -s "${H[@]}" -d '{"project":"shop","db":"dataset:dev","ttl_minutes":120}' https://ops.local/api/v1/test-sessions
 curl -s "${H[@]}" https://ops.local/api/v1/test-sessions/ts-6de03ce5d957 | jq .session.status        # until "ready"
-curl -s "${H[@]}" -d '{"path":"/checkout"}' https://ops.local/api/v1/test-sessions/ts-6de03ce5d957/snapshot | jq .run.snapshot.aria
 jq -n --rawfile p fix.diff '{target:"test",session:"ts-6de03ce5d957",client_run_id:"pr-41-1",grep:"@cart",patch:$p}' |
   curl -s "${H[@]}" -d @- https://ops.local/api/v1/runs | jq .run.id
 curl -s "${H[@]}" https://ops.local/api/v1/runs/run-5d864778d7db | jq '.run | {status, executed, summary, errors, tests}'
 curl -s "${H[@]}" -d '{"project":"shop","client_run_id":"pr-41-1"}' https://ops.local/api/v1/runs/cancel
-curl -s "${H[@]}" -d '{"target":"live","project":"shop","deploy_check":true}' https://ops.local/api/v1/runs
 curl -s "${H[@]}" -X DELETE https://ops.local/api/v1/test-sessions/ts-6de03ce5d957
 ```
 
-Refusals are `{"error", "status", "reason"?, "capacity"?}`: `400` (a bad value: the message says which), `401` (no or
-a wrong token – also for a path or method the API does not have), `403` (the permission, `stage_write_safe` without
-"manage", the artifacts of a run with roles), `404`, `405`, `409` (`reason`: `memory`, `disk`, `run_active`,
-`deploy_locked` – these four also carry `"capacity": true`: no room now, retry later –, `session_exists`,
-`session_not_ready`, `session_ended`, `storage_state_missing`, `storage_state_expired`, `cancelled`; a memory or disk
-refusal also has `needed_mb` and `available_mb`), `413`, `503` (`gate_unknown`; setup too old; the helper failed).
-
 **Verified end to end.** `python3 tests/fixtures/test_session_e2e.py <setup checkout> [--lock-file FILE]` runs the whole
-cycle against this machine's Docker as the account running it (docker group): a session of an untrusted branch (its
-specs, never its Makefile), a failing test, the patch that fixes it, a cancel, snapshots, the session's isolation, a
-stage run against a local site, and expiry through reconcile.
+cycle against this machine's Docker as the account running it: a project with `metrics` and `cron`, a session of an
+untrusted branch (its specs, never its Makefile), every container and network of the session inspected (no metrics,
+capabilities, limits, no ports, internal networks), PHP-FPM and a spec trying the internet, the host gateway and cloud
+metadata, a spec filling `/tmp` and one filling the results directory, a failing test, the patch that fixes it, a cancel
+during `make e2e`, snapshots against a site and a second server that count what they receive, a stage run, and expiry
+through reconcile.
 
 ## Project containers on the server
 
