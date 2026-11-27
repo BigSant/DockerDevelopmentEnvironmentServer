@@ -373,10 +373,12 @@ def alive(recorded):
         os.kill(int(pid), 0)
     except (OSError, TypeError, ValueError):
         return False
-    with contextlib.suppress(OSError, ValueError, IndexError):  # a zombie (killed, not yet reaped) is no longer running
-        text = (PROC / str(int(pid)) / 'stat').read_text()
-        if text[text.rindex(')') + 2] in 'ZX':
-            return False
+    for proc in dict.fromkeys((PROC, Path('/proc'))):  # a zombie (killed, not yet reaped) is no longer running
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            text = (proc / str(int(pid)) / 'stat').read_text()
+            if text[text.rindex(')') + 2] in 'ZX':
+                return False
+            break
     return start is None or process_start(pid) == start
 
 
